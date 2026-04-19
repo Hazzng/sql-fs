@@ -527,7 +527,11 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		return entry.symlinkTarget!;
 	}
 
-	async realpath(_path: string): Promise<string> {
-		throw new Error("not implemented");
+	async realpath(path: string): Promise<string> {
+		const resolvedInodeId = await this.#withTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
+		for (const [p, entry] of this.#pathCache) {
+			if (entry.inodeId === resolvedInodeId) return p;
+		}
+		throw createEnoent(path);
 	}
 }
