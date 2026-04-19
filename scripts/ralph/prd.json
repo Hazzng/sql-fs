@@ -435,7 +435,7 @@
         "Tests pass"
       ],
       "priority": 22,
-      "passes": false,
+      "passes": true,
       "notes": "Use vi.useFakeTimers() in tests to control time advancement."
     },
     {
