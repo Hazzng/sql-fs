@@ -15,10 +15,11 @@ import { createEexist, createEnoent, createEnotdir, createEnotempty } from "./er
 import type { PathCacheEntry, SqlDialect } from "./types.js";
 
 // Extract optional-parameter types from IFileSystem to avoid importing
-// from just-bash internal paths (ReadFileOptions, WriteFileOptions are not
+// from just-bash internal paths (ReadFileOptions, WriteFileOptions, DirentEntry are not
 // publicly re-exported from the just-bash main entry point).
 type ReadFileOpts = Parameters<IFileSystem["readFile"]>[1];
 type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
+type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
 const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 
@@ -426,8 +427,28 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		};
 	}
 
-	async readdir(_path: string): Promise<string[]> {
-		throw new Error("not implemented");
+	async readdir(path: string): Promise<string[]> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+		if (entry.kind !== 2) throw createEnotdir(path);
+		return this.#childPaths(path).map((p) => this.#nameOf(p));
+	}
+
+	readdirWithFileTypes(path: string): Promise<DirentEntry[]> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) return Promise.reject(createEnoent(path));
+		if (entry.kind !== 2) return Promise.reject(createEnotdir(path));
+		const children = this.#childPaths(path);
+		const result: DirentEntry[] = children.map((p) => {
+			const e = this.#pathCache.get(p)!;
+			return {
+				name: this.#nameOf(p),
+				isFile: e.kind === 1,
+				isDirectory: e.kind === 2,
+				isSymbolicLink: e.kind === 3,
+			};
+		});
+		return Promise.resolve(result);
 	}
 
 	async cp(_src: string, _dest: string, _options?: CpOptions): Promise<void> {
