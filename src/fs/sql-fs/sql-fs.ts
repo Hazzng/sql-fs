@@ -313,16 +313,25 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const parentEntry = this.#pathCache.get(parentPath);
 
 		if (options?.recursive && entry.kind === 2) {
-			// Remove all descendants and self from pathCache + contentCache
-			for (const p of this.#allPathsUnder(path)) {
+			// Snapshot subtree paths before async work
+			const subtreePaths = this.#allPathsUnder(path);
+
+			// DB: delete parent dirent + all subtree inodes in one transaction
+			await this.#withTx(async (tx) => {
+				if (parentEntry) {
+					await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
+				}
+				const allInodeIds = await this.#dialect.loadSubtreeInodes(tx, entry.inodeId);
+				for (const inodeId of allInodeIds) {
+					await this.#dialect.deleteInode(tx, inodeId);
+				}
+			});
+
+			// Update caches after successful DB operation
+			for (const p of subtreePaths) {
 				const e = this.#pathCache.get(p);
 				if (e) this.#contentCache.delete(e.inodeId);
 				this.#pathCache.delete(p);
-			}
-			if (parentEntry) {
-				await this.#withTx(async (tx) => {
-					await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
-				});
 			}
 			return;
 		}
