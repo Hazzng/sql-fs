@@ -1,0 +1,260 @@
+/**
+ * SqlDialect interface and shared types for virtualfs-api.
+ * US-001: SqlDialect interface definition
+ * US-002: Shared types for inode, dirent, cache entry
+ */
+
+/** Inode kind: 1=file, 2=directory, 3=symlink */
+export type InodeKind = 1 | 2 | 3;
+
+/** Storage backend identifiers */
+export type StorageBackend = "postgres" | "mysql" | "azure-sql" | "azure-fileshare" | "memory";
+
+/**
+ * A database row representing a filesystem inode.
+ * Matches the `inodes` table schema.
+ */
+export interface InodeRow {
+	readonly id: bigint;
+	readonly sandboxId: string;
+	readonly kind: InodeKind;
+	readonly mode: number;
+	readonly size: number;
+	readonly mtime: Date;
+	readonly nlink: number;
+	readonly contentSha256: Uint8Array | null;
+	readonly symlinkTarget: string | null;
+}
+
+/**
+ * A database row representing a directory entry.
+ * Matches the `dirents` table schema.
+ */
+export interface DirentRow {
+	readonly parentInodeId: bigint;
+	readonly name: string;
+	readonly inodeId: bigint;
+}
+
+/**
+ * An entry stored in the in-memory path cache, keyed by absolute path.
+ * Does not include sandboxId or nlink — those are inode-level concerns.
+ */
+export interface PathCacheEntry {
+	readonly inodeId: bigint;
+	readonly kind: InodeKind;
+	readonly mode: number;
+	readonly size: number;
+	readonly mtime: Date;
+	readonly contentSha256: Uint8Array | null;
+	readonly symlinkTarget: string | null;
+}
+
+/** Options for creating a new inode row */
+export interface CreateInodeOpts {
+	readonly sandboxId: string;
+	readonly kind: InodeKind;
+	readonly mode: number;
+	readonly size: number;
+	readonly contentSha256?: Uint8Array | null;
+	readonly symlinkTarget?: string | null;
+}
+
+/** Fields that can be updated on an existing inode */
+export interface UpdateInodeOpts {
+	readonly mode?: number;
+	readonly size?: number;
+	readonly mtime?: Date;
+	readonly contentSha256?: Uint8Array | null;
+}
+
+/** A single file entry for bulk ingest operations */
+export interface BulkIngestFile {
+	readonly path: string;
+	readonly content: Uint8Array;
+	readonly mode: number;
+}
+
+/**
+ * SqlDialect abstracts all database-specific SQL operations so that SqlFs
+ * can work with Postgres, MySQL, and Azure SQL without modification.
+ *
+ * The Tx type parameter is specialised by each dialect with its own
+ * transaction handle type (e.g. postgres `Sql` in transaction mode).
+ */
+export interface SqlDialect<Tx = unknown> {
+	// ── Connection ──────────────────────────────────────────────────────────────
+
+	/** Opens the connection pool to the database. */
+	connect(): Promise<void>;
+
+	/** Closes the connection pool gracefully. */
+	disconnect(): Promise<void>;
+
+	// ── Transactions ─────────────────────────────────────────────────────────────
+
+	/**
+	 * Wraps the callback in a BEGIN/COMMIT transaction.
+	 * Rolls back automatically on error and re-throws the original error.
+	 */
+	transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+
+	// ── Sandbox context ──────────────────────────────────────────────────────────
+
+	/**
+	 * Sets the per-transaction sandbox context so that RLS policies and stored
+	 * procedures can scope queries to the current sandbox.
+	 * Executes SET LOCAL app.sandbox_id = $1 inside the given transaction.
+	 */
+	setSandboxContext(tx: Tx, sandboxId: string): Promise<void>;
+
+	// ── Sandbox lifecycle ─────────────────────────────────────────────────────────
+
+	/**
+	 * Creates a new sandbox: inserts a root inode (kind=2, mode=0o755),
+	 * inserts the sandboxes row, and creates default directories
+	 * (/home, /home/user, /tmp, /bin).
+	 * Returns the root inode ID.
+	 */
+	createSandbox(tx: Tx, sandboxId: string): Promise<{ rootInodeId: bigint }>;
+
+	/**
+	 * Deletes a sandbox and all associated inodes, dirents, and blobs
+	 * by deleting the sandbox row (CASCADE removes child rows).
+	 */
+	deleteSandbox(tx: Tx, sandboxId: string): Promise<void>;
+
+	// ── Inode CRUD ────────────────────────────────────────────────────────────────
+
+	/**
+	 * Inserts a new inode into the database.
+	 * Returns the generated bigint inode ID.
+	 */
+	createInode(tx: Tx, opts: CreateInodeOpts): Promise<bigint>;
+
+	/**
+	 * Retrieves a single inode by ID.
+	 * Returns null if the inode does not exist.
+	 */
+	getInode(tx: Tx, inodeId: bigint): Promise<InodeRow | null>;
+
+	/**
+	 * Updates mutable inode fields (mode, size, mtime, contentSha256).
+	 * Only the fields present in `updates` are written; others are untouched.
+	 */
+	updateInode(tx: Tx, inodeId: bigint, updates: UpdateInodeOpts): Promise<void>;
+
+	/**
+	 * Hard-deletes an inode row by ID.
+	 */
+	deleteInode(tx: Tx, inodeId: bigint): Promise<void>;
+
+	// ── Hardlink counts ──────────────────────────────────────────────────────────
+
+	/**
+	 * Atomically increments nlink by 1.
+	 * Executes UPDATE inodes SET nlink = nlink + 1 WHERE id = $1.
+	 */
+	incrementNlink(tx: Tx, inodeId: bigint): Promise<void>;
+
+	/**
+	 * Atomically decrements nlink by 1 and returns the new nlink value.
+	 * Executes UPDATE inodes SET nlink = nlink - 1 WHERE id = $1 RETURNING nlink.
+	 */
+	decrementNlink(tx: Tx, inodeId: bigint): Promise<number>;
+
+	// ── Dirent CRUD ──────────────────────────────────────────────────────────────
+
+	/**
+	 * Inserts a directory entry linking `name` under `parentId` to `inodeId`.
+	 * Throws a translatable EEXIST error if (parentId, name) already exists.
+	 */
+	insertDirent(tx: Tx, parentId: bigint, name: string, inodeId: bigint): Promise<void>;
+
+	/**
+	 * Insert-or-replace a directory entry atomically using
+	 * INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id.
+	 * Returns the previously-referenced inodeId if a replacement occurred,
+	 * or null if this was a fresh insert.
+	 */
+	upsertDirent(tx: Tx, parentId: bigint, name: string, inodeId: bigint): Promise<bigint | null>;
+
+	/**
+	 * Deletes the directory entry (parentId, name) and returns the removed inodeId.
+	 * Throws a translatable ENOENT error if the entry does not exist.
+	 */
+	deleteDirent(tx: Tx, parentId: bigint, name: string): Promise<bigint>;
+
+	/**
+	 * Lists all directory entries under `parentId`, ordered by name.
+	 */
+	listDirents(tx: Tx, parentId: bigint): Promise<DirentRow[]>;
+
+	/**
+	 * Moves/renames a directory entry in a single UPDATE.
+	 * If the destination (newParentId, newName) already exists, deletes it first
+	 * within the same transaction.
+	 * Throws a translatable ENOENT error if the source does not exist.
+	 */
+	moveDirent(tx: Tx, oldParentId: bigint, oldName: string, newParentId: bigint, newName: string): Promise<void>;
+
+	// ── Blob storage ──────────────────────────────────────────────────────────────
+
+	/**
+	 * Stores a content-addressable blob keyed by its SHA-256 hash.
+	 * Uses INSERT ... ON CONFLICT (sha256) DO NOTHING for global deduplication.
+	 */
+	upsertBlob(tx: Tx, sha256: Uint8Array, data: Uint8Array): Promise<void>;
+
+	/**
+	 * Retrieves blob content by its SHA-256 hash.
+	 * Returns null if no blob with that hash exists.
+	 */
+	getBlob(tx: Tx, sha256: Uint8Array): Promise<Uint8Array | null>;
+
+	/**
+	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.
+	 * Returns the count of blobs deleted.
+	 */
+	gcOrphanBlobs(tx: Tx): Promise<number>;
+
+	// ── Bulk / tree operations ────────────────────────────────────────────────────
+
+	/**
+	 * Loads the complete path tree for the current sandbox in one recursive CTE
+	 * query, starting from the sandbox root inode.
+	 * Used to populate SqlFs.pathCache at session start.
+	 * The root directory is included with path '/'.
+	 * Returns one entry per filesystem node with its absolute path and metadata.
+	 */
+	loadAllPaths(tx: Tx): Promise<Array<{ path: string } & PathCacheEntry>>;
+
+	/**
+	 * Collects all inode IDs within the subtree rooted at `rootInodeId`,
+	 * including the root itself, using a recursive CTE.
+	 * Used by rm -r to gather all inodes for bulk deletion.
+	 */
+	loadSubtreeInodes(tx: Tx, rootInodeId: bigint): Promise<bigint[]>;
+
+	/**
+	 * Bulk-inserts files into the current sandbox in minimal round-trips,
+	 * creating all missing parent directories automatically.
+	 * Prefers multi-row INSERT statements for blobs and inodes.
+	 */
+	bulkIngest(tx: Tx, files: BulkIngestFile[]): Promise<void>;
+
+	// ── Path resolution ───────────────────────────────────────────────────────────
+
+	/**
+	 * Resolves an absolute `path` string to an inode ID by walking path components
+	 * and following symlinks (via the dialect's fs_resolve stored procedure or
+	 * equivalent).
+	 *
+	 * Symlinks on intermediate components are always followed.
+	 * The final component is followed only when `followLast` is true.
+	 *
+	 * Throws ENOENT if any component is missing, ENOTDIR if a non-directory
+	 * appears mid-path, or ELOOP if circular symlinks are detected.
+	 */
+	resolvePath(tx: Tx, path: string, followLast: boolean): Promise<bigint>;
+}
