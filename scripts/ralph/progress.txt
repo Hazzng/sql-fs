@@ -361,3 +361,16 @@
   - `#childPaths(dirPath)` already handles direct-children-only filtering (no additional `/` in `rest`), so `readdir` is a simple map from paths to basenames.
   - Tests call `fs.readdirWithFileTypes!(...)` (non-null assertion) since TypeScript sees it as optional — this is fine in test code.
 ---
+
+## 2026-04-19 - US-028
+- Added EISDIR guard to `readFile` — throws if `entry.kind === 2` (directory)
+- Added `byteLength > 0` guard before `#contentCache.set` in `readFile` — fixes potential throw on zero-length files (LRUCache requires positive byte sizes)
+- Implemented `readFileBuffer(path)` replacing the stub: same cache-check flow as `readFile` but returns raw `Uint8Array` instead of decoded string
+- Added `createEisdir` import to `sql-fs.ts` (was missing from prior stories)
+- Created `src/fs/sql-fs/sql-fs.read-file.test.ts` with 8 unit tests: readFile returns string/ENOENT/EISDIR; readFileBuffer returns Uint8Array/stores in cache/cache hit skips DB/ENOENT/EISDIR
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.read-file.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `readFile` from US-023 was missing the EISDIR check — US-028 added it. When a story says "throws EISDIR if kind=2", always add that guard immediately after the ENOENT check.
+  - `readFileBuffer` is structurally identical to `readFile` minus the `TextDecoder` step — reuse the same cache-check/miss pattern.
+  - The `byteLength > 0` guard before `contentCache.set` prevents the LRUCache "sizeCalculation return invalid" error for empty files. Apply this guard to both `readFile` and `readFileBuffer`.
+---

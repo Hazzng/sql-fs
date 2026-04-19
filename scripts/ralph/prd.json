@@ -1,7 +1,7 @@
 {
   "project": "VirtualFS API",
   "branchName": "ralph/phase1-sqlfs-postgres",
-  "description": "Phase 1: SqlFs IFileSystem backed by Postgres — types, dialect, caching, all read/write methods. 42 stories across 8 epics.",
+  "description": "Phase 1: SqlFs IFileSystem backed by Postgres \u2014 types, dialect, caching, all read/write methods. 42 stories across 8 epics.",
   "userStories": [
     {
       "id": "US-001",
@@ -63,7 +63,7 @@
     },
     {
       "id": "US-004",
-      "title": "Postgres dialect — connection and sandbox context",
+      "title": "Postgres dialect \u2014 connection and sandbox context",
       "description": "As a developer, I want the Postgres dialect to connect via postgres driver and set sandbox context per transaction.",
       "acceptanceCriteria": [
         "PostgresDialect class in src/fs/sql-fs/dialects/postgres.ts implementing SqlDialect",
@@ -84,7 +84,7 @@
     },
     {
       "id": "US-005",
-      "title": "Postgres dialect — createSandbox and deleteSandbox",
+      "title": "Postgres dialect \u2014 createSandbox and deleteSandbox",
       "description": "As a developer, I want to create and delete sandbox root structures in Postgres.",
       "acceptanceCriteria": [
         "createSandbox(tx, sandboxId) inserts root inode (kind=2, mode=0o755), inserts sandboxes row, creates default dirs (/home, /home/user, /tmp, /bin), returns { rootInodeId }",
@@ -100,7 +100,7 @@
     },
     {
       "id": "US-006",
-      "title": "Postgres dialect — inode CRUD operations",
+      "title": "Postgres dialect \u2014 inode CRUD operations",
       "description": "As a developer, I want CRUD operations on inodes in Postgres.",
       "acceptanceCriteria": [
         "createInode(tx, opts) inserts into inodes table, returns new bigint id",
@@ -120,7 +120,7 @@
     },
     {
       "id": "US-007",
-      "title": "Postgres dialect — incrementNlink and decrementNlink",
+      "title": "Postgres dialect \u2014 incrementNlink and decrementNlink",
       "description": "As a developer, I want to atomically increment/decrement hardlink counts on inodes.",
       "acceptanceCriteria": [
         "incrementNlink(tx, inodeId) executes UPDATE inodes SET nlink = nlink + 1 WHERE id = $1",
@@ -137,7 +137,7 @@
     },
     {
       "id": "US-008",
-      "title": "Postgres dialect — insertDirent",
+      "title": "Postgres dialect \u2014 insertDirent",
       "description": "As a developer, I want to insert a directory entry linking a name to an inode.",
       "acceptanceCriteria": [
         "insertDirent(tx, parentId, name, inodeId) inserts into dirents table",
@@ -153,7 +153,7 @@
     },
     {
       "id": "US-009",
-      "title": "Postgres dialect — upsertDirent",
+      "title": "Postgres dialect \u2014 upsertDirent",
       "description": "As a developer, I want to insert-or-replace a directory entry so that writeFile can overwrite existing files atomically.",
       "acceptanceCriteria": [
         "upsertDirent(tx, parentId, name, inodeId) uses INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id",
@@ -169,7 +169,7 @@
     },
     {
       "id": "US-010",
-      "title": "Postgres dialect — deleteDirent",
+      "title": "Postgres dialect \u2014 deleteDirent",
       "description": "As a developer, I want to remove a directory entry by parent and name.",
       "acceptanceCriteria": [
         "deleteDirent(tx, parentId, name) deletes from dirents, returns the removed inodeId",
@@ -185,7 +185,7 @@
     },
     {
       "id": "US-011",
-      "title": "Postgres dialect — listDirents",
+      "title": "Postgres dialect \u2014 listDirents",
       "description": "As a developer, I want to list all directory entries under a parent inode.",
       "acceptanceCriteria": [
         "listDirents(tx, parentId) returns DirentRow[] joined with inode metadata (kind, mode, size, mtime)",
@@ -201,7 +201,7 @@
     },
     {
       "id": "US-012",
-      "title": "Postgres dialect — moveDirent",
+      "title": "Postgres dialect \u2014 moveDirent",
       "description": "As a developer, I want to move/rename a directory entry in a single UPDATE.",
       "acceptanceCriteria": [
         "moveDirent(tx, oldParent, oldName, newParent, newName) executes single UPDATE dirents SET parent_inode_id, name",
@@ -219,7 +219,7 @@
     },
     {
       "id": "US-013",
-      "title": "Postgres dialect — upsertBlob and getBlob",
+      "title": "Postgres dialect \u2014 upsertBlob and getBlob",
       "description": "As a developer, I want to store and retrieve file content as content-addressable blobs.",
       "acceptanceCriteria": [
         "upsertBlob(tx, sha256, data) uses INSERT INTO blobs ... ON CONFLICT (sha256) DO NOTHING",
@@ -236,7 +236,7 @@
     },
     {
       "id": "US-014",
-      "title": "Postgres dialect — gcOrphanBlobs",
+      "title": "Postgres dialect \u2014 gcOrphanBlobs",
       "description": "As a developer, I want to delete blobs not referenced by any inode.",
       "acceptanceCriteria": [
         "gcOrphanBlobs(tx) deletes from blobs where sha256 not in any inode's content_sha256, returns count of deleted",
@@ -252,7 +252,7 @@
     },
     {
       "id": "US-015",
-      "title": "Postgres dialect — loadAllPaths (recursive CTE)",
+      "title": "Postgres dialect \u2014 loadAllPaths (recursive CTE)",
       "description": "As a developer, I want to load the entire file tree for a sandbox in one query for pathCache initialization.",
       "acceptanceCriteria": [
         "loadAllPaths(tx) uses recursive CTE starting from sandbox root inode",
@@ -268,7 +268,7 @@
     },
     {
       "id": "US-016",
-      "title": "Postgres dialect — loadSubtreeInodes",
+      "title": "Postgres dialect \u2014 loadSubtreeInodes",
       "description": "As a developer, I want to collect all inode IDs in a subtree for recursive delete.",
       "acceptanceCriteria": [
         "loadSubtreeInodes(tx, rootInodeId) uses recursive CTE, returns array of all descendant inode IDs including root",
@@ -282,7 +282,7 @@
     },
     {
       "id": "US-017",
-      "title": "Postgres dialect — bulkIngest",
+      "title": "Postgres dialect \u2014 bulkIngest",
       "description": "As a developer, I want to insert many files in a single transaction for fast ingest.",
       "acceptanceCriteria": [
         "bulkIngest(tx, files: { path, content, mode }[]) creates all parent dirs, inodes, dirents, and blobs in minimal round-trips",
@@ -298,7 +298,7 @@
     },
     {
       "id": "US-018",
-      "title": "Postgres dialect — fs_resolve stored procedure",
+      "title": "Postgres dialect \u2014 fs_resolve stored procedure",
       "description": "As a developer, I want a plpgsql stored procedure that resolves a path string to an inode ID with symlink handling.",
       "acceptanceCriteria": [
         "fs_resolve(p_path TEXT, p_follow_last BOOLEAN) plpgsql function in src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql",
@@ -485,7 +485,7 @@
         "Tests pass"
       ],
       "priority": 28,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -611,7 +611,7 @@
       "title": "SqlFs.mv",
       "description": "As a developer, I want mv to rename/move via single dirent update and rebuild pathCache keys.",
       "acceptanceCriteria": [
-        "Calls dialect.moveDirent(oldParent, oldName, newParent, newName) — single row UPDATE",
+        "Calls dialect.moveDirent(oldParent, oldName, newParent, newName) \u2014 single row UPDATE",
         "If destination exists: removes existing dirent + decrements its inode nlink first",
         "Rebuilds pathCache: removes all keys under old path, re-inserts under new path",
         "Does NOT invalidate contentCache (same inodeIds, same content)",
@@ -629,7 +629,7 @@
       "title": "SqlFs.cp (single file)",
       "description": "As a developer, I want cp to copy a file by creating a new inode pointing to the same blob.",
       "acceptanceCriteria": [
-        "Creates new inode with same contentSha256 as source (no blob duplication — CAS dedup)",
+        "Creates new inode with same contentSha256 as source (no blob duplication \u2014 CAS dedup)",
         "Inserts new dirent at destination",
         "Throws ENOENT if source does not exist",
         "Updates pathCache with new entry",
