@@ -190,4 +190,12 @@ describe("sanitizeFsError", () => {
 		expect(sanitized.message).not.toContain("myserver");
 		expect(sanitized.message).toContain("[redacted]");
 	});
+
+	it("strips macOS /Users/ paths from error messages", () => {
+		const err = new Error("failed at /Users/developer/projects/secret-project/config.json");
+		const sanitized = sanitizeFsError(err);
+		expect(sanitized.message).not.toContain("/Users/developer");
+		expect(sanitized.message).not.toContain("secret-project");
+		expect(sanitized.message).toContain("[redacted]");
+	});
 });

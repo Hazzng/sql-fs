@@ -151,6 +151,26 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	}
 
 	/**
+	 * Resolves a path to a readable inode entry, following symlinks.
+	 * Returns the final (non-symlink) PathCacheEntry.
+	 * Throws ENOENT if the path or its symlink target is missing from cache.
+	 * Throws ELOOP (via dialect.resolvePath) if a symlink loop is detected.
+	 */
+	async #resolveReadEntry(path: string): Promise<PathCacheEntry> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
+
+		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally
+		const resolvedId = await this.#withTx((tx) => this.#dialect.resolvePath(tx, path, true));
+		for (const [, e] of this.#pathCache) {
+			if (e.inodeId === resolvedId) return e;
+		}
+		// Resolved inode is not in pathCache → broken symlink
+		throw createEnoent(path);
+	}
+
+	/**
 	 * Validates that the parent directory of `path` exists and is a directory.
 	 * Returns parentPath, name, and the parent's PathCacheEntry.
 	 * Throws ENOENT if the parent is missing, ENOTDIR if the parent is not a directory.
@@ -221,7 +241,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: sha256,
 			symlinkTarget: null,
 		});
-		this.#contentCache.set(inodeId, bytes);
+		if (bytes.byteLength > 0) this.#contentCache.set(inodeId, bytes);
 	}
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
@@ -267,7 +287,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		if (replacedInodeId !== null) this.#contentCache.delete(replacedInodeId);
-		this.#contentCache.set(inodeId, fullBytes);
+		if (fullBytes.byteLength > 0) this.#contentCache.set(inodeId, fullBytes);
 		this.#pathCache.set(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
@@ -358,17 +378,30 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const parentEntry = this.#pathCache.get(parentPath);
 
 		if (options?.recursive && entry.kind === INODE_KIND.DIRECTORY) {
-			// Snapshot subtree paths before async work
+			// Snapshot subtree paths before async work; sort deepest-first (post-order)
+			// so children are always processed before their parents.
 			const subtreePaths = this.#allPathsUnder(path);
+			subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length);
 
-			// DB: delete parent dirent + all subtree inodes in one transaction
 			await this.#withTx(async (tx) => {
+				// Step 1: unlink the subtree root from its parent
 				if (parentEntry) {
 					await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
 				}
-				const allInodeIds = await this.#dialect.loadSubtreeInodes(tx, entry.inodeId);
-				for (const inodeId of allInodeIds) {
-					await this.#dialect.deleteInode(tx, inodeId);
+				// Step 2: process each entry in post-order —
+				//   • delete its internal dirent (for non-root entries)
+				//   • decrement nlink; delete inode only when nlink reaches zero
+				//   This preserves inodes still referenced by hardlinks outside the subtree.
+				for (const p of subtreePaths) {
+					const e = this.#pathCache.get(p)!;
+					if (p !== path) {
+						const pParentEntry = this.#pathCache.get(this.#parentOf(p));
+						if (pParentEntry) {
+							await this.#dialect.deleteDirent(tx, pParentEntry.inodeId, this.#nameOf(p));
+						}
+					}
+					const newNlink = await this.#dialect.decrementNlink(tx, e.inodeId);
+					if (newNlink === 0) await this.#dialect.deleteInode(tx, e.inodeId);
 				}
 			});
 
@@ -424,18 +457,16 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
 		const path = validatePath(inputPath);
-		const entry = this.#pathCache.get(path);
-		if (!entry) throw createEnoent(path);
+		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
+		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
 		// Cache hit: return decoded bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
-		if (cached !== undefined) {
-			return new TextDecoder().decode(cached);
-		}
+		if (cached !== undefined) return new TextDecoder().decode(cached);
 
-		// Cache miss: fetch blob from DB, populate cache
-		const data = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
+		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return new TextDecoder().decode(bytes);
@@ -443,16 +474,16 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
-		const entry = this.#pathCache.get(path);
-		if (!entry) throw createEnoent(path);
+		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
+		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
 		// Cache hit: return raw bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob from DB, populate cache
-		const data = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
+		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;

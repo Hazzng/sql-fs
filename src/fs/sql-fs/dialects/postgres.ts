@@ -63,7 +63,10 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// US-005
 	async createSandbox(tx: PgTx, sandboxId: string): Promise<{ rootInodeId: bigint }> {
-		// 1. Insert root directory inode (kind=2, mode=0o755)
+		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK
+		await tx`INSERT INTO sandboxes (id, root_inode) VALUES (${sandboxId}, NULL)`;
+
+		// 2. Insert root directory inode (kind=2, mode=0o755)
 		const rootRows = await tx<{ id: string }[]>`
 			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
 			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
@@ -73,8 +76,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		if (!rootRow) throw new Error("createSandbox: failed to create root inode");
 		const rootInodeId = BigInt(rootRow.id);
 
-		// 2. Register sandbox row, setting root_inode
-		await tx`INSERT INTO sandboxes (id, root_inode) VALUES (${sandboxId}, ${String(rootInodeId)})`;
+		// 3. Update sandbox with root_inode reference
+		await tx`UPDATE sandboxes SET root_inode = ${String(rootInodeId)} WHERE id = ${sandboxId}`;
 
 		// 3. Create default directories under root: /home, /tmp, /bin
 		const homeInodeId = await this.#createDirInode(tx, sandboxId, rootInodeId, "home");

@@ -117,6 +117,23 @@ describe("SqlFs.mv() — pathCache rebuild", () => {
 		expect(moveDirentMock).not.toHaveBeenCalled();
 	});
 
+	it("throws EINVAL when moving a directory into its own descendant", async () => {
+		// Moving /a into /a/b/new would create a cycle
+		await expect(fs.mv("/a", "/a/b/new")).rejects.toMatchObject({ code: "EINVAL" });
+		expect(moveDirentMock).not.toHaveBeenCalled();
+	});
+
+	it("throws EINVAL when moving a directory to itself", async () => {
+		await expect(fs.mv("/a", "/a")).rejects.toMatchObject({ code: "EINVAL" });
+		expect(moveDirentMock).not.toHaveBeenCalled();
+	});
+
+	it("throws ENOTDIR when destination parent is not a directory", async () => {
+		// /a/b/c is a file, so /a/b/c/new has a non-directory parent
+		await expect(fs.mv("/other", "/a/b/c/new")).rejects.toMatchObject({ code: "ENOTDIR" });
+		expect(moveDirentMock).not.toHaveBeenCalled();
+	});
+
 	it("calls moveDirent with correct parent inode IDs and names", async () => {
 		// /a (inodeId=2n) is a child of / (inodeId=1n); /x will be a child of / (inodeId=1n)
 		await fs.mv("/a", "/x");
