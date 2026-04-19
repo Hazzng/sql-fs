@@ -21,6 +21,7 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - `SessionManager` in `src/api/session-manager.ts` is the canonical way to get a warm `Bash + IFileSystem` session per sandbox — route handlers use `withSession` not `getOrCreate` directly.
 - Hono wildcard with slashes: use `/:param{.*}` (regex syntax) instead of `/*` — `c.req.param("*")` always returns `undefined` in sub-routers; use `c.req.param("param")` to get the full path including slashes.
 - InMemoryFs error format: `stat()` throws with `code: undefined` but message starts with the POSIX code (e.g., "ENOENT: no such file..."). Use `err.message.match(/^([A-Z]+):/)` as fallback when `.code` is absent to extract error codes for HTTP mapping.
+- InMemoryFs pre-populated paths: `getAllPaths()` returns built-in system paths like `/bin/*`, `/dev/*`, `/usr/bin/*`. Tests that use prefix-less tree assertions must use an isolated prefix (e.g., `/myapp`) rather than asserting exact root-level path lists.
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -236,4 +237,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `z.record(z.string(), z.string())` is the correct zod type for `Record<string, string>` bulk payloads
   - The existing `parentDir` helper and `extractErrCode` pattern reuse cleanly for the bulk write loop — no new helpers needed
   - Inline zod parsing (same pattern as mkdir) keeps the route self-contained without `validateBody` middleware
+---
+
+## 2026-04-19 - US-067
+- Added `GET /:id/tree` route to `src/api/routes/files.ts`
+- Query params validated with zod: `prefix` (string, default '/') and `depth` (coerced number, optional)
+- Calls `session.fs.getAllPaths()` (synchronous), filters by prefix and depth, then stats each path for metadata
+- Returns 200 JSON array: `[{ path, kind, size, mtime }]`
+- Depth calculation: count path segments between normalized prefix and path; `depth=1` returns only immediate children
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
+- **Learnings for future iterations:**
+  - `IFileSystem.getAllPaths()` is synchronous (no Promise) — do not await it
+  - `InMemoryFs.getAllPaths()` includes `/bin`, `/dev`, `/usr/bin`, etc. — tests must use an isolated prefix (e.g. `/myapp`) rather than asserting exact root-level path lists
+  - Depth filter: strip prefix from path, split on `/`, filter empty strings, count segments; `depth=1` means `segments <= 1`
+  - Prefix normalization: strip trailing `/` unless prefix is `/` itself to avoid double-slash matching
 ---
