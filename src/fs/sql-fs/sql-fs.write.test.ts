@@ -79,7 +79,7 @@ function makeDialect(): {
 		upsertBlob: upsertBlobMock,
 		getBlob: getBlobMock,
 		gcOrphanBlobs: vi.fn(),
-		loadSubtreeInodes: vi.fn(),
+		loadSubtreeInodes: vi.fn(async () => [3n, 4n]),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),
 	} as unknown as SqlDialect<unknown>;
