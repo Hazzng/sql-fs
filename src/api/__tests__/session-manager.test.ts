@@ -1,10 +1,10 @@
 /**
- * Unit tests for SessionManager — US-074
+ * Unit tests for SessionManager — US-074, US-075
  */
 
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../session-manager.js";
 
 function makeCreateFs(impl?: () => Promise<IFileSystem>) {
@@ -109,5 +109,45 @@ describe("SessionManager.withSession", () => {
 		const session = await sm.getOrCreate("sandbox-if");
 		expect(inFlightDuringExecution).toBe(1);
 		expect(session.inFlight).toBe(0);
+	});
+});
+
+describe("SessionManager idle eviction (US-075)", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("session idle longer than idleMs with inFlight=0 is evicted from Map", async () => {
+		vi.useFakeTimers();
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), idleMs: 1000 });
+		// Reaper runs every 2000ms
+		sm.startReaper(2000);
+
+		await sm.getOrCreate("sandbox-idle");
+		expect(sm.getSession("sandbox-idle")).toBeDefined();
+
+		// Advance 3000ms — reaper fires at 2000ms; lastUsed=0, now=2000 → 2000 > 1000 → evict
+		vi.advanceTimersByTime(3000);
+
+		expect(sm.getSession("sandbox-idle")).toBeUndefined();
+
+		sm.stopReaper();
+	});
+
+	it("busy session (inFlight > 0) past idle threshold is NOT evicted", async () => {
+		vi.useFakeTimers();
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), idleMs: 1000 });
+		sm.startReaper(2000);
+
+		const session = await sm.getOrCreate("sandbox-busy");
+		// Simulate an active in-flight operation
+		session.inFlight = 1;
+
+		// Advance past idle threshold — reaper fires at 2000ms but inFlight=1 so skip
+		vi.advanceTimersByTime(3000);
+
+		expect(sm.getSession("sandbox-busy")).toBeDefined();
+
+		sm.stopReaper();
 	});
 });
