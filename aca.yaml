@@ -1,0 +1,67 @@
+# Azure Container Apps deployment config
+# Deploy: az containerapp create --yaml aca.yaml
+properties:
+  managedEnvironmentId: /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.App/managedEnvironments/<ENV>
+  configuration:
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: http
+      allowInsecure: false
+      stickySessions:
+        affinity: sticky
+    secrets:
+      - name: database-url
+        value: "<POOLER_URL>"
+      - name: database-direct-url
+        value: "<DIRECT_URL>"
+      - name: auth-secret
+        value: "<AUTH_SECRET>"
+  template:
+    containers:
+      - name: api
+        image: <REGISTRY>/virtualfs-api:latest
+        resources:
+          cpu: 1.0
+          memory: 2Gi
+        env:
+          - name: FS_BACKEND
+            value: postgres
+          - name: DATABASE_URL
+            secretRef: database-url
+          - name: DATABASE_DIRECT_URL
+            secretRef: database-direct-url
+          - name: AUTH_SECRET
+            secretRef: auth-secret
+          - name: PORT
+            value: "8080"
+        probes:
+          - type: Liveness
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 15
+          - type: Readiness
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 10
+          - type: Startup
+            httpGet:
+              path: /readyz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+    # Uncomment for Azure FileShare backend:
+    # volumes:
+    #   - name: sandbox-storage
+    #     storageName: my-fileshare
+    #     storageType: AzureFile
+    scale:
+      minReplicas: 1
+      maxReplicas: 10
+      rules:
+        - name: http-rule
+          http:
+            metadata:
+              concurrentRequests: "50"

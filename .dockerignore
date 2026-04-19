@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.env
+.env.*
+*.test.ts
+*.md
+tasks/
+.dockerignore
+Dockerfile
