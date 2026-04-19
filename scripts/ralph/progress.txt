@@ -20,3 +20,14 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Biome lint rule `lint/complexity/useLiteralKeys` requires `process.env.DATABASE_URL` not `process.env["DATABASE_URL"]`
   - `vi.mock` must mock `transaction` as a callback-invoking fn (not just `mockResolvedValue(undefined)`) or `SqlFs.ready()` will fail trying to iterate `undefined`
 ---
+
+## 2026-04-19 - US-054
+- Implemented `loadBackendConfig(): BackendConfig` in `src/fs/sql-fs/index.ts`
+- Reads FS_BACKEND (required), DATABASE_URL (for SQL backends), FS_MOUNT_PATH (for azure-fileshare)
+- Exports `BackendConfig` interface: `{ backend: StorageBackend; databaseUrl?: string; mountPath?: string }`
+- Validates backend is one of the known StorageBackend values; throws descriptive error for unknown
+- Files changed: `src/fs/sql-fs/index.ts`, `src/fs/sql-fs/index.test.ts` (added loadBackendConfig describe block)
+- **Learnings for future iterations:**
+  - Tests for env vars: save originals as `const originalEnv = { ...process.env }` and restore in `afterEach` with empty-string fallback (not `undefined`)
+  - `ReadonlySet<StorageBackend>` with `new Set([...])` works cleanly for the SQL backend membership check
+---
