@@ -92,3 +92,15 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Test apps for typed middleware need matching variable declarations: `new Hono<{ Variables: { body: z.infer<typeof schema> } }>()`
   - `z.coerce.number()` is useful for query params (all come in as strings) — coerces before validation
 ---
+
+## 2026-04-19 - US-057b
+- Created `src/api/lib/jwt.ts`: exports `signToken({ sub, expiresIn?, secret })` and `verifyToken({ token, secret })` using jose SignJWT/jwtVerify
+- Implemented `src/api/cli/token.ts`: parses `--sub` (required) and `--expires` (optional, default no expiry) from argv, reads AUTH_SECRET from env, calls signToken, prints token to stdout
+- Duration values "30d", "1y", "24h" passed directly to jose's `setExpirationTime`; "never" and undefined both result in no exp claim
+- Errors are written to stderr with descriptive messages; exit code 1 on failure
+- Files changed: `src/api/lib/jwt.ts` (new), `src/api/cli/token.ts` (modified)
+- **Learnings for future iterations:**
+  - `signToken`/`verifyToken` in `src/api/lib/jwt.ts` are the canonical JWT helpers — future stories (US-057c admin endpoint) should import from there, not duplicate signing logic
+  - jose `SignJWT` with `setExpirationTime(string)` accepts duration strings like "30d", "1y", "24h" directly — no manual date arithmetic needed
+  - CLI arg parsing: simple manual loop over `process.argv.slice(2)` is sufficient — no arg-parsing library needed for this case
+---
