@@ -267,12 +267,17 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-013
-	async upsertBlob(_tx: PgTx, _sha256: Uint8Array, _data: Uint8Array): Promise<void> {
-		throw new Error("not implemented");
+	async upsertBlob(tx: PgTx, sha256: Uint8Array, data: Uint8Array): Promise<void> {
+		await tx`
+			INSERT INTO blobs (sha256, data, size)
+			VALUES (${sha256}, ${data}, ${data.length})
+			ON CONFLICT (sha256) DO NOTHING
+		`;
 	}
 
-	async getBlob(_tx: PgTx, _sha256: Uint8Array): Promise<Uint8Array | null> {
-		throw new Error("not implemented");
+	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
+		const rows = await tx<{ data: Buffer }[]>`SELECT data FROM blobs WHERE sha256 = ${sha256}`;
+		return rows[0]?.data ?? null;
 	}
 
 	// US-014

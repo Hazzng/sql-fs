@@ -10,6 +10,7 @@
  * US-010: deleteDirent.
  * US-011: listDirents.
  * US-012: moveDirent.
+ * US-013: upsertBlob, getBlob.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -731,5 +732,70 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () 
 				await dialect.moveDirent(tx, rootInodeId, "does-not-exist.txt", rootInodeId, "target.txt");
 			}),
 		).rejects.toMatchObject({ code: "ENOENT" });
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — upsertBlob and getBlob", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	// Track inserted sha256s so we can clean up in afterAll
+	const insertedSha256s: Uint8Array[] = [];
+
+	beforeAll(async () => {
+		await dialect.connect();
+	});
+
+	afterAll(async () => {
+		for (const sha256 of insertedSha256s) {
+			await dialect.transaction(async (tx) => {
+				await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
+			});
+		}
+		await dialect.disconnect();
+	});
+
+	it("inserts a blob and retrieves it by sha256", async () => {
+		const sha256 = new Uint8Array(32).fill(0x01);
+		const data = new TextEncoder().encode("hello world");
+		insertedSha256s.push(sha256);
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+
+		expect(result).not.toBeNull();
+		expect(result).toEqual(data);
+	});
+
+	it("inserts the same sha256 twice and only one row exists (dedup)", async () => {
+		const sha256 = new Uint8Array(32).fill(0x02);
+		const data = new TextEncoder().encode("deduplicated content");
+		insertedSha256s.push(sha256);
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+		// Second upsert with same sha256 — ON CONFLICT DO NOTHING, no error
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const rows = await dialect.transaction(async (tx) => {
+			return await tx<{ count: string }[]>`SELECT COUNT(*) AS count FROM blobs WHERE sha256 = ${sha256}`;
+		});
+		expect(Number(rows[0]!.count)).toBe(1);
+	});
+
+	it("returns null for a non-existent sha256", async () => {
+		const sha256 = new Uint8Array(32).fill(0xff);
+
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+
+		expect(result).toBeNull();
 	});
 });
