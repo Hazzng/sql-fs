@@ -1,0 +1,730 @@
+{
+  "project": "VirtualFS API",
+  "branchName": "ralph/phase1-sqlfs-postgres",
+  "description": "Phase 1: SqlFs IFileSystem backed by Postgres — types, dialect, caching, all read/write methods. 42 stories across 8 epics.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "SqlDialect interface definition",
+      "description": "As a developer, I want the SqlDialect interface defined so that dialect implementations have a clear contract to fulfill.",
+      "acceptanceCriteria": [
+        "SqlDialect interface exported from src/fs/sql-fs/types.ts with JSDoc on each method",
+        "Connection: connect(), disconnect()",
+        "Transactions: transaction<T>(fn: (tx) => Promise<T>): Promise<T>",
+        "Context: setSandboxContext(tx, sandboxId: string): Promise<void>",
+        "Sandbox lifecycle: createSandbox(tx, sandboxId) returns { rootInodeId }, deleteSandbox(tx, sandboxId)",
+        "Inode CRUD: createInode(tx, opts) returns id, getInode(tx, id) returns InodeRow|null, updateInode(tx, id, updates), deleteInode(tx, id)",
+        "Nlink: incrementNlink(tx, id), decrementNlink(tx, id) returns new nlink value",
+        "Dirent CRUD: insertDirent, upsertDirent (returns old inodeId|null), deleteDirent (returns removed inodeId), listDirents, moveDirent",
+        "Blob ops: upsertBlob(tx, sha256, data), getBlob(tx, sha256) returns Uint8Array|null, gcOrphanBlobs(tx) returns count",
+        "Bulk: loadAllPaths(tx) returns PathCacheEntry[], loadSubtreeInodes(tx, rootId) returns bigint[], bulkIngest(tx, files)",
+        "Path resolution: resolvePath(tx, path, followLast) returns inodeId",
+        "Typecheck passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Shared types for inode, dirent, cache entry",
+      "description": "As a developer, I want shared type definitions for database rows and cache entries so that SqlFs and all dialects use consistent shapes.",
+      "acceptanceCriteria": [
+        "InodeRow type: { id: bigint, sandboxId: string, kind: 1|2|3, mode: number, size: number, mtime: Date, nlink: number, contentSha256: Uint8Array|null, symlinkTarget: string|null }",
+        "DirentRow type: { parentInodeId: bigint, name: string, inodeId: bigint }",
+        "PathCacheEntry type: { inodeId: bigint, kind: 1|2|3, mode: number, size: number, mtime: Date, contentSha256: Uint8Array|null, symlinkTarget: string|null }",
+        "Transaction generic type that each dialect can specialize",
+        "StorageBackend union type: 'postgres' | 'mysql' | 'azure-sql' | 'azure-fileshare' | 'memory'",
+        "All types exported from src/fs/sql-fs/types.ts",
+        "Typecheck passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "FS error constructors and SQL error translation",
+      "description": "As a developer, I want helper functions that create standard FS errors and translate SQL-specific errors into them.",
+      "acceptanceCriteria": [
+        "src/fs/sql-fs/errors.ts with constructors: createEnoent(path), createEexist(path), createEisdir(path), createEnotdir(path), createEnotempty(path), createEloop(path), createEperm(path, op)",
+        "Each constructor returns Error with code property (e.g. 'ENOENT') matching just-bash convention",
+        "translateSqlError(err, path) maps Postgres SQLSTATE codes, MySQL error numbers, and T-SQL error numbers to the appropriate FS error",
+        "sanitizeFsError(err) strips connection strings, host paths, and internal table names from error messages",
+        "Unit tests: each constructor produces correct code + message",
+        "Unit tests: translateSqlError maps known Postgres SQLSTATE codes correctly",
+        "Unit tests: sanitizeFsError removes sensitive information",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Postgres dialect — connection and sandbox context",
+      "description": "As a developer, I want the Postgres dialect to connect via postgres driver and set sandbox context per transaction.",
+      "acceptanceCriteria": [
+        "PostgresDialect class in src/fs/sql-fs/dialects/postgres.ts implementing SqlDialect",
+        "Constructor accepts connection string (DATABASE_URL)",
+        "connect() establishes pool with prepare: false (transaction-pooler compatible)",
+        "disconnect() closes pool gracefully",
+        "transaction(fn) wraps callback in BEGIN/COMMIT with ROLLBACK on error",
+        "setSandboxContext(tx, sandboxId) executes SET LOCAL app.sandbox_id = $1",
+        "Create src/fs/sql-fs/migrations/postgres/0000_create_tables.sql with DDL for sandboxes, inodes, dirents, blobs tables (needed by all subsequent dialect tests)",
+        "Integration test file with describe.skipIf(!process.env.DATABASE_URL) wrapper",
+        "Test: connect, set context, verify current_setting('app.sandbox_id') returns correct value",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Postgres dialect — createSandbox and deleteSandbox",
+      "description": "As a developer, I want to create and delete sandbox root structures in Postgres.",
+      "acceptanceCriteria": [
+        "createSandbox(tx, sandboxId) inserts root inode (kind=2, mode=0o755), inserts sandboxes row, creates default dirs (/home, /home/user, /tmp, /bin), returns { rootInodeId }",
+        "deleteSandbox(tx, sandboxId) CASCADE deletes from sandboxes table removing all inodes and dirents",
+        "Test: create sandbox, verify root inode exists, verify default dirs via listDirents",
+        "Test: create then delete sandbox, verify no inodes/dirents remain",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Postgres dialect — inode CRUD operations",
+      "description": "As a developer, I want CRUD operations on inodes in Postgres.",
+      "acceptanceCriteria": [
+        "createInode(tx, opts) inserts into inodes table, returns new bigint id",
+        "getInode(tx, inodeId) returns InodeRow or null",
+        "updateInode(tx, inodeId, updates) updates specified fields (mode, size, mtime, contentSha256)",
+        "deleteInode(tx, inodeId) deletes inode row",
+        "Test: create file inode with content_sha256, get it back, verify all fields match",
+        "Test: create dir inode (kind=2), verify kind=2",
+        "Test: update mtime and mode, verify changes persisted via getInode",
+        "Test: delete inode, verify getInode returns null",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Postgres dialect — incrementNlink and decrementNlink",
+      "description": "As a developer, I want to atomically increment/decrement hardlink counts on inodes.",
+      "acceptanceCriteria": [
+        "incrementNlink(tx, inodeId) executes UPDATE inodes SET nlink = nlink + 1 WHERE id = $1",
+        "decrementNlink(tx, inodeId) executes UPDATE SET nlink = nlink - 1 RETURNING nlink, returns new nlink value",
+        "Test: create inode (nlink=1), increment, verify nlink=2",
+        "Test: decrement from 2 to 1, verify return value is 1",
+        "Test: decrement from 1 to 0, verify return value is 0",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Postgres dialect — insertDirent",
+      "description": "As a developer, I want to insert a directory entry linking a name to an inode.",
+      "acceptanceCriteria": [
+        "insertDirent(tx, parentId, name, inodeId) inserts into dirents table",
+        "Throws EEXIST-translatable error if (parentId, name) already exists (PK violation)",
+        "Test: insert dirent, verify it appears in listDirents",
+        "Test: insert duplicate name under same parent, verify error thrown",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Postgres dialect — upsertDirent",
+      "description": "As a developer, I want to insert-or-replace a directory entry so that writeFile can overwrite existing files atomically.",
+      "acceptanceCriteria": [
+        "upsertDirent(tx, parentId, name, inodeId) uses INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id",
+        "Returns the previously-referenced inodeId if replacement happened, null if new insert",
+        "Test: upsert new entry, returns null",
+        "Test: upsert over existing entry, returns old inodeId",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Postgres dialect — deleteDirent",
+      "description": "As a developer, I want to remove a directory entry by parent and name.",
+      "acceptanceCriteria": [
+        "deleteDirent(tx, parentId, name) deletes from dirents, returns the removed inodeId",
+        "Throws ENOENT-translatable error if entry does not exist",
+        "Test: insert then delete dirent, verify removed",
+        "Test: delete non-existent dirent, verify error",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Postgres dialect — listDirents",
+      "description": "As a developer, I want to list all directory entries under a parent inode.",
+      "acceptanceCriteria": [
+        "listDirents(tx, parentId) returns DirentRow[] joined with inode metadata (kind, mode, size, mtime)",
+        "Results ordered by name",
+        "Test: create parent dir with 3 children (file, dir, symlink), verify all returned with correct kinds",
+        "Test: empty directory returns empty array",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Postgres dialect — moveDirent",
+      "description": "As a developer, I want to move/rename a directory entry in a single UPDATE.",
+      "acceptanceCriteria": [
+        "moveDirent(tx, oldParent, oldName, newParent, newName) executes single UPDATE dirents SET parent_inode_id, name",
+        "Throws ENOENT-translatable error if source does not exist",
+        "If destination already exists, deletes existing dirent first (same transaction)",
+        "Test: rename file within same directory",
+        "Test: move file to different directory",
+        "Test: move over existing file (verify old dirent removed)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Postgres dialect — upsertBlob and getBlob",
+      "description": "As a developer, I want to store and retrieve file content as content-addressable blobs.",
+      "acceptanceCriteria": [
+        "upsertBlob(tx, sha256, data) uses INSERT INTO blobs ... ON CONFLICT (sha256) DO NOTHING",
+        "getBlob(tx, sha256) returns Uint8Array or null",
+        "Test: insert blob, retrieve by sha256, verify data matches",
+        "Test: insert same content twice, verify dedup (only one row)",
+        "Test: get non-existent sha256, returns null",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Postgres dialect — gcOrphanBlobs",
+      "description": "As a developer, I want to delete blobs not referenced by any inode.",
+      "acceptanceCriteria": [
+        "gcOrphanBlobs(tx) deletes from blobs where sha256 not in any inode's content_sha256, returns count of deleted",
+        "Test: create blob referenced by inode, GC, verify blob survives",
+        "Test: delete inode, GC, verify orphan blob removed",
+        "Test: blob referenced by two inodes, delete one, GC, verify blob survives",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Postgres dialect — loadAllPaths (recursive CTE)",
+      "description": "As a developer, I want to load the entire file tree for a sandbox in one query for pathCache initialization.",
+      "acceptanceCriteria": [
+        "loadAllPaths(tx) uses recursive CTE starting from sandbox root inode",
+        "Returns PathCacheEntry[] with full absolute path, inodeId, kind, mode, size, mtime, contentSha256, symlinkTarget",
+        "Root directory included as '/'",
+        "Test: create sandbox with nested files/dirs, call loadAllPaths, verify all paths present with correct metadata",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Postgres dialect — loadSubtreeInodes",
+      "description": "As a developer, I want to collect all inode IDs in a subtree for recursive delete.",
+      "acceptanceCriteria": [
+        "loadSubtreeInodes(tx, rootInodeId) uses recursive CTE, returns array of all descendant inode IDs including root",
+        "Test: create dir with nested structure (3 levels deep), verify all inodes collected",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Postgres dialect — bulkIngest",
+      "description": "As a developer, I want to insert many files in a single transaction for fast ingest.",
+      "acceptanceCriteria": [
+        "bulkIngest(tx, files: { path, content, mode }[]) creates all parent dirs, inodes, dirents, and blobs in minimal round-trips",
+        "Uses multi-row INSERT for blobs and inodes where possible",
+        "Resolves parent directories from pathCache or creates them",
+        "Test: bulk ingest 50 files across 5 directories, verify all accessible via listDirents",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Postgres dialect — fs_resolve stored procedure",
+      "description": "As a developer, I want a plpgsql stored procedure that resolves a path string to an inode ID with symlink handling.",
+      "acceptanceCriteria": [
+        "fs_resolve(p_path TEXT, p_follow_last BOOLEAN) plpgsql function in src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql",
+        "Walks path components left-to-right looking up each in dirents",
+        "Follows symlinks on intermediate components always; follows last component only when p_follow_last = true",
+        "Handles '.' (skip) and '..' (parent) components",
+        "Depth counter capped at 40 (raises SQLSTATE 'FS001' = ELOOP)",
+        "Raises 'FS002' for ENOENT, 'FS003' for ENOTDIR",
+        "Uses current_setting('app.sandbox_id') to find sandbox root",
+        "resolvePath(tx, path, followLast) dialect method calls this proc",
+        "Test: resolve simple path /home/user/file.txt",
+        "Test: resolve path with '.' and '..' components",
+        "Test: resolve path through symlink, follow_last true vs false",
+        "Test: detect symlink loop, verify ELOOP",
+        "Test: resolve non-existent path, verify ENOENT",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "pathCache initialization from loadAllPaths",
+      "description": "As a developer, I want the pathCache populated at session start so that stat/readdir/getAllPaths work without DB calls.",
+      "acceptanceCriteria": [
+        "SqlFs class in src/fs/sql-fs/sql-fs.ts implementing IFileSystem from just-bash",
+        "SqlFs.ready() calls dialect.loadAllPaths() inside a transaction with sandbox context",
+        "Stores results in this.pathCache: Map<string, PathCacheEntry>",
+        "getAllPaths() returns [...this.pathCache.keys()] (synchronous, no DB)",
+        "Unit test with mocked dialect: ready() populates cache, getAllPaths() returns expected paths",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "pathCache update on write operations",
+      "description": "As a developer, I want the pathCache updated whenever files are created, modified, or deleted so it stays in sync.",
+      "acceptanceCriteria": [
+        "writeFile adds/updates entry in pathCache after successful DB write",
+        "mkdir adds directory entry to pathCache",
+        "rm removes entry from pathCache (and all descendants if recursive)",
+        "appendFile updates size and mtime in pathCache entry",
+        "chmod updates mode, utimes updates mtime in pathCache entry",
+        "Unit test with mocked dialect: write file then verify pathCache has new entry; rm file then verify removed",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "pathCache rebuild on mv",
+      "description": "As a developer, I want pathCache keys rebuilt when files/directories are moved so that old paths stop resolving.",
+      "acceptanceCriteria": [
+        "mv(src, dest) after dialect.moveDirent: removes all pathCache keys starting with src, re-inserts under dest",
+        "For directory moves: all descendant keys are remapped (e.g. /a/b/c -> /x/b/c)",
+        "Unit test with mocked dialect: create dir with children in cache, mv, verify old paths gone and new paths present",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "LRU content cache setup",
+      "description": "As a developer, I want an LRU cache for file content keyed by inode ID with a configurable byte budget.",
+      "acceptanceCriteria": [
+        "contentCache initialized in SqlFs constructor using lru-cache package",
+        "Max total size configurable via contentCacheMaxBytes option (default 50MB)",
+        "Each entry size = byte length of the Uint8Array",
+        "LRU eviction: oldest-accessed entries evicted first when budget exceeded",
+        "Unit test: insert entries exceeding budget, verify oldest evicted",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "Content cache hit on readFile",
+      "description": "As a developer, I want readFile to return cached content without hitting the database.",
+      "acceptanceCriteria": [
+        "readFile() checks contentCache by inodeId before calling dialect.getBlob",
+        "On cache hit: returns cached Uint8Array (decoded to string if encoding specified)",
+        "On cache miss: calls dialect.getBlob, stores result in contentCache, returns",
+        "Unit test with mocked dialect: first read calls getBlob, second read does not call getBlob (cache hit)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "Content cache invalidation on write/delete",
+      "description": "As a developer, I want stale content evicted from cache when files are written or deleted.",
+      "acceptanceCriteria": [
+        "writeFile() sets new content in contentCache after DB write",
+        "rm() deletes entry from contentCache",
+        "appendFile() invalidates old contentCache entry (forces re-read on next access)",
+        "mv() does NOT invalidate contentCache (same inodeId, same bytes)",
+        "Unit test: write, read (cached), overwrite, read again (new content, not stale)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "SqlFs.stat and SqlFs.lstat",
+      "description": "As a developer, I want stat/lstat served from pathCache.",
+      "acceptanceCriteria": [
+        "stat(path) normalizes path, looks up pathCache, returns FsStat with isFile, isDirectory, isSymbolicLink=false (stat always follows symlinks)",
+        "lstat(path) same but isSymbolicLink=true when kind=3",
+        "Throws ENOENT if path not in cache",
+        "Symlink at final component: stat follows (looks up target in cache), lstat returns symlink's own metadata",
+        "Unit test: stat file, dir, symlink; lstat symlink returns isSymbolicLink=true",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-026",
+      "title": "SqlFs.exists",
+      "description": "As a developer, I want exists() served from pathCache without throwing.",
+      "acceptanceCriteria": [
+        "exists(path) returns true if path in pathCache, false otherwise",
+        "Never throws",
+        "Unit test: existing path returns true, non-existing returns false",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-027",
+      "title": "SqlFs.readdir and readdirWithFileTypes",
+      "description": "As a developer, I want readdir served from pathCache by filtering child paths.",
+      "acceptanceCriteria": [
+        "readdir(path) returns array of child names (not full paths) by filtering pathCache keys",
+        "Throws ENOENT if path not in cache, ENOTDIR if path is a file",
+        "readdirWithFileTypes(path) returns DirentEntry[] with name, isFile, isDirectory, isSymbolicLink",
+        "Unit test: dir with 3 children (file, dir, symlink), verify names and types",
+        "Unit test: readdir on non-existent path throws ENOENT, on file throws ENOTDIR",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-028",
+      "title": "SqlFs.readFile and readFileBuffer",
+      "description": "As a developer, I want readFile to check content cache then fall back to DB.",
+      "acceptanceCriteria": [
+        "readFile(path, options?) resolves path via pathCache, checks contentCache, falls back to dialect.getBlob",
+        "Throws ENOENT if path not in cache, EISDIR if kind=2",
+        "Returns string decoded from Uint8Array (default utf8)",
+        "readFileBuffer(path) returns raw Uint8Array",
+        "Stores fetched content in contentCache on cache miss",
+        "Unit test: read existing file, read non-existent (ENOENT), read directory (EISDIR)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 28,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-029",
+      "title": "SqlFs.readlink",
+      "description": "As a developer, I want readlink to return symlink target from pathCache.",
+      "acceptanceCriteria": [
+        "readlink(path) looks up path in pathCache, returns symlinkTarget string",
+        "Throws EINVAL if path is not a symlink (kind != 3)",
+        "Throws ENOENT if path not in cache",
+        "Unit test: readlink on symlink returns target string, readlink on file throws EINVAL",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 29,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-030",
+      "title": "SqlFs.realpath",
+      "description": "As a developer, I want realpath to resolve all symlinks via the dialect's path resolver.",
+      "acceptanceCriteria": [
+        "realpath(path) calls dialect.resolvePath(tx, path, followLast=true) and reconstructs canonical path",
+        "Returns absolute path with all symlinks resolved",
+        "Throws ENOENT if any component missing, ELOOP if circular symlinks",
+        "Unit test: realpath through symlink returns resolved target path",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 30,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-031",
+      "title": "SqlFs.writeFile",
+      "description": "As a developer, I want writeFile to persist content as a deduplicated blob and update caches.",
+      "acceptanceCriteria": [
+        "Computes sha256 of content, calls dialect.upsertBlob (dedup)",
+        "Resolves parent from pathCache, throws ENOENT if parent missing",
+        "Creates new inode via dialect.createInode(kind=1), calls dialect.upsertDirent",
+        "If replacing existing file: decrements old inode's nlink via dialect.decrementNlink",
+        "Updates pathCache with new entry and contentCache with new content",
+        "Unit test: write new file, verify in pathCache + contentCache",
+        "Unit test: overwrite existing file, verify old inode cleaned up",
+        "Unit test: write to non-existent parent dir throws ENOENT",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 31,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-032",
+      "title": "SqlFs.appendFile",
+      "description": "As a developer, I want appendFile to read current content, append, and write back.",
+      "acceptanceCriteria": [
+        "If file exists: reads current content (cache or DB), appends new content, writes back as new blob",
+        "If file does not exist: creates new file with the appended content",
+        "Updates pathCache (new size, mtime, contentSha256), invalidates old contentCache entry",
+        "Unit test: append to existing file, verify content is original + appended",
+        "Unit test: append to non-existent file, verify file created",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 32,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-033",
+      "title": "SqlFs.mkdir",
+      "description": "As a developer, I want mkdir to create directory inodes with optional recursive mode.",
+      "acceptanceCriteria": [
+        "Non-recursive: creates single dir, throws ENOENT if parent missing, throws EEXIST if already exists",
+        "Recursive (mkdir -p): creates all missing parents, silently succeeds if already exists",
+        "Each created directory added to pathCache",
+        "Unit test: mkdir single level, mkdir -p nested, mkdir existing (EEXIST), mkdir -p existing (no error)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 33,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-034",
+      "title": "SqlFs.rm (non-recursive)",
+      "description": "As a developer, I want rm to remove a single file or empty directory.",
+      "acceptanceCriteria": [
+        "Removes dirent via dialect.deleteDirent, decrements nlink via dialect.decrementNlink",
+        "If nlink reaches 0, deletes inode via dialect.deleteInode",
+        "Throws ENOENT if path does not exist (unless force=true), ENOTEMPTY if dir has children, EISDIR if dir and recursive not set",
+        "Removes entry from pathCache and contentCache",
+        "Unit test: rm file, rm empty dir, rm non-empty dir (ENOTEMPTY), rm non-existent (ENOENT), rm -f non-existent (no error)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 34,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-035",
+      "title": "SqlFs.rm (recursive)",
+      "description": "As a developer, I want rm -r to remove a directory and all its contents.",
+      "acceptanceCriteria": [
+        "Collects all descendant inode IDs via dialect.loadSubtreeInodes",
+        "Deletes all dirents and inodes in the subtree within one transaction",
+        "Removes all subtree paths from pathCache and all subtree inodes from contentCache",
+        "Unit test: create nested structure (3 levels), rm -r root, verify all gone from caches",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 35,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-036",
+      "title": "SqlFs.mv",
+      "description": "As a developer, I want mv to rename/move via single dirent update and rebuild pathCache keys.",
+      "acceptanceCriteria": [
+        "Calls dialect.moveDirent(oldParent, oldName, newParent, newName) — single row UPDATE",
+        "If destination exists: removes existing dirent + decrements its inode nlink first",
+        "Rebuilds pathCache: removes all keys under old path, re-inserts under new path",
+        "Does NOT invalidate contentCache (same inodeIds, same content)",
+        "Unit test: rename file, move file to different dir, move directory with children",
+        "Unit test: move over existing file (destination replaced)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 36,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-037",
+      "title": "SqlFs.cp (single file)",
+      "description": "As a developer, I want cp to copy a file by creating a new inode pointing to the same blob.",
+      "acceptanceCriteria": [
+        "Creates new inode with same contentSha256 as source (no blob duplication — CAS dedup)",
+        "Inserts new dirent at destination",
+        "Throws ENOENT if source does not exist",
+        "Updates pathCache with new entry",
+        "Unit test: cp file, verify dest has same content, verify blob is shared (not duplicated)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 37,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-038",
+      "title": "SqlFs.cp (recursive directory)",
+      "description": "As a developer, I want cp -r to deep-copy a directory tree.",
+      "acceptanceCriteria": [
+        "Recursively walks source subtree, creates new inode per entry (sharing contentSha256 for files)",
+        "Creates new dirents mirroring the source structure",
+        "Adds all new paths to pathCache",
+        "Throws error if recursive not set and source is directory",
+        "Unit test: cp -r dir with nested files/dirs, verify full tree duplicated with blobs shared",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 38,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-039",
+      "title": "SqlFs.link (hardlink)",
+      "description": "As a developer, I want link() to create a second directory entry pointing to the same inode.",
+      "acceptanceCriteria": [
+        "Inserts new dirent pointing to existing inode via dialect.insertDirent",
+        "Increments nlink on the inode via dialect.incrementNlink",
+        "Throws error if source is a directory (hardlinks to dirs not allowed)",
+        "Throws EEXIST if destination already exists",
+        "Adds new path to pathCache",
+        "Unit test: create hardlink, verify both paths resolve to same content, nlink=2",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 39,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-040",
+      "title": "SqlFs.symlink (default-deny)",
+      "description": "As a developer, I want symlink() to create a symlink inode, respecting default-deny policy.",
+      "acceptanceCriteria": [
+        "If allowSymlinks=false (default): throws EPERM immediately, no DB call",
+        "If allowSymlinks=true: creates kind=3 inode with symlinkTarget, inserts dirent",
+        "Adds to pathCache with kind=3",
+        "Unit test: symlink with allowSymlinks=false throws EPERM",
+        "Unit test: symlink with allowSymlinks=true creates entry, readlink returns target",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 40,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-041",
+      "title": "SqlFs.chmod and SqlFs.utimes",
+      "description": "As a developer, I want chmod/utimes to update inode metadata and pathCache.",
+      "acceptanceCriteria": [
+        "chmod(path, mode) calls dialect.updateInode(tx, inodeId, { mode }), updates pathCache entry mode",
+        "utimes(path, atime, mtime) calls dialect.updateInode(tx, inodeId, { mtime }), updates pathCache entry mtime",
+        "Both throw ENOENT if path not found in pathCache",
+        "Unit test: chmod changes mode, utimes changes mtime, both reflected in subsequent stat()",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 41,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-042",
+      "title": "SqlFs.resolvePath (synchronous, no DB)",
+      "description": "As a developer, I want resolvePath to do pure path joining without any DB call.",
+      "acceptanceCriteria": [
+        "Uses resolvePath from just-bash path-utils directly (re-export or delegate)",
+        "Synchronous, no async, no DB",
+        "resolvePath('/home/user', 'project/src') returns '/home/user/project/src'",
+        "resolvePath('/home/user', '/tmp') returns '/tmp' (absolute overrides)",
+        "Unit test: relative path, absolute path, '.' and '..' handling",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 42,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
