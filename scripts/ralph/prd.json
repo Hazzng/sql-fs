@@ -186,7 +186,7 @@
         "Tests pass"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": "Use async-mutex package (or hand-rolled Promise queue) for per-sandbox serialization. The mutex ensures pathCache/contentCache coherence."
     },
     {

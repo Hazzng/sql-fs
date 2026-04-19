@@ -16,6 +16,9 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - `res.json()` returns `unknown` — cast with `as { field: type }` in tests before accessing properties.
 - Generic Hono middleware factories: use `createMiddleware<{ Variables: { key: z.infer<T> } }>` for typed variable injection; test apps need `new Hono<{ Variables: { key: z.infer<typeof schema> } }>()`.
 - Zod for query params: use `z.coerce.number()` since query string values are always strings.
+- `async-mutex` `Mutex.runExclusive(async () => { ... })` is the idiomatic pattern for serialized async critical sections in this project.
+- Single-flight pattern: store `Promise<T>` (not `T`) in a pending `Map`; remove in `finally` so the slot is freed on completion or error.
+- `SessionManager` in `src/api/session-manager.ts` is the canonical way to get a warm `Bash + IFileSystem` session per sandbox — route handlers use `withSession` not `getOrCreate` directly.
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -114,4 +117,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Mount sub-routers with `app.route("/v1/prefix", subApp)` — auth middleware on `/v1/*` applies automatically to all sub-router routes
   - After signing a token, calling `verifyToken` on the just-signed token is a clean way to extract the exp claim for the response (no manual date math needed)
   - `z.enum(["30d", "1y", "24h", "never"]).optional()` is the right pattern for constrained duration strings; default applied in handler with destructuring default `= "30d"`
+---
+
+## 2026-04-19 - US-074
+- Created `src/api/session-manager.ts`: exports `SessionManager` class with `getOrCreate(sandboxId)`, `withSession(sandboxId, fn)`, and `Session` / `SessionManagerOptions` interfaces
+- Single-flight pattern: `Map<string, Promise<Session>>` (pending map) coalesces concurrent `getOrCreate` calls for the same sandboxId to one creation
+- Per-sandbox serialization: each session holds an `async-mutex` `Mutex`; `withSession` uses `mutex.runExclusive` with `inFlight++/--` wrapping the callback
+- Constructor accepts `{ backend, databaseUrl?, createFs? }` — `createFs` overrides the default `createSandboxFs` for DI in tests
+- Created `src/api/__tests__/session-manager.test.ts`: 5 unit tests (cache hit, single-flight, independent sandboxes, sequential withSession, inFlight tracking)
+- Files changed: `src/api/session-manager.ts` (new), `src/api/__tests__/session-manager.test.ts` (new), `package.json` (added async-mutex), `pnpm-lock.yaml`
+- **Learnings for future iterations:**
+  - `async-mutex` `Mutex.runExclusive(fn)` is the correct API for serialized async critical sections — no need to acquire/release manually
+  - Single-flight: store `Promise<Session>` (not `Session`) in the pending map; `finally` block removes it so completed entries don't leak
+  - `Bash` from just-bash accepts `{ fs: IFileSystem }` as constructor option — no required args
+  - For sequential execution tests: use a deferred blocker promise + `await firstStarted` before launching the second call to guarantee call ordering
 ---
