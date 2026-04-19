@@ -455,3 +455,16 @@
   - Mocks for `loadSubtreeInodes: vi.fn()` silently break when code iterates the result — they return `undefined` (not an array). Always use `vi.fn(async () => [])` or appropriate array for collection-returning methods.
   - The parent dirent deletion must happen first (to unlink the subtree from the tree), then loadSubtreeInodes walks the now-unlinked subtree dirents to collect inode IDs for deletion.
 ---
+
+## 2026-04-19 - US-036
+- Updated `mv(src, dest)` in `src/fs/sql-fs/sql-fs.ts` to handle the case where `dest` already exists.
+- Before calling `moveDirent`, if `dest` is in pathCache: call `decrementNlink` on the displaced dest inode, and if nlink reaches 0, call `deleteInode`. The `moveDirent` dialect method already DELETEs the dest dirent at the SQL level (from US-012).
+- Added `const destEntry = this.#pathCache.get(dest)` before the transaction, then inside the transaction: `if (destEntry) { const newNlink = await decrementNlink(...); if (newNlink === 0) await deleteInode(...); }`.
+- Added a new `describe` block in `src/fs/sql-fs/sql-fs.mv.test.ts` with 2 tests: (1) move over existing file calls decrementNlink + deleteInode when nlink drops to 0; (2) move over existing file does NOT call deleteInode when nlink > 0.
+- All prior mv tests (from US-021) still pass.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.mv.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `moveDirent` in the dialect handles the dest dirent at the SQL level (DELETE then UPDATE). The SqlFs layer is responsible for the displaced inode's nlink lifecycle — always check if dest exists in pathCache before calling moveDirent, and handle decrementNlink/deleteInode accordingly.
+  - Snapshot `destEntry = this.#pathCache.get(dest)` before the transaction (not inside it) so the cache state is captured before any async mutations.
+  - The pathCache rebuild (clearing old keys, re-inserting under dest) already handles removing the dest entry — no separate `this.#pathCache.delete(dest)` is needed since the loop clears all keys starting with dest.
+---
