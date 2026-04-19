@@ -3,11 +3,13 @@
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
+ * US-065: POST /v1/sandboxes/:id/mkdir — create directory
  */
 
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { FsStat } from "just-bash";
+import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -180,6 +182,53 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 		if (result.kind === "not_empty") {
 			return c.json({ error: "directory_not_empty", code: "ENOTEMPTY" }, 409 as ContentfulStatusCode);
+		}
+
+		return c.body(null, 204);
+	});
+
+	// POST /v1/sandboxes/:id/mkdir — create directory
+	const mkdirBodySchema = z.object({
+		path: z.string().min(1, "path is required"),
+		recursive: z.boolean().optional(),
+	});
+
+	router.post("/:id/mkdir", async (c) => {
+		const sandboxId = c.req.param("id");
+
+		let body: z.infer<typeof mkdirBodySchema>;
+		try {
+			const raw = await c.req.json();
+			const result = mkdirBodySchema.safeParse(raw);
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const { path: dirPath, recursive = false } = body;
+
+		type MkdirResult = { kind: "ok" } | { kind: "exists" };
+
+		const result = await sessionManager.withSession<MkdirResult>(sandboxId, async (session) => {
+			try {
+				await session.fs.mkdir(dirPath, { recursive });
+				return { kind: "ok" };
+			} catch (e) {
+				const code = extractErrCode(e);
+				if (code === "EEXIST") return { kind: "exists" };
+				throw e;
+			}
+		});
+
+		if (result.kind === "exists") {
+			return c.json({ error: "already_exists", code: "EEXIST" }, 409 as ContentfulStatusCode);
 		}
 
 		return c.body(null, 204);

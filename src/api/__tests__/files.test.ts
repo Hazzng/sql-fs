@@ -3,6 +3,7 @@
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
+ * US-065: POST /v1/sandboxes/:id/mkdir — create directory
  */
 
 import { Hono } from "hono";
@@ -239,5 +240,64 @@ describe("DELETE /v1/sandboxes/:id/files/*path", () => {
 			headers: { Authorization: `Bearer ${token}` },
 		});
 		expect(res.status).toBe(204);
+	});
+});
+
+describe("POST /v1/sandboxes/:id/mkdir", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("mkdir returns 204 and directory is created", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/mkdir`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ path: "/newdir" }),
+		});
+		expect(res.status).toBe(204);
+
+		const stat = await (fs as InMemoryFs).stat("/newdir");
+		expect(stat.isDirectory).toBe(true);
+	});
+
+	it("mkdir with recursive creates nested directories", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/mkdir`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ path: "/a/b/c", recursive: true }),
+		});
+		expect(res.status).toBe(204);
+
+		const stat = await (fs as InMemoryFs).stat("/a/b/c");
+		expect(stat.isDirectory).toBe(true);
+	});
+
+	it("mkdir existing directory without recursive returns 409", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).mkdir("/existing");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/mkdir`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ path: "/existing" }),
+		});
+		expect(res.status).toBe(409);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("EEXIST");
 	});
 });
