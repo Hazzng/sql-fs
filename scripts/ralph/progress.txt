@@ -407,3 +407,15 @@
   - US-031 through US-042 may similarly be "no-op" stories if their implementations were already provided as part of earlier US-020/021/022/023/024 stories. Always check existing code and tests before writing anything new.
   - When a story's implementation was front-loaded into an earlier story, the PRD story is satisfied by verifying the existing code+tests meet the acceptance criteria and running quality checks.
 ---
+
+## 2026-04-19 - US-032
+- No new code written — all acceptance criteria for SqlFs.appendFile were already satisfied by prior stories.
+- Implementation in `src/fs/sql-fs/sql-fs.ts` (appendFile method, lines 177-233) was done as part of US-020.
+- Tests covering "append to non-existent file creates new file" and "append to existing file updates pathCache" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020).
+- Tests covering "invalidates old inode contentCache entry" and "sets new inode content in contentCache" (verifying content is original + appended) exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024).
+- Verified: `pnpm typecheck` passes, all 107 unit tests pass, `pnpm lint:fix` reports no fixes.
+- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - US-032 is another no-op story — implementation and tests were front-loaded in US-020 and US-024 respectively. Check existing code before writing.
+  - The appendFile cache-invalidation test verifies "content is original + appended" by checking `new TextDecoder().decode(cached) === "hello world"` — this satisfies the "verify content is original + appended" acceptance criterion.
+---
