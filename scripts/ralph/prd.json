@@ -416,7 +416,7 @@
         "Tests pass"
       ],
       "priority": 21,
-      "passes": false,
+      "passes": true,
       "notes": "This may be partially implemented in US-068/069. This story ensures it's fully tested and correct."
     },
     {

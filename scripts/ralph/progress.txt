@@ -282,3 +282,13 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - SSE body parsing in tests: split on `"\n\n"` for event blocks, then split each block on `"\n"` and extract `event:` and `data:` lines; `data:` prefix is exactly 6 chars
   - `bash.exec()` has no streaming callback — it returns buffered output; true line-by-line streaming would require a different just-bash API
 ---
+
+## 2026-04-19 - US-070
+- Added SSE timeout unit test to `src/api/__tests__/exec.test.ts` — the abort/timer implementation was already complete from US-068/069
+- Test pre-creates session via `sessionManager.getOrCreate`, spies on `bash.exec` to hang-then-reject on abort signal, sends request with `timeoutMs: 50`, parses SSE response body and asserts exit event has `exitCode: -1` and `error: 'timeout'`
+- Exec-sync timeout test already existed; this story adds the missing SSE timeout test to complete full coverage
+- Files changed: `src/api/__tests__/exec.test.ts`
+- **Learnings for future iterations:**
+  - SSE timeout test follows same mock pattern as exec-sync: `vi.spyOn(session.bash, "exec").mockImplementation((_script, opts) => new Promise(...))` — session must be pre-created with `getOrCreate` before the spy
+  - The `timedOut` flag + catch block pattern in the SSE handler correctly emits the timeout exit event regardless of whether `bash.exec` throws or resolves after abort
+---
