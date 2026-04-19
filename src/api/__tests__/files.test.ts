@@ -1,6 +1,7 @@
 /**
  * Unit tests for file operation routes.
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
+ * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  */
 
 import { Hono } from "hono";
@@ -97,5 +98,75 @@ describe("GET /v1/sandboxes/:id/files/*path", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { error: string; code: string };
 		expect(body.code).toBe("EISDIR");
+	});
+});
+
+describe("PUT /v1/sandboxes/:id/files/*path", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("write new file returns 204 and content is readable via GET", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		const content = "hello from PUT";
+
+		const putRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/put-new.txt`, {
+			method: "PUT",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+			body: content,
+		});
+		expect(putRes.status).toBe(204);
+
+		const getRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/put-new.txt`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(getRes.status).toBe(200);
+		expect(await getRes.text()).toBe(content);
+	});
+
+	it("overwrite existing file via PUT returns 204 and new content is readable", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).writeFile("/overwrite.txt", "original content");
+
+		const putRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/overwrite.txt`, {
+			method: "PUT",
+			headers: { Authorization: `Bearer ${token}` },
+			body: "new content",
+		});
+		expect(putRes.status).toBe(204);
+
+		const getRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/overwrite.txt`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(getRes.status).toBe(200);
+		expect(await getRes.text()).toBe("new content");
+	});
+
+	it("write file under nested path creates parent dirs automatically", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const putRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/a/b/c/deep.txt`, {
+			method: "PUT",
+			headers: { Authorization: `Bearer ${token}` },
+			body: "deep content",
+		});
+		expect(putRes.status).toBe(204);
+
+		const getRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/a/b/c/deep.txt`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(getRes.status).toBe(200);
+		expect(await getRes.text()).toBe("deep content");
 	});
 });
