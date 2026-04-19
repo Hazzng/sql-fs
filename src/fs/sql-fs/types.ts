@@ -7,6 +7,13 @@
 /** Inode kind: 1=file, 2=directory, 3=symlink */
 export type InodeKind = 1 | 2 | 3;
 
+/** Named constants for inode kinds. Prefer these over raw numbers in implementation code. */
+export const INODE_KIND = {
+	FILE: 1,
+	DIRECTORY: 2,
+	SYMLINK: 3,
+} as const satisfies Record<string, InodeKind>;
+
 /** Storage backend identifiers */
 export type StorageBackend = "postgres" | "mysql" | "azure-sql" | "azure-fileshare" | "memory";
 

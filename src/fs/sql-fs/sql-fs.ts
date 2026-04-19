@@ -20,12 +20,12 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
-import type { PathCacheEntry, SqlDialect } from "./types.js";
+import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
  * Normalize a virtual filesystem path: resolve `.` and `..` components,
  * collapse slashes, always return an absolute path starting with `/`.
- * Equivalent to just-bash's internal path-utils `normalizePath` function.
+ * Matches just-bash's internal path-utils semantics (not publicly exported).
  */
 function normalizeFsPath(p: string): string {
 	if (!p || p === "/") return "/";
@@ -36,7 +36,18 @@ function normalizeFsPath(p: string): string {
 		if (part === "..") stack.pop();
 		else stack.push(part);
 	}
-	return `/${stack.join("/")}` || "/";
+	return `/${stack.join("/")}`;
+}
+
+/**
+ * Normalize and validate a path. Rejects null bytes (security risk).
+ * Throws EINVAL for invalid paths.
+ */
+function validatePath(p: string): string {
+	if (p.includes("\0")) {
+		throw createEinval(p);
+	}
+	return normalizeFsPath(p);
 }
 
 // Extract optional-parameter types from IFileSystem to avoid importing
@@ -140,6 +151,20 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	}
 
 	/**
+	 * Validates that the parent directory of `path` exists and is a directory.
+	 * Returns parentPath, name, and the parent's PathCacheEntry.
+	 * Throws ENOENT if the parent is missing, ENOTDIR if the parent is not a directory.
+	 */
+	#requireParentDir(path: string): { parentPath: string; name: string; parentEntry: PathCacheEntry } {
+		const parentPath = this.#parentOf(path);
+		const name = this.#nameOf(path);
+		const parentEntry = this.#pathCache.get(parentPath);
+		if (!parentEntry) throw createEnoent(parentPath);
+		if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(parentPath);
+		return { parentPath, name, parentEntry };
+	}
+
+	/**
 	 * Initialises the in-memory pathCache by loading all paths from the DB
 	 * via a single recursive CTE query.  Must be called once before any FS op.
 	 */
@@ -162,13 +187,9 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	// ── IFileSystem: write operations with pathCache updates ─────────────────────
 
-	async writeFile(path: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
-		const parentPath = this.#parentOf(path);
-		const name = this.#nameOf(path);
-
-		const parentEntry = this.#pathCache.get(parentPath);
-		if (!parentEntry) throw createEnoent(parentPath);
-		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
+	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+		const path = validatePath(inputPath);
+		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
@@ -178,7 +199,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			await this.#dialect.upsertBlob(tx, sha256, bytes);
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: 1,
+				kind: INODE_KIND.FILE,
 				mode: 0o644,
 				size: bytes.length,
 				contentSha256: sha256,
@@ -193,7 +214,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#pathCache.set(path, {
 			inodeId,
-			kind: 1,
+			kind: INODE_KIND.FILE,
 			mode: 0o644,
 			size: bytes.length,
 			mtime,
@@ -203,9 +224,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		this.#contentCache.set(inodeId, bytes);
 	}
 
-	async appendFile(path: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
-		const parentPath = this.#parentOf(path);
-		const name = this.#nameOf(path);
+	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+		const path = validatePath(inputPath);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const mtime = new Date();
@@ -213,7 +233,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const existing = this.#pathCache.get(path);
 		let fullBytes: Uint8Array;
 
-		if (existing && existing.kind === 1 && existing.contentSha256 !== null) {
+		if (existing && existing.kind === INODE_KIND.FILE && existing.contentSha256 !== null) {
 			const oldContent = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, existing.contentSha256!));
 			const base = oldContent ?? new Uint8Array(0);
 			const merged = new Uint8Array(base.length + bytes.length);
@@ -225,16 +245,14 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		}
 
 		const sha256 = new Uint8Array(createHash("sha256").update(fullBytes).digest());
-		const parentEntry = this.#pathCache.get(parentPath);
-		if (!parentEntry) throw createEnoent(parentPath);
-		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
+		const { name, parentEntry } = this.#requireParentDir(path);
 
 		let replacedInodeId: bigint | null = null;
 		const inodeId = await this.#withTx(async (tx) => {
 			await this.#dialect.upsertBlob(tx, sha256, fullBytes);
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: 1,
+				kind: INODE_KIND.FILE,
 				mode: 0o644,
 				size: fullBytes.length,
 				contentSha256: sha256,
@@ -252,7 +270,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		this.#contentCache.set(inodeId, fullBytes);
 		this.#pathCache.set(path, {
 			inodeId,
-			kind: 1,
+			kind: INODE_KIND.FILE,
 			mode: 0o644,
 			size: fullBytes.length,
 			mtime,
@@ -261,7 +279,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 	}
 
-	async mkdir(path: string, options?: MkdirOptions): Promise<void> {
+	async mkdir(inputPath: string, options?: MkdirOptions): Promise<void> {
+		const path = validatePath(inputPath);
 		const recursive = options?.recursive ?? false;
 		const mtime = new Date();
 
@@ -277,7 +296,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 					const inodeId = await this.#withTx(async (tx) => {
 						const id = await this.#dialect.createInode(tx, {
 							sandboxId: this.#sandboxId,
-							kind: 2,
+							kind: INODE_KIND.DIRECTORY,
 							mode: 0o755,
 							size: 0,
 						});
@@ -286,7 +305,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 					});
 					this.#pathCache.set(next, {
 						inodeId,
-						kind: 2,
+						kind: INODE_KIND.DIRECTORY,
 						mode: 0o755,
 						size: 0,
 						mtime,
@@ -301,16 +320,12 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		// Non-recursive
 		if (this.#pathCache.has(path)) throw createEexist(path);
-		const parentPath = this.#parentOf(path);
-		const name = this.#nameOf(path);
-		const parentEntry = this.#pathCache.get(parentPath);
-		if (!parentEntry) throw createEnoent(parentPath);
-		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
+		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const inodeId = await this.#withTx(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: 2,
+				kind: INODE_KIND.DIRECTORY,
 				mode: 0o755,
 				size: 0,
 			});
@@ -320,7 +335,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#pathCache.set(path, {
 			inodeId,
-			kind: 2,
+			kind: INODE_KIND.DIRECTORY,
 			mode: 0o755,
 			size: 0,
 			mtime,
@@ -329,7 +344,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 	}
 
-	async rm(path: string, options?: RmOptions): Promise<void> {
+	async rm(inputPath: string, options?: RmOptions): Promise<void> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 
 		if (!entry) {
@@ -341,7 +357,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const name = this.#nameOf(path);
 		const parentEntry = this.#pathCache.get(parentPath);
 
-		if (options?.recursive && entry.kind === 2) {
+		if (options?.recursive && entry.kind === INODE_KIND.DIRECTORY) {
 			// Snapshot subtree paths before async work
 			const subtreePaths = this.#allPathsUnder(path);
 
@@ -365,7 +381,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			return;
 		}
 
-		if (entry.kind === 2) {
+		if (entry.kind === INODE_KIND.DIRECTORY) {
 			// Non-recursive: only allow if empty
 			if (this.#childPaths(path).length > 0) throw createEnotempty(path);
 		}
@@ -380,7 +396,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		this.#pathCache.delete(path);
 	}
 
-	async chmod(path: string, mode: number): Promise<void> {
+	async chmod(inputPath: string, mode: number): Promise<void> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -391,7 +408,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		this.#pathCache.set(path, { ...entry, mode });
 	}
 
-	async utimes(path: string, _atime: Date, mtime: Date): Promise<void> {
+	async utimes(inputPath: string, _atime: Date, mtime: Date): Promise<void> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -404,10 +422,11 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
 
-	async readFile(path: string, _options?: ReadFileOpts): Promise<string> {
+	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
-		if (entry.kind === 2) throw createEisdir(path);
+		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
 		// Cache hit: return decoded bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
@@ -422,10 +441,11 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		return new TextDecoder().decode(bytes);
 	}
 
-	async readFileBuffer(path: string): Promise<Uint8Array> {
+	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
-		if (entry.kind === 2) throw createEisdir(path);
+		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
 		// Cache hit: return raw bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
@@ -438,16 +458,18 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		return bytes;
 	}
 
-	async exists(path: string): Promise<boolean> {
+	async exists(inputPath: string): Promise<boolean> {
+		const path = validatePath(inputPath);
 		return this.#pathCache.has(path);
 	}
 
-	async stat(path: string): Promise<FsStat> {
+	async stat(inputPath: string): Promise<FsStat> {
+		const path = validatePath(inputPath);
 		let entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
 		// stat follows symlinks at the final component
-		if (entry.kind === 3) {
+		if (entry.kind === INODE_KIND.SYMLINK) {
 			const target = entry.symlinkTarget ?? "";
 			const resolved = this.#pathCache.get(target);
 			if (!resolved) throw createEnoent(target);
@@ -455,8 +477,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		}
 
 		return {
-			isFile: entry.kind === 1,
-			isDirectory: entry.kind === 2,
+			isFile: entry.kind === INODE_KIND.FILE,
+			isDirectory: entry.kind === INODE_KIND.DIRECTORY,
 			isSymbolicLink: false,
 			mode: entry.mode,
 			size: entry.size,
@@ -464,49 +486,54 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		};
 	}
 
-	async lstat(path: string): Promise<FsStat> {
+	async lstat(inputPath: string): Promise<FsStat> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
 		return {
-			isFile: entry.kind === 1,
-			isDirectory: entry.kind === 2,
-			isSymbolicLink: entry.kind === 3,
+			isFile: entry.kind === INODE_KIND.FILE,
+			isDirectory: entry.kind === INODE_KIND.DIRECTORY,
+			isSymbolicLink: entry.kind === INODE_KIND.SYMLINK,
 			mode: entry.mode,
 			size: entry.size,
 			mtime: entry.mtime,
 		};
 	}
 
-	async readdir(path: string): Promise<string[]> {
+	async readdir(inputPath: string): Promise<string[]> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
-		if (entry.kind !== 2) throw createEnotdir(path);
+		if (entry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(path);
 		return this.#childPaths(path).map((p) => this.#nameOf(p));
 	}
 
-	readdirWithFileTypes(path: string): Promise<DirentEntry[]> {
+	readdirWithFileTypes(inputPath: string): Promise<DirentEntry[]> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) return Promise.reject(createEnoent(path));
-		if (entry.kind !== 2) return Promise.reject(createEnotdir(path));
+		if (entry.kind !== INODE_KIND.DIRECTORY) return Promise.reject(createEnotdir(path));
 		const children = this.#childPaths(path);
 		const result: DirentEntry[] = children.map((p) => {
 			const e = this.#pathCache.get(p)!;
 			return {
 				name: this.#nameOf(p),
-				isFile: e.kind === 1,
-				isDirectory: e.kind === 2,
-				isSymbolicLink: e.kind === 3,
+				isFile: e.kind === INODE_KIND.FILE,
+				isDirectory: e.kind === INODE_KIND.DIRECTORY,
+				isSymbolicLink: e.kind === INODE_KIND.SYMLINK,
 			};
 		});
 		return Promise.resolve(result);
 	}
 
-	async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+	async cp(inputSrc: string, inputDest: string, options?: CpOptions): Promise<void> {
+		const src = validatePath(inputSrc);
+		const dest = validatePath(inputDest);
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
-		if (srcEntry.kind === 2) {
+		if (srcEntry.kind === INODE_KIND.DIRECTORY) {
 			if (!options?.recursive) throw createEisdir(src);
 
 			// Recursive directory copy: walk source subtree, create new inodes sharing same blobs
@@ -514,10 +541,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			// Sort by depth so parents are always created before their children
 			srcPaths.sort((a, b) => a.split("/").length - b.split("/").length);
 
-			const destParentPath = this.#parentOf(dest);
-			const destParentEntry = this.#pathCache.get(destParentPath);
-			if (!destParentEntry) throw createEnoent(destParentPath);
-			if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+			// Validate dest parent exists and is a directory (throws if not)
+			this.#requireParentDir(dest);
 
 			const mtime = new Date();
 			// Maps destPath → new inodeId so children can look up their parent's new id
@@ -557,18 +582,14 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		}
 
 		// Single file copy: new inode pointing to the same blob (CAS dedup)
-		const destParentPath = this.#parentOf(dest);
-		const destName = this.#nameOf(dest);
-		const destParentEntry = this.#pathCache.get(destParentPath);
-		if (!destParentEntry) throw createEnoent(destParentPath);
-		if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(dest);
 
 		const mtime = new Date();
 
 		const newInodeId = await this.#withTx(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: 1,
+				kind: INODE_KIND.FILE,
 				mode: srcEntry.mode,
 				size: srcEntry.size,
 				contentSha256: srcEntry.contentSha256,
@@ -583,7 +604,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#pathCache.set(dest, {
 			inodeId: newInodeId,
-			kind: 1,
+			kind: INODE_KIND.FILE,
 			mode: srcEntry.mode,
 			size: srcEntry.size,
 			mtime,
@@ -592,7 +613,9 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 	}
 
-	async mv(src: string, dest: string): Promise<void> {
+	async mv(inputSrc: string, inputDest: string): Promise<void> {
+		const src = validatePath(inputSrc);
+		const dest = validatePath(inputDest);
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
@@ -606,6 +629,15 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		const destParentEntry = this.#pathCache.get(destParentPath);
 		if (!destParentEntry) throw createEnoent(destParentPath);
+		if (destParentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(destParentPath);
+
+		// Prevent moving a directory into its own descendant (would create a cycle)
+		if (srcEntry.kind === INODE_KIND.DIRECTORY) {
+			const srcPrefix = src === "/" ? "/" : `${src}/`;
+			if (dest.startsWith(srcPrefix) || dest === src) {
+				throw createEinval(src);
+			}
+		}
 
 		// Capture displaced dest inode before async work
 		const destEntry = this.#pathCache.get(dest);
@@ -642,28 +674,25 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	}
 
 	resolvePath(base: string, path: string): string {
-		// Matches just-bash InMemoryFs.resolvePath semantics (path-utils `y` function).
-		// If path is absolute, normalize it. Otherwise combine base + path and normalize.
 		if (path.startsWith("/")) return normalizeFsPath(path);
 		const combined = base === "/" ? `/${path}` : `${base}/${path}`;
 		return normalizeFsPath(combined);
 	}
 
-	async symlink(target: string, linkPath: string): Promise<void> {
+	async symlink(target: string, inputLinkPath: string): Promise<void> {
+		const linkPath = validatePath(inputLinkPath);
+		// Note: target is intentionally not normalized - it's stored as-is
+		if (target.includes("\0")) throw createEinval(target);
 		if (!this.#allowSymlinks) throw createEperm(linkPath, "symlink");
 
-		const parentPath = this.#parentOf(linkPath);
-		const name = this.#nameOf(linkPath);
-		const parentEntry = this.#pathCache.get(parentPath);
-		if (!parentEntry) throw createEnoent(parentPath);
-		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
+		const { name, parentEntry } = this.#requireParentDir(linkPath);
 
 		const mtime = new Date();
 
 		const inodeId = await this.#withTx(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: 3,
+				kind: INODE_KIND.SYMLINK,
 				mode: 0o777,
 				size: target.length,
 				symlinkTarget: target,
@@ -674,7 +703,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#pathCache.set(linkPath, {
 			inodeId,
-			kind: 3,
+			kind: INODE_KIND.SYMLINK,
 			mode: 0o777,
 			size: target.length,
 			mtime,
@@ -683,17 +712,15 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 	}
 
-	async link(existingPath: string, newPath: string): Promise<void> {
+	async link(inputExistingPath: string, inputNewPath: string): Promise<void> {
+		const existingPath = validatePath(inputExistingPath);
+		const newPath = validatePath(inputNewPath);
 		const srcEntry = this.#pathCache.get(existingPath);
 		if (!srcEntry) throw createEnoent(existingPath);
-		if (srcEntry.kind === 2) throw createEperm(existingPath, "link");
+		if (srcEntry.kind === INODE_KIND.DIRECTORY) throw createEperm(existingPath, "link");
 		if (this.#pathCache.has(newPath)) throw createEexist(newPath);
 
-		const destParentPath = this.#parentOf(newPath);
-		const destName = this.#nameOf(newPath);
-		const destParentEntry = this.#pathCache.get(destParentPath);
-		if (!destParentEntry) throw createEnoent(destParentPath);
-		if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(newPath);
 
 		await this.#withTx(async (tx) => {
 			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
@@ -703,14 +730,16 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		this.#pathCache.set(newPath, { ...srcEntry });
 	}
 
-	async readlink(path: string): Promise<string> {
+	async readlink(inputPath: string): Promise<string> {
+		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
-		if (entry.kind !== 3) throw createEinval(path);
+		if (entry.kind !== INODE_KIND.SYMLINK) throw createEinval(path);
 		return entry.symlinkTarget!;
 	}
 
-	async realpath(path: string): Promise<string> {
+	async realpath(inputPath: string): Promise<string> {
+		const path = validatePath(inputPath);
 		const resolvedInodeId = await this.#withTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
 			if (entry.inodeId === resolvedInodeId) return p;

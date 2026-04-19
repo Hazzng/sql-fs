@@ -1,7 +1,7 @@
 {
   "project": "VirtualFS API",
   "branchName": "ralph/phase1-sqlfs-postgres",
-  "description": "Phase 1: SqlFs IFileSystem backed by Postgres \u2014 types, dialect, caching, all read/write methods. 42 stories across 8 epics.",
+  "description": "Phase 1: SqlFs IFileSystem backed by Postgres \u2014 types, dialect, caching, all read/write methods, plus phase-1 hardening follow-ups. 46 stories across 8 epics.",
   "userStories": [
     {
       "id": "US-001",
@@ -723,6 +723,70 @@
         "Tests pass"
       ],
       "priority": 42,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-042a",
+      "title": "readFile/readFileBuffer symlink semantics",
+      "description": "As a developer, I want readFile and readFileBuffer to have explicit symlink-following behavior so file reads match the chosen filesystem contract.",
+      "acceptanceCriteria": [
+        "Decide and document final-component symlink semantics for readFile and readFileBuffer",
+        "Implementation follows the chosen semantics consistently for both methods",
+        "Broken symlinks return ENOENT",
+        "Symlink loops return ELOOP",
+        "Unit tests cover direct symlink reads, broken symlinks, and loop detection",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 43,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-042b",
+      "title": "hardlink-safe recursive rm",
+      "description": "As a developer, I want recursive rm to preserve inodes still referenced outside the removed subtree so hardlinks remain safe.",
+      "acceptanceCriteria": [
+        "rm -r decrements nlink once per removed dirent in the subtree",
+        "Inodes are deleted only when nlink reaches zero",
+        "Files still referenced by hardlinks outside the subtree are preserved",
+        "Directories are removed after their children",
+        "Unit tests cover external hardlinks and mixed subtree deletion",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 44,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-042c",
+      "title": "Extract inode kind constants",
+      "description": "As a developer, I want named inode kind constants so SqlFs code is easier to read and less error-prone than raw numeric kind checks.",
+      "acceptanceCriteria": [
+        "Named inode kind constants exported from src/fs/sql-fs/types.ts",
+        "src/fs/sql-fs/sql-fs.ts uses named constants instead of raw 1/2/3 checks",
+        "No behavior changes",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 45,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-042d",
+      "title": "Extract parent directory validation helper",
+      "description": "As a developer, I want a shared helper for parent-directory lookup and validation so repeated path guards stay consistent across write operations.",
+      "acceptanceCriteria": [
+        "Repeated parent directory lookup and ENOENT/ENOTDIR validation extracted into a private helper",
+        "Affected write operations use the helper",
+        "No behavior changes",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 46,
       "passes": true,
       "notes": ""
     }
