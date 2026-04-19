@@ -201,3 +201,15 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `fs.mkdir(parent, { recursive: true })` does not throw EEXIST in InMemoryFs for already-existing dirs, but the try/catch is kept for safety with other fs backends
   - `parentDir` returns `'/'` for top-level paths (e.g. `/file.txt`) — skip mkdir for `/` since it always exists
 ---
+
+## 2026-04-19 - US-064
+- Added `DELETE /:id/files/:path{.*}` route to `src/api/routes/files.ts`
+- Reads `recursive` query param (`=== "true"`); passes to `fs.rm(filePath, { recursive })`
+- Returns 204 on success, 404 for ENOENT, 409 for ENOTEMPTY
+- Added 4 unit tests to `files.test.ts`: delete file (204), delete non-existent (404), delete non-empty dir without recursive (409), delete dir with recursive=true (204)
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
+- **Learnings for future iterations:**
+  - `IFileSystem.rm(path, { recursive?, force? })` is the single deletion method — there is no separate `unlink()` or `rmdir()`
+  - `fs.rm()` throws ENOTEMPTY for non-empty directories without `recursive: true`; ENOENT when path doesn't exist (unless `force: true`)
+  - Query param boolean parsing: `c.req.query("recursive") === "true"` — do not use `Boolean(c.req.query(...))` (truthy for any non-empty string)
+---
