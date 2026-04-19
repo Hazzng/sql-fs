@@ -1,12 +1,14 @@
 /**
- * Unit tests for createSandboxFs factory function and loadBackendConfig.
+ * Unit tests for createSandboxFs factory function, loadBackendConfig, and destroySandbox.
  * US-053: createSandboxFs factory function
  * US-054: Environment variable configuration
+ * US-055: destroySandbox
  */
 
 import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createSandboxFs, loadBackendConfig } from "./index.js";
+import { PostgresDialect } from "./dialects/postgres.js";
+import { createSandboxFs, destroySandbox, loadBackendConfig } from "./index.js";
 import { SqlFs } from "./sql-fs.js";
 
 // Mock the PostgresDialect so no real DB connection is made.
@@ -148,5 +150,43 @@ describe("loadBackendConfig", () => {
 		process.env.FS_BACKEND = "azure-fileshare";
 		process.env.FS_MOUNT_PATH = "";
 		expect(() => loadBackendConfig()).toThrow("FS_MOUNT_PATH");
+	});
+});
+
+describe("destroySandbox", () => {
+	describe("memory backend", () => {
+		it("returns without error", async () => {
+			await expect(destroySandbox("memory", "sandbox-123")).resolves.toBeUndefined();
+		});
+	});
+
+	describe("postgres backend", () => {
+		beforeEach(() => {
+			process.env.DATABASE_URL = "postgres://localhost/test";
+			vi.mocked(PostgresDialect).mockClear();
+		});
+
+		afterEach(() => {
+			process.env.DATABASE_URL = "";
+		});
+
+		it("calls deleteSandbox on the dialect and disconnects", async () => {
+			await destroySandbox("postgres", "sandbox-abc");
+
+			const MockedCtor = vi.mocked(PostgresDialect);
+			expect(MockedCtor).toHaveBeenCalledWith("postgres://localhost/test");
+
+			const instance = MockedCtor.mock.results[0]?.value as {
+				deleteSandbox: ReturnType<typeof vi.fn>;
+				disconnect: ReturnType<typeof vi.fn>;
+			};
+			expect(instance.deleteSandbox).toHaveBeenCalledWith({}, "sandbox-abc");
+			expect(instance.disconnect).toHaveBeenCalled();
+		});
+
+		it("throws if DATABASE_URL is not set", async () => {
+			process.env.DATABASE_URL = "";
+			await expect(destroySandbox("postgres", "sandbox-abc")).rejects.toThrow("DATABASE_URL");
+		});
 	});
 });
