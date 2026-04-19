@@ -23,3 +23,16 @@
 - **Learnings for future iterations:**
   - US-002 was a no-op implementation: all criteria were satisfied by US-001's implementation. When the PRD has ordering like this (types story after interface story), check the existing file before writing anything new.
 ---
+
+## 2026-04-19 - US-003
+- Implemented `src/fs/sql-fs/errors.ts` with all 7 FS error constructors: `createEnoent`, `createEexist`, `createEisdir`, `createEnotdir`, `createEnotempty`, `createEloop`, `createEperm`.
+- Implemented `translateSqlError(err, path)` mapping Postgres SQLSTATE codes (23505=EEXIST, FS001=ELOOP, FS002=ENOENT, FS003=ENOTDIR), MySQL errno (1062=EEXIST), and T-SQL error numbers (2601/2627=EEXIST).
+- Implemented `sanitizeFsError(err)` stripping connection URLs, T-SQL ADO.NET strings, internal table names (sandboxes, inodes, dirents, blobs), and host filesystem paths.
+- Created `src/fs/sql-fs/errors.test.ts` with 21 unit tests covering all constructors, all SQL error mappings, and sanitization cases.
+- Files changed: `src/fs/sql-fs/errors.ts`, `src/fs/sql-fs/errors.test.ts`
+- **Learnings for future iterations:**
+  - Internal types (e.g., `FsError = Error & { code: string; path?: string }`) are not exported; use `Error` as return type of constructors to avoid leaking internal type to consumers.
+  - `Object.assign(new Error(msg), { code, path })` is the idiomatic pattern for creating typed errors with extra properties without `class`.
+  - Biome will alphabetically sort import lists — write them in any order and let `pnpm lint:fix` sort them.
+  - `sanitizeFsError` uses `const pattern of SENSITIVE_PATTERNS` with a `readonly RegExp[]` array; regex flags include `g` so they reset after each call via the replace path — no state issues with `lastIndex` since we aren't using `exec`.
+---
