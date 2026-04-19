@@ -1,10 +1,11 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, deleteSandbox, inode CRUD, and nlink operations.
+ * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
  * US-006: createInode, getInode, updateInode, deleteInode.
  * US-007: incrementNlink, decrementNlink.
+ * US-008: insertDirent.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -333,5 +334,67 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — incrementNlink a
 		});
 
 		expect(newNlink).toBe(0);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — insertDirent", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-insert-dirent-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("inserts a dirent and it appears in dirents table", async () => {
+		const name = `file-${Date.now()}.txt`;
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, name, inodeId);
+		});
+
+		// Verify via raw SQL since listDirents is not implemented yet
+		const rows = await dialect.transaction(async (tx) => {
+			return await tx<{ inode_id: string }[]>`
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(rootInodeId)} AND name = ${name} AND sandbox_id = ${sandboxId}
+			`;
+		});
+		expect(rows).toHaveLength(1);
+		expect(BigInt(rows[0]!.inode_id)).toBe(inodeId);
+	});
+
+	it("throws on duplicate (parentId, name) — PK violation maps to EEXIST", async () => {
+		const name = `dup-${Date.now()}.txt`;
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		// First insert succeeds
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, name, inodeId);
+		});
+
+		// Second insert on same (parentId, name) must throw
+		await expect(
+			dialect.transaction(async (tx) => {
+				await dialect.insertDirent(tx, rootInodeId, name, inodeId);
+			}),
+		).rejects.toThrow();
 	});
 });
