@@ -198,3 +198,23 @@
   - The recursive CTE pattern: base is `SELECT id FROM inodes WHERE id = $rootId`; recursive step joins `inodes i JOIN dirents d ON d.inode_id = i.id JOIN subtree s ON s.id = d.parent_inode_id`. This walks child-of-parent edges.
   - No cycle guard needed for well-formed trees since symlinks (kind=3) appear as inode rows but have no dirents entries (no children), so the recursion naturally terminates.
 ---
+
+## 2026-04-19 - US-017
+- Implemented `bulkIngest(tx, files)` in `src/fs/sql-fs/dialects/postgres.ts`:
+  - Reads sandbox_id and root_inode from `sandboxes WHERE id = current_setting('app.sandbox_id')` — requires `setSandboxContext` called first.
+  - Builds in-memory `Map<string, bigint>` (path → inodeId) seeded with `'/' → rootInodeId`.
+  - Collects unique ancestor directories from file paths, sorts by depth, creates missing ones sequentially (check-then-create per dir).
+  - Computes SHA-256 for each file using `createHash("sha256")` from `node:crypto`.
+  - Multi-row INSERT unique blobs via `tx\`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING\``.
+  - Multi-row INSERT all file inodes via `tx\`INSERT INTO inodes ${tx(inodeRows)} RETURNING id\``, preserving insertion order for ID mapping.
+  - Multi-row INSERT dirents via `tx\`INSERT INTO dirents ${tx(direntRows)} ON CONFLICT DO NOTHING\``.
+- Added `import { createHash } from "node:crypto"` to postgres.ts.
+- Added integration test describe block `"PostgresDialect — bulkIngest"` in `src/fs/sql-fs/integration/postgres.test.ts`: ingests 50 files across 5 directories (10 files each), verifies all dirs and files accessible via `listDirents`.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `bulkIngest` requires `setSandboxContext` to be called in the same transaction first — it reads `current_setting('app.sandbox_id')` to find the sandbox root.
+  - postgres.js `tx(arrayOfObjects)` generates a multi-row VALUES clause when used after INSERT INTO. Column names are taken from the keys of the first object (snake_case → DB column names). Works with Uint8Array (BYTEA) values.
+  - Multi-row INSERT RETURNING returns rows in insertion order — safe to zip with the input array by index.
+  - Biome's `useTemplate` rule flags `"/" + expr` — use template literals `` `/${expr}` `` instead. Run `biome check --fix --unsafe` to auto-fix.
+  - `BulkIngestFile` must be imported in integration tests (`import type { BulkIngestFile } from "../types.js"`).
+---
