@@ -252,3 +252,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Depth filter: strip prefix from path, split on `/`, filter empty strings, count segments; `depth=1` means `segments <= 1`
   - Prefix normalization: strip trailing `/` unless prefix is `/` itself to avoid double-slash matching
 ---
+
+## 2026-04-19 - US-068
+- Created `src/api/routes/exec.ts`: exports `execRoutes(sessionManager)` factory with `POST /:id/exec-sync` route
+- Body validated inline with zod: `{ script: string, cwd?: string, env?: Record<string,string>, timeoutMs?: number }`
+- Timeout: AbortController + setTimeout, `timedOut` flag checked in both try (after await) and catch to ensure 408 regardless of whether bash.exec throws or resolves on abort
+- Default timeout 30s, max 300s clamped via `Math.min`; env converted to null-prototype object
+- Updated `src/api/server.ts`: added `app.route("/v1/sandboxes", execRoutes(sessionManager))`
+- Created `src/api/__tests__/exec.test.ts`: 3 unit tests (echo hello, false, timeout via vi.spyOn mocking bash.exec)
+- Files changed: `src/api/routes/exec.ts` (new), `src/api/__tests__/exec.test.ts` (new), `src/api/server.ts` (modified)
+- **Learnings for future iterations:**
+  - Timeout pattern: set `timedOut = true` before `controller.abort()`; check timedOut in BOTH the try block (after await) and the catch block — bash.exec may either throw or resolve when aborted
+  - To mock `session.bash.exec` for timeout tests: pre-create the session via `sessionManager.getOrCreate(sandboxId)`, then `vi.spyOn(session.bash, "exec").mockImplementation(...)` — the mock must listen to `opts?.signal?.addEventListener("abort", ...)` and reject to unblock the await
+  - `Object.assign(Object.create(null) as Record<string, string>, body.env)` creates a null-prototype env object safe for user-controlled keys
+  - Biome `useTemplate` rule applies inside template literals too — `${SANDBOX_ID + "-timeout"}` → extract to a const first
+---
