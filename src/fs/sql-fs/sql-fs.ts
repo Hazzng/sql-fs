@@ -390,12 +390,40 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async stat(_path: string): Promise<FsStat> {
-		throw new Error("not implemented");
+	async stat(path: string): Promise<FsStat> {
+		let entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+
+		// stat follows symlinks at the final component
+		if (entry.kind === 3) {
+			const target = entry.symlinkTarget ?? "";
+			const resolved = this.#pathCache.get(target);
+			if (!resolved) throw createEnoent(target);
+			entry = resolved;
+		}
+
+		return {
+			isFile: entry.kind === 1,
+			isDirectory: entry.kind === 2,
+			isSymbolicLink: false,
+			mode: entry.mode,
+			size: entry.size,
+			mtime: entry.mtime,
+		};
 	}
 
-	async lstat(_path: string): Promise<FsStat> {
-		throw new Error("not implemented");
+	async lstat(path: string): Promise<FsStat> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+
+		return {
+			isFile: entry.kind === 1,
+			isDirectory: entry.kind === 2,
+			isSymbolicLink: entry.kind === 3,
+			mode: entry.mode,
+			size: entry.size,
+			mtime: entry.mtime,
+		};
 	}
 
 	async readdir(_path: string): Promise<string[]> {
