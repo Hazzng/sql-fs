@@ -31,3 +31,15 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Tests for env vars: save originals as `const originalEnv = { ...process.env }` and restore in `afterEach` with empty-string fallback (not `undefined`)
   - `ReadonlySet<StorageBackend>` with `new Set([...])` works cleanly for the SQL backend membership check
 ---
+
+## 2026-04-19 - US-055
+- Implemented `destroySandbox(backend, sandboxId): Promise<void>` in `src/fs/sql-fs/index.ts`
+- postgres: instantiates `PostgresDialect(DATABASE_URL)`, calls `connect()`, wraps `dialect.deleteSandbox` in `dialect.transaction`, disconnects in `finally` block
+- memory: no-op (returns immediately)
+- mysql/azure-sql/azure-fileshare: throws "not implemented"
+- Files changed: `src/fs/sql-fs/index.ts`, `src/fs/sql-fs/index.test.ts` (added destroySandbox describe block + PostgresDialect import)
+- **Learnings for future iterations:**
+  - To verify mocked dialect method calls, import `PostgresDialect` directly in test (it resolves to the vi.mock'd version) then use `vi.mocked(PostgresDialect).mock.results[0]?.value` to get the instance
+  - Use `vi.mocked(PostgresDialect).mockClear()` in `beforeEach` to reset call counts between tests
+  - The transaction mock passes `{}` as `tx` to the callback — assertions on `deleteSandbox` should match `({}, sandboxId)`
+---
