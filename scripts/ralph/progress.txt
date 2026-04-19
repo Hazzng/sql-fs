@@ -339,3 +339,12 @@
   - `FsStat` has exactly 6 fields: `isFile`, `isDirectory`, `isSymbolicLink`, `mode`, `size`, `mtime`. No `ino`, no `nlink`. Import from `just-bash` main entry point.
   - Test pattern for stat/lstat: build a fresh SqlFs via `await fs.ready()` with a mocked dialect returning test entries from `loadAllPaths`. No need to call `writeFile` or other write methods.
 ---
+
+## 2026-04-19 - US-026
+- Implemented `exists(path)` in `src/fs/sql-fs/sql-fs.ts`: replaced the stub with `return this.#pathCache.has(path)` — single line, never throws.
+- Created `src/fs/sql-fs/sql-fs.exists.test.ts` with 3 unit tests: (1) returns true for an existing path; (2) returns false for a non-existing path; (3) never throws — resolves false on empty cache.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.exists.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `exists()` is a pure cache lookup — no DB call, no transaction, no error. One-liner implementation.
+  - The "never throws" criterion is satisfied by returning a resolved Promise (async method) — no special try/catch needed since `Map.has()` cannot throw.
+---
