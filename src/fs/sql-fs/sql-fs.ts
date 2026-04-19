@@ -473,8 +473,50 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		return Promise.resolve(result);
 	}
 
-	async cp(_src: string, _dest: string, _options?: CpOptions): Promise<void> {
-		throw new Error("not implemented");
+	async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+		const srcEntry = this.#pathCache.get(src);
+		if (!srcEntry) throw createEnoent(src);
+
+		if (srcEntry.kind === 2) {
+			if (!options?.recursive) throw createEisdir(src);
+			// Recursive directory copy is handled in US-038
+			throw new Error("not implemented: recursive cp");
+		}
+
+		// Single file copy: new inode pointing to the same blob (CAS dedup)
+		const destParentPath = this.#parentOf(dest);
+		const destName = this.#nameOf(dest);
+		const destParentEntry = this.#pathCache.get(destParentPath);
+		if (!destParentEntry) throw createEnoent(destParentPath);
+		if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+
+		const mtime = new Date();
+
+		const newInodeId = await this.#withTx(async (tx) => {
+			const id = await this.#dialect.createInode(tx, {
+				sandboxId: this.#sandboxId,
+				kind: 1,
+				mode: srcEntry.mode,
+				size: srcEntry.size,
+				contentSha256: srcEntry.contentSha256,
+			});
+			const oldInodeId = await this.#dialect.upsertDirent(tx, destParentEntry.inodeId, destName, id);
+			if (oldInodeId !== null) {
+				const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
+				if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
+			}
+			return id;
+		});
+
+		this.#pathCache.set(dest, {
+			inodeId: newInodeId,
+			kind: 1,
+			mode: srcEntry.mode,
+			size: srcEntry.size,
+			mtime,
+			contentSha256: srcEntry.contentSha256,
+			symlinkTarget: null,
+		});
 	}
 
 	async mv(src: string, dest: string): Promise<void> {
