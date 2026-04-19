@@ -21,12 +21,23 @@ const execBodySchema = z.object({
 	timeoutMs: z.number().int().positive().optional(),
 });
 
+/** Returns 403 response if caller does not own the sandbox, undefined otherwise */
+function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
+	const session = sessionManager.getSession(sandboxId);
+	if (session?.owner && session.owner !== caller) {
+		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
+	}
+	return undefined;
+}
+
 export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// POST /v1/sandboxes/:id/exec-sync — buffered (non-streaming) bash execution
 	router.post("/:id/exec-sync", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof execBodySchema>;
 		try {
@@ -97,6 +108,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
 	router.post("/:id/exec", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof execBodySchema>;
 		try {

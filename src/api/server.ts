@@ -61,7 +61,23 @@ app.get("/readyz", (c) => c.json({ status: "ok" }));
 app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-	return c.json({ error: err.message, code }, status);
+
+	// Sanitize error messages: only expose FS error codes/messages, not internal details
+	// FS errors have well-known codes; internal errors get a generic message
+	const knownFsCodes = [
+		"ENOENT",
+		"EEXIST",
+		"EISDIR",
+		"ENOTDIR",
+		"EPERM",
+		"ENOTEMPTY",
+		"ESESSIONCLOSING",
+		"ELOOP",
+		"EINVAL",
+	];
+	const message = knownFsCodes.includes(code) ? err.message : "Internal server error";
+
+	return c.json({ error: message, code }, status);
 });
 
 // ── Server bootstrap (only when run as entry point) ───────────────────────────

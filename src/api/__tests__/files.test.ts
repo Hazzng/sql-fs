@@ -374,7 +374,13 @@ describe("GET /v1/sandboxes/:id/tree", () => {
 		const entries = (await res.json()) as Entry[];
 		const paths = entries.map((e) => e.path).sort();
 
-		expect(paths).toEqual(["/myapp/a.txt", "/myapp/sub", "/myapp/sub/b.txt", "/myapp/sub/deep", "/myapp/sub/deep/c.txt"]);
+		expect(paths).toEqual([
+			"/myapp/a.txt",
+			"/myapp/sub",
+			"/myapp/sub/b.txt",
+			"/myapp/sub/deep",
+			"/myapp/sub/deep/c.txt",
+		]);
 
 		// Verify entry shape
 		const fileEntry = entries.find((e) => e.path === "/myapp/a.txt");
