@@ -224,3 +224,16 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `IFileSystem.mkdir(path, { recursive? })` throws EEXIST when directory already exists (non-recursive); with `recursive: true` it succeeds idempotently
   - Inline zod parsing (safeParse inside the handler) avoids typing complexity with `validateBody` middleware when the router is already typed with `AuthVariables` only
 ---
+
+## 2026-04-19 - US-066
+- Added `POST /:id/writeFiles` route to `src/api/routes/files.ts`
+- Body validated inline with zod: `{ files: z.record(z.string(), z.string()) }` where key=path, value=content
+- Iterates entries, creates parent directories via `fs.mkdir(parent, { recursive: true })` (EEXIST ignored), then calls `fs.writeFile(filePath, content)` for each file
+- Returns 204 on success; 400 for invalid JSON or failed schema parse
+- Added 1 unit test to `files.test.ts`: write 5 files (including nested paths) in one call, verify all readable via GET
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
+- **Learnings for future iterations:**
+  - `z.record(z.string(), z.string())` is the correct zod type for `Record<string, string>` bulk payloads
+  - The existing `parentDir` helper and `extractErrCode` pattern reuse cleanly for the bulk write loop — no new helpers needed
+  - Inline zod parsing (same pattern as mkdir) keeps the route self-contained without `validateBody` middleware
+---
