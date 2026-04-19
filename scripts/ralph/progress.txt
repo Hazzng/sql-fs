@@ -292,3 +292,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - SSE timeout test follows same mock pattern as exec-sync: `vi.spyOn(session.bash, "exec").mockImplementation((_script, opts) => new Promise(...))` — session must be pre-created with `getOrCreate` before the spy
   - The `timedOut` flag + catch block pattern in the SSE handler correctly emits the timeout exit event regardless of whether `bash.exec` throws or resolves after abort
 ---
+
+## 2026-04-19 - US-075
+- Added `startReaper(intervalMs?)` and `stopReaper()` methods to `SessionManager` in `src/api/session-manager.ts`
+- Added private `runReaper()`: iterates all sessions, evicts those where `now - lastUsed > idleMs AND inFlight === 0 AND state !== 'closing'`
+- Eviction removes from the in-memory `sessions` Map only — no `destroySandbox` call (sandbox data persists in DB)
+- `idleMs` read from `SessionManagerOptions.idleMs` or `SESSION_IDLE_MS` env var (default 600000ms)
+- `reaperTimer` typed as `ReturnType<typeof setInterval> | undefined`
+- Added 2 unit tests using `vi.useFakeTimers()` to `src/api/__tests__/session-manager.test.ts`: idle session eviction and busy session skip
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
+- **Learnings for future iterations:**
+  - `vi.useFakeTimers()` mocks both `setInterval`/`setTimeout` AND `Date.now()` — advancing time with `vi.advanceTimersByTime(ms)` fires interval callbacks synchronously and shifts the fake clock
+  - `vi.useFakeTimers()` does NOT affect Promise microtask scheduling — `await getOrCreate(...)` still resolves normally
+  - Always call `sm.stopReaper()` + `vi.useRealTimers()` after fake-timer tests; use `afterEach` for cleanup if multiple tests share the describe block
+  - Setting `session.inFlight = 1` directly is a clean way to simulate a busy session in unit tests (field is not readonly)
+---
