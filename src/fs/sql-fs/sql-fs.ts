@@ -4,10 +4,12 @@
  *
  * US-019: pathCache initialization from loadAllPaths
  * US-020: pathCache update on write operations
+ * US-022: LRU content cache setup
  */
 
 import { createHash } from "node:crypto";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
+import { LRUCache } from "lru-cache";
 
 import { createEexist, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
 import type { PathCacheEntry, SqlDialect } from "./types.js";
@@ -18,20 +20,46 @@ import type { PathCacheEntry, SqlDialect } from "./types.js";
 type ReadFileOpts = Parameters<IFileSystem["readFile"]>[1];
 type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
 
+const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+
 interface SqlFsOptions<Tx> {
 	readonly dialect: SqlDialect<Tx>;
 	readonly sandboxId: string;
+	/** Max total byte budget for the content cache. Default: 50 MB. */
+	readonly contentCacheMaxBytes?: number;
 }
 
 export class SqlFs<Tx = unknown> implements IFileSystem {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
+	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
 		this.#pathCache = new Map();
+		this.#contentCache = new LRUCache<bigint, Uint8Array>({
+			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
+			sizeCalculation: (value) => value.byteLength,
+		});
+	}
+
+	// ── Content cache helpers (for use by readFile/writeFile in later stories) ──
+
+	/** @internal Used by unit tests and future readFile/writeFile implementations. */
+	_contentCacheGet(inodeId: bigint): Uint8Array | undefined {
+		return this.#contentCache.get(inodeId);
+	}
+
+	/** @internal Used by unit tests and future readFile/writeFile implementations. */
+	_contentCacheSet(inodeId: bigint, data: Uint8Array): void {
+		this.#contentCache.set(inodeId, data);
+	}
+
+	/** @internal Used by unit tests. */
+	_contentCacheHas(inodeId: bigint): boolean {
+		return this.#contentCache.has(inodeId);
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
