@@ -11,6 +11,7 @@
  * US-011: listDirents.
  * US-012: moveDirent.
  * US-013: upsertBlob, getBlob.
+ * US-014: gcOrphanBlobs.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -797,5 +798,137 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — upsertBlob and g
 		});
 
 		expect(result).toBeNull();
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-gc-blobs-${Date.now()}`;
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, sandboxId);
+		});
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("blob referenced by an inode survives GC", async () => {
+		const sha256 = new Uint8Array(32).fill(0xaa);
+		const data = new TextEncoder().encode("referenced content");
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		// Create an inode that references this blob
+		await dialect.transaction(async (tx) => {
+			await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: data.length, contentSha256: sha256 });
+		});
+
+		// Run GC
+		await dialect.transaction(async (tx) => {
+			await dialect.gcOrphanBlobs(tx);
+		});
+
+		// Blob should still exist (referenced by the inode)
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(result).not.toBeNull();
+		expect(result).toEqual(data);
+	});
+
+	it("orphan blob (inode deleted) is removed by GC", async () => {
+		const sha256 = new Uint8Array(32).fill(0xbb);
+		const data = new TextEncoder().encode("orphan content");
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		// Create and then delete an inode that references this blob
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: data.length,
+				contentSha256: sha256,
+			});
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId);
+		});
+
+		// Run GC — should delete the orphan blob
+		const deleted = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx);
+		});
+
+		expect(deleted).toBeGreaterThanOrEqual(1);
+
+		// Blob should be gone
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(result).toBeNull();
+	});
+
+	it("blob referenced by two inodes survives GC after one inode is deleted", async () => {
+		const sha256 = new Uint8Array(32).fill(0xcc);
+		const data = new TextEncoder().encode("shared content");
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		// Two inodes reference the same blob
+		const inodeId1 = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: data.length,
+				contentSha256: sha256,
+			});
+		});
+		const inodeId2 = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: data.length,
+				contentSha256: sha256,
+			});
+		});
+
+		// Delete one inode
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId1);
+		});
+
+		// Run GC — blob should survive (still referenced by inodeId2)
+		await dialect.transaction(async (tx) => {
+			await dialect.gcOrphanBlobs(tx);
+		});
+
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(result).not.toBeNull();
+		expect(result).toEqual(data);
+
+		// Cleanup: delete second inode (blob becomes orphan, will be cleaned by sandbox delete cascade for inodes)
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId2);
+		});
 	});
 });
