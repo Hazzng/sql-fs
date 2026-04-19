@@ -187,3 +187,17 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `fileRoutes(sessionManager)` should be mounted separately from `sandboxRoutes(sessionManager)` — both use the same mount point `/v1/sandboxes` and Hono merges them correctly
   - File route handlers should handle ENOENT/EISDIR explicitly (not rely on global handler) when using InMemoryFs in tests, because InMemoryFs doesn't set `.code`
 ---
+
+## 2026-04-19 - US-063
+- Added `PUT /:id/files/:path{.*}` route to `src/api/routes/files.ts`
+- Reads raw request body via `c.req.raw.arrayBuffer()`, converts to `Uint8Array`
+- Creates parent directories via `fs.mkdir(parent, { recursive: true })` before writing; root `/` is skipped; EEXIST is caught and ignored
+- Calls `fs.writeFile(filePath, content)` and returns 204 No Content
+- Added `parentDir(filePath)` helper: returns `/` if path has no parent segment, otherwise slices up to last `/`
+- Added 3 unit tests to `files.test.ts`: new file write + GET verify, overwrite existing file, nested path auto-creates parent dirs
+- Files changed: `src/api/routes/files.ts` (modified), `src/api/__tests__/files.test.ts` (modified)
+- **Learnings for future iterations:**
+  - Raw binary body in Hono: use `c.req.raw.arrayBuffer()` → `new Uint8Array(buffer)` — do NOT use `c.req.json()` or `c.req.text()` for binary payloads
+  - `fs.mkdir(parent, { recursive: true })` does not throw EEXIST in InMemoryFs for already-existing dirs, but the try/catch is kept for safety with other fs backends
+  - `parentDir` returns `'/'` for top-level paths (e.g. `/file.txt`) — skip mkdir for `/` since it always exists
+---
