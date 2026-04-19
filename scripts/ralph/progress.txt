@@ -175,3 +175,16 @@
   - Blobs table is globally scoped (no `sandbox_id`) — test cleanup must delete by sha256 explicitly rather than relying on sandbox CASCADE. Use an `insertedSha256s` array in the `describe` closure and delete in `afterAll`.
   - `ON CONFLICT (sha256) DO NOTHING` is sufficient for dedup — no need to check size or data equality on conflict.
 ---
+
+## 2026-04-19 - US-015
+- Implemented `loadAllPaths(tx)`: uses a recursive CTE joining `sandboxes` → root `inode` → `dirents` + `inodes` recursively. Uses `current_setting('app.sandbox_id')` to identify the sandbox root — requires `setSandboxContext` to be called in the same transaction first.
+- Root directory is included with path `'/'`. Children have path built as `parent_path || '/' || name` (special-cased when parent is `'/'` to avoid `//`).
+- Returns `Array<{ path: string } & PathCacheEntry>` with all fields mapped from snake_case DB columns.
+- Added integration test in `postgres.test.ts`: creates sandbox, adds `/home/user/file.txt`, calls `loadAllPaths` (inside transaction with `setSandboxContext`), verifies all 6 paths present including root and nested file with correct metadata.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `loadAllPaths` **must** be called inside a transaction where `setSandboxContext` was already called — it reads `current_setting('app.sandbox_id')` to find the sandbox root inode from the `sandboxes` table.
+  - Path construction in the recursive CTE: base case emits `'/'`, recursive case uses `CASE WHEN t.path = '/' THEN '/' || d.name ELSE t.path || '/' || d.name END` to avoid `//` at the root.
+  - The CTE can cycle if there are symlinks pointing to ancestor dirs — symlinks are kind=3 and have no dirent children so the `JOIN dirents d ON d.parent_inode_id = t.inode_id` naturally stops traversal there. No cycle detection needed for well-formed trees.
+  - `size` column is BIGINT so postgres.js returns it as a string — use `Number(r.size)` to convert.
+---
