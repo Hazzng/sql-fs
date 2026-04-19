@@ -519,3 +519,12 @@
   - Symlink inodes use `kind: 3`, `mode: 0o777`, `size: target.length`, `symlinkTarget: target`, `contentSha256: null`. No blob is created — symlinks store their target in the inode row directly.
   - The `allowSymlinks` option is passed at `SqlFs` construction time, not per-call. This matches the class-level policy model in the CLAUDE.md security section.
 ---
+
+## 2026-04-19 - US-041
+- No new implementation code written — `chmod` and `utimes` were already implemented in `src/fs/sql-fs/sql-fs.ts` as part of US-020.
+- Created `src/fs/sql-fs/sql-fs.chmod-utimes.test.ts` with 4 unit tests specifically verifying the US-041 AC: chmod changes mode reflected in subsequent stat(), utimes changes mtime reflected in subsequent stat(), both throw ENOENT for missing paths.
+- Files changed: `src/fs/sql-fs/sql-fs.chmod-utimes.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - The US-020 write tests verified updateInode was called but did not call stat() afterward. US-041's AC explicitly requires "reflected in subsequent stat()" — always add that explicit stat() assertion when the AC states it.
+  - `chmod` and `utimes` are pure pathCache patches: `{ ...entry, mode }` and `{ ...entry, mtime }`. stat() reads from pathCache, so the reflection is immediate after the method completes.
+---
