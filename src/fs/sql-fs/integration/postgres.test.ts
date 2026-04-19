@@ -1,12 +1,13 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert/upsert.
+ * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert/upsert/delete.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
  * US-006: createInode, getInode, updateInode, deleteInode.
  * US-007: incrementNlink, decrementNlink.
  * US-008: insertDirent.
  * US-009: upsertDirent.
+ * US-010: deleteDirent.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -475,5 +476,63 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — upsertDirent", (
 		});
 		expect(rows).toHaveLength(1);
 		expect(BigInt(rows[0]!.inode_id)).toBe(newInodeId);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — deleteDirent", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-delete-dirent-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("inserts then deletes a dirent, verifying it is removed", async () => {
+		const name = `delete-me-${Date.now()}.txt`;
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, name, inodeId);
+		});
+
+		const removedInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.deleteDirent(tx, rootInodeId, name);
+		});
+
+		expect(removedInodeId).toBe(inodeId);
+
+		// Verify dirent is gone
+		const rows = await dialect.transaction(async (tx) => {
+			return await tx<{ inode_id: string }[]>`
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(rootInodeId)} AND name = ${name} AND sandbox_id = ${sandboxId}
+			`;
+		});
+		expect(rows).toHaveLength(0);
+	});
+
+	it("throws ENOENT when deleting a non-existent dirent", async () => {
+		const name = `does-not-exist-${Date.now()}.txt`;
+
+		await expect(
+			dialect.transaction(async (tx) => {
+				return await dialect.deleteDirent(tx, rootInodeId, name);
+			}),
+		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

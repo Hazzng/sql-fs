@@ -5,6 +5,7 @@
  */
 
 import postgres from "postgres";
+import { createEnoent } from "../errors.js";
 import type {
 	BulkIngestFile,
 	CreateInodeOpts,
@@ -213,8 +214,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-010
-	async deleteDirent(_tx: PgTx, _parentId: bigint, _name: string): Promise<bigint> {
-		throw new Error("not implemented");
+	async deleteDirent(tx: PgTx, parentId: bigint, name: string): Promise<bigint> {
+		const rows = await tx<{ inode_id: string }[]>`
+			DELETE FROM dirents
+			WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+			RETURNING inode_id
+		`;
+		const row = rows[0];
+		if (!row) throw createEnoent(name);
+		return BigInt(row.inode_id);
 	}
 
 	// US-011
