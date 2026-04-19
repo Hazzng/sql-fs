@@ -322,3 +322,20 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Over-budget detection uses `pathCacheMaxBytes: 1` in tests (any path cache > 1 byte triggers over-budget); InMemoryFs has many built-in system paths so is always over-budget with tiny limit
   - The `withSession` finally block is the right place to re-estimate path cache size — covers all write/delete/move operations that route handlers perform
 ---
+
+## 2026-04-19 - US-076
+- Updated `destroy(sandboxId)` in `src/api/session-manager.ts`:
+  - Marks session `state = 'closing'` immediately so new requests fast-fail
+  - For not-in-pool case: still calls `destroySandboxFn(backend, sandboxId)` for DB cleanup, returns false
+  - Uses `session.mutex.runExclusive(...)` to queue cleanup after any currently-running in-flight work
+  - Sets `session.destroyPromise` before awaiting so concurrent destroy calls share the same Promise (idempotent)
+- Updated `withSession` to check `session.state === 'closing'` before AND inside `runExclusive` — fast-fail before queuing, safety-net inside
+- Added `destroySandboxFn?` to `SessionManagerOptions` for test dependency injection (avoids vi.mock on the module)
+- Added `destroyPromise?: Promise<void>` to `Session` interface for concurrent destroy idempotency
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
+- **Learnings for future iterations:**
+  - `mutex.runExclusive` queues callbacks in order — calling it in `destroy` after marking 'closing' guarantees destroy runs after all pre-queued withSession operations (no need for manual inFlight polling)
+  - Fast-fail in `withSession` (pre-mutex check) prevents new requests from entering the mutex queue; the in-mutex re-check is a belt-and-suspenders safety net
+  - Idempotency pattern: store `Promise<void>` on the session object (`destroyPromise`) set immediately after the mutex is queued — second concurrent destroy sees it and awaits the same promise
+  - Dependency injection via `destroySandboxFn?` in options is cleaner than `vi.mock` for functions imported at module level — no module mocking side effects
+---
