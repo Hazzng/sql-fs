@@ -22,12 +22,16 @@ export interface Session {
 	pathCacheBytes: number;
 	/** True when pathCacheBytes exceeds the configured budget — triggers eager eviction */
 	overBudget: boolean;
+	/** Set when destroy() is in progress — concurrent destroy calls await this for idempotency */
+	destroyPromise?: Promise<void>;
 }
 
 export interface SessionManagerOptions {
 	readonly backend: StorageBackend;
 	readonly databaseUrl?: string;
 	readonly createFs?: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
+	/** Override for destroySandbox — used for dependency injection in tests */
+	readonly destroySandboxFn?: (backend: StorageBackend, sandboxId: string) => Promise<void>;
 	/** Idle timeout in ms before a session is eligible for eviction (default: SESSION_IDLE_MS env var or 600000) */
 	readonly idleMs?: number;
 	/** Max pathCache bytes per session before it is marked over-budget (default: 50MB) */
@@ -40,13 +44,15 @@ export class SessionManager {
 	private readonly pending: Map<string, Promise<Session>> = new Map();
 	private readonly backend: StorageBackend;
 	private readonly createFs: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
+	private readonly destroySandboxFn: (backend: StorageBackend, sandboxId: string) => Promise<void>;
 	private readonly idleMs: number;
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-	constructor({ backend, createFs, idleMs, pathCacheMaxBytes }: SessionManagerOptions) {
+	constructor({ backend, createFs, destroySandboxFn, idleMs, pathCacheMaxBytes }: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
+		this.destroySandboxFn = destroySandboxFn ?? destroySandbox;
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 	}
@@ -120,7 +126,16 @@ export class SessionManager {
 	async withSession<T>(sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
 		const session = await this.getOrCreate(sandboxId);
 
+		// Fast-fail: session is being destroyed — don't queue in the mutex
+		if (session.state === "closing") {
+			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+		}
+
 		return session.mutex.runExclusive(async () => {
+			// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
+			if (session.state === "closing") {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+			}
 			session.inFlight++;
 			try {
 				return await fn(session);
@@ -133,17 +148,37 @@ export class SessionManager {
 	}
 
 	/**
-	 * Evicts the session from the in-memory pool and destroys backend data.
-	 * Returns true if found and destroyed, false if the session was not in the pool.
-	 * For DB backends, destroySandbox cleans up persistent data even if session not in pool.
+	 * Marks the session as closing, waits for any in-flight work to finish, then removes it
+	 * from the pool and destroys backend data. Concurrent calls are idempotent — destroySandbox
+	 * is called exactly once. Returns true if the session was in the pool, false otherwise.
+	 * Even when the session is not in the pool, destroySandbox is still called for DB cleanup.
 	 */
 	async destroy(sandboxId: string): Promise<boolean> {
 		const session = this.sessions.get(sandboxId);
+
 		if (session === undefined) {
+			// Session not in pool — still clean up backend data
+			await this.destroySandboxFn(this.backend, sandboxId);
 			return false;
 		}
-		this.sessions.delete(sandboxId);
-		await destroySandbox(this.backend, sandboxId);
+
+		// Idempotent: concurrent destroy calls share the same promise
+		if (session.destroyPromise !== undefined) {
+			await session.destroyPromise;
+			return true;
+		}
+
+		// Mark closing immediately — new withSession calls fail fast without queuing
+		session.state = "closing";
+
+		// Queue cleanup after any currently-running mutex holder finishes
+		const p = session.mutex.runExclusive(async () => {
+			this.sessions.delete(sandboxId);
+			await this.destroySandboxFn(this.backend, sandboxId);
+		});
+		session.destroyPromise = p;
+
+		await p;
 		return true;
 	}
 
