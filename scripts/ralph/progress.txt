@@ -111,3 +111,14 @@
   - `INSERT INTO t (...) SELECT $col, ..., sandbox_id FROM inodes WHERE id = $parentId` silently inserts zero rows if the parent inode doesn't exist (no error). The SqlFs layer must validate the parent before calling this.
   - PK violations from `insertDirent` will have `code: '23505'` (Postgres SQLSTATE), which `translateSqlError` in `errors.ts` already maps to EEXIST.
 ---
+
+## 2026-04-19 - US-009
+- Implemented `upsertDirent(tx, parentId, name, inodeId)`: uses a CTE to capture the pre-existing `inode_id` before the upsert, then performs `INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id`, returning the old inode_id (or null for new inserts).
+- SQL pattern: `WITH existing AS (SELECT inode_id FROM dirents WHERE parent_inode_id = $1 AND name = $2) INSERT INTO dirents ... ON CONFLICT ... DO UPDATE ... RETURNING (SELECT inode_id FROM existing) AS old_inode_id`
+- Added two integration tests in `postgres.test.ts`: (1) upsert new entry returns null; (2) upsert over existing entry returns old inodeId.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - To capture the "old" value in an INSERT ... ON CONFLICT DO UPDATE, use a CTE: `WITH existing AS (SELECT col FROM t WHERE pk = $1) INSERT ... ON CONFLICT DO UPDATE ... RETURNING (SELECT col FROM existing) AS old_col`. The CTE snapshot is taken before the INSERT, so it captures the pre-upsert value.
+  - `old_inode_id` in RETURNING is null when the row did not previously exist (new INSERT path), and contains the prior value when ON CONFLICT DO UPDATE fires.
+  - The `sandbox_id` is still derived from the parent inode via the same SELECT subquery pattern as `insertDirent`.
+---

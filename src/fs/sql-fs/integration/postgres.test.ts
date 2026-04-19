@@ -1,11 +1,12 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert.
+ * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert/upsert.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
  * US-006: createInode, getInode, updateInode, deleteInode.
  * US-007: incrementNlink, decrementNlink.
  * US-008: insertDirent.
+ * US-009: upsertDirent.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -396,5 +397,83 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — insertDirent", (
 				await dialect.insertDirent(tx, rootInodeId, name, inodeId);
 			}),
 		).rejects.toThrow();
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — upsertDirent", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-upsert-dirent-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("upserts a new entry and returns null (no previous entry)", async () => {
+		const name = `new-file-${Date.now()}.txt`;
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		const oldInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.upsertDirent(tx, rootInodeId, name, inodeId);
+		});
+
+		expect(oldInodeId).toBeNull();
+
+		// Verify the dirent was inserted
+		const rows = await dialect.transaction(async (tx) => {
+			return await tx<{ inode_id: string }[]>`
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(rootInodeId)} AND name = ${name} AND sandbox_id = ${sandboxId}
+			`;
+		});
+		expect(rows).toHaveLength(1);
+		expect(BigInt(rows[0]!.inode_id)).toBe(inodeId);
+	});
+
+	it("upserts over an existing entry and returns the old inodeId", async () => {
+		const name = `replace-file-${Date.now()}.txt`;
+
+		const oldInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		const newInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 10 });
+		});
+
+		// First upsert: new entry
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertDirent(tx, rootInodeId, name, oldInodeId);
+		});
+
+		// Second upsert: replace with newInodeId, should return oldInodeId
+		const returned = await dialect.transaction(async (tx) => {
+			return await dialect.upsertDirent(tx, rootInodeId, name, newInodeId);
+		});
+
+		expect(returned).toBe(oldInodeId);
+
+		// Verify the dirent now points to newInodeId
+		const rows = await dialect.transaction(async (tx) => {
+			return await tx<{ inode_id: string }[]>`
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(rootInodeId)} AND name = ${name} AND sandbox_id = ${sandboxId}
+			`;
+		});
+		expect(rows).toHaveLength(1);
+		expect(BigInt(rows[0]!.inode_id)).toBe(newInodeId);
 	});
 });
