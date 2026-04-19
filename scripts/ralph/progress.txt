@@ -3,6 +3,10 @@
 - `SqlDialect` is generic: `SqlDialect<Tx = unknown>`. Each dialect specialises `Tx` with its own transaction handle type so that transaction callbacks are fully typed.
 - All fields on exported interfaces use `readonly` per project conventions (immutable after construction).
 - Biome auto-reformats multi-line function signatures to single-line where they fit within 120 chars — let it do so rather than fighting it.
+- For `PostgresDialect`, `Tx = postgres.TransactionSql` (from the `postgres` npm package). `setSandboxContext` uses `SELECT set_config('app.sandbox_id', $1, true)` (SET LOCAL equivalent). `transaction(fn)` delegates to `sql.begin(fn)`.
+- `sandboxes.root_inode` is nullable BIGINT (no FK to inodes) to break the circular FK with `inodes.sandbox_id → sandboxes`. Set it immediately after inode creation within the same transaction.
+- Integration tests live in `src/fs/sql-fs/integration/` and are excluded from `pnpm test:unit`. Use `describe.skipIf(!process.env.DATABASE_URL)` wrapper.
+- Stub (not-yet-implemented) dialect methods should use `_` prefix on parameters and `throw new Error("not implemented")`. TypeScript infers `never` return which is assignable to any type.
 
 ---
 
@@ -35,4 +39,21 @@
   - `Object.assign(new Error(msg), { code, path })` is the idiomatic pattern for creating typed errors with extra properties without `class`.
   - Biome will alphabetically sort import lists — write them in any order and let `pnpm lint:fix` sort them.
   - `sanitizeFsError` uses `const pattern of SENSITIVE_PATTERNS` with a `readonly RegExp[]` array; regex flags include `g` so they reset after each call via the replace path — no state issues with `lastIndex` since we aren't using `exec`.
+---
+
+## 2026-04-19 - US-004
+- Implemented `PostgresDialect` class in `src/fs/sql-fs/dialects/postgres.ts` implementing `SqlDialect<postgres.TransactionSql>`.
+- `connect()` creates pool via `postgres(connectionString, { prepare: false })` (transaction-pooler compatible).
+- `disconnect()` calls `pool.end()` and nulls the reference.
+- `transaction<T>(fn)` delegates to `this.pool.begin(fn)` with explicit `as Promise<T>` cast to resolve UnwrapPromiseArray inference.
+- `setSandboxContext(tx, sandboxId)` executes `SELECT set_config('app.sandbox_id', $1, true)` — the `true` flag makes it transaction-local (SET LOCAL equivalent).
+- All remaining interface methods are stubs (throw "not implemented") with `_`-prefixed parameters to satisfy `noUnusedParameters`.
+- Created `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql` with DDL for all four tables. `sandboxes.root_inode` is nullable BIGINT (no FK back to inodes) to avoid the circular FK issue.
+- Created `src/fs/sql-fs/integration/postgres.test.ts` with two integration tests: (1) setSandboxContext sets current_setting within a transaction, (2) context is not visible outside the transaction.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `postgres.TransactionSql` is the correct `Tx` type — it extends `ISql` and is what `sql.begin()` passes to its callback.
+  - `set_config('app.sandbox_id', $sandboxId, true)` is the parameterized form of `SET LOCAL`; plain `SET LOCAL` with parameterized values isn't supported in Postgres.
+  - `process.env.DATABASE_URL` (not bracket notation) is required by Biome's `useLiteralKeys` rule.
+  - Biome will flag unused `biome-ignore` suppression comments as warnings — only add suppressions for rules that actually fire.
 ---
