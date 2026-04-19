@@ -15,3 +15,11 @@
   - `biome check --write` reformatted the `moveDirent` signature from multi-line to single-line; this is expected and correct.
   - `noUnusedLocals` and `noUnusedParameters` are enabled — don't add any imports or parameters that aren't used.
 ---
+
+## 2026-04-19 - US-002
+- No new code written — all shared types (InodeRow, DirentRow, PathCacheEntry, StorageBackend, and the Tx generic via SqlDialect<Tx>) were already defined in `src/fs/sql-fs/types.ts` as a prerequisite for US-001.
+- Verified: `pnpm typecheck` passes with no errors.
+- Files changed: `scripts/ralph/prd.json` (marked passes: true)
+- **Learnings for future iterations:**
+  - US-002 was a no-op implementation: all criteria were satisfied by US-001's implementation. When the PRD has ordering like this (types story after interface story), check the existing file before writing anything new.
+---
