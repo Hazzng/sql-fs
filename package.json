@@ -12,6 +12,7 @@
 		"dev": "tsx watch src/api/server.ts",
 		"build": "tsc",
 		"start": "node dist/api/server.js",
+		"bench:sql-fs-cache": "tsx src/fs/sql-fs/benchmark.ts",
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",
@@ -28,6 +29,7 @@
 	"dependencies": {
 		"@hono/node-server": "^1.14.0",
 		"@modelcontextprotocol/sdk": "^1.12.0",
+		"async-mutex": "^0.5.0",
 		"drizzle-orm": "^0.39.0",
 		"hono": "^4.7.0",
 		"jose": "^6.0.0",
