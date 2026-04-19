@@ -88,6 +88,53 @@ describe("POST /v1/sandboxes", () => {
 	});
 });
 
+describe("DELETE /v1/sandboxes/:id", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("create then delete sandbox returns 204", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-del");
+
+		// Create a sandbox
+		const postRes = await app.request("/v1/sandboxes", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(postRes.status).toBe(201);
+		const { id } = (await postRes.json()) as { id: string };
+
+		// Delete it
+		const delRes = await app.request(`/v1/sandboxes/${id}`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(delRes.status).toBe(204);
+	});
+
+	it("delete non-existent sandbox returns 404", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-del");
+
+		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000", {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(404);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body.error).toBe("not_found");
+		expect(body.code).toBe("SANDBOX_NOT_FOUND");
+	});
+});
+
 describe("GET /v1/sandboxes/:id", () => {
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;

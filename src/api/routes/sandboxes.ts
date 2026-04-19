@@ -2,6 +2,7 @@
  * Sandbox CRUD routes.
  * US-059: POST /v1/sandboxes — create sandbox
  * US-060: GET /v1/sandboxes/:id — get sandbox info
+ * US-061: DELETE /v1/sandboxes/:id — delete sandbox
  */
 
 import { Hono } from "hono";
@@ -63,6 +64,15 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			createdAt: session.createdAt,
 			lastUsedAt: new Date(session.lastUsed).toISOString(),
 		});
+	});
+
+	router.delete("/:id", async (c) => {
+		const id = c.req.param("id");
+		const found = await sessionManager.destroy(id);
+		if (!found) {
+			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+		}
+		return c.body(null, 204);
 	});
 
 	return router;

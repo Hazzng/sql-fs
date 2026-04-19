@@ -6,7 +6,7 @@
 import { Mutex } from "async-mutex";
 import { Bash } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { createSandboxFs } from "../fs/sql-fs/index.js";
+import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
 
 export interface Session {
@@ -102,5 +102,20 @@ export class SessionManager {
 				session.inFlight--;
 			}
 		});
+	}
+
+	/**
+	 * Evicts the session from the in-memory pool and destroys backend data.
+	 * Returns true if found and destroyed, false if the session was not in the pool.
+	 * For DB backends, destroySandbox cleans up persistent data even if session not in pool.
+	 */
+	async destroy(sandboxId: string): Promise<boolean> {
+		const session = this.sessions.get(sandboxId);
+		if (session === undefined) {
+			return false;
+		}
+		this.sessions.delete(sandboxId);
+		await destroySandbox(this.backend, sandboxId);
+		return true;
 	}
 }
