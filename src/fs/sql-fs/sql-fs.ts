@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
-import { createEexist, createEisdir, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
+import { createEexist, createEinval, createEisdir, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
 import type { PathCacheEntry, SqlDialect } from "./types.js";
 
 // Extract optional-parameter types from IFileSystem to avoid importing
@@ -520,8 +520,11 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async readlink(_path: string): Promise<string> {
-		throw new Error("not implemented");
+	async readlink(path: string): Promise<string> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+		if (entry.kind !== 3) throw createEinval(path);
+		return entry.symlinkTarget!;
 	}
 
 	async realpath(_path: string): Promise<string> {
