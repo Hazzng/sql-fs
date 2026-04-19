@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
-import { createEexist, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
+import { createEexist, createEisdir, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
 import type { PathCacheEntry, SqlDialect } from "./types.js";
 
 // Extract optional-parameter types from IFileSystem to avoid importing
@@ -369,6 +369,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	async readFile(path: string, _options?: ReadFileOpts): Promise<string> {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
+		if (entry.kind === 2) throw createEisdir(path);
 
 		// Cache hit: return decoded bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
@@ -379,12 +380,24 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		// Cache miss: fetch blob from DB, populate cache
 		const data = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
-		this.#contentCache.set(entry.inodeId, bytes);
+		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return new TextDecoder().decode(bytes);
 	}
 
-	async readFileBuffer(_path: string): Promise<Uint8Array> {
-		throw new Error("not implemented");
+	async readFileBuffer(path: string): Promise<Uint8Array> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+		if (entry.kind === 2) throw createEisdir(path);
+
+		// Cache hit: return raw bytes without any DB call
+		const cached = this.#contentCache.get(entry.inodeId);
+		if (cached !== undefined) return cached;
+
+		// Cache miss: fetch blob from DB, populate cache
+		const data = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		const bytes = data ?? new Uint8Array(0);
+		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
+		return bytes;
 	}
 
 	async exists(path: string): Promise<boolean> {
