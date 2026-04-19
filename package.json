@@ -1,0 +1,51 @@
+{
+	"name": "virtualfs-api",
+	"version": "0.1.0",
+	"description": "Persistent filesystem backends (Postgres/MySQL/Azure SQL/FileShare) + HTTP/MCP API for just-bash sandboxes",
+	"type": "module",
+	"license": "MIT",
+	"author": "Harry Nguyen",
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"dev": "tsx watch src/api/server.ts",
+		"build": "tsc",
+		"start": "node dist/api/server.js",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:unit": "vitest run --exclude 'src/**/integration/**'",
+		"test:integration": "vitest run src/**/integration/**",
+		"test:comparison": "vitest run --config vitest.comparison.config.ts",
+		"db:generate": "drizzle-kit generate",
+		"db:migrate": "drizzle-kit migrate",
+		"db:gc": "tsx src/api/cli/gc.ts",
+		"token:create": "tsx src/api/cli/token.ts"
+	},
+	"dependencies": {
+		"@hono/node-server": "^1.14.0",
+		"@modelcontextprotocol/sdk": "^1.12.0",
+		"drizzle-orm": "^0.39.0",
+		"hono": "^4.7.0",
+		"jose": "^6.0.0",
+		"just-bash": "^2.14.0",
+		"lru-cache": "^11.0.0",
+		"mssql": "^11.0.0",
+		"mysql2": "^3.12.0",
+		"postgres": "^3.4.0",
+		"zod": "^3.24.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.0",
+		"@types/mssql": "^9.1.0",
+		"@types/node": "^22.0.0",
+		"drizzle-kit": "^0.30.0",
+		"knip": "^6.4.1",
+		"tsx": "^4.19.0",
+		"typescript": "^5.7.0",
+		"vitest": "^3.1.0"
+	}
+}
