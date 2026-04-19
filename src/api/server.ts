@@ -6,9 +6,14 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 
 export const app = new Hono();
+
+// ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
+
+app.use("/v1/*", authMiddleware);
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
