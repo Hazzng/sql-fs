@@ -36,6 +36,8 @@ interface SqlFsOptions<Tx> {
 	readonly sandboxId: string;
 	/** Max total byte budget for the content cache. Default: 50 MB. */
 	readonly contentCacheMaxBytes?: number;
+	/** Allow symlink() to create symlinks. Default: false (EPERM). */
+	readonly allowSymlinks?: boolean;
 }
 
 export class SqlFs<Tx = unknown> implements IFileSystem {
@@ -43,10 +45,12 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	readonly #sandboxId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
+	readonly #allowSymlinks: boolean;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
+		this.#allowSymlinks = opts.allowSymlinks ?? false;
 		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
@@ -624,8 +628,38 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async symlink(_target: string, _linkPath: string): Promise<void> {
-		throw new Error("not implemented");
+	async symlink(target: string, linkPath: string): Promise<void> {
+		if (!this.#allowSymlinks) throw createEperm(linkPath, "symlink");
+
+		const parentPath = this.#parentOf(linkPath);
+		const name = this.#nameOf(linkPath);
+		const parentEntry = this.#pathCache.get(parentPath);
+		if (!parentEntry) throw createEnoent(parentPath);
+		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
+
+		const mtime = new Date();
+
+		const inodeId = await this.#withTx(async (tx) => {
+			const id = await this.#dialect.createInode(tx, {
+				sandboxId: this.#sandboxId,
+				kind: 3,
+				mode: 0o777,
+				size: target.length,
+				symlinkTarget: target,
+			});
+			await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
+			return id;
+		});
+
+		this.#pathCache.set(linkPath, {
+			inodeId,
+			kind: 3,
+			mode: 0o777,
+			size: target.length,
+			mtime,
+			contentSha256: null,
+			symlinkTarget: target,
+		});
 	}
 
 	async link(existingPath: string, newPath: string): Promise<void> {
