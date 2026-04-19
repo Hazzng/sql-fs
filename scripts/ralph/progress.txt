@@ -254,3 +254,23 @@
   - `readdirWithFileTypes` is optional in `IFileSystem` — stubs don't need to include it.
   - Private `#pathCache` field (ES2022 private) works fine. It's only accessible inside the class, so tests must verify via `getAllPaths()` (public method), not by direct field access.
 ---
+
+## 2026-04-19 - US-020
+- Implemented `writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes` in `src/fs/sql-fs/sql-fs.ts` with full pathCache update logic.
+- Added `#withTx<T>(fn)` private helper that wraps a dialect transaction with `setSandboxContext` call.
+- Added `#parentOf(path)`, `#nameOf(path)`, `#childPaths(dirPath)`, `#allPathsUnder(dirPath)` private path helpers.
+- `writeFile`: computes sha256 via `node:crypto`, calls `upsertBlob`→`createInode`→`upsertDirent` in a transaction, decrements/deletes old inode nlink on overwrite, updates pathCache.
+- `appendFile`: reads existing blob via `getBlob`, concatenates bytes, writes new blob, updates pathCache size/mtime.
+- `mkdir`: non-recursive creates single dir+dirent; recursive walks segments creating missing ones. Updates pathCache on each created dir.
+- `rm`: non-recursive calls `deleteDirent`→`decrementNlink`→`deleteInode` (if nlink=0), removes from pathCache. Recursive removes all descendants from pathCache via `#allPathsUnder`.
+- `chmod`: calls `updateInode({mode})`, patches pathCache entry with new mode.
+- `utimes`: calls `updateInode({mtime})`, patches pathCache entry with new mtime.
+- Created `src/fs/sql-fs/sql-fs.write.test.ts` with 25 unit tests using mocked dialect covering all 6 methods and their error cases.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.write.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - pathCache entries use readonly fields — to patch a single field (e.g., mode), spread and override: `{ ...existing, mode }`. TypeScript allows this even with readonly on the original.
+  - `#childPaths(dirPath)` filters for direct children (no additional `/` after prefix). `#allPathsUnder(dirPath)` collects all descendants including root. Both are needed: childPaths for ENOTEMPTY check, allPathsUnder for recursive rm.
+  - For recursive mkdir, walk segments from root accumulating `current` path. Each segment only gets created if not already in pathCache — this is the `-p` semantics.
+  - `appendFile` on a file with no existing `contentSha256` (e.g., kind≠1 or new file) falls back to just the appended bytes. Always guard: `existing && existing.kind === 1 && existing.contentSha256 !== null`.
+  - The `#withTx` helper pattern (transaction + setSandboxContext inside) is reusable across all write operations — avoids repeating the boilerplate in every method.
+---
