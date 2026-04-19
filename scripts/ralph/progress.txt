@@ -395,3 +395,15 @@
   - Errors from `resolvePath` (ENOENT, ELOOP) propagate automatically — no try/catch needed in `realpath`. The `#withTx` wrapper just re-throws.
   - Test pattern: mock `resolvePath` via `mockResolvedValue(inodeId)` or `mockRejectedValue(error)` after calling `makeFs` (which seeds pathCache via `ready()`).
 ---
+
+## 2026-04-19 - US-031
+- No new code written — all acceptance criteria for SqlFs.writeFile were already satisfied by prior stories.
+- Implementation in `src/fs/sql-fs/sql-fs.ts` (writeFile method) was done as part of US-020.
+- Tests covering "write new file, verify in pathCache + contentCache" and "overwrite existing file, verify old inode cleaned up" exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024).
+- Test covering "write to non-existent parent dir throws ENOENT" exists in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020).
+- Verified: `pnpm typecheck` passes, all 107 unit tests pass.
+- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - US-031 through US-042 may similarly be "no-op" stories if their implementations were already provided as part of earlier US-020/021/022/023/024 stories. Always check existing code and tests before writing anything new.
+  - When a story's implementation was front-loaded into an earlier story, the PRD story is satisfied by verifying the existing code+tests meet the acceptance criteria and running quality checks.
+---
