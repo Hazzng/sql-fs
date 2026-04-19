@@ -154,6 +154,16 @@
   - Biome reformats a long single-line `moveDirent(tx, oldParentId, oldName, newParentId, newName)` parameter list to multi-line — expected behaviour, don't fight it.
 ---
 
+## 2026-04-19 - US-014
+- Implemented `gcOrphanBlobs(tx)`: `DELETE FROM blobs WHERE sha256 NOT IN (SELECT content_sha256 FROM inodes WHERE content_sha256 IS NOT NULL) RETURNING sha256`. Returns `rows.length` as count of deleted blobs.
+- Added 3 integration tests in `postgres.test.ts` in a new `describe` block: (1) blob referenced by inode survives GC; (2) orphan blob (inode deleted before GC) is removed — asserts `deleted >= 1` and blob is gone; (3) blob referenced by two inodes survives GC after one inode deleted.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `NOT IN (SELECT col FROM t WHERE col IS NOT NULL)` is the correct SQL pattern for orphan detection with nullable FK columns — `NOT IN` with NULLs in the subquery would return no rows without the `IS NOT NULL` filter.
+  - GC count should be asserted with `>= 1` (not `=== 1`) since other orphan blobs from previous test runs may be cleaned up in the same GC pass.
+  - GC runs globally (not scoped to a sandbox) — any test that leaves orphan blobs can interfere with GC count assertions; use `>= 1` rather than exact counts.
+---
+
 ## 2026-04-19 - US-013
 - Implemented `upsertBlob(tx, sha256, data)`: `INSERT INTO blobs (sha256, data, size) VALUES ($sha256, $data, $size) ON CONFLICT (sha256) DO NOTHING`. `size` is `data.length`.
 - Implemented `getBlob(tx, sha256)`: `SELECT data FROM blobs WHERE sha256 = $sha256`. Returns `Buffer` (assignable to `Uint8Array`) or `null`.
