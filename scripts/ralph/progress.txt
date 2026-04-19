@@ -267,3 +267,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `Object.assign(Object.create(null) as Record<string, string>, body.env)` creates a null-prototype env object safe for user-controlled keys
   - Biome `useTemplate` rule applies inside template literals too — `${SANDBOX_ID + "-timeout"}` → extract to a const first
 ---
+
+## 2026-04-19 - US-069
+- Added `POST /:id/exec` SSE streaming route to `src/api/routes/exec.ts` using Hono's `streamSSE` from `hono/streaming`
+- Same body schema and timeout/abort logic as exec-sync; AbortController cancels on timeout or client disconnect (via `c.req.raw.signal`)
+- Since `bash.exec()` is buffered (no streaming callback), events are emitted after exec completes: stdout event (if non-empty), stderr event (if non-empty), then exit event
+- Timeout: sends `{ t: "exit", exitCode: -1, error: "timeout" }` SSE exit event
+- Added `parseSseEvents()` helper in tests to parse raw SSE body text into structured event objects
+- Added 1 unit test to `exec.test.ts`: echo hello script, verify content-type is text/event-stream, verify stdout event data and exit event exitCode
+- Files changed: `src/api/routes/exec.ts`, `src/api/__tests__/exec.test.ts`
+- **Learnings for future iterations:**
+  - `streamSSE(c, async (stream) => { ... })` from `hono/streaming` handles Content-Type, Transfer-Encoding, Cache-Control headers automatically; call `stream.writeSSE({ event, data })` inside the callback
+  - `c.req.raw.signal` provides the AbortSignal for client disconnect detection — listen with `addEventListener("abort", () => controller.abort())`
+  - SSE body parsing in tests: split on `"\n\n"` for event blocks, then split each block on `"\n"` and extract `event:` and `data:` lines; `data:` prefix is exactly 6 chars
+  - `bash.exec()` has no streaming callback — it returns buffered output; true line-by-line streaming would require a different just-bash API
+---
