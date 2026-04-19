@@ -5,6 +5,7 @@
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  * US-065: POST /v1/sandboxes/:id/mkdir — create directory
  * US-066: POST /v1/sandboxes/:id/writeFiles — bulk write
+ * US-067: GET /v1/sandboxes/:id/tree — list file tree
  */
 
 import { Hono } from "hono";
@@ -339,5 +340,75 @@ describe("POST /v1/sandboxes/:id/writeFiles", () => {
 			expect(getRes.status).toBe(200);
 			expect(await getRes.text()).toBe(expected);
 		}
+	});
+});
+
+describe("GET /v1/sandboxes/:id/tree", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("tree of nested structure returns all entries", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		// Use a unique prefix to isolate from InMemoryFs built-in paths (/bin, /dev, etc.)
+		await (fs as InMemoryFs).mkdir("/myapp");
+		await (fs as InMemoryFs).mkdir("/myapp/sub");
+		await (fs as InMemoryFs).mkdir("/myapp/sub/deep");
+		await (fs as InMemoryFs).writeFile("/myapp/a.txt", "content-a");
+		await (fs as InMemoryFs).writeFile("/myapp/sub/b.txt", "content-b");
+		await (fs as InMemoryFs).writeFile("/myapp/sub/deep/c.txt", "content-c");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/tree?prefix=/myapp`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(200);
+		type Entry = { path: string; kind: string; size: number; mtime: string };
+		const entries = (await res.json()) as Entry[];
+		const paths = entries.map((e) => e.path).sort();
+
+		expect(paths).toEqual(["/myapp/a.txt", "/myapp/sub", "/myapp/sub/b.txt", "/myapp/sub/deep", "/myapp/sub/deep/c.txt"]);
+
+		// Verify entry shape
+		const fileEntry = entries.find((e) => e.path === "/myapp/a.txt");
+		expect(fileEntry?.kind).toBe("file");
+		expect(typeof fileEntry?.size).toBe("number");
+		expect(typeof fileEntry?.mtime).toBe("string");
+
+		const dirEntry = entries.find((e) => e.path === "/myapp/sub");
+		expect(dirEntry?.kind).toBe("dir");
+	});
+
+	it("tree with depth=1 returns only direct children", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		// Use a unique prefix to isolate from InMemoryFs built-in paths
+		await (fs as InMemoryFs).mkdir("/myapp");
+		await (fs as InMemoryFs).mkdir("/myapp/sub");
+		await (fs as InMemoryFs).mkdir("/myapp/sub/deep");
+		await (fs as InMemoryFs).writeFile("/myapp/a.txt", "content-a");
+		await (fs as InMemoryFs).writeFile("/myapp/sub/b.txt", "content-b");
+		await (fs as InMemoryFs).writeFile("/myapp/sub/deep/c.txt", "content-c");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/tree?prefix=/myapp&depth=1`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(200);
+		type Entry = { path: string; kind: string; size: number; mtime: string };
+		const entries = (await res.json()) as Entry[];
+		const paths = entries.map((e) => e.path).sort();
+
+		// Only /myapp/a.txt and /myapp/sub are direct children of /myapp
+		expect(paths).toEqual(["/myapp/a.txt", "/myapp/sub"]);
 	});
 });
