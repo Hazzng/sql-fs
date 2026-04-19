@@ -442,3 +442,16 @@
   - US-034 is another no-op story — rm implementation and tests were front-loaded in US-020 and US-024.
   - The AC has a contradiction: "EISDIR if dir and recursive not set" vs test case "rm empty dir" (no error). Current implementation allows removing empty dirs without recursive (matches test cases, not the Throws criterion). Don't add EISDIR logic as it would break the listed test cases.
 ---
+
+## 2026-04-19 - US-035
+- Updated the `rm` recursive branch in `src/fs/sql-fs/sql-fs.ts` to use `dialect.loadSubtreeInodes` and delete all subtree inodes within one transaction (instead of only deleting the parent dirent).
+- New recursive rm flow: snapshot subtree paths → `#withTx` (deleteDirent parent + loadSubtreeInodes + deleteInode per inode) → update pathCache + contentCache.
+- Updated `loadSubtreeInodes` mock in `sql-fs.write.test.ts` and `sql-fs.cache-invalidation.test.ts` from `vi.fn()` (returns undefined, not iterable) to `vi.fn(async () => [3n, 4n])`.
+- Created `src/fs/sql-fs/sql-fs.rm-recursive.test.ts` with 5 unit tests: removes all subtree paths from pathCache (3-level deep), calls loadSubtreeInodes with root inodeId, calls deleteInode for each returned inodeId, removes all subtree inode entries from contentCache, calls deleteDirent to unlink subtree root.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`, `src/fs/sql-fs/sql-fs.write.test.ts`, `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - The prior recursive rm (US-020) only deleted the parent dirent — it left all child inodes and dirents orphaned in the DB. US-035 corrects this by calling loadSubtreeInodes + deleteInode for each inode.
+  - Deleting inodes in Postgres CASCADE-deletes all dirents referencing those inodes (both as `parent_inode_id` and `inode_id`), so no explicit dirent deletions are needed for subtree children.
+  - Mocks for `loadSubtreeInodes: vi.fn()` silently break when code iterates the result — they return `undefined` (not an array). Always use `vi.fn(async () => [])` or appropriate array for collection-returning methods.
+  - The parent dirent deletion must happen first (to unlink the subtree from the tree), then loadSubtreeInodes walks the now-unlinked subtree dirents to collect inode IDs for deletion.
+---
