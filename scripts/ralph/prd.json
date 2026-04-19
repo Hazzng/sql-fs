@@ -103,7 +103,7 @@
         "Tests pass"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": "Install jose as dependency. AUTH_SECRET should be at least 32 bytes for HS256."
     },
     {
