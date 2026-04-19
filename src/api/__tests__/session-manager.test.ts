@@ -1,5 +1,5 @@
 /**
- * Unit tests for SessionManager — US-074, US-075
+ * Unit tests for SessionManager — US-074, US-075, US-076
  */
 
 import { InMemoryFs } from "just-bash";
@@ -159,6 +159,111 @@ describe("SessionManager pathCache memory budget (US-075a)", () => {
 		expect(sm.getSession("sandbox-overbudget")).toBeUndefined();
 
 		sm.stopReaper();
+	});
+});
+
+describe("SessionManager.destroy (US-076)", () => {
+	it("destroy removes session from Map and calls destroySandbox", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+
+		await sm.getOrCreate("sandbox-destroy-basic");
+		expect(sm.getSession("sandbox-destroy-basic")).toBeDefined();
+
+		const result = await sm.destroy("sandbox-destroy-basic");
+
+		expect(result).toBe(true);
+		expect(sm.getSession("sandbox-destroy-basic")).toBeUndefined();
+		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-destroy-basic");
+	});
+
+	it("destroy calls destroySandbox even when session is not in pool", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+
+		const result = await sm.destroy("sandbox-never-created");
+
+		expect(result).toBe(false);
+		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-never-created");
+	});
+
+	it("destroy waits for in-flight work before calling destroySandbox", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+
+		let releaseWork!: () => void;
+		let workStartedResolve!: () => void;
+		const workStarted = new Promise<void>((resolve) => {
+			workStartedResolve = resolve;
+		});
+		const workBlocker = new Promise<void>((resolve) => {
+			releaseWork = resolve;
+		});
+
+		// Start a withSession that blocks inside the mutex
+		const workPromise = sm.withSession("sandbox-destroy-wait", async () => {
+			workStartedResolve();
+			await workBlocker;
+		});
+
+		// Wait for the work to acquire the mutex
+		await workStarted;
+
+		// Destroy is called while work is in-flight
+		const destroyPromise = sm.destroy("sandbox-destroy-wait");
+
+		// destroySandbox should not have been called yet — destroy is waiting on the mutex
+		expect(destroySandboxFn).not.toHaveBeenCalled();
+
+		// Release the in-flight work, which frees the mutex so destroy can proceed
+		releaseWork();
+		await Promise.all([workPromise, destroyPromise]);
+
+		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-destroy-wait");
+		expect(sm.getSession("sandbox-destroy-wait")).toBeUndefined();
+	});
+
+	it("request arriving during destroy is rejected with error", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+
+		let releaseWork!: () => void;
+		let workStartedResolve!: () => void;
+		const workStarted = new Promise<void>((resolve) => {
+			workStartedResolve = resolve;
+		});
+		const workBlocker = new Promise<void>((resolve) => {
+			releaseWork = resolve;
+		});
+
+		// Start a long-running withSession that holds the mutex
+		const workPromise = sm.withSession("sandbox-reject-destroy", async () => {
+			workStartedResolve();
+			await workBlocker;
+		});
+
+		await workStarted;
+
+		// Call destroy — marks state='closing' immediately (before queuing in mutex)
+		const destroyPromise = sm.destroy("sandbox-reject-destroy");
+
+		// New request arriving while destroy is pending: state='closing' → fail fast
+		await expect(sm.withSession("sandbox-reject-destroy", async () => {})).rejects.toThrow("ESESSIONCLOSING");
+
+		// Finish blocked work so destroy can complete
+		releaseWork();
+		await Promise.all([workPromise, destroyPromise]);
+	});
+
+	it("concurrent destroy calls are idempotent — destroySandbox called exactly once", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+
+		await sm.getOrCreate("sandbox-idem-destroy");
+
+		await Promise.all([sm.destroy("sandbox-idem-destroy"), sm.destroy("sandbox-idem-destroy")]);
+
+		expect(destroySandboxFn).toHaveBeenCalledTimes(1);
 	});
 });
 
