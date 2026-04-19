@@ -10,6 +10,8 @@
 - `postgres.js` template literals do NOT accept `bigint` parameters — TypeScript will error. Always wrap bigint values with `String(id)` before interpolating into `tx\`...\`` tagged templates.
 - When returning `tx\`...\`` from an `async (tx) => ...` callback, always `await` it (`return await tx\`...\``). Returning a `PendingQuery` directly causes TS1058 because PendingQuery has a `.then` member that confuses the async return type checker.
 - Private class methods with `#` prefix work fine in this TypeScript config (ES2022 target). Use them for dialect-internal helpers to keep the public interface clean.
+- For dynamic UPDATE queries in postgres.js (where only a subset of columns should be updated), use `tx(patchObj)` where `patchObj` is a `Record<string, ...>` with snake_case DB column names. This generates `"col" = $N, ...` syntax cleanly without `tx.unsafe()`. E.g., `await tx\`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(id)}\``.
+- BYTEA columns (content_sha256) are returned by postgres.js as `Buffer` objects. `Buffer extends Uint8Array` so they are directly assignable to `Uint8Array` in TypeScript — no conversion needed.
 
 ---
 
@@ -59,6 +61,20 @@
   - `set_config('app.sandbox_id', $sandboxId, true)` is the parameterized form of `SET LOCAL`; plain `SET LOCAL` with parameterized values isn't supported in Postgres.
   - `process.env.DATABASE_URL` (not bracket notation) is required by Biome's `useLiteralKeys` rule.
   - Biome will flag unused `biome-ignore` suppression comments as warnings — only add suppressions for rules that actually fire.
+---
+
+## 2026-04-19 - US-006
+- Implemented `createInode(tx, opts)`: INSERT into inodes with all fields, RETURNING id as bigint.
+- Implemented `getInode(tx, inodeId)`: SELECT with `String(inodeId)` param, maps snake_case DB columns to camelCase InodeRow. BYTEA → Buffer is directly assignable to Uint8Array.
+- Implemented `updateInode(tx, inodeId, updates)`: Builds a snake_case patch object (only fields present in updates), uses `tx(patch)` dynamic sql helper to generate `SET col = $N` clauses. Returns early if no fields provided.
+- Implemented `deleteInode(tx, inodeId)`: Single DELETE by id using `String(inodeId)`.
+- Added 4 integration tests to `src/fs/sql-fs/integration/postgres.test.ts` covering: file inode CRUD with sha256, dir inode kind=2, updateInode mode+mtime, deleteInode → getInode returns null.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `tx(obj)` (postgres.js dynamic sql helper) works cleanly for UPDATE SET without needing `tx.unsafe()`. Object keys must be DB column names (snake_case). Requires `Record<string, string | number | Date | Uint8Array | null>` type — no `any` needed.
+  - BIGSERIAL columns come back from postgres.js as strings (not numbers or bigints). Always `BigInt(row.id)` to convert.
+  - BIGINT columns (size, root_inode) also return as strings — use `Number(row.size)` for sizes.
+  - `InodeKind` must be imported in dialects that cast `row.kind as InodeKind`.
 ---
 
 ## 2026-04-19 - US-005

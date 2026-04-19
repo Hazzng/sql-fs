@@ -9,6 +9,7 @@ import type {
 	BulkIngestFile,
 	CreateInodeOpts,
 	DirentRow,
+	InodeKind,
 	InodeRow,
 	PathCacheEntry,
 	SqlDialect,
@@ -106,20 +107,65 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-006
-	async createInode(_tx: PgTx, _opts: CreateInodeOpts): Promise<bigint> {
-		throw new Error("not implemented");
+	async createInode(tx: PgTx, opts: CreateInodeOpts): Promise<bigint> {
+		const rows = await tx<{ id: string }[]>`
+			INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256, symlink_target)
+			VALUES (${opts.sandboxId}, ${opts.kind}, ${opts.mode}, ${opts.size}, ${opts.contentSha256 ?? null}, ${opts.symlinkTarget ?? null})
+			RETURNING id
+		`;
+		const row = rows[0];
+		if (!row) throw new Error("createInode: INSERT returned no rows");
+		return BigInt(row.id);
 	}
 
-	async getInode(_tx: PgTx, _inodeId: bigint): Promise<InodeRow | null> {
-		throw new Error("not implemented");
+	async getInode(tx: PgTx, inodeId: bigint): Promise<InodeRow | null> {
+		const rows = await tx<
+			{
+				id: string;
+				sandbox_id: string;
+				kind: number;
+				mode: number;
+				size: string;
+				mtime: Date;
+				nlink: number;
+				content_sha256: Buffer | null;
+				symlink_target: string | null;
+			}[]
+		>`
+			SELECT id, sandbox_id, kind, mode, size, mtime, nlink, content_sha256, symlink_target
+			FROM inodes
+			WHERE id = ${String(inodeId)}
+		`;
+		const row = rows[0];
+		if (!row) return null;
+		return {
+			id: BigInt(row.id),
+			sandboxId: row.sandbox_id,
+			kind: row.kind as InodeKind,
+			mode: row.mode,
+			size: Number(row.size),
+			mtime: row.mtime,
+			nlink: row.nlink,
+			contentSha256: row.content_sha256,
+			symlinkTarget: row.symlink_target,
+		};
 	}
 
-	async updateInode(_tx: PgTx, _inodeId: bigint, _updates: UpdateInodeOpts): Promise<void> {
-		throw new Error("not implemented");
+	async updateInode(tx: PgTx, inodeId: bigint, updates: UpdateInodeOpts): Promise<void> {
+		// Build a snake_case patch object for postgres.js dynamic sql(obj) helper
+		const patch: Record<string, string | number | Date | Uint8Array | null> = Object.create(null);
+		if (updates.mode !== undefined) patch.mode = updates.mode;
+		if (updates.size !== undefined) patch.size = updates.size;
+		if (updates.mtime !== undefined) patch.mtime = updates.mtime;
+		if ("contentSha256" in updates) patch.content_sha256 = updates.contentSha256 ?? null;
+
+		if (Object.keys(patch).length === 0) return;
+
+		await tx`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(inodeId)}`;
 	}
 
-	async deleteInode(_tx: PgTx, _inodeId: bigint): Promise<void> {
-		throw new Error("not implemented");
+	async deleteInode(tx: PgTx, inodeId: bigint): Promise<void> {
+		await tx`DELETE FROM inodes WHERE id = ${String(inodeId)}`;
 	}
 
 	// US-007

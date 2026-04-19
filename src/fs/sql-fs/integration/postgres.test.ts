@@ -1,8 +1,9 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, and deleteSandbox.
+ * createSandbox, deleteSandbox, and inode CRUD.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
+ * US-006: createInode, getInode, updateInode, deleteInode.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -155,5 +156,116 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — createSandbox an
 			`;
 		});
 		expect(Number(direntRows[0]!.count)).toBe(0);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — inode CRUD", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-inode-crud-${Date.now()}`;
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, sandboxId);
+		});
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("creates a file inode with content_sha256 and retrieves all fields via getInode", async () => {
+		const sha256 = new Uint8Array(32).fill(1);
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: 42,
+				contentSha256: sha256,
+				symlinkTarget: null,
+			});
+		});
+
+		const inode = await dialect.transaction(async (tx) => {
+			return await dialect.getInode(tx, inodeId);
+		});
+
+		expect(inode).not.toBeNull();
+		expect(inode!.id).toBe(inodeId);
+		expect(inode!.sandboxId).toBe(sandboxId);
+		expect(inode!.kind).toBe(1);
+		expect(inode!.mode).toBe(0o644);
+		expect(inode!.size).toBe(42);
+		expect(inode!.nlink).toBe(1);
+		expect(inode!.contentSha256).toEqual(sha256);
+		expect(inode!.symlinkTarget).toBeNull();
+	});
+
+	it("creates a directory inode with kind=2", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 2,
+				mode: 0o755,
+				size: 0,
+			});
+		});
+
+		const inode = await dialect.transaction(async (tx) => {
+			return await dialect.getInode(tx, inodeId);
+		});
+
+		expect(inode).not.toBeNull();
+		expect(inode!.kind).toBe(2);
+		expect(inode!.mode).toBe(0o755);
+	});
+
+	it("updates mode and mtime, verifies changes persist via getInode", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: 0,
+			});
+		});
+
+		const newMtime = new Date("2025-06-15T12:00:00.000Z");
+		await dialect.transaction(async (tx) => {
+			await dialect.updateInode(tx, inodeId, { mode: 0o600, mtime: newMtime });
+		});
+
+		const inode = await dialect.transaction(async (tx) => {
+			return await dialect.getInode(tx, inodeId);
+		});
+
+		expect(inode!.mode).toBe(0o600);
+		expect(inode!.mtime.toISOString()).toBe(newMtime.toISOString());
+	});
+
+	it("deletes an inode and getInode returns null", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: 0,
+			});
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId);
+		});
+
+		const inode = await dialect.transaction(async (tx) => {
+			return await dialect.getInode(tx, inodeId);
+		});
+
+		expect(inode).toBeNull();
 	});
 });
