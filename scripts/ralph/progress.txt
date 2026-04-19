@@ -12,6 +12,7 @@
 - Private class methods with `#` prefix work fine in this TypeScript config (ES2022 target). Use them for dialect-internal helpers to keep the public interface clean.
 - For dynamic UPDATE queries in postgres.js (where only a subset of columns should be updated), use `tx(patchObj)` where `patchObj` is a `Record<string, ...>` with snake_case DB column names. This generates `"col" = $N, ...` syntax cleanly without `tx.unsafe()`. E.g., `await tx\`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(id)}\``.
 - BYTEA columns (content_sha256) are returned by postgres.js as `Buffer` objects. `Buffer extends Uint8Array` so they are directly assignable to `Uint8Array` in TypeScript — no conversion needed.
+- Integration tests that depend on stored procedures/DDL not covered by the base migration can apply that DDL in `beforeAll` via `tx.unsafe(migrationSql)` where `migrationSql` is read from the migration file using `fileURLToPath(new URL("../migrations/postgres/000N_name.sql", import.meta.url))`. `CREATE OR REPLACE FUNCTION` is idempotent so repeated runs are safe.
 
 ---
 
@@ -217,4 +218,22 @@
   - Multi-row INSERT RETURNING returns rows in insertion order — safe to zip with the input array by index.
   - Biome's `useTemplate` rule flags `"/" + expr` — use template literals `` `/${expr}` `` instead. Run `biome check --fix --unsafe` to auto-fix.
   - `BulkIngestFile` must be imported in integration tests (`import type { BulkIngestFile } from "../types.js"`).
+---
+
+## 2026-04-19 - US-018
+- Created `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` with two plpgsql functions:
+  - `fs_resolve_internal(p_path, p_follow_last, p_depth)` — internal recursive helper that walks path components, handles `.`/`..`, follows symlinks, tracks depth (raises FS001 ELOOP at >40), raises FS002 (ENOENT) and FS003 (ENOTDIR).
+  - `fs_resolve(p_path, p_follow_last)` — public entry point that delegates to the internal helper with `p_depth=0`.
+- Implemented `resolvePath(tx, path, followLast)` in `postgres.ts`: calls `SELECT fs_resolve($path, $followLast)` and wraps errors via `translateSqlError(err, path)` so FS001/FS002/FS003 SQLSTATEs become ELOOP/ENOENT/ENOTDIR errors.
+- Added `translateSqlError` import to `postgres.ts` (alongside existing `createEnoent`).
+- Added `readFileSync`/`fileURLToPath` imports to integration test file.
+- Added `describe` block `"PostgresDialect — resolvePath (fs_resolve)"` in `postgres.test.ts` with 6 integration tests: resolve simple path, resolve path with `.`/`..`, follow symlink with followLast=true, return symlink inode with followLast=false, detect ELOOP, detect ENOENT.
+- The integration test's `beforeAll` applies the stored proc DDL via `tx.unsafe(migrationSql)` so tests are self-contained (no manual migration required).
+- Files changed: `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` (new), `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `fs_resolve_internal` uses a BIGINT array `v_stack` as a parent stack to support `..` without a reverse-index lookup on dirents.
+  - Symlink targets are treated as absolute paths and resolved via a recursive call to `fs_resolve_internal` with `p_depth + 1`. Depth > 40 raises SQLSTATE 'FS001' (ELOOP).
+  - `resolvePath` must wrap the stored proc call in try/catch and call `translateSqlError(err, path)` — the stored proc's custom SQLSTATEs (FS001/FS002/FS003) are already mapped in `errors.ts`.
+  - Integration tests can apply migration DDL via `tx.unsafe(migrationSql)` in `beforeAll`. Use `fileURLToPath(new URL("../migrations/...", import.meta.url))` to resolve the SQL file path relative to the test file.
+  - `tx.unsafe(sql)` executes raw SQL strings (including multi-statement DDL with `$$` delimiters) without parameterization — safe for migration files where content is controlled.
 ---
