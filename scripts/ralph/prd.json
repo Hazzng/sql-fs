@@ -455,7 +455,7 @@
         "Tests pass"
       ],
       "priority": 23,
-      "passes": false,
+      "passes": true,
       "notes": "No partial path eviction — either the full pathCache fits in budget or the session is not retained."
     },
     {
