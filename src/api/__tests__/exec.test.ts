@@ -1,6 +1,7 @@
 /**
  * Unit tests for exec routes.
  * US-068: POST /v1/sandboxes/:id/exec-sync — buffered execution
+ * US-069: POST /v1/sandboxes/:id/exec — SSE streaming execution
  */
 
 import { Hono } from "hono";
@@ -123,5 +124,60 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		expect(body.code).toBe("EXEC_TIMEOUT");
 
 		vi.restoreAllMocks();
+	});
+});
+
+// Helper: parse SSE response body into events array
+function parseSseEvents(body: string): Array<{ event: string; data: unknown }> {
+	const events: Array<{ event: string; data: unknown }> = [];
+	const blocks = body.split("\n\n").filter((b) => b.trim());
+	for (const block of blocks) {
+		const lines = block.split("\n");
+		let event = "message";
+		let data = "";
+		for (const line of lines) {
+			if (line.startsWith("event: ")) event = line.slice(7).trim();
+			if (line.startsWith("data: ")) data = line.slice(6).trim();
+		}
+		if (data) events.push({ event, data: JSON.parse(data) });
+	}
+	return events;
+}
+
+describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("executes script and streams stdout and exit events", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ script: "echo hello" }),
+		});
+
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+		const bodyText = await res.text();
+		const events = parseSseEvents(bodyText);
+
+		const stdoutEvent = events.find((e) => e.event === "stdout");
+		const exitEvent = events.find((e) => e.event === "exit");
+
+		expect(stdoutEvent).toBeDefined();
+		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
+		expect(exitEvent).toBeDefined();
+		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
 	});
 });
