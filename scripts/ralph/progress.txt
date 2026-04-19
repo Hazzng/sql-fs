@@ -17,6 +17,7 @@
 - `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from `just-bash`'s main entry point. When implementing `IFileSystem`, extract these types via `Parameters<IFileSystem["readFile"]>[1]` (etc.) instead of importing from internal just-bash paths.
 - `readdirWithFileTypes` is optional in `IFileSystem` (`?:`) — stubs do not need to include it.
 - `lru-cache` evicts only when adding an entry would EXCEED `maxSize` (not when it equals it). In tests, use `maxSize: N-1` (e.g., 25 for three 10-byte entries) to force eviction — `maxSize: 30` for three 10-byte entries is exactly the limit so no eviction occurs.
+- `LRUCache` with `sizeCalculation` requires each entry to have `byteLength > 0` (positive integer). Never call `_contentCacheSet` with `new Uint8Array(0)` — it throws "sizeCalculation return invalid".
 - `contentCache` is `LRUCache<bigint, Uint8Array>` with `sizeCalculation: (v) => v.byteLength`. Private `_contentCacheGet/Set/Has` test helpers on SqlFs allow unit tests to verify cache state without implementing readFile first.
 
 ---
@@ -312,4 +313,18 @@
   - `getBlob` takes `contentSha256` (Uint8Array) from the pathCache entry, not the inodeId. The contentCache uses `inodeId` as key but fetches via `sha256`.
   - Pre-seeding `contentCache` via `_contentCacheSet` before calling `readFile` is a valid test technique to verify cache-hit path without needing a DB call.
   - `TextDecoder().decode(bytes)` with default args uses UTF-8; no need to handle other encodings for US-023.
+---
+
+## 2026-04-19 - US-024
+- `writeFile()`: added `this.#contentCache.set(inodeId, bytes)` after `this.#pathCache.set(...)` — new content is immediately cached under the new inodeId.
+- `rm()` non-recursive: added `this.#contentCache.delete(entry.inodeId)` before `this.#pathCache.delete(path)` — evicts the file's content from cache on removal.
+- `rm()` recursive: inside the `for (const p of this.#allPathsUnder(path))` loop, added `const e = this.#pathCache.get(p); if (e) this.#contentCache.delete(e.inodeId);` before `this.#pathCache.delete(p)` — clears all subtree inodes from contentCache.
+- `appendFile()`: captured `replacedInodeId` via `let replacedInodeId: bigint | null = null` outside the transaction callback (set when `upsertDirent` returns a non-null old inodeId). After the transaction: `if (replacedInodeId !== null) this.#contentCache.delete(replacedInodeId)` then `this.#contentCache.set(inodeId, fullBytes)`.
+- `mv()`: no changes — mv preserves inodeIds (only pathCache keys change), so contentCache remains valid as-is.
+- Created `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` with 9 unit tests covering all four acceptance criteria.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - When tracking a transaction's "side output" (e.g., oldInodeId returned by upsertDirent) for post-transaction cache operations, use a `let` variable declared outside the `#withTx` callback and assign inside — the async callback closes over it.
+  - `LRUCache.set` with `sizeCalculation` requires `byteLength > 0` — never store `new Uint8Array(0)` in contentCache (it throws "sizeCalculation return invalid (expect positive integer)"). Guard against zero-length writes if needed.
+  - contentCache is keyed by inodeId (bigint). On file overwrite, the old inodeId's entry is orphaned (not explicitly deleted) since the path now points to a new inodeId. It will be evicted by LRU naturally. Only `rm` and `appendFile` need explicit deletion of old inodeIds.
 ---
