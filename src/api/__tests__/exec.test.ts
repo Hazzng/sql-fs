@@ -2,6 +2,7 @@
  * Unit tests for exec routes.
  * US-068: POST /v1/sandboxes/:id/exec-sync — buffered execution
  * US-069: POST /v1/sandboxes/:id/exec — SSE streaming execution
+ * US-070: Exec timeout enforcement
  */
 
 import { Hono } from "hono";
@@ -179,5 +180,51 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
 		expect(exitEvent).toBeDefined();
 		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+	});
+
+	it("timeout sends exit event with exitCode -1 and error='timeout'", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const timeoutSandboxId = `${SANDBOX_ID}-sse-timeout`;
+
+		// Pre-create session so we can spy on bash.exec
+		const session = await sessionManager.getOrCreate(timeoutSandboxId);
+
+		// Mock bash.exec to hang but respond to abort signal
+		vi.spyOn(session.bash, "exec").mockImplementation(
+			(_script, opts) =>
+				new Promise((_resolve, reject) => {
+					const handle = setTimeout(() => {
+						// Should not reach here in the timeout test
+					}, 60_000);
+					opts?.signal?.addEventListener("abort", () => {
+						clearTimeout(handle);
+						reject(new DOMException("The operation was aborted", "AbortError"));
+					});
+				}),
+		);
+
+		const res = await app.request(`/v1/sandboxes/${timeoutSandboxId}/exec`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ script: "sleep 1000", timeoutMs: 50 }),
+		});
+
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+		const bodyText = await res.text();
+		const events = parseSseEvents(bodyText);
+
+		const exitEvent = events.find((e) => e.event === "exit");
+		expect(exitEvent).toBeDefined();
+		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
+		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
+
+		vi.restoreAllMocks();
 	});
 });
