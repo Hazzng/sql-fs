@@ -6,11 +6,20 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { adminRoutes } from "./routes/admin.js";
+import { sandboxRoutes } from "./routes/sandboxes.js";
+import { SessionManager } from "./session-manager.js";
 
 export const app = new Hono();
+
+// ── Session manager (lazy — no DB access until first request) ─────────────────
+
+const sessionManager = new SessionManager({
+	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
+});
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
@@ -19,6 +28,7 @@ app.use("/v1/*", authMiddleware);
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.route("/v1/admin", adminRoutes);
+app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
