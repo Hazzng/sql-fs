@@ -301,3 +301,15 @@
   - The `@internal` test helper pattern (`_contentCacheGet/Set/Has`) is reusable — US-023/024 implementations should call these same helpers internally rather than duplicating the private field access.
   - `LRUCache` import from `lru-cache` (named export, not default) — `import { LRUCache } from "lru-cache"`.
 ---
+
+## 2026-04-19 - US-023
+- Implemented `readFile(path, _options?)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
+- Cache-check flow: look up `entry` in `#pathCache` by path → check `#contentCache.get(entry.inodeId)` → if hit, decode and return → if miss, call `dialect.getBlob(tx, entry.contentSha256)`, store in `#contentCache`, decode and return.
+- Created `src/fs/sql-fs/sql-fs.read.test.ts` with 4 unit tests: (1) first read calls getBlob (cache miss); (2) second read does NOT call getBlob (cache hit); (3) contentCache is populated after first read; (4) pre-seeded cache bypasses getBlob entirely.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.read.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `readFile` is keyed on `entry.inodeId` in the contentCache (not sha256). This means if a file is overwritten and gets a new inodeId, the old entry does not pollute the new one. US-024 must set the new inodeId's cache entry on write (not the old one).
+  - `getBlob` takes `contentSha256` (Uint8Array) from the pathCache entry, not the inodeId. The contentCache uses `inodeId` as key but fetches via `sha256`.
+  - Pre-seeding `contentCache` via `_contentCacheSet` before calling `readFile` is a valid test technique to verify cache-hit path without needing a DB call.
+  - `TextDecoder().decode(bytes)` with default args uses UTF-8; no need to handle other encodings for US-023.
+---
