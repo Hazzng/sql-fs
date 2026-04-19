@@ -13,6 +13,9 @@
 - For dynamic UPDATE queries in postgres.js (where only a subset of columns should be updated), use `tx(patchObj)` where `patchObj` is a `Record<string, ...>` with snake_case DB column names. This generates `"col" = $N, ...` syntax cleanly without `tx.unsafe()`. E.g., `await tx\`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(id)}\``.
 - BYTEA columns (content_sha256) are returned by postgres.js as `Buffer` objects. `Buffer extends Uint8Array` so they are directly assignable to `Uint8Array` in TypeScript — no conversion needed.
 - Integration tests that depend on stored procedures/DDL not covered by the base migration can apply that DDL in `beforeAll` via `tx.unsafe(migrationSql)` where `migrationSql` is read from the migration file using `fileURLToPath(new URL("../migrations/postgres/000N_name.sql", import.meta.url))`. `CREATE OR REPLACE FUNCTION` is idempotent so repeated runs are safe.
+- When mocking `SqlDialect` in unit tests, use `{ ...mocks } as unknown as SqlDialect<unknown>` to bypass TypeScript's structural check on the generic `transaction<T>` method. Save individual mock references (e.g., `const txMock = vi.fn(...)`) outside the cast object so they can be used in `expect(txMock).toHaveBeenCalledOnce()` assertions.
+- `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from `just-bash`'s main entry point. When implementing `IFileSystem`, extract these types via `Parameters<IFileSystem["readFile"]>[1]` (etc.) instead of importing from internal just-bash paths.
+- `readdirWithFileTypes` is optional in `IFileSystem` (`?:`) — stubs do not need to include it.
 
 ---
 
@@ -236,4 +239,18 @@
   - `resolvePath` must wrap the stored proc call in try/catch and call `translateSqlError(err, path)` — the stored proc's custom SQLSTATEs (FS001/FS002/FS003) are already mapped in `errors.ts`.
   - Integration tests can apply migration DDL via `tx.unsafe(migrationSql)` in `beforeAll`. Use `fileURLToPath(new URL("../migrations/...", import.meta.url))` to resolve the SQL file path relative to the test file.
   - `tx.unsafe(sql)` executes raw SQL strings (including multi-statement DDL with `$$` delimiters) without parameterization — safe for migration files where content is controlled.
+---
+
+## 2026-04-19 - US-019
+- Created `src/fs/sql-fs/sql-fs.ts` with the `SqlFs<Tx>` class implementing `IFileSystem` from just-bash.
+- `ready()` calls `dialect.transaction()`, sets sandbox context via `setSandboxContext`, then calls `dialect.loadAllPaths()`. Populates `#pathCache: Map<string, PathCacheEntry>` from the results.
+- `getAllPaths()` returns `[...this.#pathCache.keys()]` — synchronous, no DB.
+- All other `IFileSystem` methods are stubs (throw "not implemented") to satisfy TypeScript's structural type check.
+- Created `src/fs/sql-fs/sql-fs.cache.test.ts` with 4 unit tests: (1) verifies transaction/setSandboxContext/loadAllPaths call sequence; (2) getAllPaths returns all cached paths; (3) getAllPaths returns [] before ready(); (4) ready() clears stale cache on re-init.
+- Files changed: `src/fs/sql-fs/sql-fs.ts` (new), `src/fs/sql-fs/sql-fs.cache.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `vi.fn()` loses the generic `<T>` from `transaction<T>` — mock the full dialect with `as unknown as SqlDialect<unknown>` to avoid TS errors. Save mock fn references outside the cast object.
+  - `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from the just-bash main entry point. Use `Parameters<IFileSystem["readFile"]>[1]` to extract them.
+  - `readdirWithFileTypes` is optional in `IFileSystem` — stubs don't need to include it.
+  - Private `#pathCache` field (ES2022 private) works fine. It's only accessible inside the class, so tests must verify via `getAllPaths()` (public method), not by direct field access.
 ---
