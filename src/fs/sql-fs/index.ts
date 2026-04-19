@@ -2,7 +2,7 @@
  * Factory: createSandboxFs() and destroySandbox().
  * US-053: createSandboxFs factory function
  * US-054: loadBackendConfig
- * US-055: destroySandbox (TODO)
+ * US-055: destroySandbox
  */
 
 import type { IFileSystem } from "just-bash";
@@ -89,4 +89,34 @@ export function loadBackendConfig(): BackendConfig {
 	return { backend };
 }
 
-// TODO: destroySandbox()
+/**
+ * Destroys a sandbox and all its persistent data.
+ * SQL backends: connects to DB, deletes sandbox in a transaction, disconnects.
+ * Memory backend: no-op.
+ */
+export async function destroySandbox(backend: StorageBackend, sandboxId: string): Promise<void> {
+	switch (backend) {
+		case "postgres": {
+			const databaseUrl = process.env.DATABASE_URL;
+			if (!databaseUrl) {
+				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
+			}
+			const dialect = new PostgresDialect(databaseUrl);
+			await dialect.connect();
+			try {
+				await dialect.transaction(async (tx) => {
+					await dialect.deleteSandbox(tx, sandboxId);
+				});
+			} finally {
+				await dialect.disconnect();
+			}
+			return;
+		}
+		case "memory":
+			return;
+		case "mysql":
+		case "azure-sql":
+		case "azure-fileshare":
+			throw new Error(`destroySandbox: backend '${backend}' is not implemented`);
+	}
+}
