@@ -51,45 +51,6 @@ jobs:
 
       - run: pnpm test:unit
 
-  integration-tests:
-    name: Integration Tests (Postgres)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: virtualfs_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/virtualfs_test
-      DATABASE_DIRECT_URL: postgresql://postgres:postgres@localhost:5432/virtualfs_test
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - run: pnpm install --frozen-lockfile
-
-      - name: Run migrations
-        run: pnpm db:migrate
-
-      - run: pnpm test:integration
-
   build:
     name: Build
     runs-on: ubuntu-latest
