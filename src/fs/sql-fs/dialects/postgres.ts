@@ -194,8 +194,22 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-009
-	async upsertDirent(_tx: PgTx, _parentId: bigint, _name: string, _inodeId: bigint): Promise<bigint | null> {
-		throw new Error("not implemented");
+	async upsertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<bigint | null> {
+		// Capture the old inode_id (if any) before the upsert, then return it after.
+		const rows = await tx<{ old_inode_id: string | null }[]>`
+			WITH existing AS (
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+			)
+			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+			SELECT ${String(parentId)}, ${name}, ${String(inodeId)}, sandbox_id
+			FROM inodes WHERE id = ${String(parentId)}
+			ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id
+			RETURNING (SELECT inode_id FROM existing) AS old_inode_id
+		`;
+		const row = rows[0];
+		if (!row) throw new Error("upsertDirent: INSERT returned no rows");
+		return row.old_inode_id !== null ? BigInt(row.old_inode_id) : null;
 	}
 
 	// US-010
