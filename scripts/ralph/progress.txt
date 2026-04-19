@@ -1,0 +1,17 @@
+## Codebase Patterns
+- Both US-001 (SqlDialect interface) and US-002 (shared types) live in the same file `src/fs/sql-fs/types.ts`. Implementing US-001 requires defining the shared types (InodeRow, DirentRow, PathCacheEntry etc.) as they are referenced by the interface. US-002 acceptance criteria are therefore largely satisfied as a side-effect.
+- `SqlDialect` is generic: `SqlDialect<Tx = unknown>`. Each dialect specialises `Tx` with its own transaction handle type so that transaction callbacks are fully typed.
+- All fields on exported interfaces use `readonly` per project conventions (immutable after construction).
+- Biome auto-reformats multi-line function signatures to single-line where they fit within 120 chars — let it do so rather than fighting it.
+
+---
+
+## 2026-04-19 - US-001
+- Implemented the `SqlDialect<Tx>` generic interface with JSDoc on every method, covering: connect/disconnect, transaction, setSandboxContext, sandbox lifecycle (createSandbox/deleteSandbox), inode CRUD (createInode/getInode/updateInode/deleteInode), nlink ops (incrementNlink/decrementNlink), dirent CRUD (insertDirent/upsertDirent/deleteDirent/listDirents/moveDirent), blob ops (upsertBlob/getBlob/gcOrphanBlobs), bulk/tree ops (loadAllPaths/loadSubtreeInodes/bulkIngest), and path resolution (resolvePath).
+- Also defined all shared types needed for the interface to typecheck: `InodeRow`, `DirentRow`, `PathCacheEntry`, `CreateInodeOpts`, `UpdateInodeOpts`, `BulkIngestFile`, `StorageBackend`, `InodeKind`.
+- Files changed: `src/fs/sql-fs/types.ts`
+- **Learnings for future iterations:**
+  - Defining the shared types (US-002 content) was a prerequisite for US-001's "Typecheck passes" criterion — they are inseparable in practice since they live in the same file.
+  - `biome check --write` reformatted the `moveDirent` signature from multi-line to single-line; this is expected and correct.
+  - `noUnusedLocals` and `noUnusedParameters` are enabled — don't add any imports or parameters that aren't used.
+---
