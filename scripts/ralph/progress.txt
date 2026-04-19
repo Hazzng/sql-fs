@@ -468,3 +468,15 @@
   - Snapshot `destEntry = this.#pathCache.get(dest)` before the transaction (not inside it) so the cache state is captured before any async mutations.
   - The pathCache rebuild (clearing old keys, re-inserting under dest) already handles removing the dest entry — no separate `this.#pathCache.delete(dest)` is needed since the loop clears all keys starting with dest.
 ---
+
+## 2026-04-19 - US-037
+- Implemented `cp(src, dest, options?)` for single-file copy in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
+- Single file copy flow: look up src in pathCache (ENOENT if missing), throw EISDIR if src is a dir without `recursive`, resolve dest parent from pathCache, call `createInode` with same `contentSha256` (no `upsertBlob` — blob already exists via CAS dedup), call `upsertDirent` at dest, handle displaced dest inode nlink (decrementNlink/deleteInode if nlink=0), update pathCache with new entry.
+- Created `src/fs/sql-fs/sql-fs.cp.test.ts` with 8 unit tests covering: dest added to pathCache, upsertBlob NOT called (blob shared), createInode called with correct mode/size/contentSha256, upsertDirent called with correct args, src remains in pathCache (copy not move), ENOENT on missing src, EISDIR on directory without recursive, displaced dest inode lifecycle (decrementNlink + deleteInode).
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cp.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `cp` single-file does NOT call `upsertBlob` — the blob already exists (CAS dedup). Only `createInode` + `upsertDirent` are needed. This is the key difference from `writeFile`.
+  - `cp` creates a new inode (new `inodeId`) but reuses the same `contentSha256`. Both src and dest inodes point to the same blob row. nlink is NOT incremented because each inode has its own nlink=1.
+  - Pattern for displaced dest cleanup (when `upsertDirent` returns a non-null old inodeId): call `decrementNlink` → if result=0, call `deleteInode`. Identical to the pattern in `writeFile` and `appendFile`.
+  - US-038 (recursive directory cp) will need to walk the src subtree from pathCache and call the single-file cp logic per file entry. The `options?.recursive` guard already branches correctly.
+---
