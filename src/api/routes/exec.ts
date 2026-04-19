@@ -1,9 +1,11 @@
 /**
  * Execution routes.
  * US-068: POST /v1/sandboxes/:id/exec-sync — buffered execution
+ * US-069: POST /v1/sandboxes/:id/exec — SSE streaming execution
  */
 
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
@@ -90,6 +92,92 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		return c.json({ stdout: execResult.stdout, stderr: execResult.stderr, exitCode: execResult.exitCode });
+	});
+
+	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
+	router.post("/:id/exec", async (c) => {
+		const sandboxId = c.req.param("id");
+
+		let body: z.infer<typeof execBodySchema>;
+		try {
+			const raw = await c.req.json();
+			const result = execBodySchema.safeParse(raw);
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
+
+		return streamSSE(c, async (stream) => {
+			const controller = new AbortController();
+			let timedOut = false;
+			const startMs = Date.now();
+
+			// Cancel on client disconnect
+			c.req.raw.signal.addEventListener("abort", () => {
+				controller.abort();
+			});
+
+			const timer = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, timeoutMs);
+
+			await sessionManager.withSession(sandboxId, async (session) => {
+				try {
+					const result = await session.bash.exec(body.script, {
+						signal: controller.signal,
+						cwd: body.cwd,
+						env,
+					});
+					clearTimeout(timer);
+
+					if (timedOut) {
+						await stream.writeSSE({
+							event: "exit",
+							data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
+						});
+						return;
+					}
+
+					if (result.stdout) {
+						await stream.writeSSE({
+							event: "stdout",
+							data: JSON.stringify({ t: "stdout", data: result.stdout }),
+						});
+					}
+					if (result.stderr) {
+						await stream.writeSSE({
+							event: "stderr",
+							data: JSON.stringify({ t: "stderr", data: result.stderr }),
+						});
+					}
+					await stream.writeSSE({
+						event: "exit",
+						data: JSON.stringify({ t: "exit", exitCode: result.exitCode, durationMs: Date.now() - startMs }),
+					});
+				} catch (e) {
+					clearTimeout(timer);
+					if (timedOut) {
+						await stream.writeSSE({
+							event: "exit",
+							data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
+						});
+						return;
+					}
+					throw e;
+				}
+			});
+		});
 	});
 
 	return router;
