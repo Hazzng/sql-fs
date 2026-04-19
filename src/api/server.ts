@@ -10,6 +10,7 @@ import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { adminRoutes } from "./routes/admin.js";
+import { fileRoutes } from "./routes/files.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
 
@@ -29,6 +30,7 @@ app.use("/v1/*", authMiddleware);
 
 app.route("/v1/admin", adminRoutes);
 app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
+app.route("/v1/sandboxes", fileRoutes(sessionManager));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
