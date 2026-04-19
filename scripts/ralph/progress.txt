@@ -158,3 +158,14 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Set `owner` and `createdAt` on the session inside the `withSession` callback (where you have the session reference); the POST handler's `sandboxId` is unique (UUID), so no race possible
   - `Session` fields that are mutable after creation (owner, createdAt, lastUsed) should NOT be `readonly` in the interface
 ---
+
+## 2026-04-19 - US-061
+- Added `destroy(sandboxId): Promise<boolean>` method to `SessionManager` in `session-manager.ts`; removes session from Map, calls `destroySandbox(backend, sandboxId)`, returns false if session not in Map
+- Added `DELETE /:id` route to `sandboxes.ts`: calls `sessionManager.destroy(id)`, returns 204 on success, 404 if not found
+- Added 2 unit tests to `sandboxes.test.ts`: create-then-delete (204) and delete-non-existent (404)
+- Files changed: `src/api/session-manager.ts`, `src/api/routes/sandboxes.ts`, `src/api/__tests__/sandboxes.test.ts`
+- **Learnings for future iterations:**
+  - `c.body(null, 204)` is the correct Hono pattern for 204 No Content responses — don't use `c.json()` for bodyless responses
+  - `destroy` on `SessionManager` returns boolean (found/not-found) rather than throwing — route handler converts false → 404 response explicitly
+  - `destroySandbox` for memory backend is a no-op, so unit tests with InMemoryFs don't need any DB mocking for the DELETE path
+---
