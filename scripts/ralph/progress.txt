@@ -429,3 +429,16 @@
 - **Learnings for future iterations:**
   - US-033 is another no-op story — implementation and tests were front-loaded in US-020. The pattern continues: US-034 through US-042 may also be satisfied already. Check existing code before writing.
 ---
+
+## 2026-04-19 - US-034
+- No new code written — all acceptance criteria for SqlFs.rm (non-recursive) were already satisfied by prior stories.
+- Implementation in `src/fs/sql-fs/sql-fs.ts` (rm method, lines 303-343) was done as part of US-020.
+- Tests covering "rm file, rm empty dir, rm non-empty dir (ENOTEMPTY), rm non-existent (ENOENT), rm -f non-existent (no error)" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020, lines 162-223).
+- Tests covering "removes entry from pathCache and contentCache" exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024, lines 152-193).
+- Verified: `pnpm typecheck` passes, all 107 unit tests pass.
+- Note: The "EISDIR if dir and recursive not set" AC criterion is inconsistent with the "Unit test: rm empty dir" test case (which expects success). The test cases are treated as ground truth; the implementation allows removing empty dirs without recursive.
+- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - US-034 is another no-op story — rm implementation and tests were front-loaded in US-020 and US-024.
+  - The AC has a contradiction: "EISDIR if dir and recursive not set" vs test case "rm empty dir" (no error). Current implementation allows removing empty dirs without recursive (matches test cases, not the Throws criterion). Don't add EISDIR logic as it would break the listed test cases.
+---
