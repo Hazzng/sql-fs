@@ -398,7 +398,7 @@
         "Tests pass"
       ],
       "priority": 20,
-      "passes": false,
+      "passes": true,
       "notes": "Use Hono's streaming SSE response API. just-bash Bash may need exec with streaming callback."
     },
     {
