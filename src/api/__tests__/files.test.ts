@@ -2,6 +2,7 @@
  * Unit tests for file operation routes.
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
+ * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  */
 
 import { Hono } from "hono";
@@ -168,5 +169,75 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 		});
 		expect(getRes.status).toBe(200);
 		expect(await getRes.text()).toBe("deep content");
+	});
+});
+
+describe("DELETE /v1/sandboxes/:id/files/*path", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("delete existing file returns 204", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).writeFile("/to-delete.txt", "bye");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/to-delete.txt`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(204);
+	});
+
+	it("delete non-existent file returns 404", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/ghost.txt`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(404);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("ENOENT");
+	});
+
+	it("delete non-empty directory without recursive returns 409", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).mkdir("/nonempty");
+		await (fs as InMemoryFs).writeFile("/nonempty/child.txt", "content");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/nonempty`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(409);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("ENOTEMPTY");
+	});
+
+	it("delete directory with recursive=true returns 204", async () => {
+		const { sessionManager, fs } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).mkdir("/recursive-dir");
+		await (fs as InMemoryFs).writeFile("/recursive-dir/file.txt", "data");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/recursive-dir?recursive=true`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(204);
 	});
 });

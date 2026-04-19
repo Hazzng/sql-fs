@@ -2,6 +2,7 @@
  * File operation routes.
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
+ * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  */
 
 import { Hono } from "hono";
@@ -149,6 +150,37 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			}
 			await session.fs.writeFile(filePath, content);
 		});
+
+		return c.body(null, 204);
+	});
+
+	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
+	router.delete("/:id/files/:path{.*}", async (c) => {
+		const sandboxId = c.req.param("id");
+		const wildcard = c.req.param("path");
+		const filePath = `/${wildcard}`;
+		const recursive = c.req.query("recursive") === "true";
+
+		type DeleteResult = { kind: "ok" } | { kind: "not_found" } | { kind: "not_empty" };
+
+		const result = await sessionManager.withSession<DeleteResult>(sandboxId, async (session) => {
+			try {
+				await session.fs.rm(filePath, { recursive });
+				return { kind: "ok" };
+			} catch (e) {
+				const code = extractErrCode(e);
+				if (code === "ENOENT") return { kind: "not_found" };
+				if (code === "ENOTEMPTY") return { kind: "not_empty" };
+				throw e;
+			}
+		});
+
+		if (result.kind === "not_found") {
+			return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
+		}
+		if (result.kind === "not_empty") {
+			return c.json({ error: "directory_not_empty", code: "ENOTEMPTY" }, 409 as ContentfulStatusCode);
+		}
 
 		return c.body(null, 204);
 	});
