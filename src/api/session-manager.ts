@@ -24,6 +24,8 @@ export interface SessionManagerOptions {
 	readonly backend: StorageBackend;
 	readonly databaseUrl?: string;
 	readonly createFs?: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
+	/** Idle timeout in ms before a session is eligible for eviction (default: SESSION_IDLE_MS env var or 600000) */
+	readonly idleMs?: number;
 }
 
 export class SessionManager {
@@ -32,10 +34,13 @@ export class SessionManager {
 	private readonly pending: Map<string, Promise<Session>> = new Map();
 	private readonly backend: StorageBackend;
 	private readonly createFs: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
+	private readonly idleMs: number;
+	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-	constructor({ backend, createFs }: SessionManagerOptions) {
+	constructor({ backend, createFs, idleMs }: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
+		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 	}
 
 	/**
@@ -117,5 +122,34 @@ export class SessionManager {
 		this.sessions.delete(sandboxId);
 		await destroySandbox(this.backend, sandboxId);
 		return true;
+	}
+
+	/**
+	 * Starts the background idle-eviction reaper.
+	 * Checks all sessions every intervalMs and evicts those idle longer than idleMs.
+	 * Eviction drops in-memory state only — does NOT call destroySandbox.
+	 */
+	startReaper(intervalMs = 60_000): void {
+		if (this.reaperTimer !== undefined) return;
+		this.reaperTimer = setInterval(() => this.runReaper(), intervalMs);
+	}
+
+	/**
+	 * Stops the background reaper.
+	 */
+	stopReaper(): void {
+		if (this.reaperTimer !== undefined) {
+			clearInterval(this.reaperTimer);
+			this.reaperTimer = undefined;
+		}
+	}
+
+	private runReaper(): void {
+		const now = Date.now();
+		for (const [sandboxId, session] of this.sessions) {
+			if (now - session.lastUsed > this.idleMs && session.inFlight === 0 && session.state !== "closing") {
+				this.sessions.delete(sandboxId);
+			}
+		}
 	}
 }
