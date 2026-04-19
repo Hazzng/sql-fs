@@ -104,3 +104,14 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - jose `SignJWT` with `setExpirationTime(string)` accepts duration strings like "30d", "1y", "24h" directly — no manual date arithmetic needed
   - CLI arg parsing: simple manual loop over `process.argv.slice(2)` is sufficient — no arg-parsing library needed for this case
 ---
+
+## 2026-04-19 - US-057c
+- Created `src/api/routes/admin.ts`: `adminRoutes` Hono instance with `POST /tokens`; uses `validateBody(tokenBodySchema)`, calls `signToken` then `verifyToken` to extract exp, returns 201 `{ token, sub, expiresAt }`
+- Updated `src/api/server.ts`: imports `adminRoutes`, registers `app.route("/v1/admin", adminRoutes)` after auth middleware
+- Created `src/api/__tests__/admin.test.ts`: 4 unit tests (happy path + decode verify, never expiry → null expiresAt, missing sub → 400, unauthenticated → 401)
+- Files changed: `src/api/routes/admin.ts` (new), `src/api/__tests__/admin.test.ts` (new), `src/api/server.ts` (modified)
+- **Learnings for future iterations:**
+  - Mount sub-routers with `app.route("/v1/prefix", subApp)` — auth middleware on `/v1/*` applies automatically to all sub-router routes
+  - After signing a token, calling `verifyToken` on the just-signed token is a clean way to extract the exp claim for the response (no manual date math needed)
+  - `z.enum(["30d", "1y", "24h", "never"]).optional()` is the right pattern for constrained duration strings; default applied in handler with destructuring default `= "30d"`
+---
