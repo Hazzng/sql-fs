@@ -4,6 +4,7 @@
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  * US-065: POST /v1/sandboxes/:id/mkdir — create directory
+ * US-066: POST /v1/sandboxes/:id/writeFiles — bulk write
  */
 
 import { Hono } from "hono";
@@ -183,6 +184,50 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		if (result.kind === "not_empty") {
 			return c.json({ error: "directory_not_empty", code: "ENOTEMPTY" }, 409 as ContentfulStatusCode);
 		}
+
+		return c.body(null, 204);
+	});
+
+	// POST /v1/sandboxes/:id/writeFiles — bulk write files
+	const writeFilesBodySchema = z.object({
+		files: z.record(z.string(), z.string()),
+	});
+
+	router.post("/:id/writeFiles", async (c) => {
+		const sandboxId = c.req.param("id");
+
+		let body: z.infer<typeof writeFilesBodySchema>;
+		try {
+			const raw = await c.req.json();
+			const result = writeFilesBodySchema.safeParse(raw);
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const { files } = body;
+
+		await sessionManager.withSession(sandboxId, async (session) => {
+			for (const [filePath, content] of Object.entries(files)) {
+				const parent = parentDir(filePath);
+				if (parent !== "/") {
+					try {
+						await session.fs.mkdir(parent, { recursive: true });
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code !== "EEXIST") throw e;
+					}
+				}
+				await session.fs.writeFile(filePath, content);
+			}
+		});
 
 		return c.body(null, 204);
 	});

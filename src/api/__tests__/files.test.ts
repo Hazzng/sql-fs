@@ -4,6 +4,7 @@
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  * US-065: POST /v1/sandboxes/:id/mkdir — create directory
+ * US-066: POST /v1/sandboxes/:id/writeFiles — bulk write
  */
 
 import { Hono } from "hono";
@@ -299,5 +300,44 @@ describe("POST /v1/sandboxes/:id/mkdir", () => {
 		expect(res.status).toBe(409);
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("EEXIST");
+	});
+});
+
+describe("POST /v1/sandboxes/:id/writeFiles", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("write 5 files in one call, verify all readable via GET", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const files: Record<string, string> = {
+			"/a.txt": "content-a",
+			"/b.txt": "content-b",
+			"/sub/c.txt": "content-c",
+			"/sub/deep/d.txt": "content-d",
+			"/e.txt": "content-e",
+		};
+
+		const writeRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/writeFiles`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ files }),
+		});
+		expect(writeRes.status).toBe(204);
+
+		for (const [path, expected] of Object.entries(files)) {
+			const getRes = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files${path}`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			expect(getRes.status).toBe(200);
+			expect(await getRes.text()).toBe(expected);
+		}
 	});
 });
