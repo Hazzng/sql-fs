@@ -59,12 +59,50 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Stubs — implemented in subsequent user stories ────────────────────────────
 
 	// US-005
-	async createSandbox(_tx: PgTx, _sandboxId: string): Promise<{ rootInodeId: bigint }> {
-		throw new Error("not implemented");
+	async createSandbox(tx: PgTx, sandboxId: string): Promise<{ rootInodeId: bigint }> {
+		// 1. Insert root directory inode (kind=2, mode=0o755)
+		const rootRows = await tx<{ id: string }[]>`
+			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
+			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
+			RETURNING id
+		`;
+		const rootRow = rootRows[0];
+		if (!rootRow) throw new Error("createSandbox: failed to create root inode");
+		const rootInodeId = BigInt(rootRow.id);
+
+		// 2. Register sandbox row, setting root_inode
+		await tx`INSERT INTO sandboxes (id, root_inode) VALUES (${sandboxId}, ${String(rootInodeId)})`;
+
+		// 3. Create default directories under root: /home, /tmp, /bin
+		const homeInodeId = await this.#createDirInode(tx, sandboxId, rootInodeId, "home");
+		await this.#createDirInode(tx, sandboxId, rootInodeId, "tmp");
+		await this.#createDirInode(tx, sandboxId, rootInodeId, "bin");
+
+		// 4. Create /home/user under /home
+		await this.#createDirInode(tx, sandboxId, homeInodeId, "user");
+
+		return { rootInodeId };
 	}
 
-	async deleteSandbox(_tx: PgTx, _sandboxId: string): Promise<void> {
-		throw new Error("not implemented");
+	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<void> {
+		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
+	}
+
+	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */
+	async #createDirInode(tx: PgTx, sandboxId: string, parentInodeId: bigint, name: string): Promise<bigint> {
+		const rows = await tx<{ id: string }[]>`
+			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
+			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
+			RETURNING id
+		`;
+		const row = rows[0];
+		if (!row) throw new Error(`createSandbox: failed to create inode for /${name}`);
+		const inodeId = BigInt(row.id);
+		await tx`
+			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+			VALUES (${String(parentInodeId)}, ${name}, ${String(inodeId)}, ${sandboxId})
+		`;
+		return inodeId;
 	}
 
 	// US-006
