@@ -374,3 +374,14 @@
   - `readFileBuffer` is structurally identical to `readFile` minus the `TextDecoder` step — reuse the same cache-check/miss pattern.
   - The `byteLength > 0` guard before `contentCache.set` prevents the LRUCache "sizeCalculation return invalid" error for empty files. Apply this guard to both `readFile` and `readFileBuffer`.
 ---
+
+## 2026-04-19 - US-029
+- Added `createEinval(path)` to `src/fs/sql-fs/errors.ts` — returns Error with `code: "EINVAL"` and message `"EINVAL: invalid argument, '${path}'"`.
+- Implemented `readlink(path)` in `src/fs/sql-fs/sql-fs.ts`: looks up pathCache, throws ENOENT if missing, throws EINVAL if `kind !== 3`, returns `entry.symlinkTarget`.
+- Created `src/fs/sql-fs/sql-fs.readlink.test.ts` with 3 unit tests: (1) readlink on symlink returns target string; (2) readlink on regular file throws EINVAL; (3) readlink on non-existent path throws ENOENT.
+- Files changed: `src/fs/sql-fs/errors.ts`, `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.readlink.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `createEinval` was missing from `errors.ts` — add it when any story requires EINVAL (e.g., readlink on non-symlink). Pattern is identical to other constructors: `makeFsError("EINVAL", ...)`.
+  - `readlink` is a pure cache lookup — no DB call, no transaction, no `#withTx`. Same pattern as `exists`, `stat`, `readdir`.
+  - `symlinkTarget` is `string | null` in PathCacheEntry; use `entry.symlinkTarget!` (non-null assertion) inside the `kind === 3` guard — TypeScript can't narrow it automatically.
+---
