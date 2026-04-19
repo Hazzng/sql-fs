@@ -7,6 +7,9 @@
 - `sandboxes.root_inode` is nullable BIGINT (no FK to inodes) to break the circular FK with `inodes.sandbox_id → sandboxes`. Set it immediately after inode creation within the same transaction.
 - Integration tests live in `src/fs/sql-fs/integration/` and are excluded from `pnpm test:unit`. Use `describe.skipIf(!process.env.DATABASE_URL)` wrapper.
 - Stub (not-yet-implemented) dialect methods should use `_` prefix on parameters and `throw new Error("not implemented")`. TypeScript infers `never` return which is assignable to any type.
+- `postgres.js` template literals do NOT accept `bigint` parameters — TypeScript will error. Always wrap bigint values with `String(id)` before interpolating into `tx\`...\`` tagged templates.
+- When returning `tx\`...\`` from an `async (tx) => ...` callback, always `await` it (`return await tx\`...\``). Returning a `PendingQuery` directly causes TS1058 because PendingQuery has a `.then` member that confuses the async return type checker.
+- Private class methods with `#` prefix work fine in this TypeScript config (ES2022 target). Use them for dialect-internal helpers to keep the public interface clean.
 
 ---
 
@@ -56,4 +59,17 @@
   - `set_config('app.sandbox_id', $sandboxId, true)` is the parameterized form of `SET LOCAL`; plain `SET LOCAL` with parameterized values isn't supported in Postgres.
   - `process.env.DATABASE_URL` (not bracket notation) is required by Biome's `useLiteralKeys` rule.
   - Biome will flag unused `biome-ignore` suppression comments as warnings — only add suppressions for rules that actually fire.
+---
+
+## 2026-04-19 - US-005
+- Implemented `createSandbox(tx, sandboxId)`: inserts root dir inode (kind=2, mode=0o755), inserts sandboxes row with root_inode, creates /home, /tmp, /bin under root, and /home/user under /home — all via direct SQL in the transaction.
+- Implemented `deleteSandbox(tx, sandboxId)`: single `DELETE FROM sandboxes WHERE id = $1` — CASCADE removes all child inodes and dirents.
+- Added private `#createDirInode(tx, sandboxId, parentInodeId, name)` helper to avoid repetitive inode+dirent insert logic.
+- Added US-005 integration tests in `src/fs/sql-fs/integration/postgres.test.ts`: (1) creates sandbox, verifies 5 inodes + 4 dirents + correct root_inode, (2) creates then deletes sandbox, verifies CASCADE removes all rows.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `postgres.js` template literals reject `bigint` parameters at the TypeScript level — always use `String(id)` when interpolating bigint values into `tx\`...\`` templates.
+  - Returning a `PendingQuery` from an `async` callback (without `await`) causes TS1058 because PendingQuery has a `.then` member. Always `return await tx\`...\`` inside async transaction callbacks.
+  - Since `listDirents` and `getInode` are still stubs at US-005 stage, integration tests for createSandbox must verify via raw SQL rather than dialect methods. This is acceptable for integration tests.
+  - Private `#method()` syntax (ES2022 private fields) works correctly in this codebase — use it for dialect-internal helpers.
 ---
