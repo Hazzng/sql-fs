@@ -183,8 +183,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-008
-	async insertDirent(_tx: PgTx, _parentId: bigint, _name: string, _inodeId: bigint): Promise<void> {
-		throw new Error("not implemented");
+	async insertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<void> {
+		// Derive sandbox_id from the parent inode to avoid needing it as a parameter.
+		await tx`
+			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+			SELECT ${String(parentId)}, ${name}, ${String(inodeId)}, sandbox_id
+			FROM inodes
+			WHERE id = ${String(parentId)}
+		`;
 	}
 
 	// US-009
