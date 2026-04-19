@@ -123,7 +123,7 @@
         "Tests pass"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": "Install zod as dependency."
     },
     {

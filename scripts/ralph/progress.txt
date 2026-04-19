@@ -14,6 +14,8 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - Hono entry-point detection: Use `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` to guard `serve()` call so it only runs when the file is the direct entry point (not in tests).
 - Hono typed middleware: Use `createMiddleware<{ Variables: { key: type } }>` from `hono/factory` — NOT `MiddlewareHandler` without env param, which prevents `c.set()` calls (BlankEnv has no Variables). Export the Variables type for downstream apps to use in `new Hono<{ Variables: T }>()`.
 - `res.json()` returns `unknown` — cast with `as { field: type }` in tests before accessing properties.
+- Generic Hono middleware factories: use `createMiddleware<{ Variables: { key: z.infer<T> } }>` for typed variable injection; test apps need `new Hono<{ Variables: { key: z.infer<typeof schema> } }>()`.
+- Zod for query params: use `z.coerce.number()` since query string values are always strings.
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -75,4 +77,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - For test JWT creation: `new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes)` — `setExpirationTime(unixTimestamp)` accepts number (seconds since epoch) for expired token tests
   - Biome `useTemplate` rule flags `str?.slice(...) + "suffix"` — fix with template literal `` `${str?.slice(...)}suffix` ``
   - `res.json()` returns `unknown` in TypeScript — cast with `as { field: type }` before accessing properties in tests
+---
+
+## 2026-04-19 - US-058
+- Created `src/api/validation.ts`: exports `validateBody(schema)` and `validateQuery(schema)` middleware factories
+- Both use `createMiddleware<{ Variables: { body/query: z.infer<T> } }>` from `hono/factory` for correct typing
+- On validation failure: returns 400 `{ error: "validation_error", code: "INVALID_INPUT", details: string[] }` where details are zod issue messages
+- validateBody also catches malformed JSON (parse errors) and returns 400 INVALID_INPUT
+- Created `src/api/__tests__/validation.test.ts`: 6 unit tests covering valid/invalid body, malformed JSON, valid/invalid query params, optional query params
+- Files changed: `src/api/validation.ts` (new), `src/api/__tests__/validation.test.ts` (new)
+- **Learnings for future iterations:**
+  - For generic Hono middleware factories, use `createMiddleware<{ Variables: { key: z.infer<T> } }>` — this provides full type inference for downstream handlers without using `any`
+  - Biome auto-converts `import { z } from "zod"` to `import type { z } from "zod"` when `z` is only referenced as a type (type parameters) — TypeScript still resolves type-only references correctly
+  - Test apps for typed middleware need matching variable declarations: `new Hono<{ Variables: { body: z.infer<typeof schema> } }>()`
+  - `z.coerce.number()` is useful for query params (all come in as strings) — coerces before validation
 ---
