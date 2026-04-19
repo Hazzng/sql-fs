@@ -133,3 +133,13 @@
   - `old_inode_id` in RETURNING is null when the row did not previously exist (new INSERT path), and contains the prior value when ON CONFLICT DO UPDATE fires.
   - The `sandbox_id` is still derived from the parent inode via the same SELECT subquery pattern as `insertDirent`.
 ---
+
+## 2026-04-19 - US-011
+- Implemented `listDirents(tx, parentId)`: `SELECT d.parent_inode_id, d.name, d.inode_id FROM dirents d JOIN inodes i ON i.id = d.inode_id WHERE d.parent_inode_id = $1 ORDER BY d.name`. Maps rows to `DirentRow[]` using `BigInt()` conversions.
+- Added two integration tests: (1) parent dir with 3 children (file kind=1, dir kind=2, symlink kind=3) — verifies ordering, inodeIds, and kinds via `getInode`; (2) empty dir returns `[]`.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `listDirents` return type is `DirentRow[]` (only parentInodeId, name, inodeId). The JOIN with inodes is done in SQL for correctness/integrity but extra inode columns are not included in the return value.
+  - Verifying "correct kinds" in tests means calling `getInode` separately per returned `inodeId` — `DirentRow` does not carry kind.
+  - To isolate list tests from the sandbox's default root dirents (bin, home, tmp), create a fresh sub-directory as the parent for test children.
+---
