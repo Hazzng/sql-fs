@@ -89,3 +89,13 @@
   - Since `listDirents` and `getInode` are still stubs at US-005 stage, integration tests for createSandbox must verify via raw SQL rather than dialect methods. This is acceptable for integration tests.
   - Private `#method()` syntax (ES2022 private fields) works correctly in this codebase — use it for dialect-internal helpers.
 ---
+
+## 2026-04-19 - US-007
+- Implemented `incrementNlink(tx, inodeId)`: single `UPDATE inodes SET nlink = nlink + 1 WHERE id = $1`.
+- Implemented `decrementNlink(tx, inodeId)`: `UPDATE ... RETURNING nlink`, returns the new value as `number`. Throws if inode not found (rows[0] undefined).
+- Added 3 integration tests in `src/fs/sql-fs/integration/postgres.test.ts`: increment nlink=1→2, decrement 2→1 (returns 1), decrement 1→0 (returns 0).
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `RETURNING nlink` comes back as a plain `number` (not string) from postgres.js — Postgres INTEGER columns are deserialized as JS numbers, unlike BIGINT/BIGSERIAL which come back as strings.
+  - For UPDATE+RETURNING, the standard pattern is `await tx<{ col: T }[]>\`UPDATE ... RETURNING col\`` then check `rows[0]` for undefined to detect missing rows.
+---
