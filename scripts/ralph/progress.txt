@@ -12,6 +12,8 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - Hono status codes: `c.json()` requires `ContentfulStatusCode` not plain `number` or `StatusCode`. Cast via `as ContentfulStatusCode` from `hono/utils/http-status`.
 - Biome `biome-ignore` suppression: Only suppress rules that are actually enabled. Unused suppressions produce warnings. Verify by checking if the rule exists in biome.json before adding.
 - Hono entry-point detection: Use `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` to guard `serve()` call so it only runs when the file is the direct entry point (not in tests).
+- Hono typed middleware: Use `createMiddleware<{ Variables: { key: type } }>` from `hono/factory` — NOT `MiddlewareHandler` without env param, which prevents `c.set()` calls (BlankEnv has no Variables). Export the Variables type for downstream apps to use in `new Hono<{ Variables: T }>()`.
+- `res.json()` returns `unknown` — cast with `as { field: type }` in tests before accessing properties.
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -58,4 +60,19 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `app.request('/path')` works without a real server — ideal for unit testing Hono routes
   - `biome-ignore` only suppresses active rules; unused suppressions cause lint warnings — verify rule exists before adding
   - Server bootstrap guard: `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` prevents `serve()` from binding during tests
+---
+
+## 2026-04-19 - US-057
+- Created `src/api/auth.ts`: Hono auth middleware using `createMiddleware<{ Variables: AuthVariables }>` from `hono/factory`; verifies HS256 JWT via `jose`'s `jwtVerify`, extracts `sub` claim, sets `c.set("owner", sub)`
+- Returns 401 `{ error: "unauthorized", code: "AUTH_REQUIRED" }` if no Bearer token; 401 `{ error: "invalid_token", code: "AUTH_INVALID" }` if signature invalid, expired, or missing `sub`
+- Updated `src/api/server.ts` to register `authMiddleware` on `/v1/*` before logging middleware
+- Created `src/api/__tests__/auth.test.ts`: 4 unit tests (valid token, expired token, tampered token, missing header)
+- Files changed: `src/api/auth.ts` (new), `src/api/__tests__/auth.test.ts` (new), `src/api/server.ts` (modified)
+- **Learnings for future iterations:**
+  - Use `createMiddleware<{ Variables: { owner: string } }>` from `hono/factory` to type the middleware variables — plain `MiddlewareHandler` without env param causes TypeScript errors when calling `c.set()` because `BlankEnv` has no `Variables`
+  - Export `AuthVariables` type from `auth.ts` so downstream apps can do `new Hono<{ Variables: AuthVariables }>()` for proper `c.get("owner")` typing in route handlers
+  - `jose` v6 `jwtVerify` accepts `{ algorithms: ["HS256"] }` option and throws on expired/invalid tokens — catch all errors and return AUTH_INVALID
+  - For test JWT creation: `new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes)` — `setExpirationTime(unixTimestamp)` accepts number (seconds since epoch) for expired token tests
+  - Biome `useTemplate` rule flags `str?.slice(...) + "suffix"` — fix with template literal `` `${str?.slice(...)}suffix` ``
+  - `res.json()` returns `unknown` in TypeScript — cast with `as { field: type }` before accessing properties in tests
 ---
