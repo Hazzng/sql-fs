@@ -328,3 +328,14 @@
   - `LRUCache.set` with `sizeCalculation` requires `byteLength > 0` — never store `new Uint8Array(0)` in contentCache (it throws "sizeCalculation return invalid (expect positive integer)"). Guard against zero-length writes if needed.
   - contentCache is keyed by inodeId (bigint). On file overwrite, the old inodeId's entry is orphaned (not explicitly deleted) since the path now points to a new inodeId. It will be evicted by LRU naturally. Only `rm` and `appendFile` need explicit deletion of old inodeIds.
 ---
+
+## 2026-04-19 - US-025
+- Implemented `stat(path)` in `src/fs/sql-fs/sql-fs.ts`: looks up pathCache, follows symlinks at final component (looks up `symlinkTarget` in cache), returns FsStat with `isSymbolicLink: false` always. Throws ENOENT if path or symlink target not in cache.
+- Implemented `lstat(path)`: looks up pathCache directly without following symlinks, returns FsStat with `isSymbolicLink: entry.kind === 3`. Throws ENOENT if path not in cache.
+- Created `src/fs/sql-fs/sql-fs.stat.test.ts` with 8 unit tests: stat on file, dir, symlink (follows link), stat ENOENT; lstat on file, dir, symlink (returns isSymbolicLink=true), lstat ENOENT.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.stat.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `stat` symlink-follow: after resolving the initial pathCache entry, check if `kind === 3` and re-lookup `entry.symlinkTarget` in pathCache. The PRD says "stat always follows symlinks (at the final component)" — this one-level follow is sufficient since well-formed symlinks in pathCache point to absolute paths.
+  - `FsStat` has exactly 6 fields: `isFile`, `isDirectory`, `isSymbolicLink`, `mode`, `size`, `mtime`. No `ino`, no `nlink`. Import from `just-bash` main entry point.
+  - Test pattern for stat/lstat: build a fresh SqlFs via `await fs.ready()` with a mocked dialect returning test entries from `loadAllPaths`. No need to call `writeFile` or other write methods.
+---
