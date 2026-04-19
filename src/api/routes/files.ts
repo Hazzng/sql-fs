@@ -1,6 +1,7 @@
 /**
  * File operation routes.
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
+ * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  */
 
 import { Hono } from "hono";
@@ -65,6 +66,11 @@ function extractErrCode(e: unknown): string | undefined {
 	return match?.[1];
 }
 
+function parentDir(filePath: string): string {
+	const lastSlash = filePath.lastIndexOf("/");
+	return lastSlash <= 0 ? "/" : filePath.slice(0, lastSlash);
+}
+
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
@@ -120,6 +126,31 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				"X-FS-Stat": JSON.stringify(result.statHeader),
 			},
 		});
+	});
+
+	// PUT /v1/sandboxes/:id/files/* — write raw file content
+	router.put("/:id/files/:path{.*}", async (c) => {
+		const sandboxId = c.req.param("id");
+		const wildcard = c.req.param("path");
+		const filePath = `/${wildcard}`;
+
+		const buffer = await c.req.raw.arrayBuffer();
+		const content = new Uint8Array(buffer);
+
+		await sessionManager.withSession(sandboxId, async (session) => {
+			const parent = parentDir(filePath);
+			if (parent !== "/") {
+				try {
+					await session.fs.mkdir(parent, { recursive: true });
+				} catch (e) {
+					const code = extractErrCode(e);
+					if (code !== "EEXIST") throw e;
+				}
+			}
+			await session.fs.writeFile(filePath, content);
+		});
+
+		return c.body(null, 204);
 	});
 
 	return router;
