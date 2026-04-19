@@ -419,3 +419,13 @@
   - US-032 is another no-op story — implementation and tests were front-loaded in US-020 and US-024 respectively. Check existing code before writing.
   - The appendFile cache-invalidation test verifies "content is original + appended" by checking `new TextDecoder().decode(cached) === "hello world"` — this satisfies the "verify content is original + appended" acceptance criterion.
 ---
+
+## 2026-04-19 - US-033
+- No new code written — all acceptance criteria for SqlFs.mkdir were already satisfied by prior stories.
+- Implementation in `src/fs/sql-fs/sql-fs.ts` (mkdir method) was done as part of US-020.
+- Tests covering "mkdir single level, mkdir -p nested, mkdir existing (EEXIST), mkdir -p existing (no error)" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020, lines 227-273).
+- Verified: `pnpm typecheck` passes, all 107 unit tests pass, `pnpm lint:fix` reports no fixes.
+- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - US-033 is another no-op story — implementation and tests were front-loaded in US-020. The pattern continues: US-034 through US-042 may also be satisfied already. Check existing code before writing.
+---
