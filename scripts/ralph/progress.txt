@@ -112,6 +112,17 @@
   - PK violations from `insertDirent` will have `code: '23505'` (Postgres SQLSTATE), which `translateSqlError` in `errors.ts` already maps to EEXIST.
 ---
 
+## 2026-04-19 - US-010
+- Implemented `deleteDirent(tx, parentId, name)`: `DELETE FROM dirents WHERE parent_inode_id = $1 AND name = $2 RETURNING inode_id`. If no rows returned, throws `createEnoent(name)`. Returns removed `inode_id` as bigint.
+- Added `createEnoent` import from `errors.ts` to `postgres.ts`.
+- Added two integration tests in `postgres.test.ts`: (1) insert then delete dirent, verify inode_id returned and row gone; (2) delete non-existent dirent, verify error has `code: "ENOENT"`.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - For delete-then-check operations, `DELETE ... RETURNING inode_id` is the cleanest pattern — a missing row returns an empty array, no separate SELECT needed.
+  - Throwing `createEnoent(name)` directly (rather than a raw SQL SQLSTATE) is correct when the absence is detected in application code rather than a SQL constraint.
+  - Integration test assertion for ENOENT: use `rejects.toMatchObject({ code: "ENOENT" })` rather than `rejects.toThrow()` to verify the error code specifically.
+---
+
 ## 2026-04-19 - US-009
 - Implemented `upsertDirent(tx, parentId, name, inodeId)`: uses a CTE to capture the pre-existing `inode_id` before the upsert, then performs `INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id`, returning the old inode_id (or null for new inserts).
 - SQL pattern: `WITH existing AS (SELECT inode_id FROM dirents WHERE parent_inode_id = $1 AND name = $2) INSERT INTO dirents ... ON CONFLICT ... DO UPDATE ... RETURNING (SELECT inode_id FROM existing) AS old_inode_id`
