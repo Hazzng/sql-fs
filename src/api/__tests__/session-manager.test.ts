@@ -112,6 +112,56 @@ describe("SessionManager.withSession", () => {
 	});
 });
 
+describe("SessionManager pathCache memory budget (US-075a)", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("under-budget session stays resident after operations", async () => {
+		vi.useFakeTimers();
+		// Very large budget and very long idle — session should not be evicted
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeCreateFs(),
+			idleMs: 1_000_000,
+			pathCacheMaxBytes: 100 * 1024 * 1024,
+		});
+		sm.startReaper(2000);
+
+		await sm.getOrCreate("sandbox-underbudget");
+		expect(sm.getSession("sandbox-underbudget")).toBeDefined();
+
+		// Reaper fires multiple times — session is under-budget and not idle
+		vi.advanceTimersByTime(10_000);
+
+		expect(sm.getSession("sandbox-underbudget")).toBeDefined();
+
+		sm.stopReaper();
+	});
+
+	it("over-budget session is evicted when idle (inFlight=0) regardless of idleMs", async () => {
+		vi.useFakeTimers();
+		// pathCacheMaxBytes=1 means any non-empty pathCache is immediately over-budget
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeCreateFs(),
+			idleMs: 1_000_000,
+			pathCacheMaxBytes: 1,
+		});
+		sm.startReaper(2000);
+
+		await sm.getOrCreate("sandbox-overbudget");
+		expect(sm.getSession("sandbox-overbudget")).toBeDefined();
+
+		// Reaper fires at 2000ms — session is over-budget and inFlight=0, evict regardless of idle timeout
+		vi.advanceTimersByTime(3000);
+
+		expect(sm.getSession("sandbox-overbudget")).toBeUndefined();
+
+		sm.stopReaper();
+	});
+});
+
 describe("SessionManager idle eviction (US-075)", () => {
 	afterEach(() => {
 		vi.useRealTimers();

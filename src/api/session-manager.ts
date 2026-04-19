@@ -18,6 +18,10 @@ export interface Session {
 	state: "active" | "closing";
 	owner: string;
 	createdAt: string;
+	/** Estimated bytes consumed by pathCache: sum of (path.length + 100) per entry */
+	pathCacheBytes: number;
+	/** True when pathCacheBytes exceeds the configured budget — triggers eager eviction */
+	overBudget: boolean;
 }
 
 export interface SessionManagerOptions {
@@ -26,6 +30,8 @@ export interface SessionManagerOptions {
 	readonly createFs?: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
 	/** Idle timeout in ms before a session is eligible for eviction (default: SESSION_IDLE_MS env var or 600000) */
 	readonly idleMs?: number;
+	/** Max pathCache bytes per session before it is marked over-budget (default: 50MB) */
+	readonly pathCacheMaxBytes?: number;
 }
 
 export class SessionManager {
@@ -35,12 +41,24 @@ export class SessionManager {
 	private readonly backend: StorageBackend;
 	private readonly createFs: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
 	private readonly idleMs: number;
+	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-	constructor({ backend, createFs, idleMs }: SessionManagerOptions) {
+	constructor({ backend, createFs, idleMs, pathCacheMaxBytes }: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
+		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
+	}
+
+	/** Estimate bytes used by the pathCache: path.length + 100 overhead per entry */
+	private estimatePathCacheBytes(fs: IFileSystem): number {
+		const paths = fs.getAllPaths();
+		let total = 0;
+		for (const p of paths) {
+			total += p.length + 100;
+		}
+		return total;
 	}
 
 	/**
@@ -64,6 +82,7 @@ export class SessionManager {
 			try {
 				const fs = await this.createFs(this.backend, sandboxId);
 				const bash = new Bash({ fs });
+				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const session: Session = {
 					fs,
 					bash,
@@ -73,6 +92,8 @@ export class SessionManager {
 					state: "active",
 					owner: "",
 					createdAt: new Date().toISOString(),
+					pathCacheBytes,
+					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 				};
 				this.sessions.set(sandboxId, session);
 				return session;
@@ -105,6 +126,8 @@ export class SessionManager {
 				return await fn(session);
 			} finally {
 				session.inFlight--;
+				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
 			}
 		});
 	}
@@ -147,7 +170,10 @@ export class SessionManager {
 	private runReaper(): void {
 		const now = Date.now();
 		for (const [sandboxId, session] of this.sessions) {
-			if (now - session.lastUsed > this.idleMs && session.inFlight === 0 && session.state !== "closing") {
+			if (session.state === "closing") continue;
+			if (session.inFlight !== 0) continue;
+			// Over-budget sessions are evicted immediately when idle (no idle timeout)
+			if (session.overBudget || now - session.lastUsed > this.idleMs) {
 				this.sessions.delete(sandboxId);
 			}
 		}
