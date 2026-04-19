@@ -19,6 +19,8 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - `async-mutex` `Mutex.runExclusive(async () => { ... })` is the idiomatic pattern for serialized async critical sections in this project.
 - Single-flight pattern: store `Promise<T>` (not `T`) in a pending `Map`; remove in `finally` so the slot is freed on completion or error.
 - `SessionManager` in `src/api/session-manager.ts` is the canonical way to get a warm `Bash + IFileSystem` session per sandbox — route handlers use `withSession` not `getOrCreate` directly.
+- Hono wildcard with slashes: use `/:param{.*}` (regex syntax) instead of `/*` — `c.req.param("*")` always returns `undefined` in sub-routers; use `c.req.param("param")` to get the full path including slashes.
+- InMemoryFs error format: `stat()` throws with `code: undefined` but message starts with the POSIX code (e.g., "ENOENT: no such file..."). Use `err.message.match(/^([A-Z]+):/)` as fallback when `.code` is absent to extract error codes for HTTP mapping.
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -168,4 +170,20 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `c.body(null, 204)` is the correct Hono pattern for 204 No Content responses — don't use `c.json()` for bodyless responses
   - `destroy` on `SessionManager` returns boolean (found/not-found) rather than throwing — route handler converts false → 404 response explicitly
   - `destroySandbox` for memory backend is a no-op, so unit tests with InMemoryFs don't need any DB mocking for the DELETE path
+---
+
+## 2026-04-19 - US-062
+- Created `src/api/routes/files.ts`: exports `fileRoutes(sessionManager)` factory with `GET /:id/files/:path{.*}` route
+- Route calls `session.fs.stat(filePath)` inside `withSession`; returns 404 for ENOENT, 400 for EISDIR, 200 with raw bytes + Content-Type + X-FS-Stat header on success
+- Content-Type inferred from file extension via a hardcoded null-prototype MIME map; defaults to `application/octet-stream`
+- X-FS-Stat header: `JSON.stringify({ kind, mode, size, mtime })` where kind is 'file', 'dir', or 'symlink'
+- `extractErrCode(e)` helper checks `.code` first, then falls back to parsing the POSIX prefix from `err.message` (needed for InMemoryFs which doesn't set `.code`)
+- Updated `src/api/server.ts`: added `app.route("/v1/sandboxes", fileRoutes(sessionManager))`
+- Created `src/api/__tests__/files.test.ts`: 3 unit tests (happy path with Content-Type + stat header, ENOENT → 404, EISDIR → 400)
+- Files changed: `src/api/routes/files.ts` (new), `src/api/__tests__/files.test.ts` (new), `src/api/server.ts` (modified)
+- **Learnings for future iterations:**
+  - Hono wildcard route that spans path segments must use `/:param{.*}` (not `/*`); `c.req.param("*")` is always `undefined` in sub-routers — use named param with `c.req.param("param")`
+  - InMemoryFs throws errors with `code: undefined` but message prefix is the POSIX code (e.g., "ENOENT: ...") — the global error handler won't map these correctly without the fallback message-parsing strategy
+  - `fileRoutes(sessionManager)` should be mounted separately from `sandboxRoutes(sessionManager)` — both use the same mount point `/v1/sandboxes` and Hono merges them correctly
+  - File route handlers should handle ENOENT/EISDIR explicitly (not rely on global handler) when using InMemoryFs in tests, because InMemoryFs doesn't set `.code`
 ---

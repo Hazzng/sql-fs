@@ -264,7 +264,7 @@
         "Tests pass"
       ],
       "priority": 13,
-      "passes": false,
+      "passes": true,
       "notes": "Use mime-types package or a simple extension→Content-Type map."
     },
     {
