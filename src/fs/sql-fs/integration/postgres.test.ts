@@ -12,6 +12,7 @@
  * US-012: moveDirent.
  * US-013: upsertBlob, getBlob.
  * US-014: gcOrphanBlobs.
+ * US-015: loadAllPaths.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -930,5 +931,95 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 		await dialect.transaction(async (tx) => {
 			await dialect.deleteInode(tx, inodeId2);
 		});
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadAllPaths", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-load-all-paths-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("loads all paths including root and nested files/dirs with correct metadata", async () => {
+		// Add a nested structure: /home/user/file.txt and /tmp/dir/sub.txt
+		const fileData = new TextEncoder().encode("hello");
+		const sha256 = new Uint8Array(32).fill(0xde);
+
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, fileData);
+		});
+
+		// Get /home/user inode id by listing dirents under /home then /home/user
+		const rootDirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, rootInodeId);
+		});
+		const homeEntry = rootDirents.find((d) => d.name === "home");
+		if (!homeEntry) throw new Error("expected /home in sandbox root");
+
+		const homeDirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, homeEntry.inodeId);
+		});
+		const userEntry = homeDirents.find((d) => d.name === "user");
+		if (!userEntry) throw new Error("expected /home/user in sandbox");
+
+		// Create /home/user/file.txt
+		const fileInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: fileData.length,
+				contentSha256: sha256,
+			});
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, userEntry.inodeId, "file.txt", fileInodeId);
+		});
+
+		// Call loadAllPaths — must setSandboxContext first
+		const entries = await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			return await dialect.loadAllPaths(tx);
+		});
+
+		const paths = entries.map((e) => e.path).sort();
+
+		// Default sandbox creates: /, /bin, /home, /home/user, /tmp — plus our /home/user/file.txt
+		expect(paths).toContain("/");
+		expect(paths).toContain("/bin");
+		expect(paths).toContain("/home");
+		expect(paths).toContain("/home/user");
+		expect(paths).toContain("/tmp");
+		expect(paths).toContain("/home/user/file.txt");
+
+		// Verify root entry metadata
+		const rootEntry = entries.find((e) => e.path === "/");
+		expect(rootEntry).toBeDefined();
+		expect(rootEntry!.inodeId).toBe(rootInodeId);
+		expect(rootEntry!.kind).toBe(2);
+
+		// Verify file entry metadata
+		const fileEntry = entries.find((e) => e.path === "/home/user/file.txt");
+		expect(fileEntry).toBeDefined();
+		expect(fileEntry!.inodeId).toBe(fileInodeId);
+		expect(fileEntry!.kind).toBe(1);
+		expect(fileEntry!.mode).toBe(0o644);
+		expect(fileEntry!.size).toBe(fileData.length);
+		expect(fileEntry!.contentSha256).toEqual(sha256);
 	});
 });

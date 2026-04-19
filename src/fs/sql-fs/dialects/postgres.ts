@@ -293,8 +293,61 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-015
-	async loadAllPaths(_tx: PgTx): Promise<Array<{ path: string } & PathCacheEntry>> {
-		throw new Error("not implemented");
+	async loadAllPaths(tx: PgTx): Promise<Array<{ path: string } & PathCacheEntry>> {
+		const rows = await tx<
+			{
+				inode_id: string;
+				kind: number;
+				mode: number;
+				size: string;
+				mtime: Date;
+				content_sha256: Buffer | null;
+				symlink_target: string | null;
+				path: string;
+			}[]
+		>`
+			WITH RECURSIVE tree AS (
+				SELECT
+					i.id AS inode_id,
+					i.kind,
+					i.mode,
+					i.size,
+					i.mtime,
+					i.content_sha256,
+					i.symlink_target,
+					'/'::text AS path
+				FROM sandboxes s
+				JOIN inodes i ON i.id = s.root_inode
+				WHERE s.id = current_setting('app.sandbox_id')
+
+				UNION ALL
+
+				SELECT
+					i.id AS inode_id,
+					i.kind,
+					i.mode,
+					i.size,
+					i.mtime,
+					i.content_sha256,
+					i.symlink_target,
+					CASE WHEN t.path = '/' THEN '/' || d.name ELSE t.path || '/' || d.name END AS path
+				FROM tree t
+				JOIN dirents d ON d.parent_inode_id = t.inode_id
+				JOIN inodes i ON i.id = d.inode_id
+			)
+			SELECT inode_id, kind, mode, size, mtime, content_sha256, symlink_target, path
+			FROM tree
+		`;
+		return rows.map((r) => ({
+			path: r.path,
+			inodeId: BigInt(r.inode_id),
+			kind: r.kind as InodeKind,
+			mode: r.mode,
+			size: Number(r.size),
+			mtime: r.mtime,
+			contentSha256: r.content_sha256,
+			symlinkTarget: r.symlink_target,
+		}));
 	}
 
 	// US-016
