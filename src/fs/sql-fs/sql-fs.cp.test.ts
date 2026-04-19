@@ -1,6 +1,7 @@
 /**
- * Unit tests for SqlFs.cp (single file).
+ * Unit tests for SqlFs.cp (single file and recursive directory).
  * US-037: SqlFs.cp (single file)
+ * US-038: SqlFs.cp (recursive directory)
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -142,5 +143,151 @@ describe("SqlFs.cp() — single file", () => {
 
 		expect(decrementNlinkMock).toHaveBeenCalledWith(expect.anything(), 99n);
 		expect(deleteInodeMock).toHaveBeenCalledWith(expect.anything(), 99n);
+	});
+});
+
+// ── Recursive directory copy ───────────────────────────────────────────────────
+
+describe("SqlFs.cp() — recursive directory", () => {
+	const sandboxId = "test-sandbox";
+	const sha256a = new Uint8Array(32).fill(0xaa);
+	const sha256b = new Uint8Array(32).fill(0xbb);
+
+	let createInodeMock: ReturnType<typeof vi.fn>;
+	let insertDirentMock: ReturnType<typeof vi.fn>;
+	let upsertBlobMock: ReturnType<typeof vi.fn>;
+	let dialect: SqlDialect<unknown>;
+	let fs: SqlFs;
+
+	// Inode IDs used in the initial tree
+	// 1n=root, 2n=/destParent, 3n=/srcDir, 4n=/srcDir/file.txt, 5n=/srcDir/subdir, 6n=/srcDir/subdir/deep.txt
+	// New copies: 10n, 11n, 12n, 13n (returned in order by createInodeMock)
+
+	beforeEach(async () => {
+		let nextId = 10n;
+		createInodeMock = vi.fn(async () => nextId++);
+		insertDirentMock = vi.fn(async () => undefined);
+		upsertBlobMock = vi.fn(async () => undefined);
+
+		function makeEntry(
+			path: string,
+			inodeId: bigint,
+			kind: 1 | 2 | 3,
+			contentSha256: Uint8Array | null = null,
+		): { path: string } & PathCacheEntry {
+			return {
+				path,
+				inodeId,
+				kind,
+				mode: kind === 2 ? 0o755 : 0o644,
+				size: kind === 1 ? 20 : 0,
+				mtime: now,
+				contentSha256,
+				symlinkTarget: null,
+			};
+		}
+
+		dialect = {
+			connect: vi.fn(),
+			disconnect: vi.fn(),
+			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+			setSandboxContext: vi.fn(),
+			loadAllPaths: vi.fn(async () => [
+				makeEntry("/", 1n, 2),
+				makeEntry("/destParent", 2n, 2),
+				makeEntry("/srcDir", 3n, 2),
+				makeEntry("/srcDir/file.txt", 4n, 1, sha256a),
+				makeEntry("/srcDir/subdir", 5n, 2),
+				makeEntry("/srcDir/subdir/deep.txt", 6n, 1, sha256b),
+			]),
+			createSandbox: vi.fn(),
+			deleteSandbox: vi.fn(),
+			createInode: createInodeMock,
+			getInode: vi.fn(),
+			updateInode: vi.fn(),
+			deleteInode: vi.fn(),
+			incrementNlink: vi.fn(),
+			decrementNlink: vi.fn(),
+			insertDirent: insertDirentMock,
+			upsertDirent: vi.fn(),
+			deleteDirent: vi.fn(),
+			listDirents: vi.fn(),
+			moveDirent: vi.fn(),
+			upsertBlob: upsertBlobMock,
+			getBlob: vi.fn(),
+			gcOrphanBlobs: vi.fn(),
+			loadSubtreeInodes: vi.fn(),
+			bulkIngest: vi.fn(),
+			resolvePath: vi.fn(),
+		} as unknown as SqlDialect<unknown>;
+
+		fs = new SqlFs({ dialect, sandboxId });
+		await fs.ready();
+	});
+
+	it("cp -r adds all dest paths to pathCache", async () => {
+		await fs.cp("/srcDir", "/destParent/copy", { recursive: true });
+
+		const paths = fs.getAllPaths();
+		expect(paths).toContain("/destParent/copy");
+		expect(paths).toContain("/destParent/copy/file.txt");
+		expect(paths).toContain("/destParent/copy/subdir");
+		expect(paths).toContain("/destParent/copy/subdir/deep.txt");
+	});
+
+	it("cp -r leaves src paths intact in pathCache", async () => {
+		await fs.cp("/srcDir", "/destParent/copy", { recursive: true });
+
+		const paths = fs.getAllPaths();
+		expect(paths).toContain("/srcDir");
+		expect(paths).toContain("/srcDir/file.txt");
+		expect(paths).toContain("/srcDir/subdir");
+		expect(paths).toContain("/srcDir/subdir/deep.txt");
+	});
+
+	it("cp -r dest file entries share contentSha256 with src (blobs not duplicated)", async () => {
+		await fs.cp("/srcDir", "/destParent/copy", { recursive: true });
+
+		// Verify upsertBlob was never called (no blob re-upload)
+		expect(upsertBlobMock).not.toHaveBeenCalled();
+
+		// Verify createInode for the files was called with the correct sha256
+		expect(createInodeMock).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ kind: 1, contentSha256: sha256a }),
+		);
+		expect(createInodeMock).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ kind: 1, contentSha256: sha256b }),
+		);
+	});
+
+	it("cp -r creates an inode for every entry in the subtree (dir + all children)", async () => {
+		await fs.cp("/srcDir", "/destParent/copy", { recursive: true });
+
+		// 4 entries: /srcDir itself + file.txt + subdir + subdir/deep.txt
+		expect(createInodeMock).toHaveBeenCalledTimes(4);
+	});
+
+	it("cp -r inserts dirents with correct parent inodeIds (depth ordering)", async () => {
+		await fs.cp("/srcDir", "/destParent/copy", { recursive: true });
+
+		// insertDirent called once per entry
+		expect(insertDirentMock).toHaveBeenCalledTimes(4);
+
+		// Root of copy (/destParent/copy) must be inserted under destParent's inodeId (2n)
+		expect(insertDirentMock).toHaveBeenCalledWith(expect.anything(), 2n, "copy", 10n);
+	});
+
+	it("cp -r without recursive option throws EISDIR", async () => {
+		await expect(fs.cp("/srcDir", "/destParent/copy")).rejects.toMatchObject({ code: "EISDIR" });
+		expect(createInodeMock).not.toHaveBeenCalled();
+	});
+
+	it("cp -r non-existent src throws ENOENT", async () => {
+		await expect(fs.cp("/nonexistent", "/destParent/copy", { recursive: true })).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		expect(createInodeMock).not.toHaveBeenCalled();
 	});
 });

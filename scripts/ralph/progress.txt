@@ -480,3 +480,15 @@
   - Pattern for displaced dest cleanup (when `upsertDirent` returns a non-null old inodeId): call `decrementNlink` → if result=0, call `deleteInode`. Identical to the pattern in `writeFile` and `appendFile`.
   - US-038 (recursive directory cp) will need to walk the src subtree from pathCache and call the single-file cp logic per file entry. The `options?.recursive` guard already branches correctly.
 ---
+
+## 2026-04-19 - US-038
+- Implemented recursive directory copy in `cp(src, dest, options?)` in `src/fs/sql-fs/sql-fs.ts`, replacing the `throw new Error("not implemented: recursive cp")` stub.
+- Recursive cp flow: collect all paths under `src` via `#allPathsUnder`, sort by depth (fewer "/" first) so parents are always created before children, then in a single `#withTx` transaction: for each srcPath, compute destPath, resolve parent inodeId from `newInodeIds` map (newly-created) or fallback to existing pathCache entry, call `createInode` (sharing `contentSha256` and `symlinkTarget`), call `insertDirent`. After the transaction, update pathCache for all new entries.
+- Added 7 unit tests to `src/fs/sql-fs/sql-fs.cp.test.ts` in a new `describe("SqlFs.cp() — recursive directory")` block: all dest paths added to pathCache, src paths remain intact, blobs shared (upsertBlob not called, createInode called with correct sha256), createInode called 4 times (one per subtree node), insertDirent called 4 times with correct parent ids, EISDIR thrown without recursive option, ENOENT thrown for missing src.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cp.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `#allPathsUnder(dirPath)` returns the root + all descendants. Sort by `a.split("/").length - b.split("/").length` to process parents before children — this is the key invariant for the parent-lookup map to work correctly.
+  - Track newly-created inodeIds in a `Map<string, bigint>` (destPath → inodeId). Child entries look up their parent via `newInodeIds.get(destParent) ?? this.#pathCache.get(destParent)?.inodeId`. The fallback handles the copy root's parent (which already exists in pathCache).
+  - Recursive cp uses `insertDirent` (not `upsertDirent`) since dest paths are freshly computed — no conflict expected. `createInode` always produces new inodeIds even though `contentSha256` is shared.
+  - `dest + srcPath.slice(src.length)` maps any srcPath to its destPath. For the root (srcPath === src), slice gives "" so result is just dest. For children, it appends the relative suffix. Identical to the pattern used in `mv`.
+---
