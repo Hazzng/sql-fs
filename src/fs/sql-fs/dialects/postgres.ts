@@ -169,12 +169,17 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-007
-	async incrementNlink(_tx: PgTx, _inodeId: bigint): Promise<void> {
-		throw new Error("not implemented");
+	async incrementNlink(tx: PgTx, inodeId: bigint): Promise<void> {
+		await tx`UPDATE inodes SET nlink = nlink + 1 WHERE id = ${String(inodeId)}`;
 	}
 
-	async decrementNlink(_tx: PgTx, _inodeId: bigint): Promise<number> {
-		throw new Error("not implemented");
+	async decrementNlink(tx: PgTx, inodeId: bigint): Promise<number> {
+		const rows = await tx<{ nlink: number }[]>`
+			UPDATE inodes SET nlink = nlink - 1 WHERE id = ${String(inodeId)} RETURNING nlink
+		`;
+		const row = rows[0];
+		if (!row) throw new Error(`decrementNlink: inode ${inodeId} not found`);
+		return row.nlink;
 	}
 
 	// US-008
