@@ -274,3 +274,16 @@
   - `appendFile` on a file with no existing `contentSha256` (e.g., kind≠1 or new file) falls back to just the appended bytes. Always guard: `existing && existing.kind === 1 && existing.contentSha256 !== null`.
   - The `#withTx` helper pattern (transaction + setSandboxContext inside) is reusable across all write operations — avoids repeating the boilerplate in every method.
 ---
+
+## 2026-04-19 - US-021
+- Implemented `mv(src, dest)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
+- After `dialect.moveDirent`: snapshots the src subtree from pathCache, deletes src paths, clears any existing dest paths, then re-inserts all snapshot entries with the src prefix replaced by dest (e.g. `/a/b/c` → `/x/b/c`).
+- Handles both file moves (single entry) and directory moves (all descendants remapped).
+- Created `src/fs/sql-fs/sql-fs.mv.test.ts` with 5 unit tests: move file, move dir with descendants, metadata preserved, ENOENT for missing src, moveDirent called with correct args.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.mv.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `#allPathsUnder(dirPath)` always includes `dirPath` as the first element — safe since src is verified to be in cache before calling it.
+  - Snapshot the subtree entries into a `Map<string, PathCacheEntry>` before deleting from cache; deleting then re-inserting in two separate passes avoids iterator invalidation.
+  - `dest + oldPath.slice(src.length)` correctly remaps all paths: when `oldPath === src`, slice gives `""` so result is just `dest`; for children it appends the suffix.
+  - Clear existing dest subtree paths before re-inserting to handle "mv over existing dir" correctly: iterate `[...this.#pathCache.keys()]` (snapshot) to avoid mutation-during-iteration issues.
+---
