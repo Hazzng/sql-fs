@@ -142,7 +142,7 @@
         "Typecheck passes"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": "The shared jwt.ts helper avoids duplicating signing logic across CLI, auth middleware, and admin endpoint."
     },
     {
