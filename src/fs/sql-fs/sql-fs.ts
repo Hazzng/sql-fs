@@ -170,6 +170,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: sha256,
 			symlinkTarget: null,
 		});
+		this.#contentCache.set(inodeId, bytes);
 	}
 
 	async appendFile(path: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
@@ -198,6 +199,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		if (!parentEntry) throw createEnoent(parentPath);
 		if (parentEntry.kind !== 2) throw createEnotdir(parentPath);
 
+		let replacedInodeId: bigint | null = null;
 		const inodeId = await this.#withTx(async (tx) => {
 			await this.#dialect.upsertBlob(tx, sha256, fullBytes);
 			const id = await this.#dialect.createInode(tx, {
@@ -209,12 +211,15 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			});
 			const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
 			if (oldInodeId !== null) {
+				replacedInodeId = oldInodeId;
 				const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
 				if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
 			}
 			return id;
 		});
 
+		if (replacedInodeId !== null) this.#contentCache.delete(replacedInodeId);
+		this.#contentCache.set(inodeId, fullBytes);
 		this.#pathCache.set(path, {
 			inodeId,
 			kind: 1,
@@ -307,8 +312,10 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const parentEntry = this.#pathCache.get(parentPath);
 
 		if (options?.recursive && entry.kind === 2) {
-			// Remove all descendants and self from pathCache
+			// Remove all descendants and self from pathCache + contentCache
 			for (const p of this.#allPathsUnder(path)) {
+				const e = this.#pathCache.get(p);
+				if (e) this.#contentCache.delete(e.inodeId);
 				this.#pathCache.delete(p);
 			}
 			if (parentEntry) {
@@ -330,6 +337,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
 		});
 
+		this.#contentCache.delete(entry.inodeId);
 		this.#pathCache.delete(path);
 	}
 
