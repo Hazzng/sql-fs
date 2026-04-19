@@ -479,8 +479,52 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		if (srcEntry.kind === 2) {
 			if (!options?.recursive) throw createEisdir(src);
-			// Recursive directory copy is handled in US-038
-			throw new Error("not implemented: recursive cp");
+
+			// Recursive directory copy: walk source subtree, create new inodes sharing same blobs
+			const srcPaths = this.#allPathsUnder(src);
+			// Sort by depth so parents are always created before their children
+			srcPaths.sort((a, b) => a.split("/").length - b.split("/").length);
+
+			const destParentPath = this.#parentOf(dest);
+			const destParentEntry = this.#pathCache.get(destParentPath);
+			if (!destParentEntry) throw createEnoent(destParentPath);
+			if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+
+			const mtime = new Date();
+			// Maps destPath → new inodeId so children can look up their parent's new id
+			const newInodeIds = new Map<string, bigint>();
+
+			await this.#withTx(async (tx) => {
+				for (const srcPath of srcPaths) {
+					const entry = this.#pathCache.get(srcPath)!;
+					const destPath = dest + srcPath.slice(src.length);
+					const entryName = this.#nameOf(destPath);
+					const entryParent = this.#parentOf(destPath);
+
+					// Parent is either a newly-created dir (newInodeIds) or an existing pathCache entry
+					const parentInodeId = newInodeIds.get(entryParent) ?? this.#pathCache.get(entryParent)?.inodeId;
+					if (parentInodeId === undefined) throw createEnoent(entryParent);
+
+					const newId = await this.#dialect.createInode(tx, {
+						sandboxId: this.#sandboxId,
+						kind: entry.kind,
+						mode: entry.mode,
+						size: entry.size,
+						contentSha256: entry.contentSha256,
+						symlinkTarget: entry.symlinkTarget,
+					});
+					await this.#dialect.insertDirent(tx, parentInodeId, entryName, newId);
+					newInodeIds.set(destPath, newId);
+				}
+			});
+
+			// Update pathCache with all newly-created entries
+			for (const [destPath, inodeId] of newInodeIds) {
+				const srcPath = src + destPath.slice(dest.length);
+				const srcE = this.#pathCache.get(srcPath)!;
+				this.#pathCache.set(destPath, { ...srcE, inodeId, mtime });
+			}
+			return;
 		}
 
 		// Single file copy: new inode pointing to the same blob (CAS dedup)
