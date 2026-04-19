@@ -507,3 +507,15 @@
   - Hardlinks to directories are forbidden — throw EPERM with `op="link"` when `srcEntry.kind === 2`.
   - contentCache does not need updating — the shared inodeId already has its content cached (if previously read), so the new path benefits from the same cache hit automatically.
 ---
+
+## 2026-04-19 - US-040
+- Added `allowSymlinks?: boolean` option to `SqlFsOptions` (default `false`).
+- Added `readonly #allowSymlinks: boolean` field, initialized in constructor.
+- Implemented `symlink(target, linkPath)`: throws EPERM (with `op="symlink"`) immediately when `!#allowSymlinks` — no DB call. When allowed: validates parent exists and is dir, calls `createInode(kind=3, symlinkTarget=target)` + `insertDirent`, sets pathCache entry with `kind=3`.
+- Created `src/fs/sql-fs/sql-fs.symlink.test.ts` with 7 unit tests: EPERM with default options, EPERM with explicit `allowSymlinks: false`, no DB calls on EPERM, symlink creates pathCache entry with kind=3, readlink returns target, createInode called with correct args, insertDirent called with correct args.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.symlink.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `symlink` is the only `IFileSystem` method gated by an option (`allowSymlinks`). Check the option first — if false, throw EPERM with NO DB call whatsoever.
+  - Symlink inodes use `kind: 3`, `mode: 0o777`, `size: target.length`, `symlinkTarget: target`, `contentSha256: null`. No blob is created — symlinks store their target in the inode row directly.
+  - The `allowSymlinks` option is passed at `SqlFs` construction time, not per-call. This matches the class-level policy model in the CLAUDE.md security section.
+---
