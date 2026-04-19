@@ -348,3 +348,16 @@
   - `exists()` is a pure cache lookup — no DB call, no transaction, no error. One-liner implementation.
   - The "never throws" criterion is satisfied by returning a resolved Promise (async method) — no special try/catch needed since `Map.has()` cannot throw.
 ---
+
+## 2026-04-19 - US-027
+- Implemented `readdir(path)` in `src/fs/sql-fs/sql-fs.ts`: checks pathCache, throws ENOENT if missing, ENOTDIR if kind≠2, then calls `#childPaths(path)` and maps each full path to its basename via `#nameOf`.
+- Implemented `readdirWithFileTypes(path)` as an optional method: same lookup logic, maps each child to `DirentEntry` with `name`, `isFile`, `isDirectory`, `isSymbolicLink` from `entry.kind`.
+- Added `DirentEntry` type extraction: `type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number]` — `DirentEntry` is not exported from just-bash main entry point so must be extracted from the interface.
+- Created `src/fs/sql-fs/sql-fs.readdir.test.ts` with 7 unit tests: readdir with 3 children (file/dir/symlink), readdir returns only direct children (not grandchildren), ENOENT on missing path, ENOTDIR on file; readdirWithFileTypes returns correct type flags, ENOENT, ENOTDIR.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.readdir.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `DirentEntry` is NOT exported from just-bash main — extract it via `Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number]`.
+  - `readdirWithFileTypes` is optional (`?:`) on `IFileSystem` — the method body can use `Promise.resolve()`/`Promise.reject()` instead of `async` since no await is needed. Both patterns are equivalent; synchronous rejection via `Promise.reject()` is idiomatic when there are no awaits.
+  - `#childPaths(dirPath)` already handles direct-children-only filtering (no additional `/` in `rest`), so `readdir` is a simple map from paths to basenames.
+  - Tests call `fs.readdirWithFileTypes!(...)` (non-null assertion) since TypeScript sees it as optional — this is fine in test code.
+---
