@@ -307,3 +307,18 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Always call `sm.stopReaper()` + `vi.useRealTimers()` after fake-timer tests; use `afterEach` for cleanup if multiple tests share the describe block
   - Setting `session.inFlight = 1` directly is a clean way to simulate a busy session in unit tests (field is not readonly)
 ---
+
+## 2026-04-19 - US-075a
+- Added `pathCacheBytes: number` and `overBudget: boolean` fields to `Session` interface
+- Added `pathCacheMaxBytes?: number` option to `SessionManagerOptions` (default: 50MB = 50 * 1024 * 1024)
+- Added private `estimatePathCacheBytes(fs)` helper: `sum of (path.length + 100)` per entry from `fs.getAllPaths()`
+- In `getOrCreate`: computed initial `pathCacheBytes` and `overBudget` after `createFs` returns
+- In `withSession` finally block: re-estimates `pathCacheBytes` and updates `overBudget` after each operation
+- In `runReaper`: over-budget sessions with `inFlight === 0` are evicted immediately (regardless of `idleMs`); normal sessions still use idle timeout
+- Added 2 unit tests to `session-manager.test.ts`: under-budget session stays resident (100MB budget, 1M idleMs), over-budget session evicted immediately (1-byte budget, 1M idleMs)
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
+- **Learnings for future iterations:**
+  - `fs.getAllPaths()` is synchronous — no await needed; safe to call in `finally` blocks
+  - Over-budget detection uses `pathCacheMaxBytes: 1` in tests (any path cache > 1 byte triggers over-budget); InMemoryFs has many built-in system paths so is always over-budget with tiny limit
+  - The `withSession` finally block is the right place to re-estimate path cache size — covers all write/delete/move operations that route handlers perform
+---
