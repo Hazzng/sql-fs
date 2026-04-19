@@ -99,3 +99,15 @@
   - `RETURNING nlink` comes back as a plain `number` (not string) from postgres.js — Postgres INTEGER columns are deserialized as JS numbers, unlike BIGINT/BIGSERIAL which come back as strings.
   - For UPDATE+RETURNING, the standard pattern is `await tx<{ col: T }[]>\`UPDATE ... RETURNING col\`` then check `rows[0]` for undefined to detect missing rows.
 ---
+
+## 2026-04-19 - US-008
+- Implemented `insertDirent(tx, parentId, name, inodeId)`: uses `INSERT INTO dirents ... SELECT ..., sandbox_id FROM inodes WHERE id = $parentId` to derive sandbox_id from the parent inode without a separate query or requiring `setSandboxContext` to be called.
+- PK violation (SQLSTATE 23505) on duplicate `(parent_inode_id, name)` bubbles up naturally for `translateSqlError` to map to EEXIST at the SqlFs layer.
+- Added integration test describe block in `src/fs/sql-fs/integration/postgres.test.ts`: (1) insert dirent, verify via raw SQL it appears in dirents table; (2) insert duplicate, verify error thrown.
+- Since `listDirents` is still a stub at this stage, verification uses raw SQL (consistent with the established pattern from US-005).
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `insertDirent` has no `sandboxId` parameter — derive it from the parent inode via a subquery `SELECT sandbox_id FROM inodes WHERE id = $parentId` embedded in the INSERT. This is a single round-trip with no extra context lookup.
+  - `INSERT INTO t (...) SELECT $col, ..., sandbox_id FROM inodes WHERE id = $parentId` silently inserts zero rows if the parent inode doesn't exist (no error). The SqlFs layer must validate the parent before calling this.
+  - PK violations from `insertDirent` will have `code: '23505'` (Postgres SQLSTATE), which `translateSqlError` in `errors.ts` already maps to EEXIST.
+---
