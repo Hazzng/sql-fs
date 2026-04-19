@@ -8,12 +8,17 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
+import { adminRoutes } from "./routes/admin.js";
 
 export const app = new Hono();
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
 app.use("/v1/*", authMiddleware);
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+app.route("/v1/admin", adminRoutes);
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
