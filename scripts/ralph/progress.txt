@@ -385,3 +385,13 @@
   - `readlink` is a pure cache lookup — no DB call, no transaction, no `#withTx`. Same pattern as `exists`, `stat`, `readdir`.
   - `symlinkTarget` is `string | null` in PathCacheEntry; use `entry.symlinkTarget!` (non-null assertion) inside the `kind === 3` guard — TypeScript can't narrow it automatically.
 ---
+
+## 2026-04-19 - US-030
+- Implemented `realpath(path)` in `src/fs/sql-fs/sql-fs.ts`: calls `#withTx` → `dialect.resolvePath(tx, path, true)` to get the resolved inodeId, then reverse-iterates pathCache to find the canonical path for that inodeId. ENOENT and ELOOP propagate naturally from `resolvePath`.
+- Created `src/fs/sql-fs/sql-fs.realpath.test.ts` with 5 unit tests: (1) symlink resolves to canonical path; (2) non-symlink returns its own path; (3) `followLast=true` is passed to resolvePath; (4) ENOENT from resolvePath propagates; (5) ELOOP from resolvePath propagates.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.realpath.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `realpath` reverse-looks up pathCache: after getting the resolved inodeId from `dialect.resolvePath`, iterate `#pathCache` entries to find the path whose `entry.inodeId === resolvedInodeId`. This is O(n) but correct for sandbox-scale trees.
+  - Errors from `resolvePath` (ENOENT, ELOOP) propagate automatically — no try/catch needed in `realpath`. The `#withTx` wrapper just re-throws.
+  - Test pattern: mock `resolvePath` via `mockResolvedValue(inodeId)` or `mockRejectedValue(error)` after calling `makeFs` (which seeds pathCache via `ready()`).
+---
