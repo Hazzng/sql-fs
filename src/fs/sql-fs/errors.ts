@@ -61,7 +61,8 @@ const SENSITIVE_PATTERNS: readonly RegExp[] = [
 	// Internal table names
 	/\b(sandboxes|inodes|dirents|blobs)\b/g,
 	// Host absolute paths (at least 3 segments to avoid stripping FS paths like /home/user)
-	/\/(?:var|usr|opt|home|root|etc|tmp|proc|run|lib|lib64|sys|dev)(?:\/[^\s"')]+){1,}/g,
+	// Includes /Users for macOS
+	/\/(?:var|usr|opt|home|root|etc|tmp|proc|run|lib|lib64|sys|dev|Users)(?:\/[^\s"')]+){1,}/g,
 ];
 
 /**
