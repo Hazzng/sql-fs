@@ -357,8 +357,21 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
 
-	async readFile(_path: string, _options?: ReadFileOpts): Promise<string> {
-		throw new Error("not implemented");
+	async readFile(path: string, _options?: ReadFileOpts): Promise<string> {
+		const entry = this.#pathCache.get(path);
+		if (!entry) throw createEnoent(path);
+
+		// Cache hit: return decoded bytes without any DB call
+		const cached = this.#contentCache.get(entry.inodeId);
+		if (cached !== undefined) {
+			return new TextDecoder().decode(cached);
+		}
+
+		// Cache miss: fetch blob from DB, populate cache
+		const data = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		const bytes = data ?? new Uint8Array(0);
+		this.#contentCache.set(entry.inodeId, bytes);
+		return new TextDecoder().decode(bytes);
 	}
 
 	async readFileBuffer(_path: string): Promise<Uint8Array> {
