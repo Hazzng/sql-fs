@@ -351,8 +351,21 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-016
-	async loadSubtreeInodes(_tx: PgTx, _rootInodeId: bigint): Promise<bigint[]> {
-		throw new Error("not implemented");
+	async loadSubtreeInodes(tx: PgTx, rootInodeId: bigint): Promise<bigint[]> {
+		const rows = await tx<{ id: string }[]>`
+			WITH RECURSIVE subtree AS (
+				SELECT id FROM inodes WHERE id = ${String(rootInodeId)}
+
+				UNION ALL
+
+				SELECT i.id
+				FROM inodes i
+				JOIN dirents d ON d.inode_id = i.id
+				JOIN subtree s ON s.id = d.parent_inode_id
+			)
+			SELECT id FROM subtree
+		`;
+		return rows.map((r) => BigInt(r.id));
 	}
 
 	// US-017
