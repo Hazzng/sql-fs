@@ -1,6 +1,6 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert/upsert/delete.
+ * createSandbox, deleteSandbox, inode CRUD, nlink operations, and dirent insert/upsert/delete/move/list.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
  * US-006: createInode, getInode, updateInode, deleteInode.
@@ -8,6 +8,8 @@
  * US-008: insertDirent.
  * US-009: upsertDirent.
  * US-010: deleteDirent.
+ * US-011: listDirents.
+ * US-012: moveDirent.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -612,5 +614,122 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — listDirents", ()
 		});
 
 		expect(dirents).toEqual([]);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-move-dirent-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("renames a file within the same directory", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "old-name.txt", inodeId);
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.moveDirent(tx, rootInodeId, "old-name.txt", rootInodeId, "new-name.txt");
+		});
+
+		// old name should be gone, new name should resolve to same inodeId
+		const dirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, rootInodeId);
+		});
+		const names = dirents.map((d) => d.name);
+		expect(names).not.toContain("old-name.txt");
+		const moved = dirents.find((d) => d.name === "new-name.txt");
+		expect(moved).toBeDefined();
+		expect(moved!.inodeId).toBe(inodeId);
+	});
+
+	it("moves a file to a different directory", async () => {
+		// Create a sub-directory to move into
+		const destDirId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "dest-dir", destDirId);
+		});
+
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "move-me.txt", inodeId);
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.moveDirent(tx, rootInodeId, "move-me.txt", destDirId, "moved.txt");
+		});
+
+		// old location should be gone
+		const rootDirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, rootInodeId);
+		});
+		expect(rootDirents.map((d) => d.name)).not.toContain("move-me.txt");
+
+		// new location should exist and point to same inode
+		const destDirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, destDirId);
+		});
+		const moved = destDirents.find((d) => d.name === "moved.txt");
+		expect(moved).toBeDefined();
+		expect(moved!.inodeId).toBe(inodeId);
+	});
+
+	it("moves over an existing file, removing the old destination dirent", async () => {
+		const srcInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 10 });
+		});
+		const dstInodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 20 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "src-file.txt", srcInodeId);
+			await dialect.insertDirent(tx, rootInodeId, "dst-file.txt", dstInodeId);
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.moveDirent(tx, rootInodeId, "src-file.txt", rootInodeId, "dst-file.txt");
+		});
+
+		// There should be exactly one dirent named dst-file.txt, pointing to srcInodeId
+		const dirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, rootInodeId);
+		});
+		const dstDirents = dirents.filter((d) => d.name === "dst-file.txt");
+		expect(dstDirents).toHaveLength(1);
+		expect(dstDirents[0]!.inodeId).toBe(srcInodeId);
+
+		// src-file.txt should be gone
+		expect(dirents.map((d) => d.name)).not.toContain("src-file.txt");
+	});
+
+	it("throws ENOENT when moving a non-existent source dirent", async () => {
+		await expect(
+			dialect.transaction(async (tx) => {
+				await dialect.moveDirent(tx, rootInodeId, "does-not-exist.txt", rootInodeId, "target.txt");
+			}),
+		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

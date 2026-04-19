@@ -143,3 +143,13 @@
   - Verifying "correct kinds" in tests means calling `getInode` separately per returned `inodeId` — `DirentRow` does not carry kind.
   - To isolate list tests from the sandbox's default root dirents (bin, home, tmp), create a fresh sub-directory as the parent for test children.
 ---
+
+## 2026-04-19 - US-012
+- Implemented `moveDirent(tx, oldParentId, oldName, newParentId, newName)`: (1) DELETE destination dirent if it exists, (2) UPDATE source dirent's parent_inode_id+name, RETURNING inode_id. If RETURNING is empty, throws `createEnoent(oldName)`.
+- Added 4 integration tests in `postgres.test.ts`: rename within same dir, move to different dir, move over existing file (verify old destination gone and dirent points to source inode), move non-existent source (ENOENT).
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - Two-step approach (DELETE destination first, then UPDATE source) is clean and explicit. Destination DELETE is a no-op when the dirent doesn't exist, so no conditional check is needed.
+  - `RETURNING inode_id` after the UPDATE distinguishes "source existed and moved" from "source did not exist" — zero rows means ENOENT.
+  - Biome reformats a long single-line `moveDirent(tx, oldParentId, oldName, newParentId, newName)` parameter list to multi-line — expected behaviour, don't fight it.
+---

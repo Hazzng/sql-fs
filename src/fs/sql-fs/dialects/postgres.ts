@@ -243,13 +243,27 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// US-012
 	async moveDirent(
-		_tx: PgTx,
-		_oldParentId: bigint,
-		_oldName: string,
-		_newParentId: bigint,
-		_newName: string,
+		tx: PgTx,
+		oldParentId: bigint,
+		oldName: string,
+		newParentId: bigint,
+		newName: string,
 	): Promise<void> {
-		throw new Error("not implemented");
+		// If destination already exists, delete it first (within the same transaction)
+		await tx`
+			DELETE FROM dirents
+			WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
+		`;
+
+		// Move the source dirent via a single UPDATE
+		const rows = await tx<{ inode_id: string }[]>`
+			UPDATE dirents
+			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			RETURNING inode_id
+		`;
+
+		if (rows.length === 0) throw createEnoent(oldName);
 	}
 
 	// US-013
