@@ -76,12 +76,23 @@ function parentDir(filePath: string): string {
 	return lastSlash <= 0 ? "/" : filePath.slice(0, lastSlash);
 }
 
+/** Returns 403 response if caller does not own the sandbox, undefined otherwise */
+function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
+	const session = sessionManager.getSession(sandboxId);
+	if (session?.owner && session.owner !== caller) {
+		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
+	}
+	return undefined;
+}
+
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// GET /v1/sandboxes/:id/files/* — read file content
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
 	router.get("/:id/files/:path{.*}", async (c) => {
+		const ownershipErr = checkOwnership(sessionManager, c.req.param("id"), c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 		const sandboxId = c.req.param("id");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
@@ -112,8 +123,15 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				mtime: stat.mtime.toISOString(),
 			};
 
-			const content = await session.fs.readFile(filePath);
-			const body = new TextEncoder().encode(content);
+			// Use readFileBuffer if available (SqlFs), otherwise fall back to text-based readFile
+			const fs = session.fs as { readFileBuffer?: (path: string) => Promise<Uint8Array> };
+			let body: Uint8Array;
+			if (typeof fs.readFileBuffer === "function") {
+				body = await fs.readFileBuffer(filePath);
+			} else {
+				const content = await session.fs.readFile(filePath);
+				body = new TextEncoder().encode(content);
+			}
 
 			return { kind: "ok", body, statHeader };
 		});
@@ -136,6 +154,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// PUT /v1/sandboxes/:id/files/* — write raw file content
 	router.put("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
@@ -161,6 +181,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
 	router.delete("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 		const recursive = c.req.query("recursive") === "true";
@@ -196,6 +218,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/writeFiles", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof writeFilesBodySchema>;
 		try {
@@ -241,6 +265,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/mkdir", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof mkdirBodySchema>;
 		try {
@@ -288,6 +314,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.get("/:id/tree", async (c) => {
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 
 		const queryResult = treeQuerySchema.safeParse(c.req.query());
 		if (!queryResult.success) {

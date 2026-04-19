@@ -6,13 +6,16 @@
 /**
  * Maps an FS error code to an HTTP status code.
  *
- * ENOENT    → 404  Not Found
- * EEXIST    → 409  Conflict
- * EISDIR    → 400  Bad Request
- * ENOTDIR   → 400  Bad Request
- * EPERM     → 403  Forbidden
- * ENOTEMPTY → 409  Conflict
- * others    → 500  Internal Server Error
+ * ENOENT         → 404  Not Found
+ * EEXIST         → 409  Conflict
+ * EISDIR         → 400  Bad Request
+ * ENOTDIR        → 400  Bad Request
+ * EPERM          → 403  Forbidden
+ * ENOTEMPTY      → 409  Conflict
+ * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
+ * ELOOP          → 400  Bad Request (symlink loop)
+ * EINVAL         → 400  Bad Request (invalid argument)
+ * others         → 500  Internal Server Error
  */
 export function mapFsErrorToStatus(err: Error): number {
 	const code = (err as Error & { code?: string }).code;
@@ -29,6 +32,12 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 403;
 		case "ENOTEMPTY":
 			return 409;
+		case "ESESSIONCLOSING":
+			return 503;
+		case "ELOOP":
+			return 400;
+		case "EINVAL":
+			return 400;
 		default:
 			return 500;
 	}

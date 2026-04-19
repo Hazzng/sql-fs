@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { app } from "../server.js";
 
 const AUTH_SECRET = "test-secret-for-admin-endpoint-exactly-32b";
+const ADMIN_SECRET = "test-admin-secret-for-token-minting";
 
 async function makeCallerToken(sub: string): Promise<string> {
 	const key = new TextEncoder().encode(AUTH_SECRET);
@@ -14,14 +15,17 @@ async function makeCallerToken(sub: string): Promise<string> {
 }
 
 describe("POST /v1/admin/tokens", () => {
-	const originalSecret = process.env.AUTH_SECRET;
+	const originalAuthSecret = process.env.AUTH_SECRET;
+	const originalAdminSecret = process.env.ADMIN_SECRET;
 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
+		process.env.ADMIN_SECRET = ADMIN_SECRET;
 	});
 
 	afterEach(() => {
-		process.env.AUTH_SECRET = originalSecret ?? "";
+		process.env.AUTH_SECRET = originalAuthSecret ?? "";
+		process.env.ADMIN_SECRET = originalAdminSecret ?? "";
 	});
 
 	it("creates token via endpoint, decode verifies sub matches", async () => {
@@ -31,6 +35,7 @@ describe("POST /v1/admin/tokens", () => {
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
 				"Content-Type": "application/json",
+				"X-Admin-Secret": ADMIN_SECRET,
 			},
 			body: JSON.stringify({ sub: "agent-001", expiresIn: "24h" }),
 		});
@@ -54,6 +59,7 @@ describe("POST /v1/admin/tokens", () => {
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
 				"Content-Type": "application/json",
+				"X-Admin-Secret": ADMIN_SECRET,
 			},
 			body: JSON.stringify({ sub: "agent-002", expiresIn: "never" }),
 		});
@@ -70,6 +76,7 @@ describe("POST /v1/admin/tokens", () => {
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
 				"Content-Type": "application/json",
+				"X-Admin-Secret": ADMIN_SECRET,
 			},
 			body: JSON.stringify({ expiresIn: "30d" }),
 		});
@@ -84,6 +91,7 @@ describe("POST /v1/admin/tokens", () => {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
+				"X-Admin-Secret": ADMIN_SECRET,
 			},
 			body: JSON.stringify({ sub: "agent-001" }),
 		});
@@ -91,5 +99,38 @@ describe("POST /v1/admin/tokens", () => {
 		expect(res.status).toBe(401);
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("AUTH_REQUIRED");
+	});
+
+	it("missing X-Admin-Secret returns 403 FORBIDDEN", async () => {
+		const callerToken = await makeCallerToken("admin");
+		const res = await app.request("/v1/admin/tokens", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${callerToken}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ sub: "agent-001" }),
+		});
+
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("FORBIDDEN");
+	});
+
+	it("invalid X-Admin-Secret returns 403 FORBIDDEN", async () => {
+		const callerToken = await makeCallerToken("admin");
+		const res = await app.request("/v1/admin/tokens", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${callerToken}`,
+				"Content-Type": "application/json",
+				"X-Admin-Secret": "wrong-secret",
+			},
+			body: JSON.stringify({ sub: "agent-001" }),
+		});
+
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("FORBIDDEN");
 	});
 });

@@ -27,6 +27,16 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			}
 			const dialect = new PostgresDialect(databaseUrl);
 			await dialect.connect();
+			// Initialize the sandbox in the DB (creates root inode structure).
+			// Ignore unique violation (23505) — sandbox already exists on reconnect.
+			try {
+				await dialect.transaction(async (tx) => {
+					await dialect.createSandbox(tx, sandboxId);
+				});
+			} catch (e) {
+				const sqlErr = e as { code?: string };
+				if (sqlErr.code !== "23505") throw e;
+			}
 			const fs = new SqlFs({ dialect, sandboxId });
 			await fs.ready();
 			return fs;

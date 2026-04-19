@@ -58,6 +58,11 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		if (session === undefined) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 		}
+		// Enforce ownership
+		const caller = c.get("owner");
+		if (session.owner && session.owner !== caller) {
+			return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
+		}
 		return c.json({
 			id,
 			owner: session.owner,
@@ -68,6 +73,14 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.delete("/:id", async (c) => {
 		const id = c.req.param("id");
+		// Check ownership before destroying
+		const session = sessionManager.getSession(id);
+		if (session !== undefined) {
+			const caller = c.get("owner");
+			if (session.owner && session.owner !== caller) {
+				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
+			}
+		}
 		const found = await sessionManager.destroy(id);
 		if (!found) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
