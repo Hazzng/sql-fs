@@ -5,6 +5,7 @@
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
  * US-065: POST /v1/sandboxes/:id/mkdir — create directory
  * US-066: POST /v1/sandboxes/:id/writeFiles — bulk write
+ * US-067: GET /v1/sandboxes/:id/tree — list file tree
  */
 
 import { Hono } from "hono";
@@ -277,6 +278,66 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		return c.body(null, 204);
+	});
+
+	// GET /v1/sandboxes/:id/tree — list file tree with optional prefix and depth filters
+	const treeQuerySchema = z.object({
+		prefix: z.string().default("/"),
+		depth: z.coerce.number().int().positive().optional(),
+	});
+
+	router.get("/:id/tree", async (c) => {
+		const sandboxId = c.req.param("id");
+
+		const queryResult = treeQuerySchema.safeParse(c.req.query());
+		if (!queryResult.success) {
+			const details = queryResult.error.issues.map((i) => i.message);
+			return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+		}
+
+		const { prefix, depth } = queryResult.data;
+		// Normalize: strip trailing slash unless root
+		const normalizedPrefix = prefix === "/" ? "/" : prefix.replace(/\/$/, "");
+
+		type TreeEntry = { path: string; kind: string; size: number; mtime: string };
+
+		const entries = await sessionManager.withSession<TreeEntry[]>(sandboxId, async (session) => {
+			const allPaths = session.fs.getAllPaths();
+			const result: TreeEntry[] = [];
+
+			for (const p of allPaths) {
+				// Skip the prefix dir itself
+				if (p === normalizedPrefix) continue;
+
+				// Filter by prefix
+				if (normalizedPrefix !== "/") {
+					if (!p.startsWith(`${normalizedPrefix}/`)) continue;
+				}
+
+				// Filter by depth (relative segments below prefix)
+				if (depth !== undefined) {
+					const relative = normalizedPrefix === "/" ? p.slice(1) : p.slice(normalizedPrefix.length + 1);
+					const segments = relative.split("/").filter(Boolean).length;
+					if (segments > depth) continue;
+				}
+
+				try {
+					const stat = await session.fs.stat(p);
+					result.push({
+						path: p,
+						kind: toKind(stat),
+						size: stat.size,
+						mtime: stat.mtime.toISOString(),
+					});
+				} catch {
+					// Skip paths that can't be stat'd
+				}
+			}
+
+			return result;
+		});
+
+		return c.json(entries);
 	});
 
 	return router;
