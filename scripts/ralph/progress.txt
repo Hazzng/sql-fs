@@ -16,6 +16,8 @@
 - When mocking `SqlDialect` in unit tests, use `{ ...mocks } as unknown as SqlDialect<unknown>` to bypass TypeScript's structural check on the generic `transaction<T>` method. Save individual mock references (e.g., `const txMock = vi.fn(...)`) outside the cast object so they can be used in `expect(txMock).toHaveBeenCalledOnce()` assertions.
 - `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from `just-bash`'s main entry point. When implementing `IFileSystem`, extract these types via `Parameters<IFileSystem["readFile"]>[1]` (etc.) instead of importing from internal just-bash paths.
 - `readdirWithFileTypes` is optional in `IFileSystem` (`?:`) — stubs do not need to include it.
+- `lru-cache` evicts only when adding an entry would EXCEED `maxSize` (not when it equals it). In tests, use `maxSize: N-1` (e.g., 25 for three 10-byte entries) to force eviction — `maxSize: 30` for three 10-byte entries is exactly the limit so no eviction occurs.
+- `contentCache` is `LRUCache<bigint, Uint8Array>` with `sizeCalculation: (v) => v.byteLength`. Private `_contentCacheGet/Set/Has` test helpers on SqlFs allow unit tests to verify cache state without implementing readFile first.
 
 ---
 
@@ -286,4 +288,16 @@
   - Snapshot the subtree entries into a `Map<string, PathCacheEntry>` before deleting from cache; deleting then re-inserting in two separate passes avoids iterator invalidation.
   - `dest + oldPath.slice(src.length)` correctly remaps all paths: when `oldPath === src`, slice gives `""` so result is just `dest`; for children it appends the suffix.
   - Clear existing dest subtree paths before re-inserting to handle "mv over existing dir" correctly: iterate `[...this.#pathCache.keys()]` (snapshot) to avoid mutation-during-iteration issues.
+---
+
+## 2026-04-19 - US-022
+- Initialized `#contentCache: LRUCache<bigint, Uint8Array>` in `SqlFs` constructor using the `lru-cache` package.
+- Added `contentCacheMaxBytes` option to `SqlFsOptions` (default 50 MB). Passed as `maxSize` to `LRUCache` with `sizeCalculation: (v) => v.byteLength`.
+- Added three `@internal` helpers (`_contentCacheGet`, `_contentCacheSet`, `_contentCacheHas`) to allow unit tests to verify cache state before readFile/writeFile are implemented.
+- Created `src/fs/sql-fs/sql-fs.content-cache.test.ts` with 5 unit tests: store/retrieve, cache miss, LRU eviction when budget exceeded, access promotion (recently-used entry survives), default 50 MB budget accepts many small entries.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.content-cache.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - lru-cache evicts only when adding would EXCEED `maxSize`. Three 10-byte entries with `maxSize: 30` all fit (30 === 30, no eviction). Use `maxSize: 25` (strictly less than total) to trigger eviction.
+  - The `@internal` test helper pattern (`_contentCacheGet/Set/Has`) is reusable — US-023/024 implementations should call these same helpers internally rather than duplicating the private field access.
+  - `LRUCache` import from `lru-cache` (named export, not default) — `import { LRUCache } from "lru-cache"`.
 ---
