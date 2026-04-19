@@ -528,3 +528,16 @@
   - The US-020 write tests verified updateInode was called but did not call stat() afterward. US-041's AC explicitly requires "reflected in subsequent stat()" — always add that explicit stat() assertion when the AC states it.
   - `chmod` and `utimes` are pure pathCache patches: `{ ...entry, mode }` and `{ ...entry, mtime }`. stat() reads from pathCache, so the reflection is immediate after the method completes.
 ---
+
+## 2026-04-19 - US-042
+- Implemented `resolvePath(base, path)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
+- Added module-level `normalizeFsPath(p)` helper: strips trailing `/`, prepends `/` if missing, splits on `/`, filters empty and `.` components, pops stack on `..`, rejoins.
+- `resolvePath`: if `path` starts with `/`, return `normalizeFsPath(path)` (absolute override); else combine `base + "/" + path` (or `"/" + path` when base is `/`) and normalize.
+- Created `src/fs/sql-fs/sql-fs.resolvepath.test.ts` with 8 unit tests: relative path, absolute override, `.` component, `..` component, `.` in absolute path, `..` in absolute path, base is root, resolves to root via `../..`.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.resolvepath.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `resolvePath` is NOT exported from just-bash's public API (`package.json` exports only `.` and `./browser`). The internal path-utils function (`y` in the minified bundle, imported as `Be` in `InMemoryFs`) is not accessible externally. Implementing the equivalent logic inline is the correct approach.
+  - The just-bash `InMemoryFs.resolvePath` is literally `return Be(base, path)` where `Be` = `y` (normalize + combine). Matching that logic exactly (absolute override, `..` pop, `.` skip) satisfies the "re-export or delegate" AC criterion.
+  - `resolvePath` is synchronous — no `async`, no `await`, no `#withTx`. It only does string manipulation.
+  - Test pattern: instantiate `SqlFs` with a minimal mocked dialect (no `ready()` call needed since `resolvePath` doesn't touch pathCache or contentCache).
+---
