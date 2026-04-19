@@ -1,566 +1,341 @@
+# Ralph Progress Log
+Started: Sun Apr 19 20:23:14 ACST 2026
+---
+
 ## Codebase Patterns
-- Both US-001 (SqlDialect interface) and US-002 (shared types) live in the same file `src/fs/sql-fs/types.ts`. Implementing US-001 requires defining the shared types (InodeRow, DirentRow, PathCacheEntry etc.) as they are referenced by the interface. US-002 acceptance criteria are therefore largely satisfied as a side-effect.
-- `SqlDialect` is generic: `SqlDialect<Tx = unknown>`. Each dialect specialises `Tx` with its own transaction handle type so that transaction callbacks are fully typed.
-- All fields on exported interfaces use `readonly` per project conventions (immutable after construction).
-- Biome auto-reformats multi-line function signatures to single-line where they fit within 120 chars — let it do so rather than fighting it.
-- For `PostgresDialect`, `Tx = postgres.TransactionSql` (from the `postgres` npm package). `setSandboxContext` uses `SELECT set_config('app.sandbox_id', $1, true)` (SET LOCAL equivalent). `transaction(fn)` delegates to `sql.begin(fn)`.
-- `sandboxes.root_inode` is nullable BIGINT (no FK to inodes) to break the circular FK with `inodes.sandbox_id → sandboxes`. Set it immediately after inode creation within the same transaction.
-- Integration tests live in `src/fs/sql-fs/integration/` and are excluded from `pnpm test:unit`. Use `describe.skipIf(!process.env.DATABASE_URL)` wrapper.
-- Stub (not-yet-implemented) dialect methods should use `_` prefix on parameters and `throw new Error("not implemented")`. TypeScript infers `never` return which is assignable to any type.
-- `postgres.js` template literals do NOT accept `bigint` parameters — TypeScript will error. Always wrap bigint values with `String(id)` before interpolating into `tx\`...\`` tagged templates.
-- When returning `tx\`...\`` from an `async (tx) => ...` callback, always `await` it (`return await tx\`...\``). Returning a `PendingQuery` directly causes TS1058 because PendingQuery has a `.then` member that confuses the async return type checker.
-- Private class methods with `#` prefix work fine in this TypeScript config (ES2022 target). Use them for dialect-internal helpers to keep the public interface clean.
-- For dynamic UPDATE queries in postgres.js (where only a subset of columns should be updated), use `tx(patchObj)` where `patchObj` is a `Record<string, ...>` with snake_case DB column names. This generates `"col" = $N, ...` syntax cleanly without `tx.unsafe()`. E.g., `await tx\`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(id)}\``.
-- BYTEA columns (content_sha256) are returned by postgres.js as `Buffer` objects. `Buffer extends Uint8Array` so they are directly assignable to `Uint8Array` in TypeScript — no conversion needed.
-- Integration tests that depend on stored procedures/DDL not covered by the base migration can apply that DDL in `beforeAll` via `tx.unsafe(migrationSql)` where `migrationSql` is read from the migration file using `fileURLToPath(new URL("../migrations/postgres/000N_name.sql", import.meta.url))`. `CREATE OR REPLACE FUNCTION` is idempotent so repeated runs are safe.
-- When mocking `SqlDialect` in unit tests, use `{ ...mocks } as unknown as SqlDialect<unknown>` to bypass TypeScript's structural check on the generic `transaction<T>` method. Save individual mock references (e.g., `const txMock = vi.fn(...)`) outside the cast object so they can be used in `expect(txMock).toHaveBeenCalledOnce()` assertions.
-- `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from `just-bash`'s main entry point. When implementing `IFileSystem`, extract these types via `Parameters<IFileSystem["readFile"]>[1]` (etc.) instead of importing from internal just-bash paths.
-- `readdirWithFileTypes` is optional in `IFileSystem` (`?:`) — stubs do not need to include it.
-- `lru-cache` evicts only when adding an entry would EXCEED `maxSize` (not when it equals it). In tests, use `maxSize: N-1` (e.g., 25 for three 10-byte entries) to force eviction — `maxSize: 30` for three 10-byte entries is exactly the limit so no eviction occurs.
-- `LRUCache` with `sizeCalculation` requires each entry to have `byteLength > 0` (positive integer). Never call `_contentCacheSet` with `new Uint8Array(0)` — it throws "sizeCalculation return invalid".
-- `contentCache` is `LRUCache<bigint, Uint8Array>` with `sizeCalculation: (v) => v.byteLength`. Private `_contentCacheGet/Set/Has` test helpers on SqlFs allow unit tests to verify cache state without implementing readFile first.
+- Test mocking: Use `vi.mock('./dialects/postgres.js', () => ({ PostgresDialect: vi.fn().mockImplementation(...) }))` to avoid real DB connections in unit tests; mock `transaction` with `vi.fn().mockImplementation(async (fn) => fn({}))` and `loadAllPaths` with `vi.fn().mockResolvedValue([])` so `SqlFs.ready()` completes without DB access.
+- Env var cleanup in tests: Do NOT use `delete process.env.VAR` (biome noDelete lint) or `process.env.VAR = undefined` (sets it to string "undefined", not truly unset). Use `process.env.VAR = ""` for "effectively unset" — the factory checks `if (!databaseUrl)` which treats empty string as falsy.
+- The branch for Phase 2 HTTP API is `ralph/phase2-http-api` (was on `ralph/phase1-sqlfs-postgres` at session start).
+- `StorageBackend` type and `InodeKind` are exported from `src/fs/sql-fs/index.ts`.
+- `InMemoryFs` is exported from `just-bash` (no constructor args required for default use).
+- Hono testing: Use `app.request('/path')` directly — no real HTTP server needed. Returns a `Response` object. Import `app` from `server.ts` which exports the Hono instance.
+- Hono status codes: `c.json()` requires `ContentfulStatusCode` not plain `number` or `StatusCode`. Cast via `as ContentfulStatusCode` from `hono/utils/http-status`.
+- Biome `biome-ignore` suppression: Only suppress rules that are actually enabled. Unused suppressions produce warnings. Verify by checking if the rule exists in biome.json before adding.
+- Hono entry-point detection: Use `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` to guard `serve()` call so it only runs when the file is the direct entry point (not in tests).
+- Hono typed middleware: Use `createMiddleware<{ Variables: { key: type } }>` from `hono/factory` — NOT `MiddlewareHandler` without env param, which prevents `c.set()` calls (BlankEnv has no Variables). Export the Variables type for downstream apps to use in `new Hono<{ Variables: T }>()`.
+- `res.json()` returns `unknown` — cast with `as { field: type }` in tests before accessing properties.
+- Generic Hono middleware factories: use `createMiddleware<{ Variables: { key: z.infer<T> } }>` for typed variable injection; test apps need `new Hono<{ Variables: { key: z.infer<typeof schema> } }>()`.
+- Zod for query params: use `z.coerce.number()` since query string values are always strings.
+- `async-mutex` `Mutex.runExclusive(async () => { ... })` is the idiomatic pattern for serialized async critical sections in this project.
+- Single-flight pattern: store `Promise<T>` (not `T`) in a pending `Map`; remove in `finally` so the slot is freed on completion or error.
+- `SessionManager` in `src/api/session-manager.ts` is the canonical way to get a warm `Bash + IFileSystem` session per sandbox — route handlers use `withSession` not `getOrCreate` directly.
+- Hono wildcard with slashes: use `/:param{.*}` (regex syntax) instead of `/*` — `c.req.param("*")` always returns `undefined` in sub-routers; use `c.req.param("param")` to get the full path including slashes.
+- InMemoryFs error format: `stat()` throws with `code: undefined` but message starts with the POSIX code (e.g., "ENOENT: no such file..."). Use `err.message.match(/^([A-Z]+):/)` as fallback when `.code` is absent to extract error codes for HTTP mapping.
+- InMemoryFs pre-populated paths: `getAllPaths()` returns built-in system paths like `/bin/*`, `/dev/*`, `/usr/bin/*`. Tests that use prefix-less tree assertions must use an isolated prefix (e.g., `/myapp`) rather than asserting exact root-level path lists.
 
+## 2026-04-19 - US-053
+- Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
+- postgres: instantiates `PostgresDialect(DATABASE_URL)`, calls `connect()`, creates `SqlFs`, calls `ready()`, returns
+- memory: returns `new InMemoryFs()`
+- mysql/azure-sql/azure-fileshare: throws "not implemented"
+- Files changed: `src/fs/sql-fs/index.ts`, `src/fs/sql-fs/index.test.ts` (new)
+- **Learnings for future iterations:**
+  - Biome lint rule `lint/performance/noDelete` blocks `delete process.env.VAR` — use empty string assignment instead
+  - Biome lint rule `lint/complexity/useLiteralKeys` requires `process.env.DATABASE_URL` not `process.env["DATABASE_URL"]`
+  - `vi.mock` must mock `transaction` as a callback-invoking fn (not just `mockResolvedValue(undefined)`) or `SqlFs.ready()` will fail trying to iterate `undefined`
 ---
 
-## 2026-04-19 - US-001
-- Implemented the `SqlDialect<Tx>` generic interface with JSDoc on every method, covering: connect/disconnect, transaction, setSandboxContext, sandbox lifecycle (createSandbox/deleteSandbox), inode CRUD (createInode/getInode/updateInode/deleteInode), nlink ops (incrementNlink/decrementNlink), dirent CRUD (insertDirent/upsertDirent/deleteDirent/listDirents/moveDirent), blob ops (upsertBlob/getBlob/gcOrphanBlobs), bulk/tree ops (loadAllPaths/loadSubtreeInodes/bulkIngest), and path resolution (resolvePath).
-- Also defined all shared types needed for the interface to typecheck: `InodeRow`, `DirentRow`, `PathCacheEntry`, `CreateInodeOpts`, `UpdateInodeOpts`, `BulkIngestFile`, `StorageBackend`, `InodeKind`.
-- Files changed: `src/fs/sql-fs/types.ts`
+## 2026-04-19 - US-054
+- Implemented `loadBackendConfig(): BackendConfig` in `src/fs/sql-fs/index.ts`
+- Reads FS_BACKEND (required), DATABASE_URL (for SQL backends), FS_MOUNT_PATH (for azure-fileshare)
+- Exports `BackendConfig` interface: `{ backend: StorageBackend; databaseUrl?: string; mountPath?: string }`
+- Validates backend is one of the known StorageBackend values; throws descriptive error for unknown
+- Files changed: `src/fs/sql-fs/index.ts`, `src/fs/sql-fs/index.test.ts` (added loadBackendConfig describe block)
 - **Learnings for future iterations:**
-  - Defining the shared types (US-002 content) was a prerequisite for US-001's "Typecheck passes" criterion — they are inseparable in practice since they live in the same file.
-  - `biome check --write` reformatted the `moveDirent` signature from multi-line to single-line; this is expected and correct.
-  - `noUnusedLocals` and `noUnusedParameters` are enabled — don't add any imports or parameters that aren't used.
+  - Tests for env vars: save originals as `const originalEnv = { ...process.env }` and restore in `afterEach` with empty-string fallback (not `undefined`)
+  - `ReadonlySet<StorageBackend>` with `new Set([...])` works cleanly for the SQL backend membership check
 ---
 
-## 2026-04-19 - US-002
-- No new code written — all shared types (InodeRow, DirentRow, PathCacheEntry, StorageBackend, and the Tx generic via SqlDialect<Tx>) were already defined in `src/fs/sql-fs/types.ts` as a prerequisite for US-001.
-- Verified: `pnpm typecheck` passes with no errors.
-- Files changed: `scripts/ralph/prd.json` (marked passes: true)
+## 2026-04-19 - US-055
+- Implemented `destroySandbox(backend, sandboxId): Promise<void>` in `src/fs/sql-fs/index.ts`
+- postgres: instantiates `PostgresDialect(DATABASE_URL)`, calls `connect()`, wraps `dialect.deleteSandbox` in `dialect.transaction`, disconnects in `finally` block
+- memory: no-op (returns immediately)
+- mysql/azure-sql/azure-fileshare: throws "not implemented"
+- Files changed: `src/fs/sql-fs/index.ts`, `src/fs/sql-fs/index.test.ts` (added destroySandbox describe block + PostgresDialect import)
 - **Learnings for future iterations:**
-  - US-002 was a no-op implementation: all criteria were satisfied by US-001's implementation. When the PRD has ordering like this (types story after interface story), check the existing file before writing anything new.
+  - To verify mocked dialect method calls, import `PostgresDialect` directly in test (it resolves to the vi.mock'd version) then use `vi.mocked(PostgresDialect).mock.results[0]?.value` to get the instance
+  - Use `vi.mocked(PostgresDialect).mockClear()` in `beforeEach` to reset call counts between tests
+  - The transaction mock passes `{}` as `tx` to the callback — assertions on `deleteSandbox` should match `({}, sandboxId)`
 ---
 
-## 2026-04-19 - US-003
-- Implemented `src/fs/sql-fs/errors.ts` with all 7 FS error constructors: `createEnoent`, `createEexist`, `createEisdir`, `createEnotdir`, `createEnotempty`, `createEloop`, `createEperm`.
-- Implemented `translateSqlError(err, path)` mapping Postgres SQLSTATE codes (23505=EEXIST, FS001=ELOOP, FS002=ENOENT, FS003=ENOTDIR), MySQL errno (1062=EEXIST), and T-SQL error numbers (2601/2627=EEXIST).
-- Implemented `sanitizeFsError(err)` stripping connection URLs, T-SQL ADO.NET strings, internal table names (sandboxes, inodes, dirents, blobs), and host filesystem paths.
-- Created `src/fs/sql-fs/errors.test.ts` with 21 unit tests covering all constructors, all SQL error mappings, and sanitization cases.
-- Files changed: `src/fs/sql-fs/errors.ts`, `src/fs/sql-fs/errors.test.ts`
+## 2026-04-19 - US-056
+- Created `src/api/errors.ts`: exports `mapFsErrorToStatus(err)` mapping FS error codes to HTTP status codes (ENOENT→404, EEXIST/ENOTEMPTY→409, EISDIR/ENOTDIR→400, EPERM→403, default→500)
+- Created `src/api/server.ts`: Hono app with request logging middleware (structured JSON), GET /healthz, GET /readyz, global error handler using mapFsErrorToStatus, server start guarded by entry-point detection
+- Created `src/api/__tests__/server.test.ts`: 3 unit tests using `app.request()` (healthz 200, readyz 200, unknown route 404)
+- Files changed: `src/api/errors.ts` (new), `src/api/server.ts` (new), `src/api/__tests__/server.test.ts` (new)
 - **Learnings for future iterations:**
-  - Internal types (e.g., `FsError = Error & { code: string; path?: string }`) are not exported; use `Error` as return type of constructors to avoid leaking internal type to consumers.
-  - `Object.assign(new Error(msg), { code, path })` is the idiomatic pattern for creating typed errors with extra properties without `class`.
-  - Biome will alphabetically sort import lists — write them in any order and let `pnpm lint:fix` sort them.
-  - `sanitizeFsError` uses `const pattern of SENSITIVE_PATTERNS` with a `readonly RegExp[]` array; regex flags include `g` so they reset after each call via the replace path — no state issues with `lastIndex` since we aren't using `exec`.
+  - `c.json()` in Hono v4 requires `ContentfulStatusCode` (not `StatusCode` or `number`) — import from `hono/utils/http-status` and cast with `as ContentfulStatusCode`
+  - `app.request('/path')` works without a real server — ideal for unit testing Hono routes
+  - `biome-ignore` only suppresses active rules; unused suppressions cause lint warnings — verify rule exists before adding
+  - Server bootstrap guard: `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` prevents `serve()` from binding during tests
 ---
 
-## 2026-04-19 - US-004
-- Implemented `PostgresDialect` class in `src/fs/sql-fs/dialects/postgres.ts` implementing `SqlDialect<postgres.TransactionSql>`.
-- `connect()` creates pool via `postgres(connectionString, { prepare: false })` (transaction-pooler compatible).
-- `disconnect()` calls `pool.end()` and nulls the reference.
-- `transaction<T>(fn)` delegates to `this.pool.begin(fn)` with explicit `as Promise<T>` cast to resolve UnwrapPromiseArray inference.
-- `setSandboxContext(tx, sandboxId)` executes `SELECT set_config('app.sandbox_id', $1, true)` — the `true` flag makes it transaction-local (SET LOCAL equivalent).
-- All remaining interface methods are stubs (throw "not implemented") with `_`-prefixed parameters to satisfy `noUnusedParameters`.
-- Created `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql` with DDL for all four tables. `sandboxes.root_inode` is nullable BIGINT (no FK back to inodes) to avoid the circular FK issue.
-- Created `src/fs/sql-fs/integration/postgres.test.ts` with two integration tests: (1) setSandboxContext sets current_setting within a transaction, (2) context is not visible outside the transaction.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-057
+- Created `src/api/auth.ts`: Hono auth middleware using `createMiddleware<{ Variables: AuthVariables }>` from `hono/factory`; verifies HS256 JWT via `jose`'s `jwtVerify`, extracts `sub` claim, sets `c.set("owner", sub)`
+- Returns 401 `{ error: "unauthorized", code: "AUTH_REQUIRED" }` if no Bearer token; 401 `{ error: "invalid_token", code: "AUTH_INVALID" }` if signature invalid, expired, or missing `sub`
+- Updated `src/api/server.ts` to register `authMiddleware` on `/v1/*` before logging middleware
+- Created `src/api/__tests__/auth.test.ts`: 4 unit tests (valid token, expired token, tampered token, missing header)
+- Files changed: `src/api/auth.ts` (new), `src/api/__tests__/auth.test.ts` (new), `src/api/server.ts` (modified)
 - **Learnings for future iterations:**
-  - `postgres.TransactionSql` is the correct `Tx` type — it extends `ISql` and is what `sql.begin()` passes to its callback.
-  - `set_config('app.sandbox_id', $sandboxId, true)` is the parameterized form of `SET LOCAL`; plain `SET LOCAL` with parameterized values isn't supported in Postgres.
-  - `process.env.DATABASE_URL` (not bracket notation) is required by Biome's `useLiteralKeys` rule.
-  - Biome will flag unused `biome-ignore` suppression comments as warnings — only add suppressions for rules that actually fire.
+  - Use `createMiddleware<{ Variables: { owner: string } }>` from `hono/factory` to type the middleware variables — plain `MiddlewareHandler` without env param causes TypeScript errors when calling `c.set()` because `BlankEnv` has no `Variables`
+  - Export `AuthVariables` type from `auth.ts` so downstream apps can do `new Hono<{ Variables: AuthVariables }>()` for proper `c.get("owner")` typing in route handlers
+  - `jose` v6 `jwtVerify` accepts `{ algorithms: ["HS256"] }` option and throws on expired/invalid tokens — catch all errors and return AUTH_INVALID
+  - For test JWT creation: `new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes)` — `setExpirationTime(unixTimestamp)` accepts number (seconds since epoch) for expired token tests
+  - Biome `useTemplate` rule flags `str?.slice(...) + "suffix"` — fix with template literal `` `${str?.slice(...)}suffix` ``
+  - `res.json()` returns `unknown` in TypeScript — cast with `as { field: type }` before accessing properties in tests
 ---
 
-## 2026-04-19 - US-006
-- Implemented `createInode(tx, opts)`: INSERT into inodes with all fields, RETURNING id as bigint.
-- Implemented `getInode(tx, inodeId)`: SELECT with `String(inodeId)` param, maps snake_case DB columns to camelCase InodeRow. BYTEA → Buffer is directly assignable to Uint8Array.
-- Implemented `updateInode(tx, inodeId, updates)`: Builds a snake_case patch object (only fields present in updates), uses `tx(patch)` dynamic sql helper to generate `SET col = $N` clauses. Returns early if no fields provided.
-- Implemented `deleteInode(tx, inodeId)`: Single DELETE by id using `String(inodeId)`.
-- Added 4 integration tests to `src/fs/sql-fs/integration/postgres.test.ts` covering: file inode CRUD with sha256, dir inode kind=2, updateInode mode+mtime, deleteInode → getInode returns null.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-058
+- Created `src/api/validation.ts`: exports `validateBody(schema)` and `validateQuery(schema)` middleware factories
+- Both use `createMiddleware<{ Variables: { body/query: z.infer<T> } }>` from `hono/factory` for correct typing
+- On validation failure: returns 400 `{ error: "validation_error", code: "INVALID_INPUT", details: string[] }` where details are zod issue messages
+- validateBody also catches malformed JSON (parse errors) and returns 400 INVALID_INPUT
+- Created `src/api/__tests__/validation.test.ts`: 6 unit tests covering valid/invalid body, malformed JSON, valid/invalid query params, optional query params
+- Files changed: `src/api/validation.ts` (new), `src/api/__tests__/validation.test.ts` (new)
 - **Learnings for future iterations:**
-  - `tx(obj)` (postgres.js dynamic sql helper) works cleanly for UPDATE SET without needing `tx.unsafe()`. Object keys must be DB column names (snake_case). Requires `Record<string, string | number | Date | Uint8Array | null>` type — no `any` needed.
-  - BIGSERIAL columns come back from postgres.js as strings (not numbers or bigints). Always `BigInt(row.id)` to convert.
-  - BIGINT columns (size, root_inode) also return as strings — use `Number(row.size)` for sizes.
-  - `InodeKind` must be imported in dialects that cast `row.kind as InodeKind`.
+  - For generic Hono middleware factories, use `createMiddleware<{ Variables: { key: z.infer<T> } }>` — this provides full type inference for downstream handlers without using `any`
+  - Biome auto-converts `import { z } from "zod"` to `import type { z } from "zod"` when `z` is only referenced as a type (type parameters) — TypeScript still resolves type-only references correctly
+  - Test apps for typed middleware need matching variable declarations: `new Hono<{ Variables: { body: z.infer<typeof schema> } }>()`
+  - `z.coerce.number()` is useful for query params (all come in as strings) — coerces before validation
 ---
 
-## 2026-04-19 - US-005
-- Implemented `createSandbox(tx, sandboxId)`: inserts root dir inode (kind=2, mode=0o755), inserts sandboxes row with root_inode, creates /home, /tmp, /bin under root, and /home/user under /home — all via direct SQL in the transaction.
-- Implemented `deleteSandbox(tx, sandboxId)`: single `DELETE FROM sandboxes WHERE id = $1` — CASCADE removes all child inodes and dirents.
-- Added private `#createDirInode(tx, sandboxId, parentInodeId, name)` helper to avoid repetitive inode+dirent insert logic.
-- Added US-005 integration tests in `src/fs/sql-fs/integration/postgres.test.ts`: (1) creates sandbox, verifies 5 inodes + 4 dirents + correct root_inode, (2) creates then deletes sandbox, verifies CASCADE removes all rows.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-057b
+- Created `src/api/lib/jwt.ts`: exports `signToken({ sub, expiresIn?, secret })` and `verifyToken({ token, secret })` using jose SignJWT/jwtVerify
+- Implemented `src/api/cli/token.ts`: parses `--sub` (required) and `--expires` (optional, default no expiry) from argv, reads AUTH_SECRET from env, calls signToken, prints token to stdout
+- Duration values "30d", "1y", "24h" passed directly to jose's `setExpirationTime`; "never" and undefined both result in no exp claim
+- Errors are written to stderr with descriptive messages; exit code 1 on failure
+- Files changed: `src/api/lib/jwt.ts` (new), `src/api/cli/token.ts` (modified)
 - **Learnings for future iterations:**
-  - `postgres.js` template literals reject `bigint` parameters at the TypeScript level — always use `String(id)` when interpolating bigint values into `tx\`...\`` templates.
-  - Returning a `PendingQuery` from an `async` callback (without `await`) causes TS1058 because PendingQuery has a `.then` member. Always `return await tx\`...\`` inside async transaction callbacks.
-  - Since `listDirents` and `getInode` are still stubs at US-005 stage, integration tests for createSandbox must verify via raw SQL rather than dialect methods. This is acceptable for integration tests.
-  - Private `#method()` syntax (ES2022 private fields) works correctly in this codebase — use it for dialect-internal helpers.
+  - `signToken`/`verifyToken` in `src/api/lib/jwt.ts` are the canonical JWT helpers — future stories (US-057c admin endpoint) should import from there, not duplicate signing logic
+  - jose `SignJWT` with `setExpirationTime(string)` accepts duration strings like "30d", "1y", "24h" directly — no manual date arithmetic needed
+  - CLI arg parsing: simple manual loop over `process.argv.slice(2)` is sufficient — no arg-parsing library needed for this case
 ---
 
-## 2026-04-19 - US-007
-- Implemented `incrementNlink(tx, inodeId)`: single `UPDATE inodes SET nlink = nlink + 1 WHERE id = $1`.
-- Implemented `decrementNlink(tx, inodeId)`: `UPDATE ... RETURNING nlink`, returns the new value as `number`. Throws if inode not found (rows[0] undefined).
-- Added 3 integration tests in `src/fs/sql-fs/integration/postgres.test.ts`: increment nlink=1→2, decrement 2→1 (returns 1), decrement 1→0 (returns 0).
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-057c
+- Created `src/api/routes/admin.ts`: `adminRoutes` Hono instance with `POST /tokens`; uses `validateBody(tokenBodySchema)`, calls `signToken` then `verifyToken` to extract exp, returns 201 `{ token, sub, expiresAt }`
+- Updated `src/api/server.ts`: imports `adminRoutes`, registers `app.route("/v1/admin", adminRoutes)` after auth middleware
+- Created `src/api/__tests__/admin.test.ts`: 4 unit tests (happy path + decode verify, never expiry → null expiresAt, missing sub → 400, unauthenticated → 401)
+- Files changed: `src/api/routes/admin.ts` (new), `src/api/__tests__/admin.test.ts` (new), `src/api/server.ts` (modified)
 - **Learnings for future iterations:**
-  - `RETURNING nlink` comes back as a plain `number` (not string) from postgres.js — Postgres INTEGER columns are deserialized as JS numbers, unlike BIGINT/BIGSERIAL which come back as strings.
-  - For UPDATE+RETURNING, the standard pattern is `await tx<{ col: T }[]>\`UPDATE ... RETURNING col\`` then check `rows[0]` for undefined to detect missing rows.
+  - Mount sub-routers with `app.route("/v1/prefix", subApp)` — auth middleware on `/v1/*` applies automatically to all sub-router routes
+  - After signing a token, calling `verifyToken` on the just-signed token is a clean way to extract the exp claim for the response (no manual date math needed)
+  - `z.enum(["30d", "1y", "24h", "never"]).optional()` is the right pattern for constrained duration strings; default applied in handler with destructuring default `= "30d"`
 ---
 
-## 2026-04-19 - US-008
-- Implemented `insertDirent(tx, parentId, name, inodeId)`: uses `INSERT INTO dirents ... SELECT ..., sandbox_id FROM inodes WHERE id = $parentId` to derive sandbox_id from the parent inode without a separate query or requiring `setSandboxContext` to be called.
-- PK violation (SQLSTATE 23505) on duplicate `(parent_inode_id, name)` bubbles up naturally for `translateSqlError` to map to EEXIST at the SqlFs layer.
-- Added integration test describe block in `src/fs/sql-fs/integration/postgres.test.ts`: (1) insert dirent, verify via raw SQL it appears in dirents table; (2) insert duplicate, verify error thrown.
-- Since `listDirents` is still a stub at this stage, verification uses raw SQL (consistent with the established pattern from US-005).
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-074
+- Created `src/api/session-manager.ts`: exports `SessionManager` class with `getOrCreate(sandboxId)`, `withSession(sandboxId, fn)`, and `Session` / `SessionManagerOptions` interfaces
+- Single-flight pattern: `Map<string, Promise<Session>>` (pending map) coalesces concurrent `getOrCreate` calls for the same sandboxId to one creation
+- Per-sandbox serialization: each session holds an `async-mutex` `Mutex`; `withSession` uses `mutex.runExclusive` with `inFlight++/--` wrapping the callback
+- Constructor accepts `{ backend, databaseUrl?, createFs? }` — `createFs` overrides the default `createSandboxFs` for DI in tests
+- Created `src/api/__tests__/session-manager.test.ts`: 5 unit tests (cache hit, single-flight, independent sandboxes, sequential withSession, inFlight tracking)
+- Files changed: `src/api/session-manager.ts` (new), `src/api/__tests__/session-manager.test.ts` (new), `package.json` (added async-mutex), `pnpm-lock.yaml`
 - **Learnings for future iterations:**
-  - `insertDirent` has no `sandboxId` parameter — derive it from the parent inode via a subquery `SELECT sandbox_id FROM inodes WHERE id = $parentId` embedded in the INSERT. This is a single round-trip with no extra context lookup.
-  - `INSERT INTO t (...) SELECT $col, ..., sandbox_id FROM inodes WHERE id = $parentId` silently inserts zero rows if the parent inode doesn't exist (no error). The SqlFs layer must validate the parent before calling this.
-  - PK violations from `insertDirent` will have `code: '23505'` (Postgres SQLSTATE), which `translateSqlError` in `errors.ts` already maps to EEXIST.
+  - `async-mutex` `Mutex.runExclusive(fn)` is the correct API for serialized async critical sections — no need to acquire/release manually
+  - Single-flight: store `Promise<Session>` (not `Session`) in the pending map; `finally` block removes it so completed entries don't leak
+  - `Bash` from just-bash accepts `{ fs: IFileSystem }` as constructor option — no required args
+  - For sequential execution tests: use a deferred blocker promise + `await firstStarted` before launching the second call to guarantee call ordering
 ---
 
-## 2026-04-19 - US-010
-- Implemented `deleteDirent(tx, parentId, name)`: `DELETE FROM dirents WHERE parent_inode_id = $1 AND name = $2 RETURNING inode_id`. If no rows returned, throws `createEnoent(name)`. Returns removed `inode_id` as bigint.
-- Added `createEnoent` import from `errors.ts` to `postgres.ts`.
-- Added two integration tests in `postgres.test.ts`: (1) insert then delete dirent, verify inode_id returned and row gone; (2) delete non-existent dirent, verify error has `code: "ENOENT"`.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-059
+- Created `src/api/routes/sandboxes.ts`: exports `sandboxRoutes(sessionManager)` factory returning a Hono router
+- `POST /` handler: parses optional JSON body `{ env?, files? }`, generates UUID via `crypto.randomUUID()`, calls `sessionManager.withSession` to create session and write initial files, returns 201 `{ id, owner, createdAt }`
+- Updated `src/api/server.ts`: creates a `SessionManager` with `process.env.FS_BACKEND ?? "memory"` (safe default for tests), registers `app.route("/v1/sandboxes", sandboxRoutes(sessionManager))`
+- Created `src/api/__tests__/sandboxes.test.ts`: 2 unit tests using a shared `InMemoryFs` injected via `createFs` DI option; test app has auth middleware + sandbox routes
+- Files changed: `src/api/routes/sandboxes.ts` (new), `src/api/__tests__/sandboxes.test.ts` (new), `src/api/server.ts` (modified)
 - **Learnings for future iterations:**
-  - For delete-then-check operations, `DELETE ... RETURNING inode_id` is the cleanest pattern — a missing row returns an empty array, no separate SELECT needed.
-  - Throwing `createEnoent(name)` directly (rather than a raw SQL SQLSTATE) is correct when the absence is detected in application code rather than a SQL constraint.
-  - Integration test assertion for ENOENT: use `rejects.toMatchObject({ code: "ENOENT" })` rather than `rejects.toThrow()` to verify the error code specifically.
+  - Route factories (`sandboxRoutes(sessionManager)`) are the pattern for routes needing injected dependencies — test apps create their own instances with mock `createFs`
+  - `FileContent = string | Uint8Array` — can pass string directly to `fs.writeFile` without encoding; no `TextEncoder` needed
+  - Body is optional for POST routes: wrap `c.req.json()` in try/catch; missing/empty body falls through silently, only malformed JSON returns 400
+  - `process.env.FS_BACKEND ?? "memory"` in server.ts as safe default avoids breaking existing tests that don't set `FS_BACKEND`
 ---
 
-## 2026-04-19 - US-009
-- Implemented `upsertDirent(tx, parentId, name, inodeId)`: uses a CTE to capture the pre-existing `inode_id` before the upsert, then performs `INSERT ... ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id`, returning the old inode_id (or null for new inserts).
-- SQL pattern: `WITH existing AS (SELECT inode_id FROM dirents WHERE parent_inode_id = $1 AND name = $2) INSERT INTO dirents ... ON CONFLICT ... DO UPDATE ... RETURNING (SELECT inode_id FROM existing) AS old_inode_id`
-- Added two integration tests in `postgres.test.ts`: (1) upsert new entry returns null; (2) upsert over existing entry returns old inodeId.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-060
+- Added GET `/:id` route to `src/api/routes/sandboxes.ts`; returns 200 `{ id, owner, createdAt, lastUsedAt }` or 404 `{ error: "not_found", code: "SANDBOX_NOT_FOUND" }`
+- Extended `Session` interface in `session-manager.ts` with `owner: string` and `createdAt: string` fields (initialized to `""` and `new Date().toISOString()` in `getOrCreate`)
+- Added `getSession(sandboxId): Session | undefined` method to `SessionManager` for read-only metadata access without mutex
+- Updated POST handler in `sandboxes.ts` to set `session.owner` and `session.createdAt` inside the `withSession` callback
+- Added 2 unit tests to `src/api/__tests__/sandboxes.test.ts`: happy path (create then GET, verify metadata) and 404 for non-existent sandbox
+- Files changed: `src/api/session-manager.ts`, `src/api/routes/sandboxes.ts`, `src/api/__tests__/sandboxes.test.ts`
 - **Learnings for future iterations:**
-  - To capture the "old" value in an INSERT ... ON CONFLICT DO UPDATE, use a CTE: `WITH existing AS (SELECT col FROM t WHERE pk = $1) INSERT ... ON CONFLICT DO UPDATE ... RETURNING (SELECT col FROM existing) AS old_col`. The CTE snapshot is taken before the INSERT, so it captures the pre-upsert value.
-  - `old_inode_id` in RETURNING is null when the row did not previously exist (new INSERT path), and contains the prior value when ON CONFLICT DO UPDATE fires.
-  - The `sandbox_id` is still derived from the parent inode via the same SELECT subquery pattern as `insertDirent`.
+  - `getSession(sandboxId)` bypasses the mutex — correct for read-only metadata that doesn't require serialization
+  - Set `owner` and `createdAt` on the session inside the `withSession` callback (where you have the session reference); the POST handler's `sandboxId` is unique (UUID), so no race possible
+  - `Session` fields that are mutable after creation (owner, createdAt, lastUsed) should NOT be `readonly` in the interface
 ---
 
-## 2026-04-19 - US-011
-- Implemented `listDirents(tx, parentId)`: `SELECT d.parent_inode_id, d.name, d.inode_id FROM dirents d JOIN inodes i ON i.id = d.inode_id WHERE d.parent_inode_id = $1 ORDER BY d.name`. Maps rows to `DirentRow[]` using `BigInt()` conversions.
-- Added two integration tests: (1) parent dir with 3 children (file kind=1, dir kind=2, symlink kind=3) — verifies ordering, inodeIds, and kinds via `getInode`; (2) empty dir returns `[]`.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-061
+- Added `destroy(sandboxId): Promise<boolean>` method to `SessionManager` in `session-manager.ts`; removes session from Map, calls `destroySandbox(backend, sandboxId)`, returns false if session not in Map
+- Added `DELETE /:id` route to `sandboxes.ts`: calls `sessionManager.destroy(id)`, returns 204 on success, 404 if not found
+- Added 2 unit tests to `sandboxes.test.ts`: create-then-delete (204) and delete-non-existent (404)
+- Files changed: `src/api/session-manager.ts`, `src/api/routes/sandboxes.ts`, `src/api/__tests__/sandboxes.test.ts`
 - **Learnings for future iterations:**
-  - `listDirents` return type is `DirentRow[]` (only parentInodeId, name, inodeId). The JOIN with inodes is done in SQL for correctness/integrity but extra inode columns are not included in the return value.
-  - Verifying "correct kinds" in tests means calling `getInode` separately per returned `inodeId` — `DirentRow` does not carry kind.
-  - To isolate list tests from the sandbox's default root dirents (bin, home, tmp), create a fresh sub-directory as the parent for test children.
+  - `c.body(null, 204)` is the correct Hono pattern for 204 No Content responses — don't use `c.json()` for bodyless responses
+  - `destroy` on `SessionManager` returns boolean (found/not-found) rather than throwing — route handler converts false → 404 response explicitly
+  - `destroySandbox` for memory backend is a no-op, so unit tests with InMemoryFs don't need any DB mocking for the DELETE path
 ---
 
-## 2026-04-19 - US-012
-- Implemented `moveDirent(tx, oldParentId, oldName, newParentId, newName)`: (1) DELETE destination dirent if it exists, (2) UPDATE source dirent's parent_inode_id+name, RETURNING inode_id. If RETURNING is empty, throws `createEnoent(oldName)`.
-- Added 4 integration tests in `postgres.test.ts`: rename within same dir, move to different dir, move over existing file (verify old destination gone and dirent points to source inode), move non-existent source (ENOENT).
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-062
+- Created `src/api/routes/files.ts`: exports `fileRoutes(sessionManager)` factory with `GET /:id/files/:path{.*}` route
+- Route calls `session.fs.stat(filePath)` inside `withSession`; returns 404 for ENOENT, 400 for EISDIR, 200 with raw bytes + Content-Type + X-FS-Stat header on success
+- Content-Type inferred from file extension via a hardcoded null-prototype MIME map; defaults to `application/octet-stream`
+- X-FS-Stat header: `JSON.stringify({ kind, mode, size, mtime })` where kind is 'file', 'dir', or 'symlink'
+- `extractErrCode(e)` helper checks `.code` first, then falls back to parsing the POSIX prefix from `err.message` (needed for InMemoryFs which doesn't set `.code`)
+- Updated `src/api/server.ts`: added `app.route("/v1/sandboxes", fileRoutes(sessionManager))`
+- Created `src/api/__tests__/files.test.ts`: 3 unit tests (happy path with Content-Type + stat header, ENOENT → 404, EISDIR → 400)
+- Files changed: `src/api/routes/files.ts` (new), `src/api/__tests__/files.test.ts` (new), `src/api/server.ts` (modified)
 - **Learnings for future iterations:**
-  - Two-step approach (DELETE destination first, then UPDATE source) is clean and explicit. Destination DELETE is a no-op when the dirent doesn't exist, so no conditional check is needed.
-  - `RETURNING inode_id` after the UPDATE distinguishes "source existed and moved" from "source did not exist" — zero rows means ENOENT.
-  - Biome reformats a long single-line `moveDirent(tx, oldParentId, oldName, newParentId, newName)` parameter list to multi-line — expected behaviour, don't fight it.
+  - Hono wildcard route that spans path segments must use `/:param{.*}` (not `/*`); `c.req.param("*")` is always `undefined` in sub-routers — use named param with `c.req.param("param")`
+  - InMemoryFs throws errors with `code: undefined` but message prefix is the POSIX code (e.g., "ENOENT: ...") — the global error handler won't map these correctly without the fallback message-parsing strategy
+  - `fileRoutes(sessionManager)` should be mounted separately from `sandboxRoutes(sessionManager)` — both use the same mount point `/v1/sandboxes` and Hono merges them correctly
+  - File route handlers should handle ENOENT/EISDIR explicitly (not rely on global handler) when using InMemoryFs in tests, because InMemoryFs doesn't set `.code`
 ---
 
-## 2026-04-19 - US-014
-- Implemented `gcOrphanBlobs(tx)`: `DELETE FROM blobs WHERE sha256 NOT IN (SELECT content_sha256 FROM inodes WHERE content_sha256 IS NOT NULL) RETURNING sha256`. Returns `rows.length` as count of deleted blobs.
-- Added 3 integration tests in `postgres.test.ts` in a new `describe` block: (1) blob referenced by inode survives GC; (2) orphan blob (inode deleted before GC) is removed — asserts `deleted >= 1` and blob is gone; (3) blob referenced by two inodes survives GC after one inode deleted.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-063
+- Added `PUT /:id/files/:path{.*}` route to `src/api/routes/files.ts`
+- Reads raw request body via `c.req.raw.arrayBuffer()`, converts to `Uint8Array`
+- Creates parent directories via `fs.mkdir(parent, { recursive: true })` before writing; root `/` is skipped; EEXIST is caught and ignored
+- Calls `fs.writeFile(filePath, content)` and returns 204 No Content
+- Added `parentDir(filePath)` helper: returns `/` if path has no parent segment, otherwise slices up to last `/`
+- Added 3 unit tests to `files.test.ts`: new file write + GET verify, overwrite existing file, nested path auto-creates parent dirs
+- Files changed: `src/api/routes/files.ts` (modified), `src/api/__tests__/files.test.ts` (modified)
 - **Learnings for future iterations:**
-  - `NOT IN (SELECT col FROM t WHERE col IS NOT NULL)` is the correct SQL pattern for orphan detection with nullable FK columns — `NOT IN` with NULLs in the subquery would return no rows without the `IS NOT NULL` filter.
-  - GC count should be asserted with `>= 1` (not `=== 1`) since other orphan blobs from previous test runs may be cleaned up in the same GC pass.
-  - GC runs globally (not scoped to a sandbox) — any test that leaves orphan blobs can interfere with GC count assertions; use `>= 1` rather than exact counts.
+  - Raw binary body in Hono: use `c.req.raw.arrayBuffer()` → `new Uint8Array(buffer)` — do NOT use `c.req.json()` or `c.req.text()` for binary payloads
+  - `fs.mkdir(parent, { recursive: true })` does not throw EEXIST in InMemoryFs for already-existing dirs, but the try/catch is kept for safety with other fs backends
+  - `parentDir` returns `'/'` for top-level paths (e.g. `/file.txt`) — skip mkdir for `/` since it always exists
 ---
 
-## 2026-04-19 - US-013
-- Implemented `upsertBlob(tx, sha256, data)`: `INSERT INTO blobs (sha256, data, size) VALUES ($sha256, $data, $size) ON CONFLICT (sha256) DO NOTHING`. `size` is `data.length`.
-- Implemented `getBlob(tx, sha256)`: `SELECT data FROM blobs WHERE sha256 = $sha256`. Returns `Buffer` (assignable to `Uint8Array`) or `null`.
-- Added 3 integration tests in `postgres.test.ts`: (1) insert blob and retrieve by sha256, verify data matches; (2) insert same sha256 twice, verify only one row (dedup); (3) get non-existent sha256 returns null. Tests track inserted sha256s in an array and delete them in `afterAll` since blobs are not sandbox-scoped.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-064
+- Added `DELETE /:id/files/:path{.*}` route to `src/api/routes/files.ts`
+- Reads `recursive` query param (`=== "true"`); passes to `fs.rm(filePath, { recursive })`
+- Returns 204 on success, 404 for ENOENT, 409 for ENOTEMPTY
+- Added 4 unit tests to `files.test.ts`: delete file (204), delete non-existent (404), delete non-empty dir without recursive (409), delete dir with recursive=true (204)
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
 - **Learnings for future iterations:**
-  - `postgres.js` accepts `Uint8Array` directly as BYTEA parameters — no conversion needed. The driver serialises it as `\x...` hex automatically.
-  - `getBlob` returns `Buffer` (a subclass of `Uint8Array`) from postgres.js BYTEA columns — directly assignable to `Uint8Array` return type, no conversion needed.
-  - Blobs table is globally scoped (no `sandbox_id`) — test cleanup must delete by sha256 explicitly rather than relying on sandbox CASCADE. Use an `insertedSha256s` array in the `describe` closure and delete in `afterAll`.
-  - `ON CONFLICT (sha256) DO NOTHING` is sufficient for dedup — no need to check size or data equality on conflict.
+  - `IFileSystem.rm(path, { recursive?, force? })` is the single deletion method — there is no separate `unlink()` or `rmdir()`
+  - `fs.rm()` throws ENOTEMPTY for non-empty directories without `recursive: true`; ENOENT when path doesn't exist (unless `force: true`)
+  - Query param boolean parsing: `c.req.query("recursive") === "true"` — do not use `Boolean(c.req.query(...))` (truthy for any non-empty string)
 ---
 
-## 2026-04-19 - US-015
-- Implemented `loadAllPaths(tx)`: uses a recursive CTE joining `sandboxes` → root `inode` → `dirents` + `inodes` recursively. Uses `current_setting('app.sandbox_id')` to identify the sandbox root — requires `setSandboxContext` to be called in the same transaction first.
-- Root directory is included with path `'/'`. Children have path built as `parent_path || '/' || name` (special-cased when parent is `'/'` to avoid `//`).
-- Returns `Array<{ path: string } & PathCacheEntry>` with all fields mapped from snake_case DB columns.
-- Added integration test in `postgres.test.ts`: creates sandbox, adds `/home/user/file.txt`, calls `loadAllPaths` (inside transaction with `setSandboxContext`), verifies all 6 paths present including root and nested file with correct metadata.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-065
+- Added `POST /:id/mkdir` route to `src/api/routes/files.ts`
+- Body parsed inline with zod: `{ path: string, recursive?: boolean }`; returns 400 on invalid JSON or failed schema parse
+- Calls `session.fs.mkdir(path, { recursive })`; catches EEXIST and returns 409; all other errors re-thrown to global handler
+- Added 3 unit tests to `files.test.ts`: mkdir (204), mkdir with recursive (204 + nested dirs created), mkdir existing without recursive (409 EEXIST)
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
 - **Learnings for future iterations:**
-  - `loadAllPaths` **must** be called inside a transaction where `setSandboxContext` was already called — it reads `current_setting('app.sandbox_id')` to find the sandbox root inode from the `sandboxes` table.
-  - Path construction in the recursive CTE: base case emits `'/'`, recursive case uses `CASE WHEN t.path = '/' THEN '/' || d.name ELSE t.path || '/' || d.name END` to avoid `//` at the root.
-  - The CTE can cycle if there are symlinks pointing to ancestor dirs — symlinks are kind=3 and have no dirent children so the `JOIN dirents d ON d.parent_inode_id = t.inode_id` naturally stops traversal there. No cycle detection needed for well-formed trees.
-  - `size` column is BIGINT so postgres.js returns it as a string — use `Number(r.size)` to convert.
+  - `IFileSystem.mkdir(path, { recursive? })` throws EEXIST when directory already exists (non-recursive); with `recursive: true` it succeeds idempotently
+  - Inline zod parsing (safeParse inside the handler) avoids typing complexity with `validateBody` middleware when the router is already typed with `AuthVariables` only
 ---
 
-## 2026-04-19 - US-016
-- Implemented `loadSubtreeInodes(tx, rootInodeId)`: recursive CTE starting from `rootInodeId`, joining `dirents d ON d.inode_id = i.id` and `subtree s ON s.id = d.parent_inode_id` to walk all descendants. Returns `bigint[]` of all inode IDs including root.
-- Added one integration test in `postgres.test.ts`: builds a 3-level tree (subtreeRoot → child1/child2 → grandchild1/grandchild2/grandchild3), calls `loadSubtreeInodes`, verifies all 6 inodes are present using a Set comparison.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-066
+- Added `POST /:id/writeFiles` route to `src/api/routes/files.ts`
+- Body validated inline with zod: `{ files: z.record(z.string(), z.string()) }` where key=path, value=content
+- Iterates entries, creates parent directories via `fs.mkdir(parent, { recursive: true })` (EEXIST ignored), then calls `fs.writeFile(filePath, content)` for each file
+- Returns 204 on success; 400 for invalid JSON or failed schema parse
+- Added 1 unit test to `files.test.ts`: write 5 files (including nested paths) in one call, verify all readable via GET
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
 - **Learnings for future iterations:**
-  - `loadSubtreeInodes` does NOT require `setSandboxContext` — it walks the dirents graph directly from a given `rootInodeId`, not from `current_setting('app.sandbox_id')`. This is in contrast to `loadAllPaths`.
-  - The recursive CTE pattern: base is `SELECT id FROM inodes WHERE id = $rootId`; recursive step joins `inodes i JOIN dirents d ON d.inode_id = i.id JOIN subtree s ON s.id = d.parent_inode_id`. This walks child-of-parent edges.
-  - No cycle guard needed for well-formed trees since symlinks (kind=3) appear as inode rows but have no dirents entries (no children), so the recursion naturally terminates.
+  - `z.record(z.string(), z.string())` is the correct zod type for `Record<string, string>` bulk payloads
+  - The existing `parentDir` helper and `extractErrCode` pattern reuse cleanly for the bulk write loop — no new helpers needed
+  - Inline zod parsing (same pattern as mkdir) keeps the route self-contained without `validateBody` middleware
 ---
 
-## 2026-04-19 - US-017
-- Implemented `bulkIngest(tx, files)` in `src/fs/sql-fs/dialects/postgres.ts`:
-  - Reads sandbox_id and root_inode from `sandboxes WHERE id = current_setting('app.sandbox_id')` — requires `setSandboxContext` called first.
-  - Builds in-memory `Map<string, bigint>` (path → inodeId) seeded with `'/' → rootInodeId`.
-  - Collects unique ancestor directories from file paths, sorts by depth, creates missing ones sequentially (check-then-create per dir).
-  - Computes SHA-256 for each file using `createHash("sha256")` from `node:crypto`.
-  - Multi-row INSERT unique blobs via `tx\`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING\``.
-  - Multi-row INSERT all file inodes via `tx\`INSERT INTO inodes ${tx(inodeRows)} RETURNING id\``, preserving insertion order for ID mapping.
-  - Multi-row INSERT dirents via `tx\`INSERT INTO dirents ${tx(direntRows)} ON CONFLICT DO NOTHING\``.
-- Added `import { createHash } from "node:crypto"` to postgres.ts.
-- Added integration test describe block `"PostgresDialect — bulkIngest"` in `src/fs/sql-fs/integration/postgres.test.ts`: ingests 50 files across 5 directories (10 files each), verifies all dirs and files accessible via `listDirents`.
-- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-067
+- Added `GET /:id/tree` route to `src/api/routes/files.ts`
+- Query params validated with zod: `prefix` (string, default '/') and `depth` (coerced number, optional)
+- Calls `session.fs.getAllPaths()` (synchronous), filters by prefix and depth, then stats each path for metadata
+- Returns 200 JSON array: `[{ path, kind, size, mtime }]`
+- Depth calculation: count path segments between normalized prefix and path; `depth=1` returns only immediate children
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
 - **Learnings for future iterations:**
-  - `bulkIngest` requires `setSandboxContext` to be called in the same transaction first — it reads `current_setting('app.sandbox_id')` to find the sandbox root.
-  - postgres.js `tx(arrayOfObjects)` generates a multi-row VALUES clause when used after INSERT INTO. Column names are taken from the keys of the first object (snake_case → DB column names). Works with Uint8Array (BYTEA) values.
-  - Multi-row INSERT RETURNING returns rows in insertion order — safe to zip with the input array by index.
-  - Biome's `useTemplate` rule flags `"/" + expr` — use template literals `` `/${expr}` `` instead. Run `biome check --fix --unsafe` to auto-fix.
-  - `BulkIngestFile` must be imported in integration tests (`import type { BulkIngestFile } from "../types.js"`).
+  - `IFileSystem.getAllPaths()` is synchronous (no Promise) — do not await it
+  - `InMemoryFs.getAllPaths()` includes `/bin`, `/dev`, `/usr/bin`, etc. — tests must use an isolated prefix (e.g. `/myapp`) rather than asserting exact root-level path lists
+  - Depth filter: strip prefix from path, split on `/`, filter empty strings, count segments; `depth=1` means `segments <= 1`
+  - Prefix normalization: strip trailing `/` unless prefix is `/` itself to avoid double-slash matching
 ---
 
-## 2026-04-19 - US-018
-- Created `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` with two plpgsql functions:
-  - `fs_resolve_internal(p_path, p_follow_last, p_depth)` — internal recursive helper that walks path components, handles `.`/`..`, follows symlinks, tracks depth (raises FS001 ELOOP at >40), raises FS002 (ENOENT) and FS003 (ENOTDIR).
-  - `fs_resolve(p_path, p_follow_last)` — public entry point that delegates to the internal helper with `p_depth=0`.
-- Implemented `resolvePath(tx, path, followLast)` in `postgres.ts`: calls `SELECT fs_resolve($path, $followLast)` and wraps errors via `translateSqlError(err, path)` so FS001/FS002/FS003 SQLSTATEs become ELOOP/ENOENT/ENOTDIR errors.
-- Added `translateSqlError` import to `postgres.ts` (alongside existing `createEnoent`).
-- Added `readFileSync`/`fileURLToPath` imports to integration test file.
-- Added `describe` block `"PostgresDialect — resolvePath (fs_resolve)"` in `postgres.test.ts` with 6 integration tests: resolve simple path, resolve path with `.`/`..`, follow symlink with followLast=true, return symlink inode with followLast=false, detect ELOOP, detect ENOENT.
-- The integration test's `beforeAll` applies the stored proc DDL via `tx.unsafe(migrationSql)` so tests are self-contained (no manual migration required).
-- Files changed: `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` (new), `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-068
+- Created `src/api/routes/exec.ts`: exports `execRoutes(sessionManager)` factory with `POST /:id/exec-sync` route
+- Body validated inline with zod: `{ script: string, cwd?: string, env?: Record<string,string>, timeoutMs?: number }`
+- Timeout: AbortController + setTimeout, `timedOut` flag checked in both try (after await) and catch to ensure 408 regardless of whether bash.exec throws or resolves on abort
+- Default timeout 30s, max 300s clamped via `Math.min`; env converted to null-prototype object
+- Updated `src/api/server.ts`: added `app.route("/v1/sandboxes", execRoutes(sessionManager))`
+- Created `src/api/__tests__/exec.test.ts`: 3 unit tests (echo hello, false, timeout via vi.spyOn mocking bash.exec)
+- Files changed: `src/api/routes/exec.ts` (new), `src/api/__tests__/exec.test.ts` (new), `src/api/server.ts` (modified)
 - **Learnings for future iterations:**
-  - `fs_resolve_internal` uses a BIGINT array `v_stack` as a parent stack to support `..` without a reverse-index lookup on dirents.
-  - Symlink targets are treated as absolute paths and resolved via a recursive call to `fs_resolve_internal` with `p_depth + 1`. Depth > 40 raises SQLSTATE 'FS001' (ELOOP).
-  - `resolvePath` must wrap the stored proc call in try/catch and call `translateSqlError(err, path)` — the stored proc's custom SQLSTATEs (FS001/FS002/FS003) are already mapped in `errors.ts`.
-  - Integration tests can apply migration DDL via `tx.unsafe(migrationSql)` in `beforeAll`. Use `fileURLToPath(new URL("../migrations/...", import.meta.url))` to resolve the SQL file path relative to the test file.
-  - `tx.unsafe(sql)` executes raw SQL strings (including multi-statement DDL with `$$` delimiters) without parameterization — safe for migration files where content is controlled.
+  - Timeout pattern: set `timedOut = true` before `controller.abort()`; check timedOut in BOTH the try block (after await) and the catch block — bash.exec may either throw or resolve when aborted
+  - To mock `session.bash.exec` for timeout tests: pre-create the session via `sessionManager.getOrCreate(sandboxId)`, then `vi.spyOn(session.bash, "exec").mockImplementation(...)` — the mock must listen to `opts?.signal?.addEventListener("abort", ...)` and reject to unblock the await
+  - `Object.assign(Object.create(null) as Record<string, string>, body.env)` creates a null-prototype env object safe for user-controlled keys
+  - Biome `useTemplate` rule applies inside template literals too — `${SANDBOX_ID + "-timeout"}` → extract to a const first
 ---
 
-## 2026-04-19 - US-019
-- Created `src/fs/sql-fs/sql-fs.ts` with the `SqlFs<Tx>` class implementing `IFileSystem` from just-bash.
-- `ready()` calls `dialect.transaction()`, sets sandbox context via `setSandboxContext`, then calls `dialect.loadAllPaths()`. Populates `#pathCache: Map<string, PathCacheEntry>` from the results.
-- `getAllPaths()` returns `[...this.#pathCache.keys()]` — synchronous, no DB.
-- All other `IFileSystem` methods are stubs (throw "not implemented") to satisfy TypeScript's structural type check.
-- Created `src/fs/sql-fs/sql-fs.cache.test.ts` with 4 unit tests: (1) verifies transaction/setSandboxContext/loadAllPaths call sequence; (2) getAllPaths returns all cached paths; (3) getAllPaths returns [] before ready(); (4) ready() clears stale cache on re-init.
-- Files changed: `src/fs/sql-fs/sql-fs.ts` (new), `src/fs/sql-fs/sql-fs.cache.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-069
+- Added `POST /:id/exec` SSE streaming route to `src/api/routes/exec.ts` using Hono's `streamSSE` from `hono/streaming`
+- Same body schema and timeout/abort logic as exec-sync; AbortController cancels on timeout or client disconnect (via `c.req.raw.signal`)
+- Since `bash.exec()` is buffered (no streaming callback), events are emitted after exec completes: stdout event (if non-empty), stderr event (if non-empty), then exit event
+- Timeout: sends `{ t: "exit", exitCode: -1, error: "timeout" }` SSE exit event
+- Added `parseSseEvents()` helper in tests to parse raw SSE body text into structured event objects
+- Added 1 unit test to `exec.test.ts`: echo hello script, verify content-type is text/event-stream, verify stdout event data and exit event exitCode
+- Files changed: `src/api/routes/exec.ts`, `src/api/__tests__/exec.test.ts`
 - **Learnings for future iterations:**
-  - `vi.fn()` loses the generic `<T>` from `transaction<T>` — mock the full dialect with `as unknown as SqlDialect<unknown>` to avoid TS errors. Save mock fn references outside the cast object.
-  - `ReadFileOptions`, `WriteFileOptions`, `DirentEntry` are NOT exported from the just-bash main entry point. Use `Parameters<IFileSystem["readFile"]>[1]` to extract them.
-  - `readdirWithFileTypes` is optional in `IFileSystem` — stubs don't need to include it.
-  - Private `#pathCache` field (ES2022 private) works fine. It's only accessible inside the class, so tests must verify via `getAllPaths()` (public method), not by direct field access.
+  - `streamSSE(c, async (stream) => { ... })` from `hono/streaming` handles Content-Type, Transfer-Encoding, Cache-Control headers automatically; call `stream.writeSSE({ event, data })` inside the callback
+  - `c.req.raw.signal` provides the AbortSignal for client disconnect detection — listen with `addEventListener("abort", () => controller.abort())`
+  - SSE body parsing in tests: split on `"\n\n"` for event blocks, then split each block on `"\n"` and extract `event:` and `data:` lines; `data:` prefix is exactly 6 chars
+  - `bash.exec()` has no streaming callback — it returns buffered output; true line-by-line streaming would require a different just-bash API
 ---
 
-## 2026-04-19 - US-020
-- Implemented `writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes` in `src/fs/sql-fs/sql-fs.ts` with full pathCache update logic.
-- Added `#withTx<T>(fn)` private helper that wraps a dialect transaction with `setSandboxContext` call.
-- Added `#parentOf(path)`, `#nameOf(path)`, `#childPaths(dirPath)`, `#allPathsUnder(dirPath)` private path helpers.
-- `writeFile`: computes sha256 via `node:crypto`, calls `upsertBlob`→`createInode`→`upsertDirent` in a transaction, decrements/deletes old inode nlink on overwrite, updates pathCache.
-- `appendFile`: reads existing blob via `getBlob`, concatenates bytes, writes new blob, updates pathCache size/mtime.
-- `mkdir`: non-recursive creates single dir+dirent; recursive walks segments creating missing ones. Updates pathCache on each created dir.
-- `rm`: non-recursive calls `deleteDirent`→`decrementNlink`→`deleteInode` (if nlink=0), removes from pathCache. Recursive removes all descendants from pathCache via `#allPathsUnder`.
-- `chmod`: calls `updateInode({mode})`, patches pathCache entry with new mode.
-- `utimes`: calls `updateInode({mtime})`, patches pathCache entry with new mtime.
-- Created `src/fs/sql-fs/sql-fs.write.test.ts` with 25 unit tests using mocked dialect covering all 6 methods and their error cases.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.write.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-070
+- Added SSE timeout unit test to `src/api/__tests__/exec.test.ts` — the abort/timer implementation was already complete from US-068/069
+- Test pre-creates session via `sessionManager.getOrCreate`, spies on `bash.exec` to hang-then-reject on abort signal, sends request with `timeoutMs: 50`, parses SSE response body and asserts exit event has `exitCode: -1` and `error: 'timeout'`
+- Exec-sync timeout test already existed; this story adds the missing SSE timeout test to complete full coverage
+- Files changed: `src/api/__tests__/exec.test.ts`
 - **Learnings for future iterations:**
-  - pathCache entries use readonly fields — to patch a single field (e.g., mode), spread and override: `{ ...existing, mode }`. TypeScript allows this even with readonly on the original.
-  - `#childPaths(dirPath)` filters for direct children (no additional `/` after prefix). `#allPathsUnder(dirPath)` collects all descendants including root. Both are needed: childPaths for ENOTEMPTY check, allPathsUnder for recursive rm.
-  - For recursive mkdir, walk segments from root accumulating `current` path. Each segment only gets created if not already in pathCache — this is the `-p` semantics.
-  - `appendFile` on a file with no existing `contentSha256` (e.g., kind≠1 or new file) falls back to just the appended bytes. Always guard: `existing && existing.kind === 1 && existing.contentSha256 !== null`.
-  - The `#withTx` helper pattern (transaction + setSandboxContext inside) is reusable across all write operations — avoids repeating the boilerplate in every method.
+  - SSE timeout test follows same mock pattern as exec-sync: `vi.spyOn(session.bash, "exec").mockImplementation((_script, opts) => new Promise(...))` — session must be pre-created with `getOrCreate` before the spy
+  - The `timedOut` flag + catch block pattern in the SSE handler correctly emits the timeout exit event regardless of whether `bash.exec` throws or resolves after abort
 ---
 
-## 2026-04-19 - US-021
-- Implemented `mv(src, dest)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
-- After `dialect.moveDirent`: snapshots the src subtree from pathCache, deletes src paths, clears any existing dest paths, then re-inserts all snapshot entries with the src prefix replaced by dest (e.g. `/a/b/c` → `/x/b/c`).
-- Handles both file moves (single entry) and directory moves (all descendants remapped).
-- Created `src/fs/sql-fs/sql-fs.mv.test.ts` with 5 unit tests: move file, move dir with descendants, metadata preserved, ENOENT for missing src, moveDirent called with correct args.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.mv.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-075
+- Added `startReaper(intervalMs?)` and `stopReaper()` methods to `SessionManager` in `src/api/session-manager.ts`
+- Added private `runReaper()`: iterates all sessions, evicts those where `now - lastUsed > idleMs AND inFlight === 0 AND state !== 'closing'`
+- Eviction removes from the in-memory `sessions` Map only — no `destroySandbox` call (sandbox data persists in DB)
+- `idleMs` read from `SessionManagerOptions.idleMs` or `SESSION_IDLE_MS` env var (default 600000ms)
+- `reaperTimer` typed as `ReturnType<typeof setInterval> | undefined`
+- Added 2 unit tests using `vi.useFakeTimers()` to `src/api/__tests__/session-manager.test.ts`: idle session eviction and busy session skip
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
 - **Learnings for future iterations:**
-  - `#allPathsUnder(dirPath)` always includes `dirPath` as the first element — safe since src is verified to be in cache before calling it.
-  - Snapshot the subtree entries into a `Map<string, PathCacheEntry>` before deleting from cache; deleting then re-inserting in two separate passes avoids iterator invalidation.
-  - `dest + oldPath.slice(src.length)` correctly remaps all paths: when `oldPath === src`, slice gives `""` so result is just `dest`; for children it appends the suffix.
-  - Clear existing dest subtree paths before re-inserting to handle "mv over existing dir" correctly: iterate `[...this.#pathCache.keys()]` (snapshot) to avoid mutation-during-iteration issues.
+  - `vi.useFakeTimers()` mocks both `setInterval`/`setTimeout` AND `Date.now()` — advancing time with `vi.advanceTimersByTime(ms)` fires interval callbacks synchronously and shifts the fake clock
+  - `vi.useFakeTimers()` does NOT affect Promise microtask scheduling — `await getOrCreate(...)` still resolves normally
+  - Always call `sm.stopReaper()` + `vi.useRealTimers()` after fake-timer tests; use `afterEach` for cleanup if multiple tests share the describe block
+  - Setting `session.inFlight = 1` directly is a clean way to simulate a busy session in unit tests (field is not readonly)
 ---
 
-## 2026-04-19 - US-022
-- Initialized `#contentCache: LRUCache<bigint, Uint8Array>` in `SqlFs` constructor using the `lru-cache` package.
-- Added `contentCacheMaxBytes` option to `SqlFsOptions` (default 50 MB). Passed as `maxSize` to `LRUCache` with `sizeCalculation: (v) => v.byteLength`.
-- Added three `@internal` helpers (`_contentCacheGet`, `_contentCacheSet`, `_contentCacheHas`) to allow unit tests to verify cache state before readFile/writeFile are implemented.
-- Created `src/fs/sql-fs/sql-fs.content-cache.test.ts` with 5 unit tests: store/retrieve, cache miss, LRU eviction when budget exceeded, access promotion (recently-used entry survives), default 50 MB budget accepts many small entries.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.content-cache.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-075a
+- Added `pathCacheBytes: number` and `overBudget: boolean` fields to `Session` interface
+- Added `pathCacheMaxBytes?: number` option to `SessionManagerOptions` (default: 50MB = 50 * 1024 * 1024)
+- Added private `estimatePathCacheBytes(fs)` helper: `sum of (path.length + 100)` per entry from `fs.getAllPaths()`
+- In `getOrCreate`: computed initial `pathCacheBytes` and `overBudget` after `createFs` returns
+- In `withSession` finally block: re-estimates `pathCacheBytes` and updates `overBudget` after each operation
+- In `runReaper`: over-budget sessions with `inFlight === 0` are evicted immediately (regardless of `idleMs`); normal sessions still use idle timeout
+- Added 2 unit tests to `session-manager.test.ts`: under-budget session stays resident (100MB budget, 1M idleMs), over-budget session evicted immediately (1-byte budget, 1M idleMs)
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
 - **Learnings for future iterations:**
-  - lru-cache evicts only when adding would EXCEED `maxSize`. Three 10-byte entries with `maxSize: 30` all fit (30 === 30, no eviction). Use `maxSize: 25` (strictly less than total) to trigger eviction.
-  - The `@internal` test helper pattern (`_contentCacheGet/Set/Has`) is reusable — US-023/024 implementations should call these same helpers internally rather than duplicating the private field access.
-  - `LRUCache` import from `lru-cache` (named export, not default) — `import { LRUCache } from "lru-cache"`.
+  - `fs.getAllPaths()` is synchronous — no await needed; safe to call in `finally` blocks
+  - Over-budget detection uses `pathCacheMaxBytes: 1` in tests (any path cache > 1 byte triggers over-budget); InMemoryFs has many built-in system paths so is always over-budget with tiny limit
+  - The `withSession` finally block is the right place to re-estimate path cache size — covers all write/delete/move operations that route handlers perform
 ---
 
-## 2026-04-19 - US-023
-- Implemented `readFile(path, _options?)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
-- Cache-check flow: look up `entry` in `#pathCache` by path → check `#contentCache.get(entry.inodeId)` → if hit, decode and return → if miss, call `dialect.getBlob(tx, entry.contentSha256)`, store in `#contentCache`, decode and return.
-- Created `src/fs/sql-fs/sql-fs.read.test.ts` with 4 unit tests: (1) first read calls getBlob (cache miss); (2) second read does NOT call getBlob (cache hit); (3) contentCache is populated after first read; (4) pre-seeded cache bypasses getBlob entirely.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.read.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+## 2026-04-19 - US-076
+- Updated `destroy(sandboxId)` in `src/api/session-manager.ts`:
+  - Marks session `state = 'closing'` immediately so new requests fast-fail
+  - For not-in-pool case: still calls `destroySandboxFn(backend, sandboxId)` for DB cleanup, returns false
+  - Uses `session.mutex.runExclusive(...)` to queue cleanup after any currently-running in-flight work
+  - Sets `session.destroyPromise` before awaiting so concurrent destroy calls share the same Promise (idempotent)
+- Updated `withSession` to check `session.state === 'closing'` before AND inside `runExclusive` — fast-fail before queuing, safety-net inside
+- Added `destroySandboxFn?` to `SessionManagerOptions` for test dependency injection (avoids vi.mock on the module)
+- Added `destroyPromise?: Promise<void>` to `Session` interface for concurrent destroy idempotency
+- Files changed: `src/api/session-manager.ts`, `src/api/__tests__/session-manager.test.ts`
 - **Learnings for future iterations:**
-  - `readFile` is keyed on `entry.inodeId` in the contentCache (not sha256). This means if a file is overwritten and gets a new inodeId, the old entry does not pollute the new one. US-024 must set the new inodeId's cache entry on write (not the old one).
-  - `getBlob` takes `contentSha256` (Uint8Array) from the pathCache entry, not the inodeId. The contentCache uses `inodeId` as key but fetches via `sha256`.
-  - Pre-seeding `contentCache` via `_contentCacheSet` before calling `readFile` is a valid test technique to verify cache-hit path without needing a DB call.
-  - `TextDecoder().decode(bytes)` with default args uses UTF-8; no need to handle other encodings for US-023.
----
-
-## 2026-04-19 - US-024
-- `writeFile()`: added `this.#contentCache.set(inodeId, bytes)` after `this.#pathCache.set(...)` — new content is immediately cached under the new inodeId.
-- `rm()` non-recursive: added `this.#contentCache.delete(entry.inodeId)` before `this.#pathCache.delete(path)` — evicts the file's content from cache on removal.
-- `rm()` recursive: inside the `for (const p of this.#allPathsUnder(path))` loop, added `const e = this.#pathCache.get(p); if (e) this.#contentCache.delete(e.inodeId);` before `this.#pathCache.delete(p)` — clears all subtree inodes from contentCache.
-- `appendFile()`: captured `replacedInodeId` via `let replacedInodeId: bigint | null = null` outside the transaction callback (set when `upsertDirent` returns a non-null old inodeId). After the transaction: `if (replacedInodeId !== null) this.#contentCache.delete(replacedInodeId)` then `this.#contentCache.set(inodeId, fullBytes)`.
-- `mv()`: no changes — mv preserves inodeIds (only pathCache keys change), so contentCache remains valid as-is.
-- Created `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` with 9 unit tests covering all four acceptance criteria.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - When tracking a transaction's "side output" (e.g., oldInodeId returned by upsertDirent) for post-transaction cache operations, use a `let` variable declared outside the `#withTx` callback and assign inside — the async callback closes over it.
-  - `LRUCache.set` with `sizeCalculation` requires `byteLength > 0` — never store `new Uint8Array(0)` in contentCache (it throws "sizeCalculation return invalid (expect positive integer)"). Guard against zero-length writes if needed.
-  - contentCache is keyed by inodeId (bigint). On file overwrite, the old inodeId's entry is orphaned (not explicitly deleted) since the path now points to a new inodeId. It will be evicted by LRU naturally. Only `rm` and `appendFile` need explicit deletion of old inodeIds.
----
-
-## 2026-04-19 - US-025
-- Implemented `stat(path)` in `src/fs/sql-fs/sql-fs.ts`: looks up pathCache, follows symlinks at final component (looks up `symlinkTarget` in cache), returns FsStat with `isSymbolicLink: false` always. Throws ENOENT if path or symlink target not in cache.
-- Implemented `lstat(path)`: looks up pathCache directly without following symlinks, returns FsStat with `isSymbolicLink: entry.kind === 3`. Throws ENOENT if path not in cache.
-- Created `src/fs/sql-fs/sql-fs.stat.test.ts` with 8 unit tests: stat on file, dir, symlink (follows link), stat ENOENT; lstat on file, dir, symlink (returns isSymbolicLink=true), lstat ENOENT.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.stat.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `stat` symlink-follow: after resolving the initial pathCache entry, check if `kind === 3` and re-lookup `entry.symlinkTarget` in pathCache. The PRD says "stat always follows symlinks (at the final component)" — this one-level follow is sufficient since well-formed symlinks in pathCache point to absolute paths.
-  - `FsStat` has exactly 6 fields: `isFile`, `isDirectory`, `isSymbolicLink`, `mode`, `size`, `mtime`. No `ino`, no `nlink`. Import from `just-bash` main entry point.
-  - Test pattern for stat/lstat: build a fresh SqlFs via `await fs.ready()` with a mocked dialect returning test entries from `loadAllPaths`. No need to call `writeFile` or other write methods.
----
-
-## 2026-04-19 - US-026
-- Implemented `exists(path)` in `src/fs/sql-fs/sql-fs.ts`: replaced the stub with `return this.#pathCache.has(path)` — single line, never throws.
-- Created `src/fs/sql-fs/sql-fs.exists.test.ts` with 3 unit tests: (1) returns true for an existing path; (2) returns false for a non-existing path; (3) never throws — resolves false on empty cache.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.exists.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `exists()` is a pure cache lookup — no DB call, no transaction, no error. One-liner implementation.
-  - The "never throws" criterion is satisfied by returning a resolved Promise (async method) — no special try/catch needed since `Map.has()` cannot throw.
----
-
-## 2026-04-19 - US-027
-- Implemented `readdir(path)` in `src/fs/sql-fs/sql-fs.ts`: checks pathCache, throws ENOENT if missing, ENOTDIR if kind≠2, then calls `#childPaths(path)` and maps each full path to its basename via `#nameOf`.
-- Implemented `readdirWithFileTypes(path)` as an optional method: same lookup logic, maps each child to `DirentEntry` with `name`, `isFile`, `isDirectory`, `isSymbolicLink` from `entry.kind`.
-- Added `DirentEntry` type extraction: `type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number]` — `DirentEntry` is not exported from just-bash main entry point so must be extracted from the interface.
-- Created `src/fs/sql-fs/sql-fs.readdir.test.ts` with 7 unit tests: readdir with 3 children (file/dir/symlink), readdir returns only direct children (not grandchildren), ENOENT on missing path, ENOTDIR on file; readdirWithFileTypes returns correct type flags, ENOENT, ENOTDIR.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.readdir.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `DirentEntry` is NOT exported from just-bash main — extract it via `Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number]`.
-  - `readdirWithFileTypes` is optional (`?:`) on `IFileSystem` — the method body can use `Promise.resolve()`/`Promise.reject()` instead of `async` since no await is needed. Both patterns are equivalent; synchronous rejection via `Promise.reject()` is idiomatic when there are no awaits.
-  - `#childPaths(dirPath)` already handles direct-children-only filtering (no additional `/` in `rest`), so `readdir` is a simple map from paths to basenames.
-  - Tests call `fs.readdirWithFileTypes!(...)` (non-null assertion) since TypeScript sees it as optional — this is fine in test code.
----
-
-## 2026-04-19 - US-028
-- Added EISDIR guard to `readFile` — throws if `entry.kind === 2` (directory)
-- Added `byteLength > 0` guard before `#contentCache.set` in `readFile` — fixes potential throw on zero-length files (LRUCache requires positive byte sizes)
-- Implemented `readFileBuffer(path)` replacing the stub: same cache-check flow as `readFile` but returns raw `Uint8Array` instead of decoded string
-- Added `createEisdir` import to `sql-fs.ts` (was missing from prior stories)
-- Created `src/fs/sql-fs/sql-fs.read-file.test.ts` with 8 unit tests: readFile returns string/ENOENT/EISDIR; readFileBuffer returns Uint8Array/stores in cache/cache hit skips DB/ENOENT/EISDIR
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.read-file.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `readFile` from US-023 was missing the EISDIR check — US-028 added it. When a story says "throws EISDIR if kind=2", always add that guard immediately after the ENOENT check.
-  - `readFileBuffer` is structurally identical to `readFile` minus the `TextDecoder` step — reuse the same cache-check/miss pattern.
-  - The `byteLength > 0` guard before `contentCache.set` prevents the LRUCache "sizeCalculation return invalid" error for empty files. Apply this guard to both `readFile` and `readFileBuffer`.
----
-
-## 2026-04-19 - US-029
-- Added `createEinval(path)` to `src/fs/sql-fs/errors.ts` — returns Error with `code: "EINVAL"` and message `"EINVAL: invalid argument, '${path}'"`.
-- Implemented `readlink(path)` in `src/fs/sql-fs/sql-fs.ts`: looks up pathCache, throws ENOENT if missing, throws EINVAL if `kind !== 3`, returns `entry.symlinkTarget`.
-- Created `src/fs/sql-fs/sql-fs.readlink.test.ts` with 3 unit tests: (1) readlink on symlink returns target string; (2) readlink on regular file throws EINVAL; (3) readlink on non-existent path throws ENOENT.
-- Files changed: `src/fs/sql-fs/errors.ts`, `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.readlink.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `createEinval` was missing from `errors.ts` — add it when any story requires EINVAL (e.g., readlink on non-symlink). Pattern is identical to other constructors: `makeFsError("EINVAL", ...)`.
-  - `readlink` is a pure cache lookup — no DB call, no transaction, no `#withTx`. Same pattern as `exists`, `stat`, `readdir`.
-  - `symlinkTarget` is `string | null` in PathCacheEntry; use `entry.symlinkTarget!` (non-null assertion) inside the `kind === 3` guard — TypeScript can't narrow it automatically.
----
-
-## 2026-04-19 - US-030
-- Implemented `realpath(path)` in `src/fs/sql-fs/sql-fs.ts`: calls `#withTx` → `dialect.resolvePath(tx, path, true)` to get the resolved inodeId, then reverse-iterates pathCache to find the canonical path for that inodeId. ENOENT and ELOOP propagate naturally from `resolvePath`.
-- Created `src/fs/sql-fs/sql-fs.realpath.test.ts` with 5 unit tests: (1) symlink resolves to canonical path; (2) non-symlink returns its own path; (3) `followLast=true` is passed to resolvePath; (4) ENOENT from resolvePath propagates; (5) ELOOP from resolvePath propagates.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.realpath.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `realpath` reverse-looks up pathCache: after getting the resolved inodeId from `dialect.resolvePath`, iterate `#pathCache` entries to find the path whose `entry.inodeId === resolvedInodeId`. This is O(n) but correct for sandbox-scale trees.
-  - Errors from `resolvePath` (ENOENT, ELOOP) propagate automatically — no try/catch needed in `realpath`. The `#withTx` wrapper just re-throws.
-  - Test pattern: mock `resolvePath` via `mockResolvedValue(inodeId)` or `mockRejectedValue(error)` after calling `makeFs` (which seeds pathCache via `ready()`).
----
-
-## 2026-04-19 - US-031
-- No new code written — all acceptance criteria for SqlFs.writeFile were already satisfied by prior stories.
-- Implementation in `src/fs/sql-fs/sql-fs.ts` (writeFile method) was done as part of US-020.
-- Tests covering "write new file, verify in pathCache + contentCache" and "overwrite existing file, verify old inode cleaned up" exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024).
-- Test covering "write to non-existent parent dir throws ENOENT" exists in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020).
-- Verified: `pnpm typecheck` passes, all 107 unit tests pass.
-- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - US-031 through US-042 may similarly be "no-op" stories if their implementations were already provided as part of earlier US-020/021/022/023/024 stories. Always check existing code and tests before writing anything new.
-  - When a story's implementation was front-loaded into an earlier story, the PRD story is satisfied by verifying the existing code+tests meet the acceptance criteria and running quality checks.
----
-
-## 2026-04-19 - US-032
-- No new code written — all acceptance criteria for SqlFs.appendFile were already satisfied by prior stories.
-- Implementation in `src/fs/sql-fs/sql-fs.ts` (appendFile method, lines 177-233) was done as part of US-020.
-- Tests covering "append to non-existent file creates new file" and "append to existing file updates pathCache" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020).
-- Tests covering "invalidates old inode contentCache entry" and "sets new inode content in contentCache" (verifying content is original + appended) exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024).
-- Verified: `pnpm typecheck` passes, all 107 unit tests pass, `pnpm lint:fix` reports no fixes.
-- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - US-032 is another no-op story — implementation and tests were front-loaded in US-020 and US-024 respectively. Check existing code before writing.
-  - The appendFile cache-invalidation test verifies "content is original + appended" by checking `new TextDecoder().decode(cached) === "hello world"` — this satisfies the "verify content is original + appended" acceptance criterion.
----
-
-## 2026-04-19 - US-033
-- No new code written — all acceptance criteria for SqlFs.mkdir were already satisfied by prior stories.
-- Implementation in `src/fs/sql-fs/sql-fs.ts` (mkdir method) was done as part of US-020.
-- Tests covering "mkdir single level, mkdir -p nested, mkdir existing (EEXIST), mkdir -p existing (no error)" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020, lines 227-273).
-- Verified: `pnpm typecheck` passes, all 107 unit tests pass, `pnpm lint:fix` reports no fixes.
-- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - US-033 is another no-op story — implementation and tests were front-loaded in US-020. The pattern continues: US-034 through US-042 may also be satisfied already. Check existing code before writing.
----
-
-## 2026-04-19 - US-034
-- No new code written — all acceptance criteria for SqlFs.rm (non-recursive) were already satisfied by prior stories.
-- Implementation in `src/fs/sql-fs/sql-fs.ts` (rm method, lines 303-343) was done as part of US-020.
-- Tests covering "rm file, rm empty dir, rm non-empty dir (ENOTEMPTY), rm non-existent (ENOENT), rm -f non-existent (no error)" exist in `src/fs/sql-fs/sql-fs.write.test.ts` (from US-020, lines 162-223).
-- Tests covering "removes entry from pathCache and contentCache" exist in `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts` (from US-024, lines 152-193).
-- Verified: `pnpm typecheck` passes, all 107 unit tests pass.
-- Note: The "EISDIR if dir and recursive not set" AC criterion is inconsistent with the "Unit test: rm empty dir" test case (which expects success). The test cases are treated as ground truth; the implementation allows removing empty dirs without recursive.
-- Files changed: `scripts/ralph/prd.json` (marked passes: true), `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - US-034 is another no-op story — rm implementation and tests were front-loaded in US-020 and US-024.
-  - The AC has a contradiction: "EISDIR if dir and recursive not set" vs test case "rm empty dir" (no error). Current implementation allows removing empty dirs without recursive (matches test cases, not the Throws criterion). Don't add EISDIR logic as it would break the listed test cases.
----
-
-## 2026-04-19 - US-035
-- Updated the `rm` recursive branch in `src/fs/sql-fs/sql-fs.ts` to use `dialect.loadSubtreeInodes` and delete all subtree inodes within one transaction (instead of only deleting the parent dirent).
-- New recursive rm flow: snapshot subtree paths → `#withTx` (deleteDirent parent + loadSubtreeInodes + deleteInode per inode) → update pathCache + contentCache.
-- Updated `loadSubtreeInodes` mock in `sql-fs.write.test.ts` and `sql-fs.cache-invalidation.test.ts` from `vi.fn()` (returns undefined, not iterable) to `vi.fn(async () => [3n, 4n])`.
-- Created `src/fs/sql-fs/sql-fs.rm-recursive.test.ts` with 5 unit tests: removes all subtree paths from pathCache (3-level deep), calls loadSubtreeInodes with root inodeId, calls deleteInode for each returned inodeId, removes all subtree inode entries from contentCache, calls deleteDirent to unlink subtree root.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`, `src/fs/sql-fs/sql-fs.write.test.ts`, `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - The prior recursive rm (US-020) only deleted the parent dirent — it left all child inodes and dirents orphaned in the DB. US-035 corrects this by calling loadSubtreeInodes + deleteInode for each inode.
-  - Deleting inodes in Postgres CASCADE-deletes all dirents referencing those inodes (both as `parent_inode_id` and `inode_id`), so no explicit dirent deletions are needed for subtree children.
-  - Mocks for `loadSubtreeInodes: vi.fn()` silently break when code iterates the result — they return `undefined` (not an array). Always use `vi.fn(async () => [])` or appropriate array for collection-returning methods.
-  - The parent dirent deletion must happen first (to unlink the subtree from the tree), then loadSubtreeInodes walks the now-unlinked subtree dirents to collect inode IDs for deletion.
----
-
-## 2026-04-19 - US-036
-- Updated `mv(src, dest)` in `src/fs/sql-fs/sql-fs.ts` to handle the case where `dest` already exists.
-- Before calling `moveDirent`, if `dest` is in pathCache: call `decrementNlink` on the displaced dest inode, and if nlink reaches 0, call `deleteInode`. The `moveDirent` dialect method already DELETEs the dest dirent at the SQL level (from US-012).
-- Added `const destEntry = this.#pathCache.get(dest)` before the transaction, then inside the transaction: `if (destEntry) { const newNlink = await decrementNlink(...); if (newNlink === 0) await deleteInode(...); }`.
-- Added a new `describe` block in `src/fs/sql-fs/sql-fs.mv.test.ts` with 2 tests: (1) move over existing file calls decrementNlink + deleteInode when nlink drops to 0; (2) move over existing file does NOT call deleteInode when nlink > 0.
-- All prior mv tests (from US-021) still pass.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.mv.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `moveDirent` in the dialect handles the dest dirent at the SQL level (DELETE then UPDATE). The SqlFs layer is responsible for the displaced inode's nlink lifecycle — always check if dest exists in pathCache before calling moveDirent, and handle decrementNlink/deleteInode accordingly.
-  - Snapshot `destEntry = this.#pathCache.get(dest)` before the transaction (not inside it) so the cache state is captured before any async mutations.
-  - The pathCache rebuild (clearing old keys, re-inserting under dest) already handles removing the dest entry — no separate `this.#pathCache.delete(dest)` is needed since the loop clears all keys starting with dest.
----
-
-## 2026-04-19 - US-037
-- Implemented `cp(src, dest, options?)` for single-file copy in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
-- Single file copy flow: look up src in pathCache (ENOENT if missing), throw EISDIR if src is a dir without `recursive`, resolve dest parent from pathCache, call `createInode` with same `contentSha256` (no `upsertBlob` — blob already exists via CAS dedup), call `upsertDirent` at dest, handle displaced dest inode nlink (decrementNlink/deleteInode if nlink=0), update pathCache with new entry.
-- Created `src/fs/sql-fs/sql-fs.cp.test.ts` with 8 unit tests covering: dest added to pathCache, upsertBlob NOT called (blob shared), createInode called with correct mode/size/contentSha256, upsertDirent called with correct args, src remains in pathCache (copy not move), ENOENT on missing src, EISDIR on directory without recursive, displaced dest inode lifecycle (decrementNlink + deleteInode).
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cp.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `cp` single-file does NOT call `upsertBlob` — the blob already exists (CAS dedup). Only `createInode` + `upsertDirent` are needed. This is the key difference from `writeFile`.
-  - `cp` creates a new inode (new `inodeId`) but reuses the same `contentSha256`. Both src and dest inodes point to the same blob row. nlink is NOT incremented because each inode has its own nlink=1.
-  - Pattern for displaced dest cleanup (when `upsertDirent` returns a non-null old inodeId): call `decrementNlink` → if result=0, call `deleteInode`. Identical to the pattern in `writeFile` and `appendFile`.
-  - US-038 (recursive directory cp) will need to walk the src subtree from pathCache and call the single-file cp logic per file entry. The `options?.recursive` guard already branches correctly.
----
-
-## 2026-04-19 - US-038
-- Implemented recursive directory copy in `cp(src, dest, options?)` in `src/fs/sql-fs/sql-fs.ts`, replacing the `throw new Error("not implemented: recursive cp")` stub.
-- Recursive cp flow: collect all paths under `src` via `#allPathsUnder`, sort by depth (fewer "/" first) so parents are always created before children, then in a single `#withTx` transaction: for each srcPath, compute destPath, resolve parent inodeId from `newInodeIds` map (newly-created) or fallback to existing pathCache entry, call `createInode` (sharing `contentSha256` and `symlinkTarget`), call `insertDirent`. After the transaction, update pathCache for all new entries.
-- Added 7 unit tests to `src/fs/sql-fs/sql-fs.cp.test.ts` in a new `describe("SqlFs.cp() — recursive directory")` block: all dest paths added to pathCache, src paths remain intact, blobs shared (upsertBlob not called, createInode called with correct sha256), createInode called 4 times (one per subtree node), insertDirent called 4 times with correct parent ids, EISDIR thrown without recursive option, ENOENT thrown for missing src.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.cp.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `#allPathsUnder(dirPath)` returns the root + all descendants. Sort by `a.split("/").length - b.split("/").length` to process parents before children — this is the key invariant for the parent-lookup map to work correctly.
-  - Track newly-created inodeIds in a `Map<string, bigint>` (destPath → inodeId). Child entries look up their parent via `newInodeIds.get(destParent) ?? this.#pathCache.get(destParent)?.inodeId`. The fallback handles the copy root's parent (which already exists in pathCache).
-  - Recursive cp uses `insertDirent` (not `upsertDirent`) since dest paths are freshly computed — no conflict expected. `createInode` always produces new inodeIds even though `contentSha256` is shared.
-  - `dest + srcPath.slice(src.length)` maps any srcPath to its destPath. For the root (srcPath === src), slice gives "" so result is just dest. For children, it appends the relative suffix. Identical to the pattern used in `mv`.
----
-
-## 2026-04-19 - US-039
-- Implemented `link(existingPath, newPath)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
-- Added `createEperm` to the import from `./errors.js` (was previously unused by sql-fs.ts).
-- Guard order: ENOENT (src missing) → EPERM (src is dir, kind=2) → EEXIST (dest already in cache) → ENOENT (dest parent missing) → ENOTDIR (dest parent not a dir).
-- Transaction: `insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId)` + `incrementNlink(tx, srcEntry.inodeId)`.
-- pathCache update: `this.#pathCache.set(newPath, { ...srcEntry })` — same inodeId, same metadata as source.
-- Created `src/fs/sql-fs/sql-fs.link.test.ts` with 8 unit tests: dest added to pathCache, src preserved, insertDirent called with correct args, incrementNlink called with src inodeId, ENOENT for missing src, EPERM for dir src, EEXIST for existing dest, ENOENT for missing dest parent.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.link.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `link` does NOT call `upsertBlob` or `createInode` — it reuses the existing inode by calling `insertDirent` with the existing `srcEntry.inodeId`. The new pathCache entry shares the same `inodeId` as the source.
-  - `incrementNlink` must be called (not `decrementNlink`) to reflect the new reference. The nlink field is not stored in pathCache, but the DB inode row is updated.
-  - Hardlinks to directories are forbidden — throw EPERM with `op="link"` when `srcEntry.kind === 2`.
-  - contentCache does not need updating — the shared inodeId already has its content cached (if previously read), so the new path benefits from the same cache hit automatically.
----
-
-## 2026-04-19 - US-040
-- Added `allowSymlinks?: boolean` option to `SqlFsOptions` (default `false`).
-- Added `readonly #allowSymlinks: boolean` field, initialized in constructor.
-- Implemented `symlink(target, linkPath)`: throws EPERM (with `op="symlink"`) immediately when `!#allowSymlinks` — no DB call. When allowed: validates parent exists and is dir, calls `createInode(kind=3, symlinkTarget=target)` + `insertDirent`, sets pathCache entry with `kind=3`.
-- Created `src/fs/sql-fs/sql-fs.symlink.test.ts` with 7 unit tests: EPERM with default options, EPERM with explicit `allowSymlinks: false`, no DB calls on EPERM, symlink creates pathCache entry with kind=3, readlink returns target, createInode called with correct args, insertDirent called with correct args.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.symlink.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `symlink` is the only `IFileSystem` method gated by an option (`allowSymlinks`). Check the option first — if false, throw EPERM with NO DB call whatsoever.
-  - Symlink inodes use `kind: 3`, `mode: 0o777`, `size: target.length`, `symlinkTarget: target`, `contentSha256: null`. No blob is created — symlinks store their target in the inode row directly.
-  - The `allowSymlinks` option is passed at `SqlFs` construction time, not per-call. This matches the class-level policy model in the CLAUDE.md security section.
----
-
-## 2026-04-19 - US-041
-- No new implementation code written — `chmod` and `utimes` were already implemented in `src/fs/sql-fs/sql-fs.ts` as part of US-020.
-- Created `src/fs/sql-fs/sql-fs.chmod-utimes.test.ts` with 4 unit tests specifically verifying the US-041 AC: chmod changes mode reflected in subsequent stat(), utimes changes mtime reflected in subsequent stat(), both throw ENOENT for missing paths.
-- Files changed: `src/fs/sql-fs/sql-fs.chmod-utimes.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - The US-020 write tests verified updateInode was called but did not call stat() afterward. US-041's AC explicitly requires "reflected in subsequent stat()" — always add that explicit stat() assertion when the AC states it.
-  - `chmod` and `utimes` are pure pathCache patches: `{ ...entry, mode }` and `{ ...entry, mtime }`. stat() reads from pathCache, so the reflection is immediate after the method completes.
----
-
-## 2026-04-19 - US-042
-- Implemented `resolvePath(base, path)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
-- Added module-level `normalizeFsPath(p)` helper: strips trailing `/`, prepends `/` if missing, splits on `/`, filters empty and `.` components, pops stack on `..`, rejoins.
-- `resolvePath`: if `path` starts with `/`, return `normalizeFsPath(path)` (absolute override); else combine `base + "/" + path` (or `"/" + path` when base is `/`) and normalize.
-- Created `src/fs/sql-fs/sql-fs.resolvepath.test.ts` with 8 unit tests: relative path, absolute override, `.` component, `..` component, `.` in absolute path, `..` in absolute path, base is root, resolves to root via `../..`.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.resolvepath.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-- **Learnings for future iterations:**
-  - `resolvePath` is NOT exported from just-bash's public API (`package.json` exports only `.` and `./browser`). The internal path-utils function (`y` in the minified bundle, imported as `Be` in `InMemoryFs`) is not accessible externally. Implementing the equivalent logic inline is the correct approach.
-  - The just-bash `InMemoryFs.resolvePath` is literally `return Be(base, path)` where `Be` = `y` (normalize + combine). Matching that logic exactly (absolute override, `..` pop, `.` skip) satisfies the "re-export or delegate" AC criterion.
-  - `resolvePath` is synchronous — no `async`, no `await`, no `#withTx`. It only does string manipulation.
-  - Test pattern: instantiate `SqlFs` with a minimal mocked dialect (no `ready()` call needed since `resolvePath` doesn't touch pathCache or contentCache).
----
-
-## 2026-04-19 - US-042a + US-042b
-
-### US-042a — readFile/readFileBuffer symlink semantics
-- Added private `#resolveReadEntry(path)` helper to `SqlFs` that follows symlinks via `dialect.resolvePath(tx, path, true)`. Returns the final non-symlink `PathCacheEntry`. ENOENT/ELOOP propagate naturally from `resolvePath`.
-- Updated `readFile` and `readFileBuffer` to call `#resolveReadEntry` first. Content is cached under the **resolved** inode's id (not the symlink inode's id).
-- Created `src/fs/sql-fs/sql-fs.symlink-read.test.ts` with 11 unit tests: direct symlink read returns target content, resolvePath called with followLast=true, getBlob called with target's sha256, cache keyed by resolved inodeId, second read uses cache, regular file bypasses resolvePath, broken symlink returns ENOENT, loop returns ELOOP; readFileBuffer equivalents.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.symlink-read.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-
-### US-042b — hardlink-safe recursive rm
-- Replaced `loadSubtreeInodes`-based recursive rm with a post-order per-dirent approach.
-- New algorithm: (1) unlink subtree root from its parent via `deleteDirent`; (2) iterate subtree paths sorted deepest-first; (3) for each non-root entry, `deleteDirent` its parent→child dirent; (4) `decrementNlink` on every entry's inode; (5) `deleteInode` only when nlink reaches 0.
-- Files outside the subtree that hold hardlinks to inodes inside are preserved — their `decrementNlink` will return > 0 and `deleteInode` is skipped.
-- Updated `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`: replaced `loadSubtreeInodes` assertions with correct new behavior (4 `deleteDirent` calls, 4 `decrementNlink` calls, selective `deleteInode`). Added `describe("hardlink preservation")` block with 2 tests: inode with external hardlink is NOT deleted, pathCache still cleaned.
-- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
-
-- **Learnings for future iterations:**
-  - `#resolveReadEntry` is the correct pattern for any future read operations that should follow symlinks — reuse it for `stat` if symlink-following semantics are added there too.
-  - Content cache must be keyed by the **resolved** inodeId, not the symlink inodeId. Otherwise cache hits after a symlink read would be missed on subsequent direct reads of the target.
-  - Post-order sort: `subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length)` — deepest first. This guarantees children are processed before parents.
-  - Cascade deletes from `deleteInode` remove all dirents where that inode is `parent_inode_id` or `inode_id`. Since we delete child dirents explicitly before deleting parent inodes, there are no double-delete races.
-  - The old `loadSubtreeInodes` approach was unsafe once hardlinks exist: it deleted inodes directly without checking nlink. The per-dirent approach is O(n) DB calls but correct for all nlink values.
+  - `mutex.runExclusive` queues callbacks in order — calling it in `destroy` after marking 'closing' guarantees destroy runs after all pre-queued withSession operations (no need for manual inFlight polling)
+  - Fast-fail in `withSession` (pre-mutex check) prevents new requests from entering the mutex queue; the in-mutex re-check is a belt-and-suspenders safety net
+  - Idempotency pattern: store `Promise<void>` on the session object (`destroyPromise`) set immediately after the mutex is queued — second concurrent destroy sees it and awaits the same promise
+  - Dependency injection via `destroySandboxFn?` in options is cleaner than `vi.mock` for functions imported at module level — no module mocking side effects
 ---

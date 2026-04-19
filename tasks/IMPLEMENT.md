@@ -162,7 +162,7 @@ pnpm typecheck && pnpm lint:fix && pnpm knip
 
 **Goal:** API server running locally. Create sandbox, write files, execute bash, delete sandbox — all via curl.
 
-**Stories:** 23 (US-053 through US-076, plus US-057b and US-057c)
+**Stories:** 24 (US-053 through US-070, US-074 through US-076, plus US-057b, US-057c, and US-075a)
 
 ### Step 2.1 — Factory & Config (Epic 12)
 
@@ -221,7 +221,18 @@ pnpm typecheck && pnpm lint:fix && pnpm knip
 |-------|-------|------|------------|
 | US-074 | Get or create session | `api/src/session-manager.ts` | US-053 |
 | US-075 | Idle eviction | `api/src/session-manager.ts` | US-074 |
+| US-075a | pathCache memory budget | `api/src/session-manager.ts`, `src/fs/sql-fs/sql-fs.ts` | US-074 |
 | US-076 | Explicit destroy | `api/src/session-manager.ts` | US-055, US-074 |
+
+**Implementation notes:**
+- Treat the session manager as `Map<sandboxId, Session>` where `Session` owns the warm `SqlFs`, `pathCache`, `contentCache`, warm `Bash`, `lastUsed`, `inFlight`, mutex, and lifecycle state.
+- Enforce **one warm session per `sandboxId` per API process**. `getOrCreate()` must be single-flight so concurrent cache misses for the same sandbox do not create duplicate sessions.
+- Expose `withSession(sandboxId, fn)` (or equivalent) and route all file/exec operations through it. Do not hand unguarded shared session objects to route handlers.
+- Serialize **all same-sandbox operations** through a per-sandbox async mutex for Phase 2. This keeps warm Bash state and `SqlFs` caches coherent and guarantees later requests observe the cache updates from earlier completed requests.
+- Track an estimated `pathCache` byte budget per session and default it to 50MB. Unlike `contentCache`, `pathCache` should not partially evict entries; if the full tree snapshot grows over budget, the session should stop being retained once idle rather than keeping an incomplete path index.
+- Idle eviction must skip sessions with `inFlight > 0` or `state === "closing"`. Eviction drops in-memory state only; it must never delete backend data.
+- Explicit destroy must mark the session closing, prevent new work from attaching, wait for in-flight work to finish, then remove the session and call `destroySandbox(...)`.
+- This provides same-process cache correctness for concurrent requests to the same sandbox. Cross-instance/pod concurrency is still a later concern and requires additional invalidation/coordination beyond Phase 2.
 
 ### Phase 2 Verification
 
@@ -292,7 +303,7 @@ pnpm test:run api/src/
 
 **Goal:** Full agent workflow: upload a project, run commands, download results. MCP tools work in MCP Inspector.
 
-**Stories:** 14 (US-071 through US-087)
+**Stories:** 9 (US-071 through US-073, US-077 through US-080, US-086, US-087 — US-081 through US-085 removed, covered by bash_exec)
 
 ### Step 3.1 — Ingest & Export (Epic 17)
 
@@ -304,19 +315,18 @@ pnpm test:run api/src/
 
 ### Step 3.2 — MCP Server (Epic 19)
 
+5 tools total. File/dir operations are intentionally omitted — agents use `bash_exec` shell commands instead (cat, ls, mkdir, rm, mv, cp, etc.). The `bash_exec` description enumerates what just-bash supports and what it does not.
+
 | Story | Title | File | Depends on |
 |-------|-------|------|------------|
 | US-077 | MCP server setup + transport | `api/src/mcp/server.ts` | Phase 2 |
 | US-078 | sandbox_create tool | `api/src/mcp/tools.ts` | US-077 |
 | US-079 | sandbox_delete tool | `api/src/mcp/tools.ts` | US-077 |
-| US-080 | bash_exec tool | `api/src/mcp/tools.ts` | US-077 |
-| US-081 | file_read tool | `api/src/mcp/tools.ts` | US-077 |
-| US-082 | file_write tool | `api/src/mcp/tools.ts` | US-077 |
-| US-083 | file_delete tool | `api/src/mcp/tools.ts` | US-077 |
-| US-084 | dir_list tool | `api/src/mcp/tools.ts` | US-077 |
-| US-085 | dir_make tool | `api/src/mcp/tools.ts` | US-077 |
+| US-080 | bash_exec tool (with just-bash limitations in description) | `api/src/mcp/tools.ts` | US-077 |
 | US-086 | fs_ingest tool | `api/src/mcp/tools.ts` | US-077 |
 | US-087 | fs_export tool | `api/src/mcp/tools.ts` | US-077 |
+
+**Removed tools (covered by bash_exec):** ~~US-081 file_read~~, ~~US-082 file_write~~, ~~US-083 file_delete~~, ~~US-084 dir_list~~, ~~US-085 dir_make~~
 
 ### Phase 3 Verification
 
@@ -532,11 +542,11 @@ pnpm typecheck && pnpm lint:fix && pnpm knip
 | Phase | Goal | Stories | Cumulative | Verification |
 |-------|------|---------|------------|--------------|
 | 1 | SqlFs + Postgres | 46 | 46 | `pnpm test:comparison` passes with SqlFs |
-| 2 | HTTP API + Auth | 23 | 69 | token:create → admin/tokens → curl sandbox lifecycle |
-| 3 | Ingest/Export + MCP | 14 | 83 | tar.gz round-trip + MCP Inspector |
-| 4 | MySQL + Azure SQL + FileShare | 10 | 93 | comparison tests pass on all backends |
-| 5 | Container + Deploy | 12 | 105 | running on ACA, healthz works |
-| 6 | Integration tests | 6 | 111 | full test suite green |
+| 2 | HTTP API + Auth | 24 | 70 | token:create → admin/tokens → curl sandbox lifecycle |
+| 3 | Ingest/Export + MCP | 9 | 79 | tar.gz round-trip + MCP Inspector (5 tools) |
+| 4 | MySQL + Azure SQL + FileShare | 10 | 89 | comparison tests pass on all backends |
+| 5 | Container + Deploy | 12 | 101 | running on ACA, healthz works |
+| 6 | Integration tests | 6 | 107 | full test suite green |
 
 ## Dependency Graph (phases)
 

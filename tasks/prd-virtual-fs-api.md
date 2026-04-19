@@ -930,13 +930,20 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 ### Epic 18: Session Manager
 
 #### US-074: Session manager — get or create session
-**Description:** As a developer, I want the session manager to return warm Bash instances or create new ones.
+**Description:** As a developer, I want the session manager to return one warm session per `sandboxId` (per API process) or create it on demand, so concurrent requests reuse the same `SqlFs` caches and warm Bash runtime safely.
 
 **Acceptance Criteria:**
-- [ ] `get(sandboxId)` checks internal Map for existing session
-- [ ] If found: updates `lastUsed`, returns Bash instance
-- [ ] If not found: calls `createSandboxFs(backend, sandboxId)`, creates `new Bash({ fs })`, stores in Map
+- [ ] Internal `Map<string, Session>` keyed by `sandboxId`; `Session` contains at minimum `{ fs, bash, lastUsed, inFlight, mutex, state }`
+- [ ] `getOrCreate(sandboxId)` checks internal Map for existing session
+- [ ] If found: updates `lastUsed`, returns the same warm session instance
+- [ ] If not found: calls `createSandboxFs(backend, sandboxId)`, awaits `fs.ready()`, creates `new Bash({ fs })`, stores the new session in the Map
+- [ ] Session creation is single-flight: if two concurrent requests miss the same `sandboxId`, only one actual session is created and both callers receive the same instance
+- [ ] Public API includes `withSession(sandboxId, fn)` (or equivalent) so route handlers execute work through the manager instead of directly holding raw shared session objects
+- [ ] `withSession(...)` serializes all same-sandbox operations through a per-sandbox async mutex; later requests wait for earlier ones to finish instead of mutating shared `pathCache`, `contentCache`, or warm Bash state concurrently
+- [ ] When a waiting request begins, it observes the latest state left by prior completed requests (no same-process cache invalidation gap for the shared session)
 - [ ] Unit test: first get creates, second get reuses same instance
+- [ ] Unit test: two concurrent cache misses for the same `sandboxId` create exactly one session
+- [ ] Unit test: two concurrent operations for the same `sandboxId` run in order, not in parallel
 - [ ] Typecheck passes
 
 #### US-075: Session manager — idle eviction
@@ -944,19 +951,38 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 
 **Acceptance Criteria:**
 - [ ] Background interval (every 60s) checks `lastUsed` against `SESSION_IDLE_MS` (default 10 min)
-- [ ] Evicts sessions where `Date.now() - lastUsed > idleMs`
+- [ ] Evicts sessions only when `Date.now() - lastUsed > idleMs` AND `inFlight === 0` AND session state is not `closing`
+- [ ] Sessions with a running or queued same-sandbox operation are never evicted mid-flight; the reaper skips them and can retry on the next sweep
 - [ ] Does NOT call destroySandbox on eviction (sandbox data persists, only in-memory Bash dropped)
 - [ ] `startReaper()` / `stopReaper()` methods for lifecycle
 - [ ] Unit test: create session, advance time past idle threshold, verify evicted
+- [ ] Unit test: busy session past idle threshold is NOT evicted
+- [ ] Typecheck passes
+
+#### US-075a: Session manager — pathCache memory budget
+**Description:** As a developer, I want each warm session's `pathCache` bounded by a configurable byte budget so large sandboxes cannot retain unbounded path metadata in process memory.
+
+**Acceptance Criteria:**
+- [ ] `pathCache` has a configurable max total size via `pathCacheMaxBytes` / env config, default 50MB per session
+- [ ] Session creation measures or estimates total `pathCache` memory after `fs.ready()` using path string bytes plus cached metadata footprint per entry
+- [ ] `pathCache` updates on write/delete/move also update the tracked byte estimate
+- [ ] If the estimated `pathCache` size exceeds the configured budget, the current request still completes correctly, but the over-budget warm session is not retained once idle (no partial path eviction that would leave an incomplete tree snapshot)
+- [ ] Unit test: under-budget session stays resident; over-budget session is marked non-retainable and is evicted when idle
 - [ ] Typecheck passes
 
 #### US-076: Session manager — explicit destroy
-**Description:** As a developer, I want to explicitly destroy a session and its backend data.
+**Description:** As a developer, I want to explicitly destroy a session and its backend data, while preventing new requests from attaching during teardown.
 
 **Acceptance Criteria:**
+- [ ] `destroy(sandboxId)` marks the session as `closing` before backend deletion so no new work can attach to it
 - [ ] `destroy(sandboxId)` removes from Map AND calls `destroySandbox(backend, sandboxId)`
+- [ ] If a session has in-flight work, destroy waits for the active operation to finish before tearing down the backend data
+- [ ] Requests arriving after destroy has started fail fast (or are otherwise rejected) instead of creating a fresh warm session during teardown
 - [ ] No-op if session doesn't exist in Map (still calls destroySandbox for DB cleanup)
+- [ ] Concurrent destroy calls are idempotent; backend cleanup happens once
 - [ ] Unit test: destroy active session, verify removed from Map and backend cleanup called
+- [ ] Unit test: destroy waits for in-flight work, then cleans up
+- [ ] Unit test: request arriving during destroy is rejected and does not recreate the session
 - [ ] Typecheck passes
 
 ---
@@ -993,77 +1019,53 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - [ ] Typecheck passes
 
 #### US-080: MCP tool — bash_exec
-**Description:** As an AI agent, I want to execute bash in a sandbox via MCP.
+**Description:** As an AI agent, I want to execute bash in a sandbox via MCP. This is the primary tool for all file and directory operations — use shell commands (cat, echo, mkdir, rm, mv, cp, ls, find, sed, awk, etc.) instead of dedicated file/dir tools.
 
 **Acceptance Criteria:**
-- [ ] Tool name: `bash_exec`, description: "Run bash script in sandbox"
+- [ ] Tool name: `bash_exec`
+- [ ] Tool description (multi-line, shown to agent):
+  ```
+  Run a bash script in the sandbox. Use this for all file and directory operations.
+
+  **Supported:** cat, echo, printf, ls, find, mkdir, rm, mv, cp, touch, chmod,
+  stat, wc, head, tail, grep, sed, awk, sort, uniq, cut, tr, tee, xargs,
+  read, test/[, if/for/while/case, pipes, redirects, heredocs, variables,
+  functions, tar, gzip, base64, md5sum, sha256sum, date, env, pwd, cd, export.
+
+  **NOT supported (just-bash is a virtual interpreter — no real OS):**
+  - Networking: curl, wget, ping, ssh, nc, dig, nslookup
+  - Package managers: apt, yum, brew, pip, npm -g, cargo
+  - Interactive commands: vi, vim, nano, less, more, man, top
+  - Background jobs: & (background), nohup, disown, jobs, wait
+  - Process control: kill, pkill, ps, pgrep, nohup
+  - Special filesystems: /proc, /sys, /dev, /run
+  - Symlinks: ln -s (symlinks are disabled by default — use ln for hardlinks to files)
+  - Compilation: gcc, g++, make, cmake, rustc, go build
+  - Interpreter runtimes: node, python, ruby, java, php (unless pre-installed in sandbox)
+  ```
 - [ ] Params: `{ id: string, script: string, timeout?: number }`
 - [ ] Returns: `{ stdout: string, stderr: string, exitCode: number }`
 - [ ] Buffered (not streaming) — full result in one response
 - [ ] Typecheck passes
 
-#### US-081: MCP tool — file_read
-**Description:** As an AI agent, I want to read a file via MCP.
-
-**Acceptance Criteria:**
-- [ ] Tool name: `file_read`, description: "Read file content from sandbox"
-- [ ] Params: `{ id: string, path: string }`
-- [ ] Returns: `{ content: string }` (utf8) or `{ content: string, encoding: "base64" }` for binary
-- [ ] Typecheck passes
-
-#### US-082: MCP tool — file_write
-**Description:** As an AI agent, I want to write a file via MCP.
-
-**Acceptance Criteria:**
-- [ ] Tool name: `file_write`, description: "Write file to sandbox"
-- [ ] Params: `{ id: string, path: string, content: string }`
-- [ ] Returns: `{ ok: true }`
-- [ ] Creates parent dirs automatically
-- [ ] Typecheck passes
-
-#### US-083: MCP tool — file_delete
-**Description:** As an AI agent, I want to delete a file via MCP.
-
-**Acceptance Criteria:**
-- [ ] Tool name: `file_delete`, description: "Delete file or directory from sandbox"
-- [ ] Params: `{ id: string, path: string, recursive?: boolean }`
-- [ ] Returns: `{ ok: true }`
-- [ ] Typecheck passes
-
-#### US-084: MCP tool — dir_list
-**Description:** As an AI agent, I want to list directory contents via MCP.
-
-**Acceptance Criteria:**
-- [ ] Tool name: `dir_list`, description: "List directory contents"
-- [ ] Params: `{ id: string, path: string }`
-- [ ] Returns: `{ entries: [{ name, kind, size }] }`
-- [ ] Typecheck passes
-
-#### US-085: MCP tool — dir_make
-**Description:** As an AI agent, I want to create a directory via MCP.
-
-**Acceptance Criteria:**
-- [ ] Tool name: `dir_make`, description: "Create directory in sandbox"
-- [ ] Params: `{ id: string, path: string, recursive?: boolean }`
-- [ ] Returns: `{ ok: true }`
-- [ ] Typecheck passes
-
 #### US-086: MCP tool — fs_ingest
-**Description:** As an AI agent, I want to bulk-upload files via MCP.
+**Description:** As an AI agent, I want to upload multiple files into a sandbox in one call. This is the preferred way to seed a sandbox with project files before running bash commands.
 
 **Acceptance Criteria:**
-- [ ] Tool name: `fs_ingest`, description: "Upload multiple files to sandbox"
+- [ ] Tool name: `fs_ingest`, description: "Upload files into sandbox (use before bash_exec)"
 - [ ] Params: `{ id: string, basePath?: string, files: { [path]: string } }` (content as plain text, not base64 — simpler for agents)
+- [ ] `basePath` defaults to `/home/user`; relative paths in `files` are joined to it
+- [ ] Creates all parent directories automatically
 - [ ] Returns: `{ ok: true, count: number }`
 - [ ] Typecheck passes
 
 #### US-087: MCP tool — fs_export
-**Description:** As an AI agent, I want to download all files from a sandbox path via MCP.
+**Description:** As an AI agent, I want to download all modified files from a sandbox in one call. This is the preferred way to retrieve results after running bash commands.
 
 **Acceptance Criteria:**
-- [ ] Tool name: `fs_export`, description: "Download files from sandbox as JSON"
-- [ ] Params: `{ id: string, path?: string }`
-- [ ] Returns: `{ files: { [path]: string } }` (content as utf8 text, binary files as base64 with encoding marker)
+- [ ] Tool name: `fs_export`, description: "Download files from sandbox as JSON map"
+- [ ] Params: `{ id: string, path?: string }` (`path` defaults to `/home/user`)
+- [ ] Returns: `{ files: { [path]: string } }` (utf8 text; binary files as base64 with `"__encoding":"base64"` marker in the map)
 - [ ] Typecheck passes
 
 ---
@@ -1272,7 +1274,7 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - FR-16: HTTP API must authenticate requests via Bearer token
 - FR-17: HTTP exec endpoint must support SSE streaming for stdout/stderr
 - FR-18: HTTP exec must enforce configurable timeout (default 30s, max 300s) and cancel via AbortController
-- FR-19: MCP tools must have short names (under 20 chars) and one-line descriptions (under 80 chars) to minimize context window usage
+- FR-19: MCP tool set is intentionally minimal (5 tools): `sandbox_create`, `sandbox_delete`, `bash_exec`, `fs_ingest`, `fs_export`. File/dir operations (cat, ls, mkdir, rm, mv, cp, etc.) are performed via `bash_exec` shell commands. Tool names must be under 20 chars. `bash_exec` description must enumerate supported commands and explicitly list unsupported features (networking, package managers, interactive commands, /proc//sys//dev, symlinks, compilation, interpreter runtimes) so agents don't attempt them.
 - FR-20: MCP server must use streamable HTTP transport per MCP 2025-03-26 specification
 - FR-21: Ingest endpoint must accept tar.gz archives and extract using just-bash's built-in tar command
 - FR-22: Export endpoint must produce tar.gz archives using just-bash's built-in tar command
@@ -1335,7 +1337,7 @@ HTTP/MCP Client (agent or developer)
 
 ### Caching Strategy
 
-- **pathCache** (Map): loaded once at session init, updated synchronously on every write. Serves stat/exists/readdir/getAllPaths with zero DB calls.
+- **pathCache** (Map): loaded once at session init, updated synchronously on every write. Budgeted at 50MB per session by default; if a full path tree exceeds budget, the session should not keep that warm pathCache resident after the active request finishes. Serves stat/exists/readdir/getAllPaths with zero DB calls while resident.
 - **contentCache** (LRU): fills lazily on first read, capped at 50MB per session, evicted LRU when full. Invalidated on write/delete to the same inode.
 - Cache is per-session, per-process, ephemeral. Postgres/MySQL/Azure SQL is the durable source of truth. Process restart reloads cache from DB.
 

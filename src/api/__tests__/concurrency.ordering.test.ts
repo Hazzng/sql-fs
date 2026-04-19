@@ -1,0 +1,508 @@
+/**
+ * Ordering-dependent concurrency scenarios.
+ *
+ * Each scenario has two possible execution orders (A-first or B-first), determined
+ * by whichever operation wins the per-sandbox mutex.  The test fires both operations
+ * concurrently and asserts that whichever ordering occurred, the final state is
+ * fully consistent — no corruption, no phantom reads, no stale cache.
+ *
+ * The four scenarios under test:
+ *   S1 — mkdir /a  ||  writeFile /a/x.txt  (parent-creation race)
+ *   S2 — rm /a/file.txt  ||  readFile /a/file.txt  (delete-read race)
+ *   S3 — writeFile "A"  ||  writeFile "B"  (last-write-wins)
+ *   S4 — mv /a→/b  ||  writeFile /a/x.txt  (rename-then-write race)
+ *
+ * S1–S3 are tested at two layers:
+ *   - HTTP API   (PUT / DELETE / GET routes, which auto-create parent dirs on write)
+ *   - Raw fs     (session.fs.* calls via sm.withSession, no auto-mkdir safety net)
+ *
+ * S4 is tested at the raw-fs layer because no HTTP mv endpoint exists.
+ *
+ * Uses InMemoryFs — no DB required.
+ */
+
+import { Hono } from "hono";
+import { SignJWT } from "jose";
+import { InMemoryFs } from "just-bash";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { type AuthVariables, authMiddleware } from "../auth.js";
+import { fileRoutes } from "../routes/files.js";
+import { SessionManager } from "../session-manager.js";
+
+// ── Infrastructure ────────────────────────────────────────────────────────────
+
+const AUTH_SECRET = "test-secret-ordering-at-least-32bytes!!";
+const secretBytes = new TextEncoder().encode(AUTH_SECRET);
+
+async function makeToken(): Promise<string> {
+	return new SignJWT({ sub: "tester" }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes);
+}
+
+function makeEnv(): {
+	app: Hono<{ Variables: AuthVariables }>;
+	sm: SessionManager;
+} {
+	const sm = new SessionManager({ backend: "memory", createFs: async () => new InMemoryFs() });
+	const app = new Hono<{ Variables: AuthVariables }>();
+	app.use("/v1/*", authMiddleware);
+	app.route("/v1/sandboxes", fileRoutes(sm));
+	return { app, sm };
+}
+
+/**
+ * Extract the FS error code from either a SqlFs error (.code property) or an
+ * InMemoryFs error (code is the first word of the message: "ENOENT: ...").
+ * Falls back to "UNKNOWN" if neither matches.
+ */
+function errCode(e: unknown): string {
+	if (!(e instanceof Error)) return "UNKNOWN";
+	const fe = e as Error & { code?: string };
+	if (fe.code) return fe.code;
+	const m = fe.message.match(/^([A-Z]+):/);
+	return m?.[1] ?? "UNKNOWN";
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Read all paths under a prefix from the tree endpoint. */
+async function treePaths(
+	app: Hono<{ Variables: AuthVariables }>,
+	sbId: string,
+	prefix: string,
+	token: string,
+): Promise<string[]> {
+	const res = await app.request(`/v1/sandboxes/${sbId}/tree?prefix=${prefix}`, {
+		headers: { Authorization: `Bearer ${token}` },
+	});
+	type Entry = { path: string };
+	return ((await res.json()) as Entry[]).map((e) => e.path);
+}
+
+// ── S1 — mkdir /a  ||  writeFile /a/x.txt ────────────────────────────────────
+// Possible orderings:
+//   A-first (mkdir wins): mkdir 204, write 204 → /a and /a/x.txt both exist
+//   B-first (write wins):
+//     HTTP layer  → PUT auto-creates /a, so write still 204 → same as A-first
+//     Raw fs layer → write fails ENOENT, mkdir 204 → /a exists, /a/x.txt absent
+
+describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("HTTP API: PUT auto-creates parents — both orderings always succeed", async () => {
+		// The HTTP PUT route calls mkdir(parent, {recursive:true}) before writeFile.
+		// So even if the write mutex-slot runs before mkdir, the route creates /a itself.
+		const { app } = makeEnv();
+		const token = await makeToken();
+
+		for (const sbId of ["s1-http-mkdir-first", "s1-http-write-first"]) {
+			const [mkRes, wRes] = await Promise.all([
+				app.request(`/v1/sandboxes/${sbId}/mkdir`, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+					body: JSON.stringify({ path: "/a" }),
+				}),
+				app.request(`/v1/sandboxes/${sbId}/files/a/x.txt`, {
+					method: "PUT",
+					headers: { Authorization: `Bearer ${token}` },
+					body: "content",
+				}),
+			]);
+
+			// mkdir may return 204 or 409 (EEXIST) if the PUT created /a first
+			expect([204, 409], `mkdir status for ${sbId}`).toContain(mkRes.status);
+			expect(wRes.status, `write status for ${sbId}`).toBe(204);
+
+			const paths = await treePaths(app, sbId, "/a", token);
+			expect(paths).toContain("/a/x.txt");
+		}
+	});
+
+	it("raw fs: InMemoryFs auto-creates parents, both orderings produce consistent final state", async () => {
+		// NOTE: InMemoryFs.writeFile silently creates missing parent dirs (unlike SqlFs which
+		// throws ENOENT on a missing parent).  That means write to /a/x.txt ALWAYS succeeds
+		// here regardless of ordering.  The consistency guarantee is what we verify:
+		// whichever ran first, /a and /a/x.txt must both exist afterwards.
+		const { sm } = makeEnv();
+
+		// ── Ordering A: mkdir first ──
+		const sbA = "s1-raw-mkdir-first";
+		const [mkA, wA] = await Promise.all([
+			sm.withSession(sbA, (s) =>
+				s.fs
+					.mkdir("/a")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+			sm.withSession(sbA, (s) =>
+				s.fs
+					.writeFile("/a/x.txt", "hi")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+		]);
+		expect(mkA).toBe("ok"); // mkdir wins first slot
+		expect(wA).toBe("ok"); // write succeeds — parent exists
+		expect(await sm.withSession(sbA, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+
+		// ── Ordering B: write first ──
+		const sbB = "s1-raw-write-first";
+		const [wB, mkB] = await Promise.all([
+			sm.withSession(sbB, (s) =>
+				s.fs
+					.writeFile("/a/x.txt", "hi")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+			sm.withSession(sbB, (s) =>
+				s.fs
+					.mkdir("/a")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+		]);
+		expect(wB).toBe("ok"); // InMemoryFs auto-created /a; write succeeds
+		// mkdir may return ok or EEXIST (InMemoryFs created /a for the write already)
+		expect(["ok", "EEXIST"]).toContain(mkB);
+		// Consistency: /a and /a/x.txt both exist regardless of ordering
+		expect(await sm.withSession(sbB, (s) => s.fs.exists("/a"))).toBe(true);
+		expect(await sm.withSession(sbB, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+	});
+});
+
+// ── S2 — rm /a/file.txt  ||  readFile /a/file.txt ────────────────────────────
+// Possible orderings:
+//   A-first (delete wins): delete 204, read 404  → file gone
+//   B-first (read wins):   read 200, delete 204  → file gone
+
+describe("S2 — concurrent delete and read of the same file", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("HTTP API: whichever runs first, delete always 204 and final state is file-absent", async () => {
+		const { app } = makeEnv();
+		const token = await makeToken();
+
+		for (const [sbId, label] of [
+			["s2-http-delete-first", "delete-first"],
+			["s2-http-read-first", "read-first"],
+		] as const) {
+			// Setup: create the file
+			await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				method: "PUT",
+				headers: { Authorization: `Bearer ${token}` },
+				body: "original",
+			});
+
+			const ops =
+				label === "delete-first"
+					? ([
+							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+								method: "DELETE",
+								headers: { Authorization: `Bearer ${token}` },
+							}),
+							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+								headers: { Authorization: `Bearer ${token}` },
+							}),
+						] as const)
+					: ([
+							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+								headers: { Authorization: `Bearer ${token}` },
+							}),
+							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+								method: "DELETE",
+								headers: { Authorization: `Bearer ${token}` },
+							}),
+						] as const);
+
+			const [first, second] = await Promise.all(ops);
+
+			if (label === "delete-first") {
+				expect(first.status, "delete status").toBe(204);
+				expect(second.status, "read-after-delete status").toBe(404);
+			} else {
+				expect(first.status, "read status").toBe(200);
+				expect(await first.text()).toBe("original");
+				expect(second.status, "delete-after-read status").toBe(204);
+			}
+
+			// In both orderings: file must be absent after both ops complete
+			const finalRead = await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			expect(finalRead.status, `${label}: file must be gone`).toBe(404);
+		}
+	});
+
+	it("raw fs: delete-first → read ENOENT; read-first → read content then deleted", async () => {
+		// errCode() handles both InMemoryFs (code in message) and SqlFs (.code property).
+		const { sm } = makeEnv();
+
+		// ── delete first ──
+		const sbDel = "s2-raw-delete-first";
+		await sm.withSession(sbDel, (s) => s.fs.writeFile("/file.txt", "data"));
+		const [del, rd] = await Promise.all([
+			sm.withSession(sbDel, (s) =>
+				s.fs
+					.rm("/file.txt")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+			sm.withSession(sbDel, (s) => s.fs.readFile("/file.txt").catch(errCode)),
+		]);
+		expect(del).toBe("ok");
+		expect(rd).toBe("ENOENT"); // delete won the lock first — pathCache cleared before read ran
+		expect(await sm.withSession(sbDel, (s) => s.fs.exists("/file.txt"))).toBe(false);
+
+		// ── read first ──
+		const sbRead = "s2-raw-read-first";
+		await sm.withSession(sbRead, (s) => s.fs.writeFile("/file.txt", "data"));
+		const [content, delR] = await Promise.all([
+			sm.withSession(sbRead, (s) => s.fs.readFile("/file.txt").catch(errCode)),
+			sm.withSession(sbRead, (s) =>
+				s.fs
+					.rm("/file.txt")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+		]);
+		expect(content).toBe("data"); // read won the lock — saw file before delete ran
+		expect(delR).toBe("ok");
+		expect(await sm.withSession(sbRead, (s) => s.fs.exists("/file.txt"))).toBe(false);
+	});
+});
+
+// ── S3 — writeFile "A"  ||  writeFile "B" (last-write-wins) ──────────────────
+// Both orderings produce 204.  Final content = value written last (second in queue).
+
+describe("S3 — concurrent writes with different content (last-write-wins)", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("HTTP API: both 204, final content = the second writer's value", async () => {
+		const { app } = makeEnv();
+		const token = await makeToken();
+
+		// A-first ordering
+		{
+			const sbId = "s3-http-a-first";
+			const [rA, rB] = await Promise.all([
+				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+					method: "PUT",
+					headers: { Authorization: `Bearer ${token}` },
+					body: "A",
+				}),
+				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+					method: "PUT",
+					headers: { Authorization: `Bearer ${token}` },
+					body: "B",
+				}),
+			]);
+			expect(rA.status).toBe(204);
+			expect(rB.status).toBe(204);
+			const final = await app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			expect(await final.text()).toBe("B"); // B queued after A → runs last → wins
+		}
+
+		// B-first ordering
+		{
+			const sbId = "s3-http-b-first";
+			const [rB, rA] = await Promise.all([
+				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+					method: "PUT",
+					headers: { Authorization: `Bearer ${token}` },
+					body: "B",
+				}),
+				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+					method: "PUT",
+					headers: { Authorization: `Bearer ${token}` },
+					body: "A",
+				}),
+			]);
+			expect(rB.status).toBe(204);
+			expect(rA.status).toBe(204);
+			const final = await app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			expect(await final.text()).toBe("A"); // A queued after B → runs last → wins
+		}
+	});
+
+	it("raw fs: both succeed, the second-queued write is the final value", async () => {
+		const { sm } = makeEnv();
+
+		// A-first (A runs first, B queued second → B is final)
+		const sbAB = "s3-raw-ab";
+		await Promise.all([
+			sm.withSession(sbAB, (s) => s.fs.writeFile("/f.txt", "A")),
+			sm.withSession(sbAB, (s) => s.fs.writeFile("/f.txt", "B")),
+		]);
+		expect(await sm.withSession(sbAB, (s) => s.fs.readFile("/f.txt"))).toBe("B");
+
+		// B-first (B runs first, A queued second → A is final)
+		const sbBA = "s3-raw-ba";
+		await Promise.all([
+			sm.withSession(sbBA, (s) => s.fs.writeFile("/f.txt", "B")),
+			sm.withSession(sbBA, (s) => s.fs.writeFile("/f.txt", "A")),
+		]);
+		expect(await sm.withSession(sbBA, (s) => s.fs.readFile("/f.txt"))).toBe("A");
+	});
+});
+
+// ── S4 — mv /a→/b  ||  writeFile /a/x.txt ────────────────────────────────────
+// Possible outcomes with InMemoryFs (which auto-creates missing parents on write):
+//
+//   mv-first:    mv succeeds (/a→/b). InMemoryFs then auto-creates /a for the write.
+//                Result: /b exists (empty dir), /a re-created, /a/x.txt written.
+//
+//   write-first: write auto-creates /a (or uses existing) and writes /a/x.txt.
+//                mv then moves /a→/b (including x.txt). Result: /b/x.txt exists, /a gone.
+//
+// Key consistency invariant (both orderings):
+//   - mv always succeeds
+//   - write always succeeds (InMemoryFs auto-mkdir)
+//   - x.txt exists somewhere (/a/x.txt or /b/x.txt) but never in both places
+//   - /a gone after mv-first write-second (mv removes /a, write re-creates it)
+//
+// Tested at raw-fs layer (no HTTP mv endpoint exists).
+
+describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
+	it("mv-first: mv succeeds, InMemoryFs auto-recreates /a for write; /b and /a/x.txt both exist", async () => {
+		const { sm } = makeEnv();
+		const sbId = "s4-mv-first";
+		await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+
+		const [mvRes, wRes] = await Promise.all([
+			sm.withSession(sbId, (s) =>
+				s.fs
+					.mv("/a", "/b")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+			sm.withSession(sbId, (s) =>
+				s.fs
+					.writeFile("/a/x.txt", "content")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+		]);
+
+		expect(mvRes).toBe("ok");
+		// InMemoryFs auto-creates /a for the write (unlike SqlFs which would ENOENT)
+		expect(wRes).toBe("ok");
+
+		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b"))).toBe(true);
+		// /a was re-created by InMemoryFs auto-mkdir; /a/x.txt was written there
+		expect(await sm.withSession(sbId, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+		// /b/x.txt absent — x.txt was written to the newly auto-created /a, not the original
+		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(false);
+	});
+
+	it("write-first: write succeeds, mv moves the whole /a subtree to /b; /b/x.txt exists", async () => {
+		const { sm } = makeEnv();
+		const sbId = "s4-write-first";
+		await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+
+		const [wRes, mvRes] = await Promise.all([
+			sm.withSession(sbId, (s) =>
+				s.fs
+					.writeFile("/a/x.txt", "content")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+			sm.withSession(sbId, (s) =>
+				s.fs
+					.mv("/a", "/b")
+					.then(() => "ok")
+					.catch(errCode),
+			),
+		]);
+
+		expect(wRes).toBe("ok");
+		expect(mvRes).toBe("ok");
+
+		// /a (with x.txt) was moved to /b — /b/x.txt exists, /a is gone
+		expect(await sm.withSession(sbId, (s) => s.fs.exists("/a"))).toBe(false);
+		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(true);
+		expect(await sm.withSession(sbId, (s) => s.fs.readFile("/b/x.txt"))).toBe("content");
+	});
+
+	it("both orderings are consistent: x.txt exists exactly once and /b always exists", async () => {
+		// Regardless of InMemoryFs auto-mkdir behavior, the invariant is:
+		//   - mv always succeeds → /b always exists
+		//   - write always succeeds → x.txt exists exactly once (/a/x.txt or /b/x.txt)
+		//   - no data corruption, no missing file
+		const { sm } = makeEnv();
+
+		const orderings: Array<["mv-first" | "write-first", string]> = [
+			["mv-first", "s4-cons-mv"],
+			["write-first", "s4-cons-wr"],
+		];
+
+		for (const [label, sbId] of orderings) {
+			await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+
+			const ops =
+				label === "mv-first"
+					? ([
+							sm.withSession(sbId, (s) =>
+								s.fs
+									.mv("/a", "/b")
+									.then(() => "ok")
+									.catch(errCode),
+							),
+							sm.withSession(sbId, (s) =>
+								s.fs
+									.writeFile("/a/x.txt", "content")
+									.then(() => "ok")
+									.catch(errCode),
+							),
+						] as const)
+					: ([
+							sm.withSession(sbId, (s) =>
+								s.fs
+									.writeFile("/a/x.txt", "content")
+									.then(() => "ok")
+									.catch(errCode),
+							),
+							sm.withSession(sbId, (s) =>
+								s.fs
+									.mv("/a", "/b")
+									.then(() => "ok")
+									.catch(errCode),
+							),
+						] as const);
+
+			const [r1, r2] = await Promise.all(ops);
+			expect(r1, `${label} op1`).toBe("ok");
+			expect(r2, `${label} op2`).toBe("ok");
+
+			// /b must always exist (mv always runs)
+			expect(await sm.withSession(sbId, (s) => s.fs.exists("/b")), `${label}: /b must exist`).toBe(true);
+
+			// x.txt must exist exactly once — either at /a/x.txt or /b/x.txt (not both, not neither)
+			const inA = await sm.withSession(sbId, (s) => s.fs.exists("/a/x.txt"));
+			const inB = await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"));
+			expect(inA || inB, `${label}: x.txt must exist somewhere`).toBe(true);
+			expect(inA && inB, `${label}: x.txt must not exist in both places`).toBe(false);
+
+			// Content must be intact wherever it landed
+			const where = inB ? "/b/x.txt" : "/a/x.txt";
+			expect(await sm.withSession(sbId, (s) => s.fs.readFile(where))).toBe("content");
+		}
+	});
+});
