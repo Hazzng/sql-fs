@@ -8,6 +8,10 @@ Started: Sun Apr 19 20:23:14 ACST 2026
 - The branch for Phase 2 HTTP API is `ralph/phase2-http-api` (was on `ralph/phase1-sqlfs-postgres` at session start).
 - `StorageBackend` type and `InodeKind` are exported from `src/fs/sql-fs/index.ts`.
 - `InMemoryFs` is exported from `just-bash` (no constructor args required for default use).
+- Hono testing: Use `app.request('/path')` directly — no real HTTP server needed. Returns a `Response` object. Import `app` from `server.ts` which exports the Hono instance.
+- Hono status codes: `c.json()` requires `ContentfulStatusCode` not plain `number` or `StatusCode`. Cast via `as ContentfulStatusCode` from `hono/utils/http-status`.
+- Biome `biome-ignore` suppression: Only suppress rules that are actually enabled. Unused suppressions produce warnings. Verify by checking if the rule exists in biome.json before adding.
+- Hono entry-point detection: Use `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` to guard `serve()` call so it only runs when the file is the direct entry point (not in tests).
 
 ## 2026-04-19 - US-053
 - Implemented `createSandboxFs(backend, sandboxId): Promise<IFileSystem>` in `src/fs/sql-fs/index.ts`
@@ -42,4 +46,16 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - To verify mocked dialect method calls, import `PostgresDialect` directly in test (it resolves to the vi.mock'd version) then use `vi.mocked(PostgresDialect).mock.results[0]?.value` to get the instance
   - Use `vi.mocked(PostgresDialect).mockClear()` in `beforeEach` to reset call counts between tests
   - The transaction mock passes `{}` as `tx` to the callback — assertions on `deleteSandbox` should match `({}, sandboxId)`
+---
+
+## 2026-04-19 - US-056
+- Created `src/api/errors.ts`: exports `mapFsErrorToStatus(err)` mapping FS error codes to HTTP status codes (ENOENT→404, EEXIST/ENOTEMPTY→409, EISDIR/ENOTDIR→400, EPERM→403, default→500)
+- Created `src/api/server.ts`: Hono app with request logging middleware (structured JSON), GET /healthz, GET /readyz, global error handler using mapFsErrorToStatus, server start guarded by entry-point detection
+- Created `src/api/__tests__/server.test.ts`: 3 unit tests using `app.request()` (healthz 200, readyz 200, unknown route 404)
+- Files changed: `src/api/errors.ts` (new), `src/api/server.ts` (new), `src/api/__tests__/server.test.ts` (new)
+- **Learnings for future iterations:**
+  - `c.json()` in Hono v4 requires `ContentfulStatusCode` (not `StatusCode` or `number`) — import from `hono/utils/http-status` and cast with `as ContentfulStatusCode`
+  - `app.request('/path')` works without a real server — ideal for unit testing Hono routes
+  - `biome-ignore` only suppresses active rules; unused suppressions cause lint warnings — verify rule exists before adding
+  - Server bootstrap guard: `import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""))` prevents `serve()` from binding during tests
 ---
