@@ -22,6 +22,23 @@ import {
 } from "./errors.js";
 import type { PathCacheEntry, SqlDialect } from "./types.js";
 
+/**
+ * Normalize a virtual filesystem path: resolve `.` and `..` components,
+ * collapse slashes, always return an absolute path starting with `/`.
+ * Equivalent to just-bash's internal path-utils `normalizePath` function.
+ */
+function normalizeFsPath(p: string): string {
+	if (!p || p === "/") return "/";
+	const s = p.startsWith("/") ? p : `/${p}`;
+	const parts = s.split("/").filter((seg) => seg && seg !== ".");
+	const stack: string[] = [];
+	for (const part of parts) {
+		if (part === "..") stack.pop();
+		else stack.push(part);
+	}
+	return `/${stack.join("/")}` || "/";
+}
+
 // Extract optional-parameter types from IFileSystem to avoid importing
 // from just-bash internal paths (ReadFileOptions, WriteFileOptions, DirentEntry are not
 // publicly re-exported from the just-bash main entry point).
@@ -624,8 +641,12 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		}
 	}
 
-	resolvePath(_base: string, _path: string): string {
-		throw new Error("not implemented");
+	resolvePath(base: string, path: string): string {
+		// Matches just-bash InMemoryFs.resolvePath semantics (path-utils `y` function).
+		// If path is absolute, normalize it. Otherwise combine base + path and normalize.
+		if (path.startsWith("/")) return normalizeFsPath(path);
+		const combined = base === "/" ? `/${path}` : `${base}/${path}`;
+		return normalizeFsPath(combined);
 	}
 
 	async symlink(target: string, linkPath: string): Promise<void> {
