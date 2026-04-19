@@ -4,6 +4,7 @@
  * Subsequent stories fill in the stub methods below.
  */
 
+import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { createEnoent } from "../errors.js";
 import type {
@@ -369,8 +370,119 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-017
-	async bulkIngest(_tx: PgTx, _files: BulkIngestFile[]): Promise<void> {
-		throw new Error("not implemented");
+	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<void> {
+		if (files.length === 0) return;
+
+		// Get sandbox_id and root_inode via current session context
+		const ctxRows = await tx<{ id: string; root_inode: string }[]>`
+			SELECT id, root_inode FROM sandboxes WHERE id = current_setting('app.sandbox_id')
+		`;
+		const ctxRow = ctxRows[0];
+		if (!ctxRow?.root_inode) throw new Error("bulkIngest: sandbox not found or has no root inode");
+		const sandboxId = ctxRow.id;
+		const rootInodeId = BigInt(ctxRow.root_inode);
+
+		// Build path → inodeId map starting from the root
+		const dirMap = new Map<string, bigint>();
+		dirMap.set("/", rootInodeId);
+
+		// Collect all unique ancestor directory paths, sorted shallow-first
+		const dirPaths = new Set<string>();
+		for (const f of files) {
+			const parts = f.path.split("/").filter(Boolean);
+			for (let i = 1; i < parts.length; i++) {
+				dirPaths.add(`/${parts.slice(0, i).join("/")}`);
+			}
+		}
+		const sortedDirPaths = [...dirPaths].sort((a, b) => {
+			const da = a.split("/").filter(Boolean).length;
+			const db = b.split("/").filter(Boolean).length;
+			return da - db;
+		});
+
+		// Ensure each directory exists, creating it if missing
+		for (const dirPath of sortedDirPaths) {
+			if (dirMap.has(dirPath)) continue;
+			const parts = dirPath.split("/").filter(Boolean);
+			const name = parts[parts.length - 1]!;
+			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+			const parentInodeId = dirMap.get(parentPath);
+			if (!parentInodeId) throw new Error(`bulkIngest: parent dir ${parentPath} not found`);
+
+			// Check if dir already exists in DB
+			const existing = await tx<{ inode_id: string }[]>`
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(parentInodeId)} AND name = ${name}
+			`;
+			if (existing[0]) {
+				dirMap.set(dirPath, BigInt(existing[0].inode_id));
+				continue;
+			}
+
+			// Create dir inode + dirent
+			const dirInodeRows = await tx<{ id: string }[]>`
+				INSERT INTO inodes (sandbox_id, kind, mode, size)
+				VALUES (${sandboxId}, 2, ${0o755}, 0)
+				RETURNING id
+			`;
+			const dirInodeRow = dirInodeRows[0];
+			if (!dirInodeRow) throw new Error(`bulkIngest: failed to create dir inode for ${dirPath}`);
+			const dirInodeId = BigInt(dirInodeRow.id);
+
+			await tx`
+				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+				VALUES (${String(parentInodeId)}, ${name}, ${String(dirInodeId)}, ${sandboxId})
+			`;
+			dirMap.set(dirPath, dirInodeId);
+		}
+
+		// Compute sha256 for every file
+		const filesWithHash = files.map((f) => ({
+			path: f.path,
+			content: f.content,
+			mode: f.mode,
+			sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
+		}));
+
+		// Multi-row INSERT unique blobs, dedup via ON CONFLICT DO NOTHING
+		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
+		for (const f of filesWithHash) {
+			const key = f.sha256.toString("hex");
+			if (!uniqueBlobs.has(key)) {
+				uniqueBlobs.set(key, { sha256: f.sha256, data: f.content, size: f.content.length });
+			}
+		}
+		if (uniqueBlobs.size > 0) {
+			const blobRows = [...uniqueBlobs.values()];
+			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING`;
+		}
+
+		// Multi-row INSERT file inodes, RETURNING ids in insertion order
+		const inodeInserts = filesWithHash.map((f) => ({
+			sandbox_id: sandboxId,
+			kind: 1,
+			mode: f.mode,
+			size: f.content.length,
+			content_sha256: f.sha256,
+		}));
+		const insertedInodes = await tx<{ id: string }[]>`INSERT INTO inodes ${tx(inodeInserts)} RETURNING id`;
+
+		// Multi-row INSERT dirents linking each file inode to its parent dir
+		const direntInserts = filesWithHash.map((f, i) => {
+			const parts = f.path.split("/").filter(Boolean);
+			const name = parts[parts.length - 1]!;
+			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+			const parentInodeId = dirMap.get(parentPath);
+			if (!parentInodeId) throw new Error(`bulkIngest: parent dir not found for ${f.path}`);
+			const inodeId = insertedInodes[i]!.id;
+			return {
+				parent_inode_id: String(parentInodeId),
+				name,
+				inode_id: inodeId,
+				sandbox_id: sandboxId,
+			};
+		});
+		await tx`INSERT INTO dirents ${tx(direntInserts)} ON CONFLICT DO NOTHING`;
 	}
 
 	// US-018

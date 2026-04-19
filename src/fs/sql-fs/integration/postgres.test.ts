@@ -20,6 +20,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../dialects/postgres.js";
+import type { BulkIngestFile } from "../types.js";
 
 describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — connection and sandbox context", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
@@ -1103,5 +1104,66 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadSubtreeInode
 		expect(idSet.has(String(grandchild1Id))).toBe(true);
 		expect(idSet.has(String(grandchild2Id))).toBe(true);
 		expect(idSet.has(String(grandchild3Id))).toBe(true);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — bulkIngest", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-bulk-ingest-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("bulk ingests 50 files across 5 directories and all are accessible via listDirents", async () => {
+		const dirs = ["dir1", "dir2", "dir3", "dir4", "dir5"];
+		const files: BulkIngestFile[] = [];
+		for (const dir of dirs) {
+			for (let i = 0; i < 10; i++) {
+				files.push({
+					path: `/${dir}/file${i}.txt`,
+					content: new TextEncoder().encode(`content-${dir}-${i}`),
+					mode: 0o644,
+				});
+			}
+		}
+
+		await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			await dialect.bulkIngest(tx, files);
+		});
+
+		// Verify all 5 directories exist under root and each contains 10 files
+		const rootDirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, rootInodeId);
+		});
+
+		for (const dir of dirs) {
+			const dirEntry = rootDirents.find((d) => d.name === dir);
+			expect(dirEntry, `expected directory ${dir} in root`).toBeDefined();
+
+			const dirFiles = await dialect.transaction(async (tx) => {
+				return await dialect.listDirents(tx, dirEntry!.inodeId);
+			});
+			expect(dirFiles).toHaveLength(10);
+
+			for (let i = 0; i < 10; i++) {
+				const fileEntry = dirFiles.find((d) => d.name === `file${i}.txt`);
+				expect(fileEntry, `expected file${i}.txt in ${dir}`).toBeDefined();
+			}
+		}
 	});
 });
