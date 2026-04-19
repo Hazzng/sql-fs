@@ -1,5 +1,5 @@
 /**
- * Unit tests for POST /v1/sandboxes (US-059)
+ * Unit tests for sandbox CRUD routes (US-059, US-060)
  */
 
 import { Hono } from "hono";
@@ -85,5 +85,56 @@ describe("POST /v1/sandboxes", () => {
 		const content = await fs.readFile("/hello.txt");
 		const decoded = typeof content === "string" ? content : new TextDecoder().decode(content);
 		expect(decoded).toBe("hello world");
+	});
+});
+
+describe("GET /v1/sandboxes/:id", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("get existing sandbox returns 200 with correct metadata", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-get");
+
+		// Create a sandbox first
+		const postRes = await app.request("/v1/sandboxes", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(postRes.status).toBe(201);
+		const { id } = (await postRes.json()) as { id: string };
+
+		// Get the sandbox
+		const getRes = await app.request(`/v1/sandboxes/${id}`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(getRes.status).toBe(200);
+		const body = (await getRes.json()) as { id: string; owner: string; createdAt: string; lastUsedAt: string };
+		expect(body.id).toBe(id);
+		expect(body.owner).toBe("owner-get");
+		expect(typeof body.createdAt).toBe("string");
+		expect(typeof body.lastUsedAt).toBe("string");
+	});
+
+	it("get non-existent sandbox returns 404", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-get");
+
+		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000", {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(404);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body.error).toBe("not_found");
+		expect(body.code).toBe("SANDBOX_NOT_FOUND");
 	});
 });
