@@ -281,8 +281,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-014
-	async gcOrphanBlobs(_tx: PgTx): Promise<number> {
-		throw new Error("not implemented");
+	async gcOrphanBlobs(tx: PgTx): Promise<number> {
+		const rows = await tx<{ sha256: Buffer }[]>`
+			DELETE FROM blobs
+			WHERE sha256 NOT IN (
+				SELECT content_sha256 FROM inodes WHERE content_sha256 IS NOT NULL
+			)
+			RETURNING sha256
+		`;
+		return rows.length;
 	}
 
 	// US-015
