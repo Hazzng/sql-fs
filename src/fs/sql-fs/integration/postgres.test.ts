@@ -13,6 +13,7 @@
  * US-013: upsertBlob, getBlob.
  * US-014: gcOrphanBlobs.
  * US-015: loadAllPaths.
+ * US-016: loadSubtreeInodes.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -1021,5 +1022,86 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadAllPaths", (
 		expect(fileEntry!.mode).toBe(0o644);
 		expect(fileEntry!.size).toBe(fileData.length);
 		expect(fileEntry!.contentSha256).toEqual(sha256);
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadSubtreeInodes", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-subtree-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("collects all descendant inode IDs including root for a 3-level-deep nested structure", async () => {
+		// Build a 3-level subtree under a fresh directory (isolated from sandbox defaults)
+		//   subtreeRoot
+		//     child1
+		//       grandchild1
+		//       grandchild2
+		//     child2
+		//       grandchild3
+
+		const subtreeRootId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "subtree-root", subtreeRootId);
+		});
+
+		const child1Id = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+		const child2Id = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, subtreeRootId, "child1", child1Id);
+			await dialect.insertDirent(tx, subtreeRootId, "child2", child2Id);
+		});
+
+		const grandchild1Id = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		const grandchild2Id = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		const grandchild3Id = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, child1Id, "grandchild1.txt", grandchild1Id);
+			await dialect.insertDirent(tx, child1Id, "grandchild2.txt", grandchild2Id);
+			await dialect.insertDirent(tx, child2Id, "grandchild3.txt", grandchild3Id);
+		});
+
+		const inodeIds = await dialect.transaction(async (tx) => {
+			return await dialect.loadSubtreeInodes(tx, subtreeRootId);
+		});
+
+		// All 6 inodes (root + 2 children + 3 grandchildren) must be present
+		expect(inodeIds).toHaveLength(6);
+		const idSet = new Set(inodeIds.map((id) => String(id)));
+		expect(idSet.has(String(subtreeRootId))).toBe(true);
+		expect(idSet.has(String(child1Id))).toBe(true);
+		expect(idSet.has(String(child2Id))).toBe(true);
+		expect(idSet.has(String(grandchild1Id))).toBe(true);
+		expect(idSet.has(String(grandchild2Id))).toBe(true);
+		expect(idSet.has(String(grandchild3Id))).toBe(true);
 	});
 });
