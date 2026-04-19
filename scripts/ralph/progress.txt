@@ -213,3 +213,14 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `fs.rm()` throws ENOTEMPTY for non-empty directories without `recursive: true`; ENOENT when path doesn't exist (unless `force: true`)
   - Query param boolean parsing: `c.req.query("recursive") === "true"` — do not use `Boolean(c.req.query(...))` (truthy for any non-empty string)
 ---
+
+## 2026-04-19 - US-065
+- Added `POST /:id/mkdir` route to `src/api/routes/files.ts`
+- Body parsed inline with zod: `{ path: string, recursive?: boolean }`; returns 400 on invalid JSON or failed schema parse
+- Calls `session.fs.mkdir(path, { recursive })`; catches EEXIST and returns 409; all other errors re-thrown to global handler
+- Added 3 unit tests to `files.test.ts`: mkdir (204), mkdir with recursive (204 + nested dirs created), mkdir existing without recursive (409 EEXIST)
+- Files changed: `src/api/routes/files.ts`, `src/api/__tests__/files.test.ts`
+- **Learnings for future iterations:**
+  - `IFileSystem.mkdir(path, { recursive? })` throws EEXIST when directory already exists (non-recursive); with `recursive: true` it succeeds idempotently
+  - Inline zod parsing (safeParse inside the handler) avoids typing complexity with `validateBody` middleware when the router is already typed with `AuthVariables` only
+---
