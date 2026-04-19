@@ -16,6 +16,8 @@ export interface Session {
 	inFlight: number;
 	readonly mutex: Mutex;
 	state: "active" | "closing";
+	owner: string;
+	createdAt: string;
 }
 
 export interface SessionManagerOptions {
@@ -64,6 +66,8 @@ export class SessionManager {
 					inFlight: 0,
 					mutex: new Mutex(),
 					state: "active",
+					owner: "",
+					createdAt: new Date().toISOString(),
 				};
 				this.sessions.set(sandboxId, session);
 				return session;
@@ -74,6 +78,13 @@ export class SessionManager {
 
 		this.pending.set(sandboxId, creationPromise);
 		return creationPromise;
+	}
+
+	/**
+	 * Returns the session for the given sandboxId, or undefined if not found.
+	 */
+	getSession(sandboxId: string): Session | undefined {
+		return this.sessions.get(sandboxId);
 	}
 
 	/**

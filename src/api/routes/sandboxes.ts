@@ -1,6 +1,7 @@
 /**
  * Sandbox CRUD routes.
  * US-059: POST /v1/sandboxes — create sandbox
+ * US-060: GET /v1/sandboxes/:id — get sandbox info
  */
 
 import { Hono } from "hono";
@@ -38,6 +39,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		const createdAt = new Date().toISOString();
 
 		await sessionManager.withSession(sandboxId, async (session) => {
+			session.owner = owner;
+			session.createdAt = createdAt;
 			if (files !== undefined) {
 				for (const [path, content] of Object.entries(files)) {
 					await session.fs.writeFile(path, content);
@@ -46,6 +49,20 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		});
 
 		return c.json({ id: sandboxId, owner, createdAt }, 201 as ContentfulStatusCode);
+	});
+
+	router.get("/:id", (c) => {
+		const id = c.req.param("id");
+		const session = sessionManager.getSession(id);
+		if (session === undefined) {
+			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+		}
+		return c.json({
+			id,
+			owner: session.owner,
+			createdAt: session.createdAt,
+			lastUsedAt: new Date(session.lastUsed).toISOString(),
+		});
 	});
 
 	return router;
