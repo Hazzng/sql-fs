@@ -1,0 +1,52 @@
+/**
+ * Hono HTTP server entry point.
+ * US-056: Hono server bootstrap
+ */
+
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { mapFsErrorToStatus } from "./errors.js";
+
+export const app = new Hono();
+
+// ── Middleware ─────────────────────────────────────────────────────────────────
+
+/** Structured JSON request logging */
+app.use("*", async (c, next) => {
+	const start = Date.now();
+	await next();
+	const durationMs = Date.now() - start;
+	console.log(
+		JSON.stringify({
+			method: c.req.method,
+			path: c.req.path,
+			status: c.res.status,
+			durationMs,
+		}),
+	);
+});
+
+// ── Health endpoints ───────────────────────────────────────────────────────────
+
+app.get("/healthz", (c) => c.json({ status: "ok" }));
+app.get("/readyz", (c) => c.json({ status: "ok" }));
+
+// ── Global error handler ───────────────────────────────────────────────────────
+
+app.onError((err, c) => {
+	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
+	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
+	return c.json({ error: err.message, code }, status);
+});
+
+// ── Server bootstrap (only when run as entry point) ───────────────────────────
+
+const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""));
+
+if (isMain) {
+	const port = Number(process.env.PORT ?? "8080");
+	serve({ fetch: app.fetch, port }, () => {
+		console.log(JSON.stringify({ event: "server_start", port }));
+	});
+}
