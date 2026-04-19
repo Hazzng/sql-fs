@@ -153,3 +153,15 @@
   - `RETURNING inode_id` after the UPDATE distinguishes "source existed and moved" from "source did not exist" — zero rows means ENOENT.
   - Biome reformats a long single-line `moveDirent(tx, oldParentId, oldName, newParentId, newName)` parameter list to multi-line — expected behaviour, don't fight it.
 ---
+
+## 2026-04-19 - US-013
+- Implemented `upsertBlob(tx, sha256, data)`: `INSERT INTO blobs (sha256, data, size) VALUES ($sha256, $data, $size) ON CONFLICT (sha256) DO NOTHING`. `size` is `data.length`.
+- Implemented `getBlob(tx, sha256)`: `SELECT data FROM blobs WHERE sha256 = $sha256`. Returns `Buffer` (assignable to `Uint8Array`) or `null`.
+- Added 3 integration tests in `postgres.test.ts`: (1) insert blob and retrieve by sha256, verify data matches; (2) insert same sha256 twice, verify only one row (dedup); (3) get non-existent sha256 returns null. Tests track inserted sha256s in an array and delete them in `afterAll` since blobs are not sandbox-scoped.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `postgres.js` accepts `Uint8Array` directly as BYTEA parameters — no conversion needed. The driver serialises it as `\x...` hex automatically.
+  - `getBlob` returns `Buffer` (a subclass of `Uint8Array`) from postgres.js BYTEA columns — directly assignable to `Uint8Array` return type, no conversion needed.
+  - Blobs table is globally scoped (no `sandbox_id`) — test cleanup must delete by sha256 explicitly rather than relying on sandbox CASCADE. Use an `insertedSha256s` array in the `describe` closure and delete in `afterAll`.
+  - `ON CONFLICT (sha256) DO NOTHING` is sufficient for dedup — no need to check size or data equality on conflict.
+---
