@@ -1,11 +1,12 @@
 /**
- * Unit tests for createSandboxFs factory function.
+ * Unit tests for createSandboxFs factory function and loadBackendConfig.
  * US-053: createSandboxFs factory function
+ * US-054: Environment variable configuration
  */
 
 import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createSandboxFs } from "./index.js";
+import { createSandboxFs, loadBackendConfig } from "./index.js";
 import { SqlFs } from "./sql-fs.js";
 
 // Mock the PostgresDialect so no real DB connection is made.
@@ -73,5 +74,79 @@ describe("createSandboxFs", () => {
 				await expect(createSandboxFs(backend, "test-sandbox")).rejects.toThrow("not implemented");
 			},
 		);
+	});
+});
+
+describe("loadBackendConfig", () => {
+	const originalEnv = { ...process.env };
+
+	afterEach(() => {
+		// Restore original env after each test
+		process.env.FS_BACKEND = originalEnv.FS_BACKEND ?? "";
+		process.env.DATABASE_URL = originalEnv.DATABASE_URL ?? "";
+		process.env.FS_MOUNT_PATH = originalEnv.FS_MOUNT_PATH ?? "";
+	});
+
+	it("throws descriptive error if FS_BACKEND not set", () => {
+		process.env.FS_BACKEND = "";
+		expect(() => loadBackendConfig()).toThrow("FS_BACKEND");
+	});
+
+	it("returns correct config for postgres backend", () => {
+		process.env.FS_BACKEND = "postgres";
+		process.env.DATABASE_URL = "postgres://localhost/test";
+		const config = loadBackendConfig();
+		expect(config).toEqual({ backend: "postgres", databaseUrl: "postgres://localhost/test" });
+	});
+
+	it("returns correct config for mysql backend", () => {
+		process.env.FS_BACKEND = "mysql";
+		process.env.DATABASE_URL = "mysql://localhost/test";
+		const config = loadBackendConfig();
+		expect(config).toEqual({ backend: "mysql", databaseUrl: "mysql://localhost/test" });
+	});
+
+	it("returns correct config for azure-sql backend", () => {
+		process.env.FS_BACKEND = "azure-sql";
+		process.env.DATABASE_URL = "mssql://localhost/test";
+		const config = loadBackendConfig();
+		expect(config).toEqual({ backend: "azure-sql", databaseUrl: "mssql://localhost/test" });
+	});
+
+	it("returns correct config for azure-fileshare backend", () => {
+		process.env.FS_BACKEND = "azure-fileshare";
+		process.env.FS_MOUNT_PATH = "/mnt/share";
+		const config = loadBackendConfig();
+		expect(config).toEqual({ backend: "azure-fileshare", mountPath: "/mnt/share" });
+	});
+
+	it("returns correct config for memory backend", () => {
+		process.env.FS_BACKEND = "memory";
+		const config = loadBackendConfig();
+		expect(config).toEqual({ backend: "memory" });
+	});
+
+	it("throws if DATABASE_URL missing for postgres", () => {
+		process.env.FS_BACKEND = "postgres";
+		process.env.DATABASE_URL = "";
+		expect(() => loadBackendConfig()).toThrow("DATABASE_URL");
+	});
+
+	it("throws if DATABASE_URL missing for mysql", () => {
+		process.env.FS_BACKEND = "mysql";
+		process.env.DATABASE_URL = "";
+		expect(() => loadBackendConfig()).toThrow("DATABASE_URL");
+	});
+
+	it("throws if DATABASE_URL missing for azure-sql", () => {
+		process.env.FS_BACKEND = "azure-sql";
+		process.env.DATABASE_URL = "";
+		expect(() => loadBackendConfig()).toThrow("DATABASE_URL");
+	});
+
+	it("throws if FS_MOUNT_PATH missing for azure-fileshare", () => {
+		process.env.FS_BACKEND = "azure-fileshare";
+		process.env.FS_MOUNT_PATH = "";
+		expect(() => loadBackendConfig()).toThrow("FS_MOUNT_PATH");
 	});
 });

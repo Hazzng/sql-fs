@@ -1,7 +1,7 @@
 /**
  * Factory: createSandboxFs() and destroySandbox().
  * US-053: createSandboxFs factory function
- * US-054: loadBackendConfig (TODO)
+ * US-054: loadBackendConfig
  * US-055: destroySandbox (TODO)
  */
 
@@ -40,5 +40,53 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 	}
 }
 
+/** Config returned by loadBackendConfig(). */
+export interface BackendConfig {
+	readonly backend: StorageBackend;
+	readonly databaseUrl?: string;
+	readonly mountPath?: string;
+}
+
+const SQL_BACKENDS: ReadonlySet<StorageBackend> = new Set(["postgres", "mysql", "azure-sql"]);
+
+/**
+ * Reads backend configuration from environment variables.
+ * FS_BACKEND is required. DATABASE_URL is required for SQL backends.
+ * FS_MOUNT_PATH is required for azure-fileshare.
+ */
+export function loadBackendConfig(): BackendConfig {
+	const fsBackend = process.env.FS_BACKEND;
+	if (!fsBackend) {
+		throw new Error(
+			"FS_BACKEND environment variable is required. Valid values: postgres, mysql, azure-sql, azure-fileshare, memory",
+		);
+	}
+
+	const validBackends: StorageBackend[] = ["postgres", "mysql", "azure-sql", "azure-fileshare", "memory"];
+	if (!validBackends.includes(fsBackend as StorageBackend)) {
+		throw new Error(`FS_BACKEND '${fsBackend}' is not a valid backend. Valid values: ${validBackends.join(", ")}`);
+	}
+
+	const backend = fsBackend as StorageBackend;
+
+	if (SQL_BACKENDS.has(backend)) {
+		const databaseUrl = process.env.DATABASE_URL;
+		if (!databaseUrl) {
+			throw new Error(`DATABASE_URL environment variable is required when FS_BACKEND is '${backend}'`);
+		}
+		return { backend, databaseUrl };
+	}
+
+	if (backend === "azure-fileshare") {
+		const mountPath = process.env.FS_MOUNT_PATH;
+		if (!mountPath) {
+			throw new Error("FS_MOUNT_PATH environment variable is required when FS_BACKEND is 'azure-fileshare'");
+		}
+		return { backend, mountPath };
+	}
+
+	// memory backend — no additional config needed
+	return { backend };
+}
+
 // TODO: destroySandbox()
-// TODO: loadBackendConfig()
