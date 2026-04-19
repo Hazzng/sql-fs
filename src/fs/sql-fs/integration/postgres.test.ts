@@ -14,10 +14,14 @@
  * US-014: gcOrphanBlobs.
  * US-015: loadAllPaths.
  * US-016: loadSubtreeInodes.
+ * US-017: bulkIngest.
+ * US-018: resolvePath (fs_resolve stored procedure).
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../dialects/postgres.js";
 import type { BulkIngestFile } from "../types.js";
@@ -1165,5 +1169,138 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — bulkIngest", () 
 				expect(fileEntry, `expected file${i}.txt in ${dir}`).toBeDefined();
 			}
 		}
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — resolvePath (fs_resolve)", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	const sandboxId = `test-resolve-${Date.now()}`;
+	let rootInodeId: bigint;
+	let fileInodeId: bigint;
+	let userInodeId: bigint;
+	let symlinkInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+
+		// Apply stored procedure DDL (idempotent via CREATE OR REPLACE)
+		const migrationSql = readFileSync(
+			fileURLToPath(new URL("../migrations/postgres/0001_rls_and_procs.sql", import.meta.url)),
+			"utf8",
+		);
+		await dialect.transaction(async (tx) => {
+			await tx.unsafe(migrationSql);
+		});
+
+		// Create sandbox and populate test fixtures
+		await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			const result = await dialect.createSandbox(tx, sandboxId);
+			rootInodeId = result.rootInodeId;
+
+			// Locate /home and /home/user (created by createSandbox)
+			const rootDirents = await dialect.listDirents(tx, rootInodeId);
+			const homeEntry = rootDirents.find((d) => d.name === "home");
+			if (!homeEntry) throw new Error("home dir not found after createSandbox");
+
+			const homeDirents = await dialect.listDirents(tx, homeEntry.inodeId);
+			const userEntry = homeDirents.find((d) => d.name === "user");
+			if (!userEntry) throw new Error("user dir not found after createSandbox");
+			userInodeId = userEntry.inodeId;
+
+			// Create /home/user/file.txt
+			fileInodeId = await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 5 });
+			await dialect.insertDirent(tx, userInodeId, "file.txt", fileInodeId);
+
+			// Create /link_to_user → /home/user (symlink)
+			symlinkInodeId = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 3,
+				mode: 0o777,
+				size: 0,
+				symlinkTarget: "/home/user",
+			});
+			await dialect.insertDirent(tx, rootInodeId, "link_to_user", symlinkInodeId);
+
+			// Create /loop_a → /loop_b and /loop_b → /loop_a (circular)
+			const loopAId = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 3,
+				mode: 0o777,
+				size: 0,
+				symlinkTarget: "/loop_b",
+			});
+			await dialect.insertDirent(tx, rootInodeId, "loop_a", loopAId);
+
+			const loopBId = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 3,
+				mode: 0o777,
+				size: 0,
+				symlinkTarget: "/loop_a",
+			});
+			await dialect.insertDirent(tx, rootInodeId, "loop_b", loopBId);
+		});
+	});
+
+	afterAll(async () => {
+		try {
+			await dialect.transaction(async (tx) => {
+				await dialect.deleteSandbox(tx, sandboxId);
+			});
+		} finally {
+			await dialect.disconnect();
+		}
+	});
+
+	it("resolves simple path /home/user/file.txt to the correct inode", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			return dialect.resolvePath(tx, "/home/user/file.txt", true);
+		});
+		expect(inodeId).toBe(fileInodeId);
+	});
+
+	it("resolves path with '.' and '..' components correctly", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			return dialect.resolvePath(tx, "/home/user/../user/./file.txt", true);
+		});
+		expect(inodeId).toBe(fileInodeId);
+	});
+
+	it("follows symlink on final component when followLast=true", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			return dialect.resolvePath(tx, "/link_to_user", true);
+		});
+		// /link_to_user → /home/user; should resolve to the /home/user directory inode
+		expect(inodeId).toBe(userInodeId);
+	});
+
+	it("returns symlink inode itself when followLast=false", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, sandboxId);
+			return dialect.resolvePath(tx, "/link_to_user", false);
+		});
+		expect(inodeId).toBe(symlinkInodeId);
+	});
+
+	it("throws ELOOP when resolving a circular symlink chain", async () => {
+		await expect(
+			dialect.transaction(async (tx) => {
+				await dialect.setSandboxContext(tx, sandboxId);
+				return dialect.resolvePath(tx, "/loop_a", true);
+			}),
+		).rejects.toMatchObject({ code: "ELOOP" });
+	});
+
+	it("throws ENOENT when path does not exist", async () => {
+		await expect(
+			dialect.transaction(async (tx) => {
+				await dialect.setSandboxContext(tx, sandboxId);
+				return dialect.resolvePath(tx, "/nonexistent/path", true);
+			}),
+		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });

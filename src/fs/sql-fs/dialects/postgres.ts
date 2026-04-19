@@ -6,7 +6,7 @@
 
 import { createHash } from "node:crypto";
 import postgres from "postgres";
-import { createEnoent } from "../errors.js";
+import { createEnoent, translateSqlError } from "../errors.js";
 import type {
 	BulkIngestFile,
 	CreateInodeOpts,
@@ -486,7 +486,16 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-018
-	async resolvePath(_tx: PgTx, _path: string, _followLast: boolean): Promise<bigint> {
-		throw new Error("not implemented");
+	async resolvePath(tx: PgTx, path: string, followLast: boolean): Promise<bigint> {
+		try {
+			const rows = await tx<{ inode_id: string }[]>`
+				SELECT fs_resolve(${path}, ${followLast}) AS inode_id
+			`;
+			const row = rows[0];
+			if (!row) throw createEnoent(path);
+			return BigInt(row.inode_id);
+		} catch (err) {
+			throw translateSqlError(err, path);
+		}
 	}
 }
