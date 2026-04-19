@@ -225,7 +225,7 @@
         "Tests pass"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": "Sandbox metadata may be stored in session manager or queried from DB."
     },
     {

@@ -145,3 +145,16 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - Body is optional for POST routes: wrap `c.req.json()` in try/catch; missing/empty body falls through silently, only malformed JSON returns 400
   - `process.env.FS_BACKEND ?? "memory"` in server.ts as safe default avoids breaking existing tests that don't set `FS_BACKEND`
 ---
+
+## 2026-04-19 - US-060
+- Added GET `/:id` route to `src/api/routes/sandboxes.ts`; returns 200 `{ id, owner, createdAt, lastUsedAt }` or 404 `{ error: "not_found", code: "SANDBOX_NOT_FOUND" }`
+- Extended `Session` interface in `session-manager.ts` with `owner: string` and `createdAt: string` fields (initialized to `""` and `new Date().toISOString()` in `getOrCreate`)
+- Added `getSession(sandboxId): Session | undefined` method to `SessionManager` for read-only metadata access without mutex
+- Updated POST handler in `sandboxes.ts` to set `session.owner` and `session.createdAt` inside the `withSession` callback
+- Added 2 unit tests to `src/api/__tests__/sandboxes.test.ts`: happy path (create then GET, verify metadata) and 404 for non-existent sandbox
+- Files changed: `src/api/session-manager.ts`, `src/api/routes/sandboxes.ts`, `src/api/__tests__/sandboxes.test.ts`
+- **Learnings for future iterations:**
+  - `getSession(sandboxId)` bypasses the mutex — correct for read-only metadata that doesn't require serialization
+  - Set `owner` and `createdAt` on the session inside the `withSession` callback (where you have the session reference); the POST handler's `sandboxId` is unique (UUID), so no race possible
+  - `Session` fields that are mutable after creation (owner, createdAt, lastUsed) should NOT be `readonly` in the interface
+---
