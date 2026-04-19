@@ -357,8 +357,44 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async mv(_src: string, _dest: string): Promise<void> {
-		throw new Error("not implemented");
+	async mv(src: string, dest: string): Promise<void> {
+		const srcEntry = this.#pathCache.get(src);
+		if (!srcEntry) throw createEnoent(src);
+
+		const srcParentPath = this.#parentOf(src);
+		const srcName = this.#nameOf(src);
+		const destParentPath = this.#parentOf(dest);
+		const destName = this.#nameOf(dest);
+
+		const srcParentEntry = this.#pathCache.get(srcParentPath);
+		if (!srcParentEntry) throw createEnoent(srcParentPath);
+
+		const destParentEntry = this.#pathCache.get(destParentPath);
+		if (!destParentEntry) throw createEnoent(destParentPath);
+
+		await this.#withTx(async (tx) => {
+			await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
+		});
+
+		// Snapshot src subtree before mutating the cache
+		const srcPaths = this.#allPathsUnder(src);
+		const snapshot = new Map<string, PathCacheEntry>();
+		for (const p of srcPaths) {
+			const e = this.#pathCache.get(p);
+			if (e) snapshot.set(p, e);
+		}
+
+		// Remove src subtree and any existing dest subtree from cache
+		for (const p of srcPaths) this.#pathCache.delete(p);
+		const destPrefix = dest === "/" ? "/" : `${dest}/`;
+		for (const key of [...this.#pathCache.keys()]) {
+			if (key === dest || key.startsWith(destPrefix)) this.#pathCache.delete(key);
+		}
+
+		// Re-insert src entries under dest (remap prefix src → dest)
+		for (const [oldPath, entry] of snapshot) {
+			this.#pathCache.set(dest + oldPath.slice(src.length), entry);
+		}
 	}
 
 	resolvePath(_base: string, _path: string): string {
