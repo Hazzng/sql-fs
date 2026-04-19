@@ -1,0 +1,37 @@
+{
+	"01e22b0a5a658000": {
+		"command": "rm -f marker; ( echo $(( (echo LEFT; echo DESYNC > marker) || (echo RIGHT) )) >/dev/null ) 2>/dev/null || true; if [ -f marker ]; then echo MARKER_PRESENT; else echo MARKER_ABSENT; fi",
+		"files": {},
+		"stdout": "MARKER_ABSENT\n",
+		"stderr": "",
+		"exitCode": 0
+	},
+	"418e82aa94c7472d": {
+		"command": "rm -f marker; ( echo $(( `printf \"%s\\n\" \") ; echo DESYNC > marker ; #\"` + 1 )) >/dev/null ) 2>/dev/null || true; if [ -f marker ]; then echo MARKER_PRESENT; else echo MARKER_ABSENT; fi",
+		"files": {},
+		"stdout": "MARKER_ABSENT\n",
+		"stderr": "",
+		"exitCode": 0
+	},
+	"546745a1b6b106fd": {
+		"command": "rm -f marker; echo $( (echo LEFT; echo DESYNC > marker) || (echo RIGHT) ) >/dev/null; if [ -f marker ]; then echo MARKER_PRESENT; else echo MARKER_ABSENT; fi",
+		"files": {},
+		"stdout": "MARKER_PRESENT\n",
+		"stderr": "",
+		"exitCode": 0
+	},
+	"e7accfa7d60b71b5": {
+		"command": "echo $((echo AA; false || echo BB)2>/dev/null)",
+		"files": {},
+		"stdout": "AA BB\n",
+		"stderr": "",
+		"exitCode": 0
+	},
+	"f54ac59038a825b9": {
+		"command": "rm -f marker; ( echo $(( $(printf \"%s\\n\" \") ; echo DESYNC > marker ; #\") + 1 )) >/dev/null ) 2>/dev/null || true; if [ -f marker ]; then echo MARKER_PRESENT; else echo MARKER_ABSENT; fi",
+		"files": {},
+		"stdout": "MARKER_ABSENT\n",
+		"stderr": "",
+		"exitCode": 0
+	}
+}
