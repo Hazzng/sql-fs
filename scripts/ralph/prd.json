@@ -1,0 +1,483 @@
+{
+  "project": "VirtualFS API",
+  "branchName": "ralph/phase2-http-api",
+  "description": "Phase 2: HTTP API — Hono server, JWT auth, sandbox CRUD, file operations, bash execution, and session manager. 24 stories across 6 epics.",
+  "userStories": [
+    {
+      "id": "US-053",
+      "title": "createSandboxFs factory function",
+      "description": "As a developer, I want a single function that creates the right IFileSystem from a config object.",
+      "acceptanceCriteria": [
+        "createSandboxFs(backend: StorageBackend, sandboxId: string): Promise<IFileSystem> exported from src/fs/sql-fs/index.ts",
+        "Handles 'postgres' → creates PostgresDialect + SqlFs + calls ready(), returns SqlFs",
+        "Handles 'memory' → returns InMemoryFs from just-bash",
+        "Other backends ('mysql', 'azure-sql', 'azure-fileshare') throw 'not implemented' for now",
+        "Unit test: factory with memory backend returns InMemoryFs instance",
+        "Unit test: factory with postgres backend returns SqlFs instance (mocked dialect)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Phase 1 SqlFs is complete. This factory wraps it with backend selection."
+    },
+    {
+      "id": "US-054",
+      "title": "Environment variable configuration",
+      "description": "As a developer, I want backend selection via environment variables.",
+      "acceptanceCriteria": [
+        "loadBackendConfig() function exported from src/fs/sql-fs/index.ts",
+        "Reads FS_BACKEND (required), DATABASE_URL (for SQL backends), FS_MOUNT_PATH (for FileShare)",
+        "Returns { backend: StorageBackend, databaseUrl?: string, mountPath?: string }",
+        "Throws descriptive error if FS_BACKEND not set",
+        "Throws descriptive error if DATABASE_URL missing when backend is postgres/mysql/azure-sql",
+        "Throws descriptive error if FS_MOUNT_PATH missing when backend is azure-fileshare",
+        "Unit test: mock env vars, verify correct config returned for each backend",
+        "Unit test: missing FS_BACKEND throws with helpful message",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-055",
+      "title": "destroySandbox function",
+      "description": "As a developer, I want a companion function to clean up a sandbox's persistent data.",
+      "acceptanceCriteria": [
+        "destroySandbox(backend: StorageBackend, sandboxId: string): Promise<void> exported from src/fs/sql-fs/index.ts",
+        "SQL backends: connects to DB, calls dialect.transaction + dialect.deleteSandbox, disconnects",
+        "Memory backend: no-op (returns immediately)",
+        "Unit test: postgres backend calls deleteSandbox on dialect (mocked)",
+        "Unit test: memory backend returns without error",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-056",
+      "title": "Hono server bootstrap",
+      "description": "As a developer, I want the Hono HTTP server initialized with middleware and error handling.",
+      "acceptanceCriteria": [
+        "src/api/server.ts creates and exports Hono app",
+        "JSON body parsing enabled",
+        "Request logging middleware (structured JSON: method, path, status, durationMs)",
+        "Global error handler: catches errors, maps FS error codes to HTTP status (ENOENT→404, EEXIST→409, EISDIR/ENOTDIR→400, EPERM→403, ENOTEMPTY→409), returns { error, code } JSON",
+        "GET /healthz returns 200 { status: 'ok' }",
+        "GET /readyz returns 200 { status: 'ok' } (basic check, DB health deferred to later)",
+        "Server listens on PORT env var (default 8080)",
+        "src/api/errors.ts exports mapFsErrorToStatus(err) helper used by global error handler",
+        "Unit test: healthz returns 200",
+        "Unit test: readyz returns 200",
+        "Unit test: unknown route returns 404",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Use @hono/node-server for Node.js runtime. Hono v4+."
+    },
+    {
+      "id": "US-057",
+      "title": "JWT/HMAC auth middleware",
+      "description": "As a developer, I want auth middleware that verifies JWT tokens (HMAC-SHA256) signed with AUTH_SECRET and extracts the owner identity from the sub claim.",
+      "acceptanceCriteria": [
+        "src/api/auth.ts exports Hono middleware function",
+        "Extracts Authorization: Bearer <token> header",
+        "Verifies JWT signature using AUTH_SECRET env var with HS256 algorithm via jose library",
+        "Rejects expired tokens (checks exp claim if present)",
+        "Extracts sub claim as owner identity, sets c.set('owner', sub) for downstream handlers",
+        "Returns 401 { error: 'unauthorized', code: 'AUTH_REQUIRED' } if token missing",
+        "Returns 401 { error: 'invalid_token', code: 'AUTH_INVALID' } if signature invalid or expired",
+        "Applied to all /v1/* routes (not /healthz, /readyz)",
+        "Uses jose library (zero-dependency JOSE implementation) — NOT jsonwebtoken",
+        "Unit test: valid token passes with correct sub extracted",
+        "Unit test: expired token returns 401",
+        "Unit test: tampered token returns 401",
+        "Unit test: missing Authorization header returns 401",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Install jose as dependency. AUTH_SECRET should be at least 32 bytes for HS256."
+    },
+    {
+      "id": "US-058",
+      "title": "Zod request validation middleware",
+      "description": "As a developer, I want reusable zod validation for request bodies and query params.",
+      "acceptanceCriteria": [
+        "src/api/validation.ts exports validateBody(schema) and validateQuery(schema) middleware factories",
+        "validateBody: parses c.req.json() against zod schema, sets c.set('body', parsed) on success",
+        "validateQuery: parses c.req.query() against zod schema, sets c.set('query', parsed) on success",
+        "On validation failure: returns 400 { error: 'validation_error', code: 'INVALID_INPUT', details: [...] }",
+        "details array contains field-level error messages from zod",
+        "Unit test: valid body passes with parsed data available",
+        "Unit test: invalid body returns 400 with field-level details",
+        "Unit test: validateQuery works for query parameters",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Install zod as dependency."
+    },
+    {
+      "id": "US-057b",
+      "title": "Token generation CLI (bootstrap)",
+      "description": "As an operator, I want a local CLI command to generate the initial admin JWT token so I can bootstrap access before the API is deployed.",
+      "acceptanceCriteria": [
+        "src/api/cli/token.ts script using jose to sign JWTs with AUTH_SECRET env var",
+        "pnpm token:create script added to package.json that runs the CLI",
+        "Accepts --sub <identity> (required) and --expires <duration> (optional, default: no expiry)",
+        "Duration supports: 30d, 1y, 24h, never",
+        "Prints only the token string to stdout (for easy piping)",
+        "Errors with descriptive message if AUTH_SECRET env var not set",
+        "Errors if --sub not provided",
+        "Shared helper: src/api/lib/jwt.ts exports signToken({ sub, expiresIn?, secret }) and verifyToken({ token, secret }) — reused by auth middleware and admin endpoint",
+        "Typecheck passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "The shared jwt.ts helper avoids duplicating signing logic across CLI, auth middleware, and admin endpoint."
+    },
+    {
+      "id": "US-057c",
+      "title": "Token generation admin endpoint",
+      "description": "As an operator, I want an API endpoint to generate JWT tokens for agents/clients.",
+      "acceptanceCriteria": [
+        "POST /v1/admin/tokens endpoint in src/api/routes/admin.ts",
+        "Requires valid JWT auth (uses auth middleware from US-057)",
+        "Body validated by zod: { sub: string, expiresIn?: string }",
+        "sub is required, expiresIn optional (default: '30d'), supports 30d, 1y, 24h, never",
+        "Returns 201 { token: string, sub: string, expiresAt: string | null }",
+        "Uses shared signToken helper from src/api/lib/jwt.ts",
+        "Unit test: create token via endpoint, decode and verify sub matches",
+        "Unit test: missing sub returns 400",
+        "Unit test: unauthenticated request returns 401",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-074",
+      "title": "Session manager — get or create session",
+      "description": "As a developer, I want the session manager to return one warm session per sandboxId or create it on demand, with per-sandbox serialization.",
+      "acceptanceCriteria": [
+        "src/api/session-manager.ts exports SessionManager class",
+        "Internal Map<string, Session> keyed by sandboxId; Session contains { fs, bash, lastUsed, inFlight, mutex, state }",
+        "getOrCreate(sandboxId) checks Map; if found, updates lastUsed and returns existing session",
+        "If not found: calls createSandboxFs(backend, sandboxId), creates Bash({ fs }), stores new session",
+        "Single-flight: concurrent cache misses for the same sandboxId create exactly one session (use a pending Promise map)",
+        "withSession(sandboxId, fn) acquires per-sandbox async mutex, increments inFlight, calls fn(session), decrements inFlight on completion",
+        "Same-sandbox operations are serialized through the mutex — later requests wait for earlier ones",
+        "Constructor accepts { backend, databaseUrl?, createFs? } for dependency injection in tests",
+        "Unit test: first getOrCreate creates session, second reuses same instance",
+        "Unit test: two concurrent getOrCreate for same sandboxId create exactly one session",
+        "Unit test: two concurrent withSession calls execute sequentially (not in parallel)",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Use async-mutex package (or hand-rolled Promise queue) for per-sandbox serialization. The mutex ensures pathCache/contentCache coherence."
+    },
+    {
+      "id": "US-059",
+      "title": "POST /v1/sandboxes — create sandbox",
+      "description": "As an API consumer, I want to create a new sandbox.",
+      "acceptanceCriteria": [
+        "POST /v1/sandboxes route in src/api/routes/sandboxes.ts",
+        "Body (optional): { env?: Record<string,string>, files?: Record<string,string> }",
+        "Generates unique sandbox ID (crypto.randomUUID())",
+        "Creates sandbox via sessionManager.getOrCreate(sandboxId)",
+        "If files provided in body, writes each via fs.writeFile",
+        "Returns 201 { id, owner, createdAt }",
+        "owner comes from c.get('owner') set by auth middleware",
+        "Route requires auth middleware",
+        "Unit test: create sandbox returns 201 with id",
+        "Unit test: create with initial files, verify files written",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-060",
+      "title": "GET /v1/sandboxes/:id — get sandbox info",
+      "description": "As an API consumer, I want to inspect sandbox metadata.",
+      "acceptanceCriteria": [
+        "GET /v1/sandboxes/:id route in src/api/routes/sandboxes.ts",
+        "Returns 200 { id, owner, createdAt, lastUsedAt }",
+        "Returns 404 { error: 'not_found', code: 'SANDBOX_NOT_FOUND' } if sandbox doesn't exist",
+        "Unit test: get existing sandbox returns 200 with correct metadata",
+        "Unit test: get non-existent sandbox returns 404",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Sandbox metadata may be stored in session manager or queried from DB."
+    },
+    {
+      "id": "US-061",
+      "title": "DELETE /v1/sandboxes/:id — delete sandbox",
+      "description": "As an API consumer, I want to destroy a sandbox and all its data.",
+      "acceptanceCriteria": [
+        "DELETE /v1/sandboxes/:id route in src/api/routes/sandboxes.ts",
+        "Calls sessionManager.destroy(sandboxId) to evict session and clean up backend data",
+        "Returns 204 (no body)",
+        "Returns 404 if sandbox doesn't exist in session manager or DB",
+        "Unit test: create then delete sandbox, verify 204 returned",
+        "Unit test: delete non-existent sandbox returns 404",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "Depends on US-076 for full destroy semantics, but basic version can evict + destroySandbox directly."
+    },
+    {
+      "id": "US-062",
+      "title": "GET /v1/sandboxes/:id/files/*path — read file",
+      "description": "As an API consumer, I want to download a file's content from a sandbox.",
+      "acceptanceCriteria": [
+        "GET /v1/sandboxes/:id/files/*path route in src/api/routes/files.ts",
+        "Uses sessionManager.withSession to get fs instance",
+        "Returns raw bytes with Content-Type inferred from extension (or application/octet-stream)",
+        "X-FS-Stat response header: JSON { kind, mode, size, mtime }",
+        "Returns 404 for ENOENT",
+        "Returns 400 if path is a directory (EISDIR)",
+        "Unit test: read existing file returns content with correct Content-Type",
+        "Unit test: read non-existent file returns 404",
+        "Unit test: read directory returns 400",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Use mime-types package or a simple extension→Content-Type map."
+    },
+    {
+      "id": "US-063",
+      "title": "PUT /v1/sandboxes/:id/files/*path — write file",
+      "description": "As an API consumer, I want to upload/overwrite a file in a sandbox.",
+      "acceptanceCriteria": [
+        "PUT /v1/sandboxes/:id/files/*path route in src/api/routes/files.ts",
+        "Request body = raw file content (read as ArrayBuffer/Uint8Array)",
+        "Creates parent directories if they don't exist (mkdir -p behavior before writeFile)",
+        "Returns 204 on success",
+        "Unit test: write new file, read it back via GET, verify content matches",
+        "Unit test: overwrite existing file, verify new content",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-064",
+      "title": "DELETE /v1/sandboxes/:id/files/*path — delete file or dir",
+      "description": "As an API consumer, I want to remove a file or directory from a sandbox.",
+      "acceptanceCriteria": [
+        "DELETE /v1/sandboxes/:id/files/*path route in src/api/routes/files.ts",
+        "Query param recursive=true for directory removal",
+        "Returns 204 on success",
+        "Returns 404 for ENOENT",
+        "Returns 409 for ENOTEMPTY (directory without recursive flag)",
+        "Unit test: delete file returns 204",
+        "Unit test: delete non-existent returns 404",
+        "Unit test: delete non-empty dir without recursive returns 409",
+        "Unit test: delete dir with recursive=true returns 204",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-065",
+      "title": "POST /v1/sandboxes/:id/mkdir — create directory",
+      "description": "As an API consumer, I want to create a directory in a sandbox.",
+      "acceptanceCriteria": [
+        "POST /v1/sandboxes/:id/mkdir route in src/api/routes/files.ts",
+        "Body validated by zod: { path: string, recursive?: boolean }",
+        "Returns 204 on success",
+        "Returns 409 if already exists (without recursive flag) — maps EEXIST to 409",
+        "Unit test: mkdir returns 204",
+        "Unit test: mkdir with recursive creates nested dirs",
+        "Unit test: mkdir existing dir without recursive returns 409",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-066",
+      "title": "POST /v1/sandboxes/:id/writeFiles — bulk write",
+      "description": "As an API consumer, I want to write multiple files in one request.",
+      "acceptanceCriteria": [
+        "POST /v1/sandboxes/:id/writeFiles route in src/api/routes/files.ts",
+        "Body validated by zod: { files: Record<string, string> } where key=path, value=content",
+        "Creates all parent directories as needed (mkdir -p per file)",
+        "Returns 204 on success",
+        "Unit test: write 5 files in one call, verify all readable via GET",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-067",
+      "title": "GET /v1/sandboxes/:id/tree — list file tree",
+      "description": "As an API consumer, I want to list all files under a path with metadata.",
+      "acceptanceCriteria": [
+        "GET /v1/sandboxes/:id/tree route in src/api/routes/files.ts",
+        "Query params validated by zod: prefix (string, default '/'), depth (number, optional, default unlimited)",
+        "Returns 200 JSON array: [{ path, kind, size, mtime }]",
+        "depth=1 returns only direct children of prefix",
+        "Filters paths by prefix from fs.getAllPaths() + fs.stat()",
+        "Unit test: tree of nested structure returns all entries",
+        "Unit test: tree with depth=1 returns only direct children",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 18,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-068",
+      "title": "POST /v1/sandboxes/:id/exec-sync — buffered execution",
+      "description": "As an API consumer, I want to run a bash script and get the full result as JSON.",
+      "acceptanceCriteria": [
+        "POST /v1/sandboxes/:id/exec-sync route in src/api/routes/exec.ts",
+        "Body validated by zod: { script: string, cwd?: string, env?: Record<string,string>, timeoutMs?: number }",
+        "Uses sessionManager.withSession to get bash instance, calls bash.exec(script, opts)",
+        "Returns 200 { stdout, stderr, exitCode }",
+        "Default timeout 30s (30000ms), max 300s (300000ms)",
+        "Returns 408 on timeout",
+        "Unit test: echo hello returns { stdout: 'hello\\n', exitCode: 0 }",
+        "Unit test: false command returns { exitCode: 1 }",
+        "Unit test: timeout returns 408",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 19,
+      "passes": true,
+      "notes": "just-bash Bash.exec() returns { stdout, stderr, exitCode }."
+    },
+    {
+      "id": "US-069",
+      "title": "POST /v1/sandboxes/:id/exec — SSE streaming execution",
+      "description": "As an API consumer, I want to run a bash script and stream output via Server-Sent Events.",
+      "acceptanceCriteria": [
+        "POST /v1/sandboxes/:id/exec route in src/api/routes/exec.ts",
+        "Same body schema as exec-sync",
+        "Response Content-Type: text/event-stream",
+        "Events: event: stdout with data { t: 'stdout', data }, event: stderr with data { t: 'stderr', data }, event: exit with data { t: 'exit', exitCode, durationMs }",
+        "Client disconnect triggers AbortController to cancel execution",
+        "Uses Hono's streamSSE helper or manual SSE response",
+        "Unit test: execute script, collect all SSE events, verify stdout + exit event present",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 20,
+      "passes": true,
+      "notes": "Use Hono's streaming SSE response API. just-bash Bash may need exec with streaming callback."
+    },
+    {
+      "id": "US-070",
+      "title": "Exec timeout enforcement",
+      "description": "As a developer, I want exec to be aborted if it exceeds the timeout.",
+      "acceptanceCriteria": [
+        "AbortController created per request with setTimeout(abort, timeoutMs)",
+        "Passed to bash.exec(script, { signal }) which just-bash already supports",
+        "Timer cleared after execution completes (clearTimeout)",
+        "Sync endpoint: returns 408 { error: 'timeout', code: 'EXEC_TIMEOUT' }",
+        "SSE endpoint: sends exit event with exitCode=-1 and error='timeout'",
+        "Unit test: script that sleeps longer than timeout, verify cancellation and correct response",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 21,
+      "passes": true,
+      "notes": "This may be partially implemented in US-068/069. This story ensures it's fully tested and correct."
+    },
+    {
+      "id": "US-075",
+      "title": "Session manager — idle eviction",
+      "description": "As a developer, I want idle sessions evicted after a configurable timeout.",
+      "acceptanceCriteria": [
+        "Background interval (every 60s) checks lastUsed against SESSION_IDLE_MS (default 600000ms = 10 min)",
+        "Evicts sessions only when Date.now() - lastUsed > idleMs AND inFlight === 0 AND state !== 'closing'",
+        "Busy sessions past idle threshold are NOT evicted — reaper skips them",
+        "Eviction drops in-memory state only; does NOT call destroySandbox (sandbox data persists in DB)",
+        "startReaper() and stopReaper() methods for lifecycle control",
+        "Unit test: create session, advance time past idle threshold, verify evicted from Map",
+        "Unit test: busy session (inFlight > 0) past idle threshold is NOT evicted",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 22,
+      "passes": true,
+      "notes": "Use vi.useFakeTimers() in tests to control time advancement."
+    },
+    {
+      "id": "US-075a",
+      "title": "Session manager — pathCache memory budget",
+      "description": "As a developer, I want each session's pathCache bounded by a configurable byte budget.",
+      "acceptanceCriteria": [
+        "pathCacheMaxBytes configurable option, default 50MB per session",
+        "After fs.ready(), estimate total pathCache memory: sum of (path string bytes + ~100 bytes metadata overhead) per entry",
+        "Write/delete/move operations update the tracked byte estimate",
+        "If estimated pathCache size exceeds budget, session is marked non-retainable (overBudget flag)",
+        "Over-budget sessions are evicted when idle (inFlight drops to 0) regardless of SESSION_IDLE_MS",
+        "Under-budget sessions follow normal idle eviction rules",
+        "Unit test: under-budget session stays resident after operations",
+        "Unit test: over-budget session is evicted when idle",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 23,
+      "passes": true,
+      "notes": "No partial path eviction — either the full pathCache fits in budget or the session is not retained."
+    },
+    {
+      "id": "US-076",
+      "title": "Session manager — explicit destroy",
+      "description": "As a developer, I want to explicitly destroy a session and its backend data.",
+      "acceptanceCriteria": [
+        "destroy(sandboxId) marks session state as 'closing' immediately",
+        "New requests arriving after destroy started fail fast (withSession rejects with error if state === 'closing')",
+        "If session has in-flight work, destroy waits for active operation to finish before calling destroySandbox",
+        "After in-flight completes: removes session from Map, calls destroySandbox(backend, sandboxId)",
+        "No-op if session not in Map — still calls destroySandbox for DB cleanup",
+        "Concurrent destroy calls are idempotent; backend cleanup happens exactly once",
+        "Unit test: destroy removes session from Map and calls destroySandbox",
+        "Unit test: destroy waits for in-flight work before cleanup",
+        "Unit test: request arriving during destroy is rejected",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 24,
+      "passes": true,
+      "notes": "Use a Promise/resolve pattern to wait for inFlight to reach 0."
+    }
+  ]
+}
