@@ -541,3 +541,26 @@
   - `resolvePath` is synchronous — no `async`, no `await`, no `#withTx`. It only does string manipulation.
   - Test pattern: instantiate `SqlFs` with a minimal mocked dialect (no `ready()` call needed since `resolvePath` doesn't touch pathCache or contentCache).
 ---
+
+## 2026-04-19 - US-042a + US-042b
+
+### US-042a — readFile/readFileBuffer symlink semantics
+- Added private `#resolveReadEntry(path)` helper to `SqlFs` that follows symlinks via `dialect.resolvePath(tx, path, true)`. Returns the final non-symlink `PathCacheEntry`. ENOENT/ELOOP propagate naturally from `resolvePath`.
+- Updated `readFile` and `readFileBuffer` to call `#resolveReadEntry` first. Content is cached under the **resolved** inode's id (not the symlink inode's id).
+- Created `src/fs/sql-fs/sql-fs.symlink-read.test.ts` with 11 unit tests: direct symlink read returns target content, resolvePath called with followLast=true, getBlob called with target's sha256, cache keyed by resolved inodeId, second read uses cache, regular file bypasses resolvePath, broken symlink returns ENOENT, loop returns ELOOP; readFileBuffer equivalents.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.symlink-read.test.ts` (new), `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+
+### US-042b — hardlink-safe recursive rm
+- Replaced `loadSubtreeInodes`-based recursive rm with a post-order per-dirent approach.
+- New algorithm: (1) unlink subtree root from its parent via `deleteDirent`; (2) iterate subtree paths sorted deepest-first; (3) for each non-root entry, `deleteDirent` its parent→child dirent; (4) `decrementNlink` on every entry's inode; (5) `deleteInode` only when nlink reaches 0.
+- Files outside the subtree that hold hardlinks to inodes inside are preserved — their `decrementNlink` will return > 0 and `deleteInode` is skipped.
+- Updated `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`: replaced `loadSubtreeInodes` assertions with correct new behavior (4 `deleteDirent` calls, 4 `decrementNlink` calls, selective `deleteInode`). Added `describe("hardlink preservation")` block with 2 tests: inode with external hardlink is NOT deleted, pathCache still cleaned.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+
+- **Learnings for future iterations:**
+  - `#resolveReadEntry` is the correct pattern for any future read operations that should follow symlinks — reuse it for `stat` if symlink-following semantics are added there too.
+  - Content cache must be keyed by the **resolved** inodeId, not the symlink inodeId. Otherwise cache hits after a symlink read would be missed on subsequent direct reads of the target.
+  - Post-order sort: `subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length)` — deepest first. This guarantees children are processed before parents.
+  - Cascade deletes from `deleteInode` remove all dirents where that inode is `parent_inode_id` or `inode_id`. Since we delete child dirents explicitly before deleting parent inodes, there are no double-delete races.
+  - The old `loadSubtreeInodes` approach was unsafe once hardlinks exist: it deleted inodes directly without checking nlink. The per-dirent approach is O(n) DB calls but correct for all nlink values.
+---
