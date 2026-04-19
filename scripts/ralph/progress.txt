@@ -188,3 +188,13 @@
   - The CTE can cycle if there are symlinks pointing to ancestor dirs — symlinks are kind=3 and have no dirent children so the `JOIN dirents d ON d.parent_inode_id = t.inode_id` naturally stops traversal there. No cycle detection needed for well-formed trees.
   - `size` column is BIGINT so postgres.js returns it as a string — use `Number(r.size)` to convert.
 ---
+
+## 2026-04-19 - US-016
+- Implemented `loadSubtreeInodes(tx, rootInodeId)`: recursive CTE starting from `rootInodeId`, joining `dirents d ON d.inode_id = i.id` and `subtree s ON s.id = d.parent_inode_id` to walk all descendants. Returns `bigint[]` of all inode IDs including root.
+- Added one integration test in `postgres.test.ts`: builds a 3-level tree (subtreeRoot → child1/child2 → grandchild1/grandchild2/grandchild3), calls `loadSubtreeInodes`, verifies all 6 inodes are present using a Set comparison.
+- Files changed: `src/fs/sql-fs/dialects/postgres.ts`, `src/fs/sql-fs/integration/postgres.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `loadSubtreeInodes` does NOT require `setSandboxContext` — it walks the dirents graph directly from a given `rootInodeId`, not from `current_setting('app.sandbox_id')`. This is in contrast to `loadAllPaths`.
+  - The recursive CTE pattern: base is `SELECT id FROM inodes WHERE id = $rootId`; recursive step joins `inodes i JOIN dirents d ON d.inode_id = i.id JOIN subtree s ON s.id = d.parent_inode_id`. This walks child-of-parent edges.
+  - No cycle guard needed for well-formed trees since symlinks (kind=3) appear as inode rows but have no dirents entries (no children), so the recursion naturally terminates.
+---
