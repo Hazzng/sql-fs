@@ -132,3 +132,16 @@ Started: Sun Apr 19 20:23:14 ACST 2026
   - `Bash` from just-bash accepts `{ fs: IFileSystem }` as constructor option — no required args
   - For sequential execution tests: use a deferred blocker promise + `await firstStarted` before launching the second call to guarantee call ordering
 ---
+
+## 2026-04-19 - US-059
+- Created `src/api/routes/sandboxes.ts`: exports `sandboxRoutes(sessionManager)` factory returning a Hono router
+- `POST /` handler: parses optional JSON body `{ env?, files? }`, generates UUID via `crypto.randomUUID()`, calls `sessionManager.withSession` to create session and write initial files, returns 201 `{ id, owner, createdAt }`
+- Updated `src/api/server.ts`: creates a `SessionManager` with `process.env.FS_BACKEND ?? "memory"` (safe default for tests), registers `app.route("/v1/sandboxes", sandboxRoutes(sessionManager))`
+- Created `src/api/__tests__/sandboxes.test.ts`: 2 unit tests using a shared `InMemoryFs` injected via `createFs` DI option; test app has auth middleware + sandbox routes
+- Files changed: `src/api/routes/sandboxes.ts` (new), `src/api/__tests__/sandboxes.test.ts` (new), `src/api/server.ts` (modified)
+- **Learnings for future iterations:**
+  - Route factories (`sandboxRoutes(sessionManager)`) are the pattern for routes needing injected dependencies — test apps create their own instances with mock `createFs`
+  - `FileContent = string | Uint8Array` — can pass string directly to `fs.writeFile` without encoding; no `TextEncoder` needed
+  - Body is optional for POST routes: wrap `c.req.json()` in try/catch; missing/empty body falls through silently, only malformed JSON returns 400
+  - `process.env.FS_BACKEND ?? "memory"` in server.ts as safe default avoids breaking existing tests that don't set `FS_BACKEND`
+---
