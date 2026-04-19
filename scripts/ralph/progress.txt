@@ -492,3 +492,18 @@
   - Recursive cp uses `insertDirent` (not `upsertDirent`) since dest paths are freshly computed — no conflict expected. `createInode` always produces new inodeIds even though `contentSha256` is shared.
   - `dest + srcPath.slice(src.length)` maps any srcPath to its destPath. For the root (srcPath === src), slice gives "" so result is just dest. For children, it appends the relative suffix. Identical to the pattern used in `mv`.
 ---
+
+## 2026-04-19 - US-039
+- Implemented `link(existingPath, newPath)` in `src/fs/sql-fs/sql-fs.ts`, replacing the stub.
+- Added `createEperm` to the import from `./errors.js` (was previously unused by sql-fs.ts).
+- Guard order: ENOENT (src missing) → EPERM (src is dir, kind=2) → EEXIST (dest already in cache) → ENOENT (dest parent missing) → ENOTDIR (dest parent not a dir).
+- Transaction: `insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId)` + `incrementNlink(tx, srcEntry.inodeId)`.
+- pathCache update: `this.#pathCache.set(newPath, { ...srcEntry })` — same inodeId, same metadata as source.
+- Created `src/fs/sql-fs/sql-fs.link.test.ts` with 8 unit tests: dest added to pathCache, src preserved, insertDirent called with correct args, incrementNlink called with src inodeId, ENOENT for missing src, EPERM for dir src, EEXIST for existing dest, ENOENT for missing dest parent.
+- Files changed: `src/fs/sql-fs/sql-fs.ts`, `src/fs/sql-fs/sql-fs.link.test.ts`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`
+- **Learnings for future iterations:**
+  - `link` does NOT call `upsertBlob` or `createInode` — it reuses the existing inode by calling `insertDirent` with the existing `srcEntry.inodeId`. The new pathCache entry shares the same `inodeId` as the source.
+  - `incrementNlink` must be called (not `decrementNlink`) to reflect the new reference. The nlink field is not stored in pathCache, but the DB inode row is updated.
+  - Hardlinks to directories are forbidden — throw EPERM with `op="link"` when `srcEntry.kind === 2`.
+  - contentCache does not need updating — the shared inodeId already has its content cached (if previously read), so the new path benefits from the same cache hit automatically.
+---
