@@ -536,3 +536,81 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — deleteDirent", (
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — listDirents", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-list-dirents-${Date.now()}`;
+		const result = await dialect.transaction(async (tx) => {
+			return await dialect.createSandbox(tx, sandboxId);
+		});
+		rootInodeId = result.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("returns all children with correct inodeIds ordered by name", async () => {
+		// Create a sub-directory to use as parent (isolate from root's default dirs)
+		const parentId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, `parent-${Date.now()}`, parentId);
+		});
+
+		// Create 3 children: a file, a dir, and a symlink
+		const fileId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+		const dirId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+		const symlinkId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 3, mode: 0o777, size: 0, symlinkTarget: "/tmp" });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, parentId, "aaa-file.txt", fileId);
+			await dialect.insertDirent(tx, parentId, "bbb-dir", dirId);
+			await dialect.insertDirent(tx, parentId, "ccc-link", symlinkId);
+		});
+
+		const dirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, parentId);
+		});
+
+		expect(dirents).toHaveLength(3);
+		expect(dirents[0]).toEqual({ parentInodeId: parentId, name: "aaa-file.txt", inodeId: fileId });
+		expect(dirents[1]).toEqual({ parentInodeId: parentId, name: "bbb-dir", inodeId: dirId });
+		expect(dirents[2]).toEqual({ parentInodeId: parentId, name: "ccc-link", inodeId: symlinkId });
+
+		// Verify kinds via getInode
+		const fileInode = await dialect.transaction(async (tx) => dialect.getInode(tx, fileId));
+		const dirInode = await dialect.transaction(async (tx) => dialect.getInode(tx, dirId));
+		const symlinkInode = await dialect.transaction(async (tx) => dialect.getInode(tx, symlinkId));
+		expect(fileInode!.kind).toBe(1);
+		expect(dirInode!.kind).toBe(2);
+		expect(symlinkInode!.kind).toBe(3);
+	});
+
+	it("returns empty array for an empty directory", async () => {
+		const emptyDirId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 2, mode: 0o755, size: 0 });
+		});
+
+		const dirents = await dialect.transaction(async (tx) => {
+			return await dialect.listDirents(tx, emptyDirId);
+		});
+
+		expect(dirents).toEqual([]);
+	});
+});

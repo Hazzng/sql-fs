@@ -226,8 +226,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-011
-	async listDirents(_tx: PgTx, _parentId: bigint): Promise<DirentRow[]> {
-		throw new Error("not implemented");
+	async listDirents(tx: PgTx, parentId: bigint): Promise<DirentRow[]> {
+		const rows = await tx<{ parent_inode_id: string; name: string; inode_id: string }[]>`
+			SELECT d.parent_inode_id, d.name, d.inode_id
+			FROM dirents d
+			JOIN inodes i ON i.id = d.inode_id
+			WHERE d.parent_inode_id = ${String(parentId)}
+			ORDER BY d.name
+		`;
+		return rows.map((r) => ({
+			parentInodeId: BigInt(r.parent_inode_id),
+			name: r.name,
+			inodeId: BigInt(r.inode_id),
+		}));
 	}
 
 	// US-012
