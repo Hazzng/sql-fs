@@ -492,7 +492,16 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const destParentEntry = this.#pathCache.get(destParentPath);
 		if (!destParentEntry) throw createEnoent(destParentPath);
 
+		// Capture displaced dest inode before async work
+		const destEntry = this.#pathCache.get(dest);
+
 		await this.#withTx(async (tx) => {
+			// If destination exists, decrement nlink on the displaced inode.
+			// moveDirent will DELETE the dest dirent in SQL; we handle the inode lifecycle here.
+			if (destEntry) {
+				const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
+				if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
+			}
 			await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
 		});
 

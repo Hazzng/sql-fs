@@ -130,3 +130,79 @@ describe("SqlFs.mv() — pathCache rebuild", () => {
 		);
 	});
 });
+
+describe("SqlFs.mv() — move over existing destination", () => {
+	const sandboxId = "test-sandbox";
+	let moveDirentMock: ReturnType<typeof vi.fn>;
+	let decrementNlinkMock: ReturnType<typeof vi.fn>;
+	let deleteInodeMock: ReturnType<typeof vi.fn>;
+	let dialect: SqlDialect<unknown>;
+	let fs: SqlFs;
+
+	beforeEach(async () => {
+		moveDirentMock = vi.fn(async () => undefined);
+		decrementNlinkMock = vi.fn(async () => 0); // returns 0 → inode deleted
+		deleteInodeMock = vi.fn(async () => undefined);
+
+		dialect = {
+			connect: vi.fn(),
+			disconnect: vi.fn(),
+			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+			setSandboxContext: vi.fn(),
+			loadAllPaths: vi.fn(async () => [
+				dirEntry("/", 1n),
+				fileEntry("/src.txt", 2n, 10),
+				fileEntry("/dest.txt", 3n, 20), // existing destination
+			]),
+			createSandbox: vi.fn(),
+			deleteSandbox: vi.fn(),
+			createInode: vi.fn(),
+			getInode: vi.fn(),
+			updateInode: vi.fn(),
+			deleteInode: deleteInodeMock,
+			incrementNlink: vi.fn(),
+			decrementNlink: decrementNlinkMock,
+			insertDirent: vi.fn(),
+			upsertDirent: vi.fn(),
+			deleteDirent: vi.fn(),
+			listDirents: vi.fn(),
+			moveDirent: moveDirentMock,
+			upsertBlob: vi.fn(),
+			getBlob: vi.fn(),
+			gcOrphanBlobs: vi.fn(),
+			loadSubtreeInodes: vi.fn(),
+			bulkIngest: vi.fn(),
+			resolvePath: vi.fn(),
+		} as unknown as SqlDialect<unknown>;
+
+		fs = new SqlFs({ dialect, sandboxId });
+		await fs.ready();
+	});
+
+	it("move over existing file: decrements dest inode nlink and removes dest from pathCache", async () => {
+		await fs.mv("/src.txt", "/dest.txt");
+
+		// decrementNlink called with displaced dest inodeId (3n)
+		expect(decrementNlinkMock).toHaveBeenCalledWith(expect.anything(), 3n);
+		// nlink=0 so deleteInode called with displaced dest inodeId (3n)
+		expect(deleteInodeMock).toHaveBeenCalledWith(expect.anything(), 3n);
+		// moveDirent still called
+		expect(moveDirentMock).toHaveBeenCalledOnce();
+
+		const paths = fs.getAllPaths();
+		// src gone, dest now points to moved file
+		expect(paths).not.toContain("/src.txt");
+		expect(paths).toContain("/dest.txt");
+	});
+
+	it("move over existing file: does not delete inode when nlink > 0", async () => {
+		decrementNlinkMock.mockResolvedValue(1); // nlink still 1 after decrement
+
+		await fs.mv("/src.txt", "/dest.txt");
+
+		expect(decrementNlinkMock).toHaveBeenCalledWith(expect.anything(), 3n);
+		// nlink > 0 so deleteInode NOT called for the displaced inode (3n)
+		expect(deleteInodeMock).not.toHaveBeenCalled();
+		expect(moveDirentMock).toHaveBeenCalledOnce();
+	});
+});
