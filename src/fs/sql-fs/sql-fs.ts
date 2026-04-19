@@ -386,8 +386,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async exists(_path: string): Promise<boolean> {
-		throw new Error("not implemented");
+	async exists(path: string): Promise<boolean> {
+		return this.#pathCache.has(path);
 	}
 
 	async stat(path: string): Promise<FsStat> {
