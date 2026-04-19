@@ -11,7 +11,15 @@ import { createHash } from "node:crypto";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
-import { createEexist, createEinval, createEisdir, createEnoent, createEnotdir, createEnotempty } from "./errors.js";
+import {
+	createEexist,
+	createEinval,
+	createEisdir,
+	createEnoent,
+	createEnotdir,
+	createEnotempty,
+	createEperm,
+} from "./errors.js";
 import type { PathCacheEntry, SqlDialect } from "./types.js";
 
 // Extract optional-parameter types from IFileSystem to avoid importing
@@ -620,8 +628,24 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		throw new Error("not implemented");
 	}
 
-	async link(_existingPath: string, _newPath: string): Promise<void> {
-		throw new Error("not implemented");
+	async link(existingPath: string, newPath: string): Promise<void> {
+		const srcEntry = this.#pathCache.get(existingPath);
+		if (!srcEntry) throw createEnoent(existingPath);
+		if (srcEntry.kind === 2) throw createEperm(existingPath, "link");
+		if (this.#pathCache.has(newPath)) throw createEexist(newPath);
+
+		const destParentPath = this.#parentOf(newPath);
+		const destName = this.#nameOf(newPath);
+		const destParentEntry = this.#pathCache.get(destParentPath);
+		if (!destParentEntry) throw createEnoent(destParentPath);
+		if (destParentEntry.kind !== 2) throw createEnotdir(destParentPath);
+
+		await this.#withTx(async (tx) => {
+			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
+			await this.#dialect.incrementNlink(tx, srcEntry.inodeId);
+		});
+
+		this.#pathCache.set(newPath, { ...srcEntry });
 	}
 
 	async readlink(path: string): Promise<string> {
