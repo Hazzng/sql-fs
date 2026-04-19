@@ -1,9 +1,10 @@
 /**
  * Integration tests for PostgresDialect — connection, sandbox context,
- * createSandbox, deleteSandbox, and inode CRUD.
+ * createSandbox, deleteSandbox, inode CRUD, and nlink operations.
  * US-004: connect, setSandboxContext, verify current_setting.
  * US-005: createSandbox, deleteSandbox.
  * US-006: createInode, getInode, updateInode, deleteInode.
+ * US-007: incrementNlink, decrementNlink.
  *
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
@@ -267,5 +268,70 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — inode CRUD", () 
 		});
 
 		expect(inode).toBeNull();
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — incrementNlink and decrementNlink", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-nlink-${Date.now()}`;
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, sandboxId);
+		});
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	it("incrementNlink increases nlink from 1 to 2", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		await dialect.transaction(async (tx) => {
+			await dialect.incrementNlink(tx, inodeId);
+		});
+
+		const inode = await dialect.transaction(async (tx) => {
+			return await dialect.getInode(tx, inodeId);
+		});
+
+		expect(inode!.nlink).toBe(2);
+	});
+
+	it("decrementNlink from 2 to 1 returns 1", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		// Increment to nlink=2 first
+		await dialect.transaction(async (tx) => {
+			await dialect.incrementNlink(tx, inodeId);
+		});
+
+		const newNlink = await dialect.transaction(async (tx) => {
+			return await dialect.decrementNlink(tx, inodeId);
+		});
+
+		expect(newNlink).toBe(1);
+	});
+
+	it("decrementNlink from 1 to 0 returns 0", async () => {
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 0 });
+		});
+
+		const newNlink = await dialect.transaction(async (tx) => {
+			return await dialect.decrementNlink(tx, inodeId);
+		});
+
+		expect(newNlink).toBe(0);
 	});
 });
