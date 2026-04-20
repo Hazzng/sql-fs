@@ -4,6 +4,7 @@
  */
 
 import { serve } from "@hono/node-server";
+import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
@@ -11,6 +12,7 @@ import { type AuthVariables, authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest } from "./mcp/server.js";
+import { openapiSpec } from "./openapi-spec.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
@@ -73,6 +75,11 @@ app.use("*", async (c, next) => {
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
 app.get("/readyz", (c) => c.json({ status: "ok" }));
+
+// ── OpenAPI / Swagger ──────────────────────────────────────────────────────────
+
+app.get("/openapi.json", (c) => c.json(openapiSpec));
+app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 
 // ── Global error handler ───────────────────────────────────────────────────────
 
