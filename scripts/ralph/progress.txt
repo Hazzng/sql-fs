@@ -10,6 +10,8 @@ Started: Sun Apr 19 23:23:07 ACST 2026
 - `mkdir -p` in just-bash must create `/tmp` before writing to `/tmp/...` via `fs.mkdir` API; InMemoryFs doesn't auto-create parent dirs for writeFile (the route must ensure parents exist)
 - Tests use `InMemoryFs` + real just-bash `Bash` (no mocking needed for exec) — commands actually execute in the virtual FS
 - Biome lint: use dot notation `body.archive` not bracket notation `body["archive"]` for object keys (enforced as error)
+- MCP transport for Hono: use `WebStandardStreamableHTTPServerTransport`; mount with `app.all("/mcp", (c) => handleMcpRequest(c.req.raw))`; one McpServer+transport per MCP session
+- MCP tools are registered on McpServer before `server.connect(transport)` — future tools go in `src/api/mcp/tools.ts`
 
 ---
 
@@ -42,4 +44,15 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - Return `new Response(bytes, { headers: { 'Content-Type': 'application/gzip', 'Content-Disposition': '...' } })` directly from a Hono route handler for binary responses — Hono accepts raw Response objects
   - In tests, use `mkdtempSync` for extracting and verifying tar archives on host; cleanup with `rmSync(dir, { recursive: true, force: true })`
   - Errors thrown inside `sessionManager.withSession` propagate up — catch by code property to map to HTTP status codes
+---
+
+## 2026-04-20 - US-077
+- What was implemented: MCP server setup in src/api/mcp/server.ts; creates McpServer with name 'virtualfs'/version '1.0.0'; uses WebStandardStreamableHTTPServerTransport (web-standard, not Node.js-specific) for Hono compatibility; session management via Map<sessionId, transport>; each new session gets a fresh McpServer+transport pair; mounted at /mcp in server.ts via `app.all("/mcp", (c) => handleMcpRequest(c.req.raw))`
+- Files changed: src/api/mcp/server.ts (new), src/api/__tests__/mcp.test.ts (new), src/api/server.ts (added /mcp mount)
+- **Learnings for future iterations:**
+  - Use `WebStandardStreamableHTTPServerTransport` (not `StreamableHTTPServerTransport`) for Hono — it uses Web Standard Request/Response APIs directly: `transport.handleRequest(c.req.raw)`
+  - `McpServer.connect(transport)` assumes ownership of the transport; for multi-client support, create one McpServer per session
+  - Session management pattern: `Map<sessionId, transport>`; check `req.headers.get("mcp-session-id")`; create new McpServer+transport on first request, reuse on subsequent
+  - Tools are registered on the McpServer instance before `connect()` — future stories (US-078+) should register tools in a shared `registerTools(server, sessionManager)` call in mcp/server.ts
+  - MCP SDK import paths: `@modelcontextprotocol/sdk/server/mcp.js` for McpServer, `@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js` for transport
 ---

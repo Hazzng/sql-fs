@@ -80,7 +80,7 @@
         "Tests pass"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": "The MCP SDK provides Server class and StreamableHTTPServerTransport. Mount as Hono route that bridges to the MCP transport. Check @modelcontextprotocol/sdk docs for the latest transport API."
     },
     {
