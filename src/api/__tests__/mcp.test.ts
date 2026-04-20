@@ -4,6 +4,7 @@
  * US-078: MCP tool — sandbox_create
  * US-079: MCP tool — sandbox_delete
  * US-080: MCP tool — bash_exec
+ * US-086: MCP tool — fs_ingest
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -171,6 +172,67 @@ describe("MCP tool — bash_exec", () => {
 		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
 		expect(parsed.stdout).toBe("hello\n");
 		expect(parsed.exitCode).toBe(0);
+
+		await client.close();
+	});
+});
+
+describe("MCP tool — fs_ingest", () => {
+	it("ingests 3 files and verifies they are readable via bash_exec cat", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager);
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		// Create a sandbox
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		// Ingest 3 files
+		const ingestResult = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/project",
+				files: {
+					"a.txt": "hello from a",
+					"subdir/b.txt": "hello from b",
+					"subdir/c.txt": "hello from c",
+				},
+			},
+		});
+
+		const ingestContent = ingestResult.content as Array<{ type: string; text?: string }>;
+		expect(ingestContent).toHaveLength(1);
+		const ingestParsed = JSON.parse(ingestContent[0]?.text ?? "") as { ok: boolean; count: number };
+		expect(ingestParsed.ok).toBe(true);
+		expect(ingestParsed.count).toBe(3);
+
+		// Verify files are readable via cat
+		for (const [rel, expected] of [
+			["a.txt", "hello from a"],
+			["subdir/b.txt", "hello from b"],
+			["subdir/c.txt", "hello from c"],
+		] as Array<[string, string]>) {
+			const execResult = await client.callTool({
+				name: "bash_exec",
+				arguments: { id: created.id, script: `cat /home/user/project/${rel}` },
+			});
+			const execContent = execResult.content as Array<{ type: string; text?: string }>;
+			const execParsed = JSON.parse(execContent[0]?.text ?? "") as { stdout: string; exitCode: number };
+			expect(execParsed.exitCode).toBe(0);
+			expect(execParsed.stdout).toBe(expected);
+		}
 
 		await client.close();
 	});

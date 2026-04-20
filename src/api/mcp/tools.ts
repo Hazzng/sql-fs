@@ -3,6 +3,7 @@
  * US-078: MCP tool — sandbox_create
  * US-079: MCP tool — sandbox_delete
  * US-080: MCP tool — bash_exec
+ * US-086: MCP tool — fs_ingest
  */
 
 import { randomUUID } from "node:crypto";
@@ -97,6 +98,43 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: message, exitCode: 1 }) }],
+				};
+			}
+		},
+	);
+
+	server.tool(
+		"fs_ingest",
+		"Upload files into sandbox (use before bash_exec to seed project files)",
+		{
+			id: z.string(),
+			basePath: z.string().optional(),
+			files: z.record(z.string(), z.string()),
+		},
+		async (args) => {
+			const basePath = args.basePath ?? "/home/user";
+			try {
+				await sessionManager.withSession(args.id, async (session) => {
+					for (const [relativePath, content] of Object.entries(args.files)) {
+						const absPath = `${basePath}/${relativePath}`;
+						const lastSlash = absPath.lastIndexOf("/");
+						const parentDir = absPath.slice(0, lastSlash);
+						if (parentDir) {
+							await session.fs.mkdir(parentDir, { recursive: true });
+						}
+						await session.fs.writeFile(absPath, content);
+					}
+				});
+
+				return {
+					content: [
+						{ type: "text" as const, text: JSON.stringify({ ok: true, count: Object.keys(args.files).length }) },
+					],
+				};
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};
 			}
 		},
