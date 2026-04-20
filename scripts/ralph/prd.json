@@ -166,7 +166,7 @@
         "Tests pass"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": "Unlike the HTTP ingest-files endpoint (US-072) which uses base64, MCP fs_ingest uses plain text for simpler agent interaction."
     },
     {

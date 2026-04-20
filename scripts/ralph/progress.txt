@@ -84,3 +84,13 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - For bash_exec test, use a real `SessionManager` with `InMemoryFs` instead of mocking — the test actually exercises the real Bash interpreter
   - `DEFAULT_TIMEOUT_MS` and `MAX_TIMEOUT_MS` are module-level constants — not exported, only used by tools in this file
 ---
+
+## 2026-04-20 - US-086
+- What was implemented: `fs_ingest` MCP tool in `src/api/mcp/tools.ts`; input schema `{ id, basePath?, files: Record<string, string> }`; basePath defaults to `/home/user`; content is plain text (not base64); creates parent dirs via `session.fs.mkdir(parentDir, { recursive: true })`; writes each file via `session.fs.writeFile(absPath, content)`; returns `{ ok: true, count: number }`; errors return `{ ok: false, error: message }`
+- Files changed: src/api/mcp/tools.ts (added fs_ingest tool), src/api/__tests__/mcp.test.ts (added fs_ingest test)
+- **Learnings for future iterations:**
+  - `IFileSystem.mkdir(path, { recursive: true })` creates all parent directories — same pattern as the HTTP ingest route
+  - Path join for MCP tools: simple string template `${basePath}/${relativePath}` works; no need for node:path
+  - MCP tool tests using `session.fs` operations: use real `SessionManager` with `InMemoryFs` (same pattern as bash_exec test) — exercise the real filesystem instead of mocking
+  - `cat` in just-bash does NOT append newline — output is exactly the file content (unlike `echo`)
+---
