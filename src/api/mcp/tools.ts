@@ -4,6 +4,7 @@
  * US-079: MCP tool — sandbox_delete
  * US-080: MCP tool — bash_exec
  * US-086: MCP tool — fs_ingest
+ * US-087: MCP tool — fs_export
  */
 
 import { randomUUID } from "node:crypto";
@@ -130,6 +131,55 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 					content: [
 						{ type: "text" as const, text: JSON.stringify({ ok: true, count: Object.keys(args.files).length }) },
 					],
+				};
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+				};
+			}
+		},
+	);
+
+	server.tool(
+		"fs_export",
+		"Download files from sandbox as JSON map",
+		{
+			id: z.string(),
+			path: z.string().optional(),
+		},
+		async (args) => {
+			const basePath = args.path ?? "/home/user";
+			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+			try {
+				const files = await sessionManager.withSession(args.id, async (session) => {
+					const allPaths = session.fs.getAllPaths();
+					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
+					const result: Record<string, string> = Object.create(null);
+
+					for (const absPath of allPaths) {
+						if (!absPath.startsWith(prefix)) {
+							continue;
+						}
+						const stat = await session.fs.stat(absPath);
+						if (!stat.isFile) {
+							continue;
+						}
+						const buf = await session.fs.readFileBuffer(absPath);
+						const relativePath = absPath.slice(prefix.length);
+						try {
+							result[relativePath] = utf8Decoder.decode(buf);
+						} catch {
+							result[relativePath] = `data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+						}
+					}
+
+					return result;
+				});
+
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ files }) }],
 				};
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);

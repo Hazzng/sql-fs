@@ -5,6 +5,7 @@
  * US-079: MCP tool — sandbox_delete
  * US-080: MCP tool — bash_exec
  * US-086: MCP tool — fs_ingest
+ * US-087: MCP tool — fs_export
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -233,6 +234,59 @@ describe("MCP tool — fs_ingest", () => {
 			expect(execParsed.exitCode).toBe(0);
 			expect(execParsed.stdout).toBe(expected);
 		}
+
+		await client.close();
+	});
+});
+
+describe("MCP tool — fs_export", () => {
+	it("exports files written to sandbox as a JSON map", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager);
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		// Create a sandbox and ingest files
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/proj",
+				files: {
+					"a.txt": "content of a",
+					"sub/b.txt": "content of b",
+					"sub/c.txt": "content of c",
+				},
+			},
+		});
+
+		// Export the files
+		const exportResult = await client.callTool({
+			name: "fs_export",
+			arguments: { id: created.id, path: "/home/user/proj" },
+		});
+
+		const exportContent = exportResult.content as Array<{ type: string; text?: string }>;
+		expect(exportContent).toHaveLength(1);
+		const parsed = JSON.parse(exportContent[0]?.text ?? "") as { files: Record<string, string> };
+		expect(parsed.files["a.txt"]).toBe("content of a");
+		expect(parsed.files["sub/b.txt"]).toBe("content of b");
+		expect(parsed.files["sub/c.txt"]).toBe("content of c");
+		// Should not include directories
+		expect(Object.keys(parsed.files)).toHaveLength(3);
 
 		await client.close();
 	});
