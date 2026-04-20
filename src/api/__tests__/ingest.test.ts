@@ -1,6 +1,7 @@
 /**
  * Unit tests for ingest routes.
  * US-071: POST /v1/sandboxes/:id/ingest — tar.gz upload
+ * US-072: POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
  */
 
 import { execSync } from "node:child_process";
@@ -155,5 +156,75 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		});
 
 		expect(res.status).toBe(401);
+	});
+});
+
+describe("POST /v1/sandboxes/:id/ingest-files", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("ingest 3 files via JSON — content matches after base64 decode", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const files: Record<string, string> = {
+			"hello.txt": Buffer.from("hello world").toString("base64"),
+			"foo.js": Buffer.from("console.log('foo');").toString("base64"),
+			"sub/bar.md": Buffer.from("# Bar\nSome content").toString("base64"),
+		};
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ basePath: "/home/user/project", files }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { status: string; fileCount: number };
+		expect(body.status).toBe("ok");
+		expect(body.fileCount).toBe(3);
+
+		const session = await sessionManager.getOrCreate(SANDBOX_ID);
+		expect(await session.fs.readFile("/home/user/project/hello.txt")).toBe("hello world");
+		expect(await session.fs.readFile("/home/user/project/foo.js")).toBe("console.log('foo');");
+		expect(await session.fs.readFile("/home/user/project/sub/bar.md")).toBe("# Bar\nSome content");
+	});
+
+	it("missing basePath returns 400 validation error", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ files: { "a.txt": Buffer.from("a").toString("base64") } }),
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("INVALID_INPUT");
+	});
+
+	it("missing files returns 400 validation error", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ basePath: "/home/user" }),
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("INVALID_INPUT");
 	});
 });
