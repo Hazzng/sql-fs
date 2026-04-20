@@ -1,6 +1,7 @@
 /**
  * MCP tool definitions and handlers.
  * US-078: MCP tool — sandbox_create
+ * US-079: MCP tool — sandbox_delete
  */
 
 import { randomUUID } from "node:crypto";
@@ -21,4 +22,18 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 			};
 		},
 	);
+
+	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
+		try {
+			await sessionManager.destroy(args.id);
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify({ ok: true }) }],
+			};
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+			};
+		}
+	});
 }
