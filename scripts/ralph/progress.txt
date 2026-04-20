@@ -23,3 +23,12 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - Biome enforces dot notation for string literal keys on object access — use `body.archive` not `body["archive"]`
   - Pre-existing flaky test: `concurrency.ordering.test.ts` S2/S3 may fail non-deterministically (race condition, not related to ingest)
 ---
+
+## 2026-04-20 - US-072
+- What was implemented: POST /v1/sandboxes/:id/ingest-files route added to src/api/routes/ingest.ts; Zod validation for { basePath, files: Record<string, string> } (base64 values); decodes base64 with Buffer.from(base64, 'base64'); creates parent dirs via fs.mkdir recursive; writes each file via fs.writeFile; returns { status: 'ok', fileCount }
+- Files changed: src/api/routes/ingest.ts (added route + zod schema), src/api/__tests__/ingest.test.ts (added 3 tests for US-072)
+- **Learnings for future iterations:**
+  - Base64 decoding: `Buffer.from(base64Content, 'base64')` then `new Uint8Array(decoded)` for fs.writeFile
+  - Parent dir extraction: `absPath.slice(0, absPath.lastIndexOf('/'))` — no need for path.dirname, avoids importing node:path
+  - Zod `z.record(z.string(), z.string())` correctly validates Record<string, string> maps
+---
