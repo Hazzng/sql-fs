@@ -66,3 +66,12 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - `client.callTool(...)` returns `{ content: unknown }` — cast with `as Array<{ type: string; text?: string }>` for TypeScript
   - All future MCP tools go in `src/api/mcp/tools.ts` inside `registerTools(server, sessionManager)` — no changes to `server.ts` or `server.ts` (api) needed for new tools
 ---
+
+## 2026-04-20 - US-079
+- What was implemented: `sandbox_delete` MCP tool in `src/api/mcp/tools.ts`; calls `sessionManager.destroy(id)`; returns `{ ok: true }` on success; catches errors and returns `{ ok: false, error: message }` for error cases (e.g. sandbox not found)
+- Files changed: src/api/mcp/tools.ts (added sandbox_delete tool), src/api/__tests__/mcp.test.ts (added 2 tests for US-079)
+- **Learnings for future iterations:**
+  - MCP tools wrap all errors in a `{ ok: false, error: message }` content response — never let errors propagate to the MCP framework from tool handlers
+  - `server.tool(name, description, schema, handler)` — all 4 args; no changes to server.ts or mcp/server.ts needed for new tools
+  - Mock `SessionManager` for MCP tool tests: only stub the methods the tool under test calls — tests stay focused
+---
