@@ -189,7 +189,7 @@
         "Tests pass"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": "Uses fs.getAllPaths() or fs.readdir recursive to enumerate files, then fs.readFile for each. Binary detection: try UTF-8 decode, check for replacement chars."
     }
   ]

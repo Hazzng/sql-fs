@@ -94,3 +94,13 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - MCP tool tests using `session.fs` operations: use real `SessionManager` with `InMemoryFs` (same pattern as bash_exec test) — exercise the real filesystem instead of mocking
   - `cat` in just-bash does NOT append newline — output is exactly the file content (unlike `echo`)
 ---
+
+## 2026-04-20 - US-087
+- What was implemented: `fs_export` MCP tool in `src/api/mcp/tools.ts`; input schema `{ id, path? }`; path defaults to `/home/user`; uses `session.fs.getAllPaths()` to enumerate all paths; filters to those starting with `path + '/'`; `stat().isFile` to skip directories; `readFileBuffer()` to read bytes; tries `TextDecoder('utf-8', {fatal: true}).decode(buf)` — if it throws, encodes as `data:application/octet-stream;base64,...`; returns `{ files: Record<string, string> }` with relative paths as keys
+- Files changed: src/api/mcp/tools.ts (added fs_export tool), src/api/__tests__/mcp.test.ts (added fs_export test)
+- **Learnings for future iterations:**
+  - `session.fs.getAllPaths()` returns all absolute paths in the FS — filter with `startsWith(prefix)` where prefix is `basePath + '/'`
+  - `stat().isFile` (not `stat().kind === 'file'`) is the field to check — confirmed by runtime inspection
+  - Binary detection: `new TextDecoder('utf-8', { fatal: true }).decode(buf)` throws on invalid UTF-8 — catch to fall back to base64 with `data:` URI marker
+  - `Buffer.from(uint8Array).toString('base64')` works in Node.js for Uint8Array → base64
+---
