@@ -9,6 +9,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
+import { handleMcpRequest } from "./mcp/server.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
@@ -35,6 +36,10 @@ app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 app.route("/v1/sandboxes", fileRoutes(sessionManager));
 app.route("/v1/sandboxes", execRoutes(sessionManager));
 app.route("/v1/sandboxes", ingestRoutes(sessionManager));
+
+// ── MCP endpoint ──────────────────────────────────────────────────────────────
+
+app.all("/mcp", (c) => handleMcpRequest(c.req.raw));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
