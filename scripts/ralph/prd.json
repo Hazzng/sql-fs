@@ -61,7 +61,7 @@
         "Tests pass"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": "Uses sessionManager.withSession to get bash and fs instances. bash.exec runs tar inside the virtual FS."
     },
     {

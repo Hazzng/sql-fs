@@ -32,3 +32,14 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - Parent dir extraction: `absPath.slice(0, absPath.lastIndexOf('/'))` — no need for path.dirname, avoids importing node:path
   - Zod `z.record(z.string(), z.string())` correctly validates Record<string, string> maps
 ---
+
+## 2026-04-20 - US-073
+- What was implemented: GET /v1/sandboxes/:id/export route added to src/api/routes/ingest.ts; accepts optional `basePath` query param (default `/home/user`); checks basePath exists (returns 404 if not); ensures /tmp exists; runs `tar -czf /tmp/_export.tar.gz -C $basePath .` via bash.exec; reads bytes via fs.readFileBuffer; deletes temp file; returns response with Content-Type: application/gzip and Content-Disposition: attachment; filename=export.tar.gz
+- Files changed: src/api/routes/ingest.ts (added export route), src/api/__tests__/ingest.test.ts (added 3 tests for US-073)
+- **Learnings for future iterations:**
+  - `fs.readFileBuffer(path)` is available on IFileSystem and returns Uint8Array — use for binary reads (archives, images)
+  - `fs.exists(path)` is available on IFileSystem — use for 404 detection before running commands
+  - Return `new Response(bytes, { headers: { 'Content-Type': 'application/gzip', 'Content-Disposition': '...' } })` directly from a Hono route handler for binary responses — Hono accepts raw Response objects
+  - In tests, use `mkdtempSync` for extracting and verifying tar archives on host; cleanup with `rmSync(dir, { recursive: true, force: true })`
+  - Errors thrown inside `sessionManager.withSession` propagate up — catch by code property to map to HTTP status codes
+---
