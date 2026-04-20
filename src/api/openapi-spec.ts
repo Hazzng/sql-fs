@@ -148,8 +148,14 @@ export const openapiSpec = {
 							},
 						},
 					},
-					"403": { description: "Wrong X-Admin-Secret", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"500": { description: "ADMIN_SECRET not configured", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"403": {
+						description: "Wrong X-Admin-Secret",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"500": {
+						description: "ADMIN_SECRET not configured",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -189,7 +195,10 @@ export const openapiSpec = {
 						description: "Sandbox created",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Sandbox" } } },
 					},
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -204,8 +213,14 @@ export const openapiSpec = {
 						description: "Sandbox info",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/SandboxInfo" } } },
 					},
-					"403": { description: "Caller does not own sandbox", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"403": {
+						description: "Caller does not own sandbox",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 			delete: {
@@ -214,8 +229,14 @@ export const openapiSpec = {
 				parameters: [sandboxIdParam],
 				responses: {
 					"204": { description: "Deleted" },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -248,9 +269,18 @@ export const openapiSpec = {
 						},
 						content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } },
 					},
-					"400": { description: "Path is a directory", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "File not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Path is a directory",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "File not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 			put: {
@@ -273,8 +303,14 @@ export const openapiSpec = {
 				},
 				responses: {
 					"204": { description: "Written" },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 			delete: {
@@ -299,9 +335,18 @@ export const openapiSpec = {
 				],
 				responses: {
 					"204": { description: "Deleted" },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"409": { description: "Directory not empty (and recursive not set)", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"409": {
+						description: "Directory not empty (and recursive not set)",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -332,9 +377,18 @@ export const openapiSpec = {
 				},
 				responses: {
 					"204": { description: "All files written" },
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -361,10 +415,22 @@ export const openapiSpec = {
 				},
 				responses: {
 					"204": { description: "Created" },
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"409": { description: "Already exists", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"409": {
+						description: "Already exists",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -400,9 +466,18 @@ export const openapiSpec = {
 							},
 						},
 					},
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -435,10 +510,22 @@ export const openapiSpec = {
 							},
 						},
 					},
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"408": { description: "Execution timed out", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"408": {
+						description: "Execution timed out",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -463,9 +550,18 @@ export const openapiSpec = {
 							},
 						},
 					},
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -485,7 +581,11 @@ export const openapiSpec = {
 								type: "object",
 								properties: {
 									archive: { type: "string", format: "binary", description: "The .tar.gz file" },
-									basePath: { type: "string", default: "/home/user/project", description: "Extraction target directory" },
+									basePath: {
+										type: "string",
+										default: "/home/user/project",
+										description: "Extraction target directory",
+									},
 								},
 								required: ["archive"],
 							},
@@ -497,13 +597,26 @@ export const openapiSpec = {
 						description: "Extracted",
 						content: {
 							"application/json": {
-								schema: { type: "object", properties: { status: { type: "string" }, basePath: { type: "string" } }, required: ["status", "basePath"] },
+								schema: {
+									type: "object",
+									properties: { status: { type: "string" }, basePath: { type: "string" } },
+									required: ["status", "basePath"],
+								},
 							},
 						},
 					},
-					"400": { description: "Validation error or extraction failure", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error or extraction failure",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -546,9 +659,18 @@ export const openapiSpec = {
 							},
 						},
 					},
-					"400": { description: "Validation error", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -572,13 +694,22 @@ export const openapiSpec = {
 					"200": {
 						description: "Archive download",
 						headers: {
-							"Content-Disposition": { schema: { type: "string" }, description: 'attachment; filename=export.tar.gz' },
+							"Content-Disposition": { schema: { type: "string" }, description: "attachment; filename=export.tar.gz" },
 						},
 						content: { "application/gzip": { schema: { type: "string", format: "binary" } } },
 					},
-					"400": { description: "Invalid basePath", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"403": { description: "Forbidden", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
-					"404": { description: "Sandbox or basePath not found", content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } } },
+					"400": {
+						description: "Invalid basePath",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox or basePath not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},

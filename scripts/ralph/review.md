@@ -1,73 +1,202 @@
 # Branch Review Report
 
-## Scope
-- Reviewed the current branch diff against `main`, plus related untracked files currently present in the worktree.
-- This was a static review only. I could not execute `pnpm` validation commands from this environment because command execution was blocked by policy.
+Reviewed scope:
+- `main...HEAD`
+- Current tracked worktree edits
+- Related untracked files in the worktree
 
-## Top Findings
-1. **Critical:** `src/fs/sql-fs/dialects/postgres.ts` and `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql` appear mutually incompatible. `createSandbox()` inserts into `inodes` before the `sandboxes` row exists, but `inodes.sandbox_id` has a non-deferrable FK to `sandboxes(id)`, so sandbox creation should fail on a real schema.
-2. **High:** Postgres sandbox isolation is not actually implemented. `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` contains no RLS setup despite its name, and most queries in `src/fs/sql-fs/dialects/postgres.ts` are not sandbox-scoped. `setSandboxContext()` currently provides little protection on its own.
-3. **High:** `src/fs/sql-fs/sql-fs.ts` has multiple correctness hazards: missing path normalization/null-byte validation on most methods, `mv()` can create cycles or place children under non-directories, recursive `rm()` ignores hardlink counts, and `readFile()`/`readFileBuffer()` do not resolve symlinks.
-4. **High:** Several public/deployment surfaces are incomplete or broken in the current branch: `src/api/cli/token.ts`, `src/fs/sql-fs/index.ts`, `drizzle.config.ts`, `Dockerfile`, and multiple `package.json` scripts refer to missing or stubbed files.
+Verification:
+- Static review only. Attempts to run `pnpm test` and `pnpm typecheck` were blocked by the environment, so the findings below are from code and diff inspection.
 
-## Runtime, DB, Config, and Packaging Files
-- `.dockerignore`: Change: adds Docker context exclusions for build/test/docs files. Bugs/logic: no direct bug, but `scripts/` is still included in the build context even though it is not needed by the container. Security: fine as long as real `.env` files stay excluded. Quality: consider excluding `scripts/` and any local archive directories to shrink context further. Severity: **Low**.
-- `.env.example`: Change: adds sample backend, DB, auth, and session environment variables. Bugs/logic: none in the file itself, but it advertises `AUTH_SECRET=change-me-in-production`, which is easy to cargo-cult into insecure local or shared deployments. Security: placeholder secret is safe, but it should be more explicit that this value must never be used outside local dev. Quality: add comments for required vs optional variables by backend. Severity: **Low**.
-- `.gitignore`: Change: adds standard ignores for build output and env files. Bugs/logic: no obvious logic issues. Security: good that `.env` is ignored while `.env.example` is kept. Quality: consider ignoring any generated review/archive artifacts under `scripts/ralph/archive/` if those are expected locally. Severity: **Low**.
-- `Dockerfile`: Change: adds multi-stage Node 22 build/runtime image with non-root user and healthcheck. Bugs/logic: `pnpm build` is very likely broken on this branch because `package.json` points at API entrypoints that do not exist yet; that makes the Docker build unusable as written. Security: runs as non-root, which is good. Quality: runtime image copies the entire `node_modules` tree from the builder, including dev dependencies, which will bloat the final image. Severity: **High**.
-- `aca.yaml`: Change: adds Azure Container Apps deployment config with probes, secrets, and scaling. Bugs/logic: readiness/startup probes point at `/readyz`, but no server exists in this branch yet, so the deployment manifest is ahead of implementation. Security: uses `secretRef` correctly in the template; just ensure real values are injected out-of-band and never committed. Quality: add a note about required image tags / registry login flow. Severity: **Medium**.
-- `biome.json`: Change: adds formatting/lint configuration. Bugs/logic: no direct logic issue. Security: none. Quality: ignoring `*.sql` and `scripts` means migrations and the autonomous shell script are outside automated style/lint enforcement, which is where some of the highest-risk review findings currently sit. Severity: **Low**.
-- `drizzle.config.ts`: Change: adds Drizzle config pointing at Postgres schema/migrations. Bugs/logic: it references `src/fs/sql-fs/schema.ts`, which does not exist in this branch, so `pnpm db:generate` should fail immediately. Security: none direct. Quality: do not land migration tooling until the referenced schema file exists or gate the script behind the corresponding phase. Severity: **Medium**.
-- `package.json`: Change: adds project metadata, scripts, runtime deps, and dev deps. Bugs/logic: several scripts are not runnable on this branch (`dev`, `start`, `db:gc`, and likely `build`) because the referenced API files do not exist or are TODOs; docs also mention scripts like `test:run` that are not defined here. Security: dependency set is broad and includes database drivers and JWT tooling, but nothing obviously unsafe by itself. Quality: keep scripts aligned with the actual implemented phase, or mark future-phase scripts clearly. Severity: **High**.
-- `pnpm-lock.yaml`: Change: lockfile for the newly added dependency set. Bugs/logic: no code-level review findings here; this is an auto-generated artifact. Security: dependency security still depends on upstream package versions and advisories, which were not audited in this static review. Quality: keep regenerated in sync with `package.json`. Severity: **Low**.
-- `tsconfig.json`: Change: adds strict TypeScript compiler configuration. Bugs/logic: config files like `drizzle.config.ts` and `vitest.config.ts` are not included in typechecking, so broken tooling config can slip through even if `pnpm typecheck` is green. Security: none. Quality: consider a separate `tsconfig.tools.json` or broaden includes if you want tooling entrypoints checked too. Severity: **Low**.
-- `vitest.config.ts`: Change: adds basic Vitest configuration with globals and timeouts. Bugs/logic: none obvious. Security: none. Quality: consider explicit include/exclude patterns for integration vs unit suites, since this repo is already splitting them conceptually in scripts/docs. Severity: **Low**.
-- `src/index.ts`: Change: adds a package root export that re-exports `InodeKind` from the SQL FS package. Bugs/logic: because `src/fs/sql-fs/index.ts` is still a stub, the top-level package export is incomplete and not very useful to consumers yet. Security: none. Quality: either export the real public API or avoid adding the package root entry until the module is actually ready. Severity: **Low**.
-- `src/api/cli/token.ts`: Change: placeholder file for a JWT token generator CLI. Bugs/logic: it is still a TODO, so `pnpm token:create` is effectively broken today. Security: the missing implementation blocks an auth bootstrap path described throughout the docs. Quality: either implement it or remove the script/documentation until the phase is complete. Severity: **Medium**.
-- `src/fs/sql-fs/index.ts`: Change: placeholder entrypoint intended to expose factory/config helpers. Bugs/logic: still entirely TODO, yet multiple docs and exports already assume the factory exists; this creates a misleading public API surface. Security: backend configuration and sandbox destruction are not implemented here, so any future callers may assume safeguards that do not exist. Quality: do not export stubbed modules as if they were ready. Severity: **Medium**.
-- `src/fs/sql-fs/types.ts`: Change: introduces the core dialect interface and shared row/cache types. Bugs/logic: `size` is modeled as `number` everywhere even though the database uses `BIGINT`, so large-file metadata can silently lose precision in JavaScript. Security: none direct. Quality: consider documenting or enforcing max supported file size, or switch to `bigint` in the internal model if large files are a real use case. Severity: **Low**.
-- `src/fs/sql-fs/errors.ts`: Change: adds FS error constructors, SQL error translation, and sanitization. Bugs/logic: `translateSqlError()` only maps a narrow set of database errors, so many real SQL failures will still bubble up as generic sanitized errors; that weakens behavioral compatibility and error handling. Security: `sanitizeFsError()` redacts Unix paths like `/var/...` and `/home/...`, but it does not redact macOS-style `/Users/...` paths, so local host paths can still leak in this repo’s primary development environment. Quality: expand translation coverage and broaden path redaction patterns. Severity: **Medium**.
-- `src/fs/sql-fs/dialects/postgres.ts`: Change: implements most of the Postgres dialect including sandbox, inode, dirent, blob, tree, bulk-ingest, and path-resolution operations. Bugs/logic: `createSandbox()` inserts an inode before the sandbox row exists, which conflicts with the FK in `0000_create_tables.sql`; `bulkIngest()` uses `ON CONFLICT DO NOTHING` for dirents, so pre-existing files can be silently skipped while new inodes are still created and orphaned; many queries are not sandbox-scoped at all. Security: despite the architecture docs, this file currently relies on `setSandboxContext()` without actual RLS or explicit `WHERE sandbox_id = ...` clauses in most methods, so cross-sandbox access is still possible if a wrong inode ID leaks in. Quality: centralize SQL error translation, add missing scoping guarantees, and split the file by concern because it is already carrying too many responsibilities. Severity: **Critical**.
-- `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql`: Change: creates the initial Postgres tables and indexes. Bugs/logic: the `inodes.sandbox_id -> sandboxes(id)` FK makes the current `createSandbox()` implementation invalid because the root inode insert happens before the sandbox row insert; this is the most severe branch issue. Security: no RLS-related setup or even schema comments guarding future isolation assumptions. Quality: either make the FK deferrable / change insertion order / seed `sandboxes` first with nullable `root_inode`. Severity: **Critical**.
-- `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql`: Change: adds `fs_resolve` stored procedures for path walking and symlink handling. Bugs/logic: the file name promises “RLS and procs” but it contains only path-resolution procedures; it also assumes symlink targets are absolute while `SqlFs.symlink()` accepts any string, so relative symlink targets will resolve incorrectly. Security: the absence of RLS policy creation here means the repo’s stated sandbox-isolation model is not actually enforced in the database. Quality: either rename the file honestly or add the missing extension/RLS/policy work that the rest of the branch assumes exists. Severity: **High**.
-- `src/fs/sql-fs/sql-fs.ts`: Change: implements the main `SqlFs` class, path cache, content cache, and most filesystem methods. Bugs/logic: most methods do not normalize input paths or reject null bytes; `writeFile()`/`appendFile()` can overwrite an existing directory entry without checking `EISDIR`; `mv()` does not verify that the destination parent is a directory and does not prevent moving a directory into its own descendant, which can create cycles; recursive `rm()` unconditionally deletes subtree inodes and will delete hardlinked content still reachable outside the subtree; `readFile()`/`readFileBuffer()` do not resolve symlinks; `appendFile()` bypasses the content cache and always re-reads from DB; `readFile()` ignores read options/encoding. Security: raw SQL errors from most dialect methods are not consistently translated/sanitized at the `SqlFs` layer, so concurrent or unexpected DB failures can still leak implementation detail through higher layers later. Quality: split path handling, inode lifecycle, and cache mutation into dedicated helpers, then add missing edge-case tests before expanding API layers on top. Severity: **High**.
+## Overall Findings
 
-## Test Files
-- `src/fs/sql-fs/errors.test.ts`: Change: adds unit coverage for error constructors, SQL translation, and sanitization. Bugs/logic: it does not cover macOS `/Users/...` path leakage or broader SQL error mappings, so the current sanitization blind spot would pass. Security: no direct issue in the test file itself. Quality: add targeted regression cases for local-host path redaction and unmapped DB error classes. Severity: **Low**.
-- `src/fs/sql-fs/integration/postgres.test.ts`: Change: adds a large end-to-end Postgres dialect test suite. Bugs/logic: the file does not test the branch’s highest-risk cases, including RLS enforcement, relative symlink resolution, moving a directory into its own descendant, `bulkIngest()` overwrite behavior, or hardlink safety during recursive delete; it also assumes schema/migrations are already in place instead of bootstrapping them consistently. Security: no test verifies actual sandbox isolation. Quality: the file is far beyond the repo’s own “keep test files under 300 lines” guidance and should be split by concern for maintainability. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.cache-invalidation.test.ts`: Change: adds unit tests for content-cache population/invalidation across writes, deletes, appends, and moves. Bugs/logic: it misses the hardlink case where recursive delete can invalidate or delete content still reachable via another path. Security: none. Quality: add hardlink + subtree scenarios, because that is where the implementation is currently unsafe. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.cache.test.ts`: Change: adds tests for `ready()` and `pathCache` initialization. Bugs/logic: no coverage for normalized-vs-non-normalized path keys, so current path-canonicalization issues are not caught. Security: none. Quality: add tests that demonstrate all externally visible methods use canonical absolute paths consistently. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.chmod-utimes.test.ts`: Change: adds focused tests for `chmod()` and `utimes()`. Bugs/logic: no hardlink/shared-inode scenario is covered, so metadata consistency across multiple links is still unproven. Security: none. Quality: add a hardlink case once link semantics are finalized. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.content-cache.test.ts`: Change: adds LRU cache behavior tests. Bugs/logic: zero-length file behavior is not covered, even though the implementation has special handling and known limitations around zero-byte cache entries. Security: none. Quality: add an explicit empty-file regression test. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.cp.test.ts`: Change: adds tests for single-file and recursive directory copy behavior. Bugs/logic: it does not cover copying symlinks, copying into an existing directory, or copying a directory into its own subtree, so several ambiguous or dangerous edge cases remain unchecked. Security: none. Quality: extend coverage before treating `cp()` semantics as stable. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.exists.test.ts`: Change: adds tests for `exists()`. Bugs/logic: it only tests exact cache keys, not normalized path variants. Security: none. Quality: add canonicalization cases so `exists("/a/../b")` and similar inputs are validated. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.link.test.ts`: Change: adds tests for hardlink creation. Bugs/logic: it does not cover interactions between hardlinks and recursive delete, which is the biggest correctness risk introduced by the current `rm()` implementation. Security: none. Quality: add hardlink lifecycle tests before relying on recursive removal semantics. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.mv.test.ts`: Change: adds tests for path-cache rebuild and destination replacement during move. Bugs/logic: it does not test moving into a non-directory parent or moving a directory into its own descendant, so the current cycle/corruption bug would go undetected. Security: none. Quality: add regression tests for cycle prevention and parent kind validation. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.read-file.test.ts`: Change: adds tests for `readFile()`/`readFileBuffer()` ENOENT/EISDIR behavior and cache usage. Bugs/logic: it never tests reading through a symlink or honoring read options/encodings, so the current behavior gap is invisible to the suite. Security: none. Quality: add symlink-read and encoding cases. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.read.test.ts`: Change: adds cache-hit/cache-miss tests for string reads. Bugs/logic: it does not cover empty-file behavior or symlink resolution. Security: none. Quality: add a zero-byte file case and a symlink-follow case. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.readdir.test.ts`: Change: adds tests for directory listing and typed entries. Bugs/logic: it only covers already-normalized cache keys, so normalization issues still slip through. Security: none. Quality: add ordering and path-normalization assertions if those semantics matter to callers. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.readlink.test.ts`: Change: adds tests for `readlink()`. Bugs/logic: it does not check relative symlink targets, even though the stored-procedure resolver currently assumes absolute targets. Security: none. Quality: add relative-target coverage if those links are meant to be supported. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.realpath.test.ts`: Change: adds tests for `realpath()` calling the dialect resolver and returning canonical paths. Bugs/logic: it does not cover hardlink ambiguity or relative symlink targets, so canonical-path expectations remain underspecified. Security: none. Quality: add explicit hardlink behavior documentation/tests. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.resolvepath.test.ts`: Change: adds tests for the local `resolvePath()` helper behavior. Bugs/logic: it only proves parity with the local implementation, not with just-bash’s real semantics; if upstream behavior differs, this suite will still stay green. Security: none. Quality: if possible, compare against upstream path-utils behavior rather than only local expectations. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.rm-recursive.test.ts`: Change: adds focused tests for recursive deletion. Bugs/logic: it does not cover a subtree containing a hardlink to an inode also referenced elsewhere, so the current data-loss bug in recursive `rm()` is not caught. Security: none. Quality: this test file should get a hardlink safety regression test before recursive delete is considered ready. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.stat.test.ts`: Change: adds tests for `stat()`/`lstat()` behavior. Bugs/logic: it only covers a direct absolute symlink target and does not test nested/relative symlinks, so the current one-hop cache lookup passes without exercising real resolver semantics. Security: none. Quality: add nested/relative symlink cases or route `stat()` through the same resolver used by `realpath()`. Severity: **Medium**.
-- `src/fs/sql-fs/sql-fs.symlink.test.ts`: Change: adds tests for default-deny symlink policy and happy-path creation when enabled. Bugs/logic: relative target behavior is not covered, even though the backend currently stores arbitrary target strings. Security: good coverage of the default-deny guard. Quality: add follow-up tests proving how relative targets should behave. Severity: **Low**.
-- `src/fs/sql-fs/sql-fs.write.test.ts`: Change: adds a broad set of unit tests for write/update/remove operations. Bugs/logic: it does not cover writing over an existing directory or symlink, missing path normalization, or the raw-SQL-error translation path under races/failures. Security: none direct. Quality: add edge-case coverage before building API layers on top of these semantics. Severity: **Medium**.
+1. `src/api/server.ts` + `src/api/mcp/tools.ts` introduce a critical auth/authz gap: `/mcp` is unauthenticated, and the MCP tools do not enforce ownership.
+2. `src/api/routes/ingest.ts` and `src/api/mcp/tools.ts` accept unsanitized file keys, so `../` traversal can escape the requested `basePath`.
+3. `src/api/routes/ingest.ts` does not check `bash.exec()` exit codes for `tar`, which can turn failed ingest/export operations into false-success or misleading responses.
+4. `src/api/mcp/tools.ts` has additional correctness issues: `sandbox_delete` can return success for a missing sandbox, and `fs_export` can silently drop files after the worktree change that swallows all read errors.
 
-## Automation and Documentation Files
-- `CLAUDE.md`: Change: adds repo guidance, architecture notes, commands, and coding standards. Bugs/logic: several statements no longer match the branch state yet (for example, `schema.ts`, API server files, RLS guarantees, and some verification commands), so future automation may trust capabilities that are not actually implemented. Security: none direct, but the doc overstates isolation guarantees that are currently missing in code. Quality: keep this file synchronized with what really exists on the branch today. Severity: **Low**.
-- `scripts/ralph/.last-branch`: Change: stores the last Ralph branch name. Bugs/logic: none. Security: none. Quality: probably should stay untracked if it is only local automation state. Severity: **Low**.
-- `scripts/ralph/CLAUDE.md`: Change: adds autonomous-agent iteration instructions. Bugs/logic: it mandates commit/advance behavior that can mark stories complete even when cross-story integration gaps remain; the current branch seems to reflect that risk. Security: none direct. Quality: add an explicit “do not mark done if shared acceptance criteria are only partially satisfied” guard. Severity: **Low**.
-- `scripts/ralph/prd.json`: Change: adds a machine-readable phase/story tracker and marks many stories as passed. Bugs/logic: the branch still contains critical runtime/security issues and TODO public entrypoints, so the “all phase 1 stories pass” state is overstated. Security: none direct. Quality: tighten completion criteria so cross-cutting acceptance requirements like isolation and real-schema validation must be demonstrated before setting `passes: true`. Severity: **Medium**.
-- `scripts/ralph/progress.txt`: Change: adds detailed automation progress logs and claimed learnings. Bugs/logic: it contains strong success claims such as all unit tests passing and stories being complete, but the code still shows unresolved critical gaps; at minimum, the log overstates confidence. Security: none direct. Quality: distinguish “story-local tests passed” from “branch is production-ready” to avoid misleading future iterations. Severity: **Medium**.
-- `scripts/ralph/ralph.sh`: Change: adds a long-running autonomous implementation/review/fix loop script. Bugs/logic: it assumes `jq`, `claude`, `amp`, and `agent` are installed and working; failures are often masked with `|| true`, which can hide real breakage. Security: very risky as written because it invokes tools with `--dangerously-skip-permissions` and `--dangerously-allow-all`, then asks an agent to review and auto-fix findings without a human approval gate. Quality: add dependency checks, fail-fast behavior, and an opt-in approval step before destructive/autonomous phases. Severity: **High**.
-- `tasks/IMPLEMENT.md`: Change: adds a phased implementation plan with verification commands. Bugs/logic: some commands and paths are already out of sync with the repository (`pnpm test:run`, referenced files, expected comparison tests), so the plan is not directly executable as written. Security: none. Quality: update the plan to reflect the actual scripts/files in this branch or clearly label future-state steps. Severity: **Low**.
-- `tasks/prd-virtual-fs-api.md`: Change: adds the detailed product requirements document. Bugs/logic: the implementation no longer matches several stated guarantees yet, especially around RLS, schema artifacts, API files, and some command names; treating this as current truth would be misleading. Security: the PRD claims sandbox isolation guarantees that the present Postgres implementation does not enforce. Quality: keep the PRD, but note explicitly which sections are aspirational versus already implemented. Severity: **Low**.
-- `tasks/virtualFS.md`: Change: adds a high-level project overview and architecture summary. Bugs/logic: it reads like a finished-system overview, but several referenced modules do not exist yet and some stated guarantees are not implemented. Security: it repeats the current RLS/isolation overstatement. Quality: relabel as design/target architecture or annotate implementation status. Severity: **Low**.
+## File Reviews
 
-## Suggested Fix Order
-1. Fix the `createSandbox()` / schema FK incompatibility between `src/fs/sql-fs/dialects/postgres.ts` and `src/fs/sql-fs/migrations/postgres/0000_create_tables.sql`.
-2. Implement real sandbox isolation for Postgres: add RLS in `src/fs/sql-fs/migrations/postgres/0001_rls_and_procs.sql` and/or explicit `sandbox_id` scoping in `src/fs/sql-fs/dialects/postgres.ts`.
-3. Harden `src/fs/sql-fs/sql-fs.ts`: path normalization and null-byte rejection, directory/symlink overwrite guards, recursive `rm()` hardlink safety, and cycle prevention in `mv()`.
-4. Bring public tooling back into sync: `src/api/cli/token.ts`, `src/fs/sql-fs/index.ts`, `drizzle.config.ts`, `package.json`, and `Dockerfile`.
-5. Expand tests around the uncovered edge cases before treating phase 1 as complete.
+### `src/api/server.ts`
+- Summary: mounts the new ingest/export HTTP routes and adds a new `/mcp` endpoint backed by the shared `SessionManager`.
+- Potential bugs / logic errors:
+  - No file-local logic bug beyond the route wiring itself, but this file exposes the new MCP surface without adding any guardrail around it.
+- Security vulnerabilities:
+  - Critical: `authMiddleware` only protects `/v1/*`, but `/mcp` is mounted outside that namespace. Every MCP tool becomes remotely reachable without authentication.
+- Code quality improvements:
+  - Put `/mcp` behind dedicated auth middleware or mount it under an authenticated prefix.
+  - Add an HTTP-level regression test that unauthenticated `POST /mcp` and `GET /mcp` requests are rejected.
+- Severity: critical
+
+### `src/api/mcp/server.ts`
+- Summary: adds MCP server creation plus streamable HTTP transport reuse keyed by `mcp-session-id`.
+- Potential bugs / logic errors:
+  - The module-level `sessions` map only shrinks when `onsessionclosed` fires. If clients disappear without a clean close, transports can accumulate indefinitely.
+  - Unknown `mcp-session-id` values fall through to "create a new session" behavior instead of being rejected, which can hide client/session bugs.
+- Security vulnerabilities:
+  - High: this layer does not propagate any authenticated caller identity into tool handlers, so even after route auth is added there is still no per-owner authorization hook for the tools.
+- Code quality improvements:
+  - Bind caller identity into the MCP session context and pass it into `registerTools(...)`.
+  - Add invalid-session tests and consider time-based cleanup for abandoned transports.
+- Severity: high
+
+### `src/api/mcp/tools.ts`
+- Summary: adds `sandbox_create`, `sandbox_delete`, `bash_exec`, `fs_ingest`, and `fs_export`; the current worktree also renames `fs_export.path` to `basePath` and parallelizes export reads.
+- Potential bugs / logic errors:
+  - `sandbox_delete` ignores the boolean returned by `sessionManager.destroy()`. In the real implementation, a missing sandbox can yield `false`, but the tool still reports `{ ok: true }`.
+  - `bash_exec`, `fs_ingest`, and `fs_export` all call `withSession()`, which auto-creates a sandbox when the ID does not exist. That lets callers bypass `sandbox_create` and create ownerless sandboxes implicitly.
+  - The current worktree change makes `fs_export` swallow every `readFileBuffer()` failure. Directory skips are fine, but genuine read errors now degrade into silent partial exports.
+  - `sandbox_create` advertises an optional `env` input and then ignores it completely.
+- Security vulnerabilities:
+  - Critical: there are no auth or ownership checks anywhere in the tool layer. Combined with the unauthenticated `/mcp` route, this is effectively remote arbitrary sandbox creation, command execution, file ingest/export, and deletion.
+  - High: `fs_ingest` does not validate `relativePath`. Keys like `../outside.txt` will normalize outside the requested `basePath`.
+  - Medium: `fs_export` can return arbitrarily large JSON payloads with no size guard or pagination.
+- Code quality improvements:
+  - Thread authenticated caller identity into every tool call and enforce ownership consistently.
+  - Reject absolute paths, `..`, and NUL bytes in file keys before joining with `basePath`.
+  - Surface partial export failures instead of silently skipping them.
+  - Either implement `env` for `sandbox_create` or remove it from the schema/description.
+- Severity: critical
+
+### `src/api/routes/ingest.ts`
+- Summary: adds three authenticated HTTP routes for tar.gz ingest, JSON/base64 file ingest, and tar.gz export.
+- Potential bugs / logic errors:
+  - All three handlers use `withSession()`, which auto-creates a sandbox if the ID does not exist. That means `POST /ingest`, `POST /ingest-files`, and `GET /export` can create orphaned sandboxes instead of returning 404.
+  - The tar-based ingest/export paths call `session.bash.exec(...)` but never inspect `exitCode`. A bad archive, a failed `tar`, or a failed `rm` can still produce a 200 or a misleading follow-on error.
+  - `Buffer.from(base64Content, "base64")` accepts malformed input leniently. Invalid payloads can silently decode to corrupted bytes instead of returning 400.
+  - Temporary archive files are only deleted on the happy path; failures leave `/tmp/_ingest.tar.gz` or `/tmp/_export.tar.gz` behind inside the sandbox.
+- Security vulnerabilities:
+  - High: `ingest-files` does not validate `relativePath`, so `../` traversal can escape the requested `basePath`.
+  - High: tar ingest trusts archive member paths and special entries. There is no screening for traversal entries, absolute paths, or other dangerous archive contents before extraction.
+  - Medium: both upload and export fully buffer archive bytes in memory, with no request/response size limit.
+  - Medium: ownership checks only consult the in-memory session. When a sandbox is cold or evicted, the new session starts with `owner = ""`, so the route cannot enforce persisted ownership.
+- Code quality improvements:
+  - Add a shared path-validation helper for manifest keys and archive extraction policy.
+  - Check `bash.exec()` results explicitly and map failures to structured HTTP errors.
+  - Clean up temp files in `finally` blocks.
+  - Add negative tests for missing sandbox IDs, malformed base64, traversal attempts, and tar failures.
+- Severity: high
+
+### `src/api/__tests__/mcp.test.ts`
+- Summary: adds end-to-end in-memory tests for MCP server init and all five MCP tools; the worktree also updates the `fs_export` argument name to `basePath`.
+- Potential bugs / logic errors:
+  - The delete-not-found test uses a mock that throws, so it never exercises the real `SessionManager.destroy() -> false` behavior that currently produces a false success in the tool.
+  - There is no regression test for implicit sandbox creation when `bash_exec`, `fs_ingest`, or `fs_export` are called with a nonexistent ID.
+- Security vulnerabilities:
+  - No direct vulnerability in the test file, but it misses the two critical security cases: unauthenticated `/mcp` access and unauthorized access to another sandbox ID.
+  - There is no test for `../` traversal in `fs_ingest`.
+- Code quality improvements:
+  - Add HTTP-level MCP tests for auth.
+  - Add tool tests for missing IDs, traversal rejection, and partial export failure behavior.
+- Severity: medium
+
+### `src/api/__tests__/ingest.test.ts`
+- Summary: adds unit tests for tar ingest, JSON ingest-files, and tar export happy paths plus a small amount of basic validation/auth coverage.
+- Potential bugs / logic errors:
+  - The helper `createTarGz()` shell-builds its file list and only works safely for simple names. Nested or shell-sensitive filenames would break the helper itself.
+  - The tests do not cover failed `tar` commands, malformed base64 input, missing sandbox IDs, or leftover temp files.
+- Security vulnerabilities:
+  - No direct vulnerability in the test file, but it omits traversal coverage for JSON manifests and malicious tar member paths.
+  - There is no regression test for the cold-session ownership gap.
+- Code quality improvements:
+  - Build archive fixtures without shell interpolation when possible.
+  - Add failure-path tests for traversal attempts, malformed base64, tar extraction failures, and nonexistent sandbox IDs.
+- Severity: medium
+
+### `scripts/ralph/prd.json`
+- Summary: replaces the Phase 2 planning file with a Phase 3 plan focused on ingest/export and MCP stories.
+- Potential bugs / logic errors:
+  - The current file is stale relative to the worktree: it still documents `fs_export` as `{ id, path? }`, while the current code/tests now use `basePath`.
+  - The story `passes` flags read as complete even though the implementation still has major auth, authorization, and path-safety gaps.
+- Security vulnerabilities:
+  - The MCP stories do not require authentication or ownership enforcement, which likely contributed to the critical security gap that shipped in code.
+- Code quality improvements:
+  - Add explicit acceptance criteria for authN/authZ, traversal rejection, missing-sandbox behavior, and negative security tests.
+  - Keep the documented tool contract in sync with current code (`basePath` vs `path`).
+- Severity: low
+
+### `scripts/ralph/progress.txt`
+- Summary: rewrites the main Ralph progress log around Phase 3 work and implementation notes.
+- Potential bugs / logic errors:
+  - The log is stale relative to the current worktree: it still documents `handleMcpRequest(c.req.raw)` instead of `handleMcpRequest(c.req.raw, sessionManager)`.
+  - It also still describes `fs_export` using `path?` instead of `basePath?`.
+- Security vulnerabilities:
+  - The notes normalize an unauthenticated `/mcp` mount pattern without calling out the security implications.
+- Code quality improvements:
+  - Record unresolved security issues and verification gaps, not only happy-path implementation notes.
+  - Keep the log aligned with the live code contract after worktree edits.
+- Severity: low
+
+### `scripts/ralph/.last-branch`
+- Summary: updates the branch marker from `ralph/phase1-sqlfs-postgres` to `ralph/phase3-ingest-mcp`.
+- Potential bugs / logic errors:
+  - None obvious; this appears to be an internal bookkeeping file.
+- Security vulnerabilities:
+  - None direct.
+- Code quality improvements:
+  - If this file is tool-managed and noisy, consider ignoring it from review/commit workflows unless it is intentionally versioned.
+- Severity: low
+
+### `REDIS_DISTRIBUTED_ARCH.md`
+- Summary: adds a design doc for multi-replica Session Manager + Redis + Postgres behavior.
+- Potential bugs / logic errors:
+  - No code issues. The document is coherent as an architecture note.
+- Security vulnerabilities:
+  - No direct implementation vulnerability, but the doc should explicitly note that shared cache coherence never replaces auth/ownership checks.
+- Code quality improvements:
+  - Mark the document clearly as "proposed" versus "implemented".
+  - Add a short section on tenant isolation and cache key hygiene if Redis is introduced later.
+- Severity: low
+
+### `src/fs/sql-fs/benchmark.ts`
+- Summary: adds a standalone Postgres benchmark that seeds synthetic data and measures `ready()`, cold reads, and warm reads.
+- Potential bugs / logic errors:
+  - Running the script auto-applies migrations and mutates the database pointed to by `DATABASE_URL`; that is an operational footgun if someone points it at a shared or production database.
+  - The file executes via top-level `await main()`, so any accidental import would run side effects immediately.
+- Security vulnerabilities:
+  - No app-facing vulnerability, but accidental execution against production credentials could still cause destructive operational impact.
+- Code quality improvements:
+  - Move it under a dedicated `scripts/` or `bench/` entry point.
+  - Require an explicit opt-in env var before running against a real database.
+  - Add CLI help and document that it expects an isolated benchmark database.
+- Severity: medium
+
+### `scripts/ralph/archive/2026-04-19-phase1-sqlfs-postgres/progress.txt`
+- Summary: archived Phase 1 progress snapshot.
+- Potential bugs / logic errors:
+  - None in current use; this is a historical artifact.
+- Security vulnerabilities:
+  - None direct.
+- Code quality improvements:
+  - If these archives are intended to be immutable snapshots, consider documenting that convention so tooling does not treat them as live planning inputs.
+- Severity: low
+
+### `scripts/ralph/archive/2026-04-19-phase1-sqlfs-postgres/prd.json`
+- Summary: archived Phase 1 PRD snapshot.
+- Potential bugs / logic errors:
+  - None in current use; it appears to be a preserved planning artifact.
+- Security vulnerabilities:
+  - None direct.
+- Code quality improvements:
+  - Same suggestion as above: make snapshot status explicit if other tooling scans `scripts/ralph/`.
+- Severity: low
+
+### `scripts/ralph/archive/2026-04-19-phase2-http-api/progress.txt`
+- Summary: archived Phase 2 progress snapshot.
+- Potential bugs / logic errors:
+  - None in current use; historical snapshot only.
+- Security vulnerabilities:
+  - None direct.
+- Code quality improvements:
+  - Consider a lightweight archive index so humans/tools can distinguish "live" files from preserved history.
+- Severity: low
+
+### `scripts/ralph/archive/2026-04-19-phase2-http-api/prd.json`
+- Summary: archived Phase 2 PRD snapshot.
+- Potential bugs / logic errors:
+  - None in current use; historical snapshot only.
+- Security vulnerabilities:
+  - None direct.
+- Code quality improvements:
+  - Same as the other archive files: make immutable/archive intent explicit for downstream tooling.
+- Severity: low
