@@ -29,16 +29,20 @@ describe("MCP server", () => {
 describe("MCP tool — sandbox_create", () => {
 	it("returns a sandbox id when called", async () => {
 		const createdIds: string[] = [];
+		const sessions = new Map<string, Session>();
 
 		const mockSessionManager = {
 			getOrCreate: async (id: string): Promise<Session> => {
 				createdIds.push(id);
-				return {} as Session;
+				const session = { owner: "" } as unknown as Session;
+				sessions.set(id, session);
+				return session;
 			},
+			getSession: (id: string): Session | undefined => sessions.get(id),
 		};
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never);
+		registerTools(server, mockSessionManager as never, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -64,6 +68,31 @@ describe("MCP tool — sandbox_create", () => {
 
 		await client.close();
 	});
+
+	it("sandbox_create sets session.owner to the caller", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "agent-1");
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const result = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const content = result.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { id: string };
+
+		const session = sessionManager.getSession(parsed.id);
+		expect(session?.owner).toBe("agent-1");
+
+		await client.close();
+	});
 });
 
 describe("MCP tool — sandbox_delete", () => {
@@ -72,10 +101,11 @@ describe("MCP tool — sandbox_delete", () => {
 
 		const mockSessionManager = {
 			getOrCreate: async (id: string): Promise<Session> => {
-				const session = {} as Session;
+				const session = { owner: "" } as unknown as Session;
 				sessions.set(id, session);
 				return session;
 			},
+			getSession: (id: string): Session | undefined => sessions.get(id),
 			destroy: async (id: string): Promise<boolean> => {
 				if (!sessions.has(id)) {
 					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
@@ -86,7 +116,7 @@ describe("MCP tool — sandbox_delete", () => {
 		};
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never);
+		registerTools(server, mockSessionManager as never, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -115,14 +145,15 @@ describe("MCP tool — sandbox_delete", () => {
 
 	it("returns error content when sandbox not found", async () => {
 		const mockSessionManager = {
-			getOrCreate: async (id: string): Promise<Session> => ({ id }) as unknown as Session,
+			getOrCreate: async (id: string): Promise<Session> => ({ id, owner: "" }) as unknown as Session,
+			getSession: (_id: string): Session | undefined => undefined,
 			destroy: async (_id: string): Promise<boolean> => {
 				throw Object.assign(new Error("ENOENT: sandbox not found"), { code: "ENOENT" });
 			},
 		};
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never);
+		registerTools(server, mockSessionManager as never, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -149,7 +180,7 @@ describe("MCP tool — bash_exec", () => {
 		});
 
 		const server = createMcpServer();
-		registerTools(server, sessionManager);
+		registerTools(server, sessionManager, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -176,6 +207,100 @@ describe("MCP tool — bash_exec", () => {
 
 		await client.close();
 	});
+
+	it("returns sandbox not found error for non-existent sandbox", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner");
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const result = await client.callTool({
+			name: "bash_exec",
+			arguments: { id: "nonexistent-id", script: "echo hello" },
+		});
+		const content = result.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
+		expect(parsed.stderr).toBe("sandbox not found");
+		expect(parsed.exitCode).toBe(1);
+
+		await client.close();
+	});
+
+	it("returns forbidden when caller does not own sandbox", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		// Create sandbox as user-a
+		const serverA = createMcpServer();
+		registerTools(serverA, sessionManager, "user-a");
+		const [clientTransportA, serverTransportA] = InMemoryTransport.createLinkedPair();
+		const clientA = new Client({ name: "test-a", version: "1.0.0" });
+		await serverA.connect(serverTransportA);
+		await clientA.connect(clientTransportA);
+
+		const createResult = await clientA.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+		await clientA.close();
+
+		// Attempt bash_exec as user-b
+		const serverB = createMcpServer();
+		registerTools(serverB, sessionManager, "user-b");
+		const [clientTransportB, serverTransportB] = InMemoryTransport.createLinkedPair();
+		const clientB = new Client({ name: "test-b", version: "1.0.0" });
+		await serverB.connect(serverTransportB);
+		await clientB.connect(clientTransportB);
+
+		const execResult = await clientB.callTool({
+			name: "bash_exec",
+			arguments: { id: created.id, script: "echo hello" },
+		});
+		const content = execResult.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
+		expect(parsed.stderr).toBe("forbidden");
+		expect(parsed.exitCode).toBe(1);
+
+		await clientB.close();
+	});
+
+	it("succeeds when caller owns sandbox", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "user-a");
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+		const execResult = await client.callTool({
+			name: "bash_exec",
+			arguments: { id: created.id, script: "echo hello" },
+		});
+		const content = execResult.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
+		expect(parsed.stdout).toBe("hello\n");
+		expect(parsed.exitCode).toBe(0);
+
+		await client.close();
+	});
 });
 
 describe("MCP tool — fs_ingest", () => {
@@ -186,7 +311,7 @@ describe("MCP tool — fs_ingest", () => {
 		});
 
 		const server = createMcpServer();
-		registerTools(server, sessionManager);
+		registerTools(server, sessionManager, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -247,7 +372,7 @@ describe("MCP tool — fs_export", () => {
 		});
 
 		const server = createMcpServer();
-		registerTools(server, sessionManager);
+		registerTools(server, sessionManager, "test-owner");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -276,7 +401,7 @@ describe("MCP tool — fs_export", () => {
 		// Export the files
 		const exportResult = await client.callTool({
 			name: "fs_export",
-			arguments: { id: created.id, path: "/home/user/proj" },
+			arguments: { id: created.id, basePath: "/home/user/proj" },
 		});
 
 		const exportContent = exportResult.content as Array<{ type: string; text?: string }>;

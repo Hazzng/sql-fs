@@ -15,23 +15,55 @@ import type { SessionManager } from "../session-manager.js";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
 
-export function registerTools(server: McpServer, sessionManager: SessionManager): void {
-	server.tool(
-		"sandbox_create",
-		"Create an isolated bash sandbox with a virtual filesystem",
-		{ env: z.record(z.string(), z.string()).optional() },
-		async (_args) => {
-			const id = randomUUID();
-			await sessionManager.getOrCreate(id);
-			return {
-				content: [{ type: "text" as const, text: JSON.stringify({ id }) }],
-			};
-		},
-	);
+/**
+ * Validates that a relative path is safe (no traversal, no absolute paths, no null bytes).
+ */
+function isValidRelativePath(p: string): boolean {
+	if (p.includes("\0")) return false;
+	if (p.startsWith("/")) return false;
+	const segments = p.split("/");
+	for (const seg of segments) {
+		if (seg === "..") return false;
+	}
+	return true;
+}
+
+/**
+ * Returns an error message if the caller does not own the sandbox, null if OK.
+ * Matches HTTP route checkOwnership behavior: empty owner means no enforcement.
+ */
+function checkMcpOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): string | null {
+	const session = sessionManager.getSession(sandboxId);
+	if (session?.owner && session.owner !== caller) {
+		return "forbidden";
+	}
+	return null;
+}
+
+export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string): void {
+	server.tool("sandbox_create", "Create an isolated bash sandbox with a virtual filesystem", {}, async () => {
+		const id = randomUUID();
+		const session = await sessionManager.getOrCreate(id);
+		session.owner = owner;
+		return {
+			content: [{ type: "text" as const, text: JSON.stringify({ id }) }],
+		};
+	});
 
 	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
+		const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+		if (ownershipErr) {
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+			};
+		}
 		try {
-			await sessionManager.destroy(args.id);
+			const existed = await sessionManager.destroy(args.id);
+			if (!existed) {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+				};
+			}
 			return {
 				content: [{ type: "text" as const, text: JSON.stringify({ ok: true }) }],
 			};
@@ -64,10 +96,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 			timeout: z.number().int().positive().optional(),
 		},
 		async (args) => {
+			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			if (ownershipErr) {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: "forbidden", exitCode: 1 }) }],
+				};
+			}
+
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const result = await sessionManager.withSession(args.id, async (session) => {
+				const result = await sessionManager.withExistingSession(args.id, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 
@@ -96,6 +135,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 					content: [{ type: "text" as const, text: JSON.stringify(result) }],
 				};
 			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "ENOENT") {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({ stdout: "", stderr: "sandbox not found", exitCode: 1 }),
+							},
+						],
+					};
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: message, exitCode: 1 }) }],
@@ -114,8 +164,30 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 		},
 		async (args) => {
 			const basePath = args.basePath ?? "/home/user";
+
+			// Validate all relative paths before writing any files
+			for (const relativePath of Object.keys(args.files)) {
+				if (!isValidRelativePath(relativePath)) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({ ok: false, error: `invalid path: ${relativePath}` }),
+							},
+						],
+					};
+				}
+			}
+
+			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			if (ownershipErr) {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+				};
+			}
+
 			try {
-				await sessionManager.withSession(args.id, async (session) => {
+				await sessionManager.withExistingSession(args.id, async (session) => {
 					for (const [relativePath, content] of Object.entries(args.files)) {
 						const absPath = `${basePath}/${relativePath}`;
 						const lastSlash = absPath.lastIndexOf("/");
@@ -133,7 +205,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 					],
 				};
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
+				const code = (err as Error & { code?: string }).code;
+				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};
@@ -146,43 +219,62 @@ export function registerTools(server: McpServer, sessionManager: SessionManager)
 		"Download files from sandbox as JSON map",
 		{
 			id: z.string(),
-			path: z.string().optional(),
+			basePath: z.string().optional(),
 		},
 		async (args) => {
-			const basePath = args.path ?? "/home/user";
+			const basePath = args.basePath ?? "/home/user";
 			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
+			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			if (ownershipErr) {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+				};
+			}
+
 			try {
-				const files = await sessionManager.withSession(args.id, async (session) => {
+				const { files, errors } = await sessionManager.withExistingSession(args.id, async (session) => {
 					const allPaths = session.fs.getAllPaths();
 					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
 					const result: Record<string, string> = Object.create(null);
+					const readErrors: string[] = [];
 
-					for (const absPath of allPaths) {
-						if (!absPath.startsWith(prefix)) {
-							continue;
-						}
-						const stat = await session.fs.stat(absPath);
-						if (!stat.isFile) {
-							continue;
-						}
-						const buf = await session.fs.readFileBuffer(absPath);
-						const relativePath = absPath.slice(prefix.length);
-						try {
-							result[relativePath] = utf8Decoder.decode(buf);
-						} catch {
-							result[relativePath] = `data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
-						}
-					}
+					const candidates = allPaths.filter((p) => p.startsWith(prefix));
+					await Promise.all(
+						candidates.map(async (absPath) => {
+							try {
+								const buf = await session.fs.readFileBuffer(absPath);
+								const relativePath = absPath.slice(prefix.length);
+								try {
+									result[relativePath] = utf8Decoder.decode(buf);
+								} catch {
+									result[relativePath] = `data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+								}
+							} catch (e) {
+								const code = (e as Error & { code?: string }).code;
+								// EISDIR is expected — directories cannot be read as files
+								if (code !== "EISDIR") {
+									readErrors.push(absPath);
+								}
+							}
+						}),
+					);
 
-					return result;
+					return { files: result, errors: readErrors };
 				});
+
+				if (errors.length > 0) {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ files, errors }) }],
+					};
+				}
 
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ files }) }],
 				};
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
+				const code = (err as Error & { code?: string }).code;
+				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};
