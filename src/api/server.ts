@@ -12,6 +12,7 @@ import { mapFsErrorToStatus } from "./errors.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
+import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
 
@@ -33,6 +34,7 @@ app.route("/v1/admin", adminRoutes);
 app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 app.route("/v1/sandboxes", fileRoutes(sessionManager));
 app.route("/v1/sandboxes", execRoutes(sessionManager));
+app.route("/v1/sandboxes", ingestRoutes(sessionManager));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
