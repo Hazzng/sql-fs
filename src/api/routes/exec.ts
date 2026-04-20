@@ -62,7 +62,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type ExecSyncResult = { kind: "ok"; stdout: string; stderr: string; exitCode: number } | { kind: "timeout" };
 
-		const execResult = await sessionManager.withSession<ExecSyncResult>(sandboxId, async (session) => {
+		const execResult = await sessionManager.withExistingSession<ExecSyncResult>(sandboxId, async (session) => {
 			const controller = new AbortController();
 			let timedOut = false;
 
@@ -72,7 +72,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			}, timeoutMs);
 
 			try {
-				const result = await session.bash.exec(body.script, {
+				const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 					signal: controller.signal,
 					cwd: body.cwd,
 					env,
@@ -145,9 +145,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				controller.abort();
 			}, timeoutMs);
 
-			await sessionManager.withSession(sandboxId, async (session) => {
+			await sessionManager.withExistingSession(sandboxId, async (session) => {
 				try {
-					const result = await session.bash.exec(body.script, {
+					const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 						signal: controller.signal,
 						cwd: body.cwd,
 						env,

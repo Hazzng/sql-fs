@@ -4,18 +4,23 @@
  */
 
 import { serve } from "@hono/node-server";
+import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
-import { authMiddleware } from "./auth.js";
+import { type AuthVariables, authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
+import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
+import { handleMcpRequest } from "./mcp/server.js";
+import { openapiSpec } from "./openapi-spec.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
+import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
 
-export const app = new Hono();
+export const app = new Hono<{ Variables: AuthVariables }>();
 
 // ── Session manager (lazy — no DB access until first request) ─────────────────
 
@@ -33,6 +38,21 @@ app.route("/v1/admin", adminRoutes);
 app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 app.route("/v1/sandboxes", fileRoutes(sessionManager));
 app.route("/v1/sandboxes", execRoutes(sessionManager));
+app.route("/v1/sandboxes", ingestRoutes(sessionManager));
+
+// ── MCP endpoint (requires auth) + CORS for browser MCP clients (Inspector UI) ─
+
+app.use("/mcp", async (c, next) => {
+	if (c.req.method === "OPTIONS") {
+		return mcpOptionsResponse(c.req.raw);
+	}
+	await next();
+	if (c.res !== undefined) {
+		c.res = withMcpCors(c.req.raw, c.res);
+	}
+});
+app.use("/mcp", authMiddleware);
+app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner")));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +75,11 @@ app.use("*", async (c, next) => {
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
 app.get("/readyz", (c) => c.json({ status: "ok" }));
+
+// ── OpenAPI / Swagger ──────────────────────────────────────────────────────────
+
+app.get("/openapi.json", (c) => c.json(openapiSpec));
+app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 
 // ── Global error handler ───────────────────────────────────────────────────────
 

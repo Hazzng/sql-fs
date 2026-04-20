@@ -1,7 +1,7 @@
 # Implementation Plan: VirtualFS — Persistent Filesystem Backends + HTTP/MCP API
 
 > PRD: [tasks/prd-virtual-fs-api.md](./prd-virtual-fs-api.md)
-> 105 user stories across 23 epics, organized into 6 phases.
+> V1 = 97 stories across Phases 1, 2, 3, 5, 6. Phase 4 is documented future roadmap (11 stories, not in V1).
 > Each phase ends with a concrete verification step.
 
 ---
@@ -366,13 +366,15 @@ npx @modelcontextprotocol/inspector http://localhost:8080/mcp
 
 ---
 
-## Phase 4: Additional Backends — MySQL, Azure SQL, FileShare
+## Phase 4: Future Roadmap — Additional Backends + Optional Runtimes
 
-**Goal:** Same comparison tests pass on all backends. Backend is swappable via env var.
+> **NOT IN V1.** This phase is documented in advance so the work is well-scoped when we return to it. The user story acceptance criteria in the PRD remain the source of truth — do not re-derive them. V1 ships after Phase 3 + Phase 5 (Container) + Phase 6 (Tests). Phase 4 is additive and unblocks no downstream phase.
 
-**Stories:** 10 (US-043 through US-052)
+**Goal (when revisited):** Additional SQL/FileShare backends are swappable via env var. Python + JavaScript WASM runtimes are opt-in per sandbox, with a process-wide Python semaphore preventing OOM.
 
-### Step 4.1 — MySQL Dialect (Epic 9)
+**Stories:** 11 (US-043 through US-052, plus US-080a)
+
+### Step 4.1 — MySQL Dialect (Epic 9) *(future)*
 
 | Story | Title | File | Depends on |
 |-------|-------|------|------------|
@@ -381,7 +383,7 @@ npx @modelcontextprotocol/inspector http://localhost:8080/mcp
 | US-045 | MySQL fs_resolve procedure | `src/fs/sql-fs/migrations/mysql/` | US-043 |
 | US-046 | MySQL all remaining CRUD | `src/fs/sql-fs/dialects/mysql.ts` | US-043 |
 
-### Step 4.2 — Azure SQL Dialect (Epic 10)
+### Step 4.2 — Azure SQL Dialect (Epic 10) *(future)*
 
 | Story | Title | File | Depends on |
 |-------|-------|------|------------|
@@ -390,39 +392,77 @@ npx @modelcontextprotocol/inspector http://localhost:8080/mcp
 | US-049 | Azure SQL fs_resolve procedure | `src/fs/sql-fs/migrations/azure-sql/` | US-047 |
 | US-050 | Azure SQL all remaining CRUD | `src/fs/sql-fs/dialects/azure-sql.ts` | US-047 |
 
-### Step 4.3 — Azure FileShare (Epic 11)
+### Step 4.3 — Azure FileShare Backend (Epic 11) *(future)*
 
 | Story | Title | File | Depends on |
 |-------|-------|------|------------|
 | US-051 | FileShare sandbox dir creation | `src/fs/sql-fs/index.ts` | US-053 |
 | US-052 | FileShare sandbox deletion | `src/fs/sql-fs/index.ts` | US-051 |
 
-### Phase 4 Verification
+**Tradeoff reference:** `COMPARISON.md` documents why Postgres was chosen as the V1 default. Revisit when one of: (a) >10MB binary file workloads become common, (b) customer requirement forces Azure-native storage, (c) Azure Files Premium is already provisioned for another reason.
+
+### Step 4.4 — Optional WASM Runtimes + Python Semaphore (US-080a) *(future)*
+
+| Story | Title | File | Depends on |
+|-------|-------|------|------------|
+| US-080a | Runtime opt-in + Python semaphore | `src/api/session-manager.ts`, routes, mcp tools | Phase 2 |
+
+**Why deferred:** CPython WASM workers cost ~80MB RAM each (fresh per `python3` invocation, EXIT_RUNTIME). 100 concurrent Python-using sandboxes would peak at ~8GB, past the 2Gi ACA limit. V1 ships without runtimes; Phase 4.4 adds them with a global semaphore cap.
+
+**Full implementation guide lives in the PRD under US-080a** — including `RuntimeOptions` shape, semaphore acquire/release with transfer-on-release to avoid counter races, regex word-boundary detection of `python3`/`python`, all call sites that must migrate to `execWithRuntimeThrottle`, and the exact `new Bash({ python: opts.python || undefined, javascript: opts.javascript || undefined })` pattern (use `|| undefined` because just-bash distinguishes `true` from `undefined`, treating `false` differently).
+
+**Files to change when implementing:**
+- `src/api/session-manager.ts` — `RuntimeOptions` interface, `Session.runtimeOptions`, semaphore state (`pythonInFlight`, `pythonWaiters`, `maxConcurrentPython`), private `acquirePythonSlot`/`releasePythonSlot`, public `execWithRuntimeThrottle`, updated `getOrCreate`/`withSession` signatures
+- `src/api/routes/sandboxes.ts` — add `python?: boolean, javascript?: boolean` to `createBodySchema`; forward via `withSession(..., { python, javascript })`; include both in 201 response
+- `src/api/routes/exec.ts` — migrate `session.bash.exec(...)` → `sessionManager.execWithRuntimeThrottle(session, ...)` in both exec-sync (line ~75) and SSE (line ~150) paths
+- `src/api/routes/ingest.ts` — migrate all three `session.bash.exec(...)` sites (tar extract, tar pack, cleanup rm)
+- `src/api/mcp/tools.ts` — add `python`/`javascript` params to `sandbox_create`; migrate `bash_exec` handler to `execWithRuntimeThrottle`; add the "Optional runtimes" subsection to the `bash_exec` description (only the runtime section — the rest is already accurate from the V1 description update)
+- `CLAUDE.md` — add `MAX_CONCURRENT_PYTHON` to env var table
+- `src/api/__tests__/session-manager.test.ts` — add semaphore tests (slot limit, queueing, throw safety, word-boundary regex, cache-hit ignores runtime opts)
+
+### Phase 4 Verification (when revisited)
 
 ```bash
-# MySQL
+# --- 4.1/4.2/4.3: Additional backends ---
 docker run -d --name mysql-test -e MYSQL_ROOT_PASSWORD=test -p 3306:3306 mysql:8
-FS_BACKEND=mysql DATABASE_URL=mysql://root:test@localhost/test \
-  pnpm test:run src/fs/sql-fs/dialects/mysql.test.ts
-FS_BACKEND=mysql DATABASE_URL=mysql://root:test@localhost/test \
-  pnpm test:comparison
+FS_BACKEND=mysql DATABASE_URL=mysql://root:test@localhost/test pnpm test:comparison
 
-# Azure SQL (local SQL Server via Docker, or Azure instance)
 docker run -d --name mssql-test -e ACCEPT_EULA=Y -e SA_PASSWORD='Test1234!' \
   -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
-FS_BACKEND=azure-sql DATABASE_URL='Server=localhost;Database=test;User=sa;Password=Test1234!' \
-  pnpm test:run src/fs/sql-fs/dialects/azure-sql.test.ts
-FS_BACKEND=azure-sql DATABASE_URL=... \
-  pnpm test:comparison
+FS_BACKEND=azure-sql DATABASE_URL='Server=localhost;...' pnpm test:comparison
 
-# FileShare (simulated with temp dir)
-FS_BACKEND=azure-fileshare FS_MOUNT_PATH=/tmp/fileshare-test \
-  pnpm test:comparison
+FS_BACKEND=azure-fileshare FS_MOUNT_PATH=/tmp/fileshare-test pnpm test:comparison
+# All three: comparison tests PASS
 
-# All three should show: comparison tests PASS
+# --- 4.4: Python/JS runtimes + semaphore ---
+TOKEN=$(AUTH_SECRET=... pnpm token:create -- --sub admin --expires 30d)
+
+# Python-enabled sandbox runs python3
+SB=$(curl -s -X POST http://localhost:8080/v1/sandboxes \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"python": true}' | jq -r '.id')
+curl -s -X POST "http://localhost:8080/v1/sandboxes/$SB/exec-sync" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"script": "python3 -c \"print(1+1)\""}' | jq
+# → { "stdout": "2\n", "stderr": "", "exitCode": 0 }
+
+# Default sandbox rejects python3
+SB2=$(curl -s -X POST http://localhost:8080/v1/sandboxes \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" | jq -r '.id')
+curl -s -X POST "http://localhost:8080/v1/sandboxes/$SB2/exec-sync" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"script": "python3 -c \"print(1)\""}' | jq
+# → non-zero exitCode (command not found)
+
+# Semaphore: create 6 Python sandboxes, kick off a 10s python script in each
+# at roughly the same time. With MAX_CONCURRENT_PYTHON=5, exactly one should
+# queue (wall-clock evidence: 6th result arrives ~10s after the first five).
+
+pnpm test:run src/api/__tests__/session-manager.test.ts  # semaphore unit tests
+pnpm typecheck
 ```
 
-**If `pnpm test:comparison` passes on all 4 backends (postgres, mysql, azure-sql, azure-fileshare) → Phase 4 is complete.**
+**Phase 4 is complete when:** comparison tests pass on all 4 backends AND the Python semaphore queues the (N+1)th concurrent Python script AND typecheck/unit tests green.
 
 ---
 
@@ -539,14 +579,16 @@ pnpm typecheck && pnpm lint:fix && pnpm knip
 
 ## Summary
 
-| Phase | Goal | Stories | Cumulative | Verification |
-|-------|------|---------|------------|--------------|
-| 1 | SqlFs + Postgres | 46 | 46 | `pnpm test:comparison` passes with SqlFs |
-| 2 | HTTP API + Auth | 24 | 70 | token:create → admin/tokens → curl sandbox lifecycle |
-| 3 | Ingest/Export + MCP | 9 | 79 | tar.gz round-trip + MCP Inspector (5 tools) |
-| 4 | MySQL + Azure SQL + FileShare | 10 | 89 | comparison tests pass on all backends |
-| 5 | Container + Deploy | 12 | 101 | running on ACA, healthz works |
-| 6 | Integration tests | 6 | 107 | full test suite green |
+| Phase | Goal | Stories | Cumulative | Status | Verification |
+|-------|------|---------|------------|--------|--------------|
+| 1 | SqlFs + Postgres | 46 | 46 | V1 | `pnpm test:comparison` passes with SqlFs |
+| 2 | HTTP API + Auth | 24 | 70 | V1 | token:create → admin/tokens → curl sandbox lifecycle |
+| 3 | Ingest/Export + MCP | 9 | 79 | V1 | tar.gz round-trip + MCP Inspector (5 tools) |
+| 4 | MySQL + Azure SQL + FileShare + WASM runtimes | 11 | — | **Future Roadmap** | see Phase 4 verification |
+| 5 | Container + Deploy | 12 | 91 | V1 | running on ACA, healthz works |
+| 6 | Integration tests | 6 | 97 | V1 | full test suite green |
+
+V1 scope = Phases 1, 2, 3, 5, 6 (97 stories). Phase 4 is documented but deferred.
 
 ## Dependency Graph (phases)
 
@@ -554,18 +596,23 @@ pnpm typecheck && pnpm lint:fix && pnpm knip
 Phase 1 (SqlFs + Postgres)
    |
    v
-Phase 2 (HTTP API)──────> Phase 4 (MySQL/AzureSQL/FileShare)
-   |                            |
-   v                            v
-Phase 3 (MCP + Ingest)   Phase 5 (Container + Deploy)
-   |                            |
-   +------------+---------------+
-                |
-                v
-          Phase 6 (Integration Tests)
-```
+Phase 2 (HTTP API)
+   |
+   v
+Phase 3 (MCP + Ingest)
+   |
+   v
+Phase 5 (Container + Deploy)
+   |
+   v
+Phase 6 (Integration Tests)  ← V1 ships here
 
-Phase 4 can be done in parallel with Phase 3 since they don't depend on each other.
+
+Phase 4 (Future Roadmap — additional backends + WASM runtimes)
+   • depends on Phase 1 (backends) and Phase 2 (runtimes)
+   • additive — does not block any other phase
+   • can be picked up any time after V1 ships
+```
 
 ## Quick Reference: File Layout
 

@@ -195,13 +195,15 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 
 | Variable | Required | Description |
 |---|---|---|
-| `FS_BACKEND` | Yes | `postgres` \| `mysql` \| `azure-sql` \| `azure-fileshare` \| `memory` |
+| `FS_BACKEND` | Yes | `postgres` | `memory` |
 | `DATABASE_URL` | SQL backends | Connection string (use pooler endpoint for Neon) |
 | `DATABASE_DIRECT_URL` | Postgres (migrations) | Direct connection (not pooler) for DDL |
 | `FS_MOUNT_PATH` | FileShare backend | Mount path for Azure FileShare |
 | `PORT` | No (default: 8080) | HTTP server port |
 | `AUTH_SECRET` | Yes | Secret for Bearer token validation |
 | `SESSION_IDLE_MS` | No (default: 600000) | Idle timeout before session eviction (ms) |
+| `MAX_CONCURRENT_PYTHON` | No (default: 5) | Max concurrent Python executions across all sessions. CPython WASM workers cost ~80MB each (EXIT_RUNTIME per invocation); the semaphore caps concurrency to prevent OOM. Excess scripts queue FIFO. |
+| `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
 
 ## File Layout
 

@@ -267,6 +267,376 @@ describe("SessionManager.destroy (US-076)", () => {
 	});
 });
 
+describe("SessionManager.withExistingSession (US-076a)", () => {
+	it("throws ENOENT for non-existent sandbox", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await expect(sm.withExistingSession("nonexistent", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("succeeds for existing sandbox", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await sm.getOrCreate("test-existing");
+		const result = await sm.withExistingSession("test-existing", async (session) => {
+			return session.fs.exists("/");
+		});
+		expect(result).toBe(true);
+	});
+
+	it("throws ENOENT after destroy completes", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		await sm.getOrCreate("closing-test");
+		await sm.destroy("closing-test");
+		await expect(sm.withExistingSession("closing-test", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("increments and decrements inFlight", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await sm.getOrCreate("sandbox-existing-if");
+		let inFlightDuringExecution = -1;
+		await sm.withExistingSession("sandbox-existing-if", async (session) => {
+			inFlightDuringExecution = session.inFlight;
+		});
+		const session = sm.getSession("sandbox-existing-if");
+		expect(inFlightDuringExecution).toBe(1);
+		expect(session?.inFlight).toBe(0);
+	});
+});
+
+describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
+	type ExecImpl = (
+		script: string,
+	) => Promise<{ stdout: string; stderr: string; exitCode: number; env: Record<string, string> }>;
+
+	// Replaces `session.bash.exec` with a controllable fake so tests don't actually spawn WASM.
+	function stubBashExec(session: { bash: unknown }, impl: ExecImpl): void {
+		// biome-ignore lint/suspicious/noExplicitAny: deliberately overwriting a readonly method for test control
+		(session.bash as any).exec = impl;
+	}
+
+	it("warm session ignores subsequent runtimeOptions (cache-hit path)", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		const first = await sm.getOrCreate("sandbox-warm", { python: true, javascript: false });
+		const second = await sm.getOrCreate("sandbox-warm", { python: false, javascript: true });
+		expect(second).toBe(first);
+		expect(second.runtimeOptions).toEqual({ python: true, javascript: false });
+	});
+
+	it("non-Python script bypasses semaphore entirely", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate("sandbox-no-py", { python: true, javascript: false });
+		stubBashExec(session, async () => ({ stdout: "hi", stderr: "", exitCode: 0, env: {} }));
+
+		await sm.execWithRuntimeThrottle(session, "echo hi");
+		// If the script had consumed a slot, pythonInFlight would have been incremented
+		// to 1. Probing: kick off a Python exec and ensure it is not stuck on the semaphore
+		// (which would be the case if the echo above had wrongfully consumed the only slot).
+		stubBashExec(session, async () => ({ stdout: "2", stderr: "", exitCode: 0, env: {} }));
+		const result = await sm.execWithRuntimeThrottle(session, "python3 -c 'print(1+1)'");
+		expect(result.stdout).toBe("2");
+	});
+
+	it("session without python runtime does NOT throttle even if script mentions python3", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate("sandbox-no-runtime");
+		let execCount = 0;
+		stubBashExec(session, async () => {
+			execCount++;
+			return { stdout: "", stderr: "", exitCode: 127, env: {} };
+		});
+
+		// Kick off 3 "python3" scripts in parallel with a 1-slot cap. Since the runtime
+		// is NOT enabled, the semaphore must not gate them — all run concurrently.
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "python3 -c 'x'"),
+			sm.execWithRuntimeThrottle(session, "python3 -c 'y'"),
+			sm.execWithRuntimeThrottle(session, "python3 -c 'z'"),
+		]);
+		expect(execCount).toBe(3);
+	});
+
+	it("regex does not match mypython_script or python-config (word boundary)", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate("sandbox-regex", { python: true, javascript: false });
+
+		let running = 0;
+		let peak = 0;
+		stubBashExec(session, async () => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((r) => setTimeout(r, 20));
+			running--;
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		// These scripts should NOT match the python-word-boundary regex and should run in parallel,
+		// even though the concurrency cap is 1.
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "echo mypython_script"),
+			sm.execWithRuntimeThrottle(session, "echo python-config"),
+			sm.execWithRuntimeThrottle(session, "echo pythonic"),
+		]);
+		expect(peak).toBeGreaterThan(1);
+	});
+
+	it("semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 2 });
+		const session = await sm.getOrCreate("sandbox-sem", { python: true, javascript: false });
+
+		const releasers: Array<() => void> = [];
+		let started = 0;
+		stubBashExec(session, async () => {
+			started++;
+			await new Promise<void>((resolve) => {
+				releasers.push(resolve);
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const p1 = sm.execWithRuntimeThrottle(session, "python3 -c 'a'");
+		const p2 = sm.execWithRuntimeThrottle(session, "python3 -c 'b'");
+		const p3 = sm.execWithRuntimeThrottle(session, "python3 -c 'c'");
+
+		// Give the event loop a chance to start the first two
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(2);
+
+		// Release the first slot — the third script should now start
+		releasers[0]?.();
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(3);
+
+		// Release the rest
+		releasers[1]?.();
+		releasers[2]?.();
+		await Promise.all([p1, p2, p3]);
+	});
+
+	it("slot is released even when bash.exec throws", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate("sandbox-throw", { python: true, javascript: false });
+
+		let execCount = 0;
+		stubBashExec(session, async () => {
+			execCount++;
+			if (execCount === 1) throw new Error("boom");
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		await expect(sm.execWithRuntimeThrottle(session, "python3 -c '1'")).rejects.toThrow("boom");
+
+		// If the slot was not released, this second call would hang forever because the
+		// cap is 1. Add a timeout to fail fast if so.
+		const second = sm.execWithRuntimeThrottle(session, "python3 -c '2'");
+		const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("slot not released")), 500));
+		await expect(Promise.race([second, timeout])).resolves.toMatchObject({ exitCode: 0 });
+	});
+});
+
+describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
+	type ExecImpl = (
+		script: string,
+	) => Promise<{ stdout: string; stderr: string; exitCode: number; env: Record<string, string> }>;
+
+	function stubBashExec(session: { bash: unknown }, impl: ExecImpl): void {
+		// biome-ignore lint/suspicious/noExplicitAny: deliberately overwriting a readonly method for test control
+		(session.bash as any).exec = impl;
+	}
+
+	it("session without javascript runtime does NOT throttle even if script mentions js-exec/node", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate("sandbox-js-off");
+		let execCount = 0;
+		stubBashExec(session, async () => {
+			execCount++;
+			return { stdout: "", stderr: "", exitCode: 127, env: {} };
+		});
+
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "js-exec -c 'a'"),
+			sm.execWithRuntimeThrottle(session, "node -e 'b'"),
+			sm.execWithRuntimeThrottle(session, "js-exec script.ts"),
+		]);
+		expect(execCount).toBe(3);
+	});
+
+	it("JS regex does not match mynode/nodejs_tool/js-exec-helper etc (word boundary)", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate("sandbox-js-regex", { python: false, javascript: true });
+
+		let running = 0;
+		let peak = 0;
+		stubBashExec(session, async () => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((r) => setTimeout(r, 20));
+			running--;
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "echo mynode"),
+			sm.execWithRuntimeThrottle(session, "echo nodejs_tool"),
+			sm.execWithRuntimeThrottle(session, "echo myjs-exec-helper"),
+		]);
+		expect(peak).toBeGreaterThan(1);
+	});
+
+	it("12 parallel js-exec scripts with cap=4 run in 3 batches of 4", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 4 });
+		const session = await sm.getOrCreate("sandbox-js-12", { python: false, javascript: true });
+
+		let running = 0;
+		let peak = 0;
+		const batches: number[] = [];
+		stubBashExec(session, async () => {
+			running++;
+			peak = Math.max(peak, running);
+			batches.push(running);
+			await new Promise((r) => setTimeout(r, 30));
+			running--;
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const all = Array.from({ length: 12 }, (_, i) =>
+			sm.execWithRuntimeThrottle(session, `js-exec -c 'console.log(${i})'`),
+		);
+		await Promise.all(all);
+
+		expect(peak).toBe(4);
+		expect(batches.length).toBe(12);
+	});
+
+	it("semaphore allows up to N concurrent JS executions, queues the (N+1)th until a slot frees", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 2 });
+		const session = await sm.getOrCreate("sandbox-js-sem", { python: false, javascript: true });
+
+		const releasers: Array<() => void> = [];
+		let started = 0;
+		stubBashExec(session, async () => {
+			started++;
+			await new Promise<void>((resolve) => {
+				releasers.push(resolve);
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const p1 = sm.execWithRuntimeThrottle(session, "js-exec -c 'a'");
+		const p2 = sm.execWithRuntimeThrottle(session, "node script.js");
+		const p3 = sm.execWithRuntimeThrottle(session, "js-exec -c 'c'");
+
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(2);
+
+		releasers[0]?.();
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(3);
+
+		releasers[1]?.();
+		releasers[2]?.();
+		await Promise.all([p1, p2, p3]);
+	});
+
+	it("JS slot is released even when bash.exec throws", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate("sandbox-js-throw", { python: false, javascript: true });
+
+		let execCount = 0;
+		stubBashExec(session, async () => {
+			execCount++;
+			if (execCount === 1) throw new Error("boom");
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		await expect(sm.execWithRuntimeThrottle(session, "js-exec -c '1'")).rejects.toThrow("boom");
+
+		const second = sm.execWithRuntimeThrottle(session, "js-exec -c '2'");
+		const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("slot not released")), 500));
+		await expect(Promise.race([second, timeout])).resolves.toMatchObject({ exitCode: 0 });
+	});
+});
+
+describe("SessionManager combined python + js semaphores", () => {
+	type ExecImpl = (
+		script: string,
+	) => Promise<{ stdout: string; stderr: string; exitCode: number; env: Record<string, string> }>;
+
+	function stubBashExec(session: { bash: unknown }, impl: ExecImpl): void {
+		// biome-ignore lint/suspicious/noExplicitAny: deliberately overwriting a readonly method for test control
+		(session.bash as any).exec = impl;
+	}
+
+	it("combined-runtime script eventually holds both slots; other callers on each semaphore queue correctly", async () => {
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeCreateFs(),
+			maxConcurrentPython: 1,
+			maxConcurrentJs: 1,
+		});
+		const session = await sm.getOrCreate("sandbox-both", { python: true, javascript: true });
+
+		const releasers: Array<() => void> = [];
+		stubBashExec(session, async () => {
+			await new Promise<void>((resolve) => {
+				releasers.push(resolve);
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		// Launch a combined script first — it acquires python, then js.
+		const combined = sm.execWithRuntimeThrottle(session, "python3 x.py && js-exec y.ts");
+		await new Promise((r) => setTimeout(r, 10));
+		// Combined is now running with both slots held.
+		expect(releasers.length).toBe(1);
+
+		// While combined holds both slots, a python-only script must queue.
+		const pyOnly = sm.execWithRuntimeThrottle(session, "python3 -c 'p'");
+		// And a js-only script must also queue.
+		const jsOnly = sm.execWithRuntimeThrottle(session, "js-exec -c 'j'");
+		await new Promise((r) => setTimeout(r, 10));
+		expect(releasers.length).toBe(1); // neither has started
+
+		// Release combined → both slots free up. Next two should now run concurrently.
+		releasers[0]?.();
+		await new Promise((r) => setTimeout(r, 10));
+		expect(releasers.length).toBe(3); // combined's + py's + js's
+
+		releasers[1]?.();
+		releasers[2]?.();
+		await Promise.all([combined, pyOnly, jsOnly]);
+	});
+
+	it("acquisition order python→js avoids deadlock when two scripts each need both slots", async () => {
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeCreateFs(),
+			maxConcurrentPython: 1,
+			maxConcurrentJs: 1,
+		});
+		const session = await sm.getOrCreate("sandbox-deadlock", { python: true, javascript: true });
+
+		let peak = 0;
+		let running = 0;
+		stubBashExec(session, async () => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((r) => setTimeout(r, 15));
+			running--;
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		// Two scripts, each needing BOTH slots — with the fixed acquisition order
+		// (python first, then js), they serialize cleanly. If acquisition order weren't
+		// fixed, these could deadlock if one acquired py and the other acquired js.
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "python3 x.py && js-exec y.ts"),
+			sm.execWithRuntimeThrottle(session, "python3 a.py && node b.js"),
+		]);
+
+		expect(peak).toBe(1); // never run concurrently since both slots are 1-capped
+	});
+});
+
 describe("SessionManager idle eviction (US-075)", () => {
 	afterEach(() => {
 		vi.useRealTimers();

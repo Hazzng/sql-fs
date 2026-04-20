@@ -24,12 +24,13 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 	return new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes);
 }
 
-function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
+async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFileSystem }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
 		backend: "memory",
 		createFs: async () => fs,
 	});
+	await sessionManager.getOrCreate(SANDBOX_ID);
 	return { sessionManager, fs };
 }
 
@@ -52,7 +53,7 @@ describe("GET /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("read existing file returns content with correct Content-Type and X-FS-Stat", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -75,7 +76,7 @@ describe("GET /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("read non-existent file returns 404", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -89,7 +90,7 @@ describe("GET /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("read directory returns 400", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -115,7 +116,7 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("write new file returns 204 and content is readable via GET", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 		const content = "hello from PUT";
@@ -135,7 +136,7 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("overwrite existing file via PUT returns 204 and new content is readable", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -156,7 +157,7 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("write file under nested path creates parent dirs automatically", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -185,7 +186,7 @@ describe("DELETE /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("delete existing file returns 204", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -199,7 +200,7 @@ describe("DELETE /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("delete non-existent file returns 404", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -213,7 +214,7 @@ describe("DELETE /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("delete non-empty directory without recursive returns 409", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -230,7 +231,7 @@ describe("DELETE /v1/sandboxes/:id/files/*path", () => {
 	});
 
 	it("delete directory with recursive=true returns 204", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -255,7 +256,7 @@ describe("POST /v1/sandboxes/:id/mkdir", () => {
 	});
 
 	it("mkdir returns 204 and directory is created", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -271,7 +272,7 @@ describe("POST /v1/sandboxes/:id/mkdir", () => {
 	});
 
 	it("mkdir with recursive creates nested directories", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -287,7 +288,7 @@ describe("POST /v1/sandboxes/:id/mkdir", () => {
 	});
 
 	it("mkdir existing directory without recursive returns 409", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -314,7 +315,7 @@ describe("POST /v1/sandboxes/:id/writeFiles", () => {
 	});
 
 	it("write 5 files in one call, verify all readable via GET", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -353,7 +354,7 @@ describe("GET /v1/sandboxes/:id/tree", () => {
 	});
 
 	it("tree of nested structure returns all entries", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -393,7 +394,7 @@ describe("GET /v1/sandboxes/:id/tree", () => {
 	});
 
 	it("tree with depth=1 returns only direct children", async () => {
-		const { sessionManager, fs } = makeTestEnv();
+		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 

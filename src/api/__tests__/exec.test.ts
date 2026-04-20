@@ -21,12 +21,13 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 	return new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes);
 }
 
-function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
+async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFileSystem }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
 		backend: "memory",
 		createFs: async () => fs,
 	});
+	await sessionManager.getOrCreate(SANDBOX_ID);
 	return { sessionManager, fs };
 }
 
@@ -49,7 +50,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 	});
 
 	it("echo hello returns stdout with hello and exitCode 0", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -69,7 +70,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 	});
 
 	it("false command returns exitCode 1", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -88,7 +89,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 	});
 
 	it("timeout returns 408", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -155,7 +156,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 	});
 
 	it("executes script and streams stdout and exit events", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
@@ -183,7 +184,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 	});
 
 	it("timeout sends exit event with exitCode -1 and error='timeout'", async () => {
-		const { sessionManager } = makeTestEnv();
+		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 
