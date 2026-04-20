@@ -1,11 +1,14 @@
 /**
  * MCP server setup with streamable HTTP transport.
  * US-077: MCP server setup and streamable HTTP transport
+ * US-078: MCP tool — sandbox_create
  */
 
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import type { SessionManager } from "../session-manager.js";
+import { registerTools } from "./tools.js";
 
 // Map from MCP session ID to active transport for stateful session management
 const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
@@ -24,7 +27,7 @@ export function createMcpServer(): McpServer {
  * Handles an incoming MCP HTTP request (POST or GET SSE).
  * Reuses the existing transport for known sessions; creates a new one otherwise.
  */
-export async function handleMcpRequest(req: Request): Promise<Response> {
+export async function handleMcpRequest(req: Request, sessionManager: SessionManager): Promise<Response> {
 	const sessionId = req.headers.get("mcp-session-id") ?? undefined;
 
 	if (sessionId !== undefined && sessions.has(sessionId)) {
@@ -33,6 +36,7 @@ export async function handleMcpRequest(req: Request): Promise<Response> {
 	}
 
 	const server = createMcpServer();
+	registerTools(server, sessionManager);
 	const transport = new WebStandardStreamableHTTPServerTransport({
 		sessionIdGenerator: () => randomUUID(),
 		onsessioninitialized: (id) => {

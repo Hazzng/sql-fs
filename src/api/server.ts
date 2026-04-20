@@ -39,7 +39,7 @@ app.route("/v1/sandboxes", ingestRoutes(sessionManager));
 
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
 
-app.all("/mcp", (c) => handleMcpRequest(c.req.raw));
+app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
