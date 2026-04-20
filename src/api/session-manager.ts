@@ -5,13 +5,31 @@
 
 import { Mutex } from "async-mutex";
 import { Bash } from "just-bash";
-import type { IFileSystem } from "just-bash";
+import type { ExecOptions, IFileSystem } from "just-bash";
+import type { BashExecResult } from "just-bash";
 import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+
+/**
+ * Per-sandbox runtime opt-in flags. Runtimes must be declared at session creation
+ * because `just-bash` decides which commands to register when the `Bash` instance is built.
+ */
+export interface RuntimeOptions {
+	readonly python: boolean;
+	readonly javascript: boolean;
+}
+
+const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false };
+
+/** Matches `python3` or `python` as a standalone word (avoids false positives like `mypython`). */
+const PYTHON_INVOCATION_REGEX = /\bpython3?\b/;
+/** Matches `js-exec` or `node` as a standalone command word (avoids `mynode`, `nodejs-config`, etc). */
+const JS_INVOCATION_REGEX = /\bjs-exec\b|\bnode\b/;
 
 export interface Session {
 	readonly fs: IFileSystem;
 	readonly bash: Bash;
+	readonly runtimeOptions: RuntimeOptions;
 	lastUsed: number;
 	inFlight: number;
 	readonly mutex: Mutex;
@@ -36,6 +54,17 @@ export interface SessionManagerOptions {
 	readonly idleMs?: number;
 	/** Max pathCache bytes per session before it is marked over-budget (default: 50MB) */
 	readonly pathCacheMaxBytes?: number;
+	/** Max concurrent Python executions across all sessions (default: MAX_CONCURRENT_PYTHON env var or 5) */
+	readonly maxConcurrentPython?: number;
+	/** Max concurrent JavaScript (js-exec/node) executions across all sessions (default: MAX_CONCURRENT_JS env var or 5) */
+	readonly maxConcurrentJs?: number;
+}
+
+/** Internal FIFO-semaphore state shared by the python and js throttles. */
+interface Semaphore {
+	readonly limit: number;
+	inFlight: number;
+	readonly waiters: Array<() => void>;
 }
 
 export class SessionManager {
@@ -49,12 +78,40 @@ export class SessionManager {
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 
-	constructor({ backend, createFs, destroySandboxFn, idleMs, pathCacheMaxBytes }: SessionManagerOptions) {
+	// --- Runtime throttle semaphores (US-080a) ---
+	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
+	private readonly pythonSem: Semaphore;
+	/**
+	 * JS runtime semaphore — caps QuickJS executions. Note: just-bash currently
+	 * serializes `js-exec` internally via a single global worker, so this cap is
+	 * an upper bound that may not be a binding constraint at runtime.
+	 */
+	private readonly jsSem: Semaphore;
+
+	constructor({
+		backend,
+		createFs,
+		destroySandboxFn,
+		idleMs,
+		pathCacheMaxBytes,
+		maxConcurrentPython,
+		maxConcurrentJs,
+	}: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
 		this.destroySandboxFn = destroySandboxFn ?? destroySandbox;
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
+		this.pythonSem = {
+			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
+			inFlight: 0,
+			waiters: [],
+		};
+		this.jsSem = {
+			limit: maxConcurrentJs ?? Number(process.env.MAX_CONCURRENT_JS ?? "5"),
+			inFlight: 0,
+			waiters: [],
+		};
 	}
 
 	/** Estimate bytes used by the pathCache: path.length + 100 overhead per entry */
@@ -70,8 +127,11 @@ export class SessionManager {
 	/**
 	 * Returns an existing session or creates a new one.
 	 * Concurrent calls for the same sandboxId are coalesced into a single creation (single-flight).
+	 *
+	 * `runtimeOptions` are applied only on **cache miss** — the first caller "wins" the runtime flags.
+	 * Subsequent callers receive the warm session regardless of the flags they pass.
 	 */
-	async getOrCreate(sandboxId: string): Promise<Session> {
+	async getOrCreate(sandboxId: string, runtimeOptions?: RuntimeOptions): Promise<Session> {
 		const existing = this.sessions.get(sandboxId);
 		if (existing !== undefined) {
 			existing.lastUsed = Date.now();
@@ -84,14 +144,23 @@ export class SessionManager {
 			return inProgress;
 		}
 
+		const resolvedRuntime: RuntimeOptions = runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS;
+
 		const creationPromise = (async (): Promise<Session> => {
 			try {
 				const fs = await this.createFs(this.backend, sandboxId);
-				const bash = new Bash({ fs });
+				// just-bash treats `false` and `undefined` both as off, but the types distinguish them —
+				// `|| undefined` keeps types happy without changing behavior.
+				const bash = new Bash({
+					fs,
+					python: resolvedRuntime.python || undefined,
+					javascript: resolvedRuntime.javascript || undefined,
+				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const session: Session = {
 					fs,
 					bash,
+					runtimeOptions: resolvedRuntime,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					mutex: new Mutex(),
@@ -122,9 +191,16 @@ export class SessionManager {
 	/**
 	 * Acquires the per-sandbox mutex, tracks inFlight, then calls fn(session).
 	 * Same-sandbox operations are serialized — later requests wait for earlier ones.
+	 *
+	 * `runtimeOptions` are forwarded to `getOrCreate` — applied only on cache miss.
+	 * A warm session ignores subsequent runtimeOptions; the first caller's flags stick.
 	 */
-	async withSession<T>(sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-		const session = await this.getOrCreate(sandboxId);
+	async withSession<T>(
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		const session = await this.getOrCreate(sandboxId, runtimeOptions);
 
 		// Fast-fail: session is being destroyed — don't queue in the mutex
 		if (session.state === "closing") {
@@ -241,6 +317,70 @@ export class SessionManager {
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
 				this.sessions.delete(sandboxId);
 			}
+		}
+	}
+
+	/**
+	 * Acquires a semaphore slot, waiting if the concurrency cap is reached.
+	 * Paired with release() in a try/finally.
+	 */
+	private acquireSlot(sem: Semaphore): Promise<void> {
+		if (sem.inFlight < sem.limit) {
+			sem.inFlight++;
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			sem.waiters.push(resolve);
+		});
+	}
+
+	/**
+	 * Releases a semaphore slot. If a waiter is queued, the slot is transferred directly
+	 * (no decrement-then-increment) to avoid a counter race between a releaser and a
+	 * concurrent acquirer running in the same microtask turn.
+	 */
+	private releaseSlot(sem: Semaphore): void {
+		const next = sem.waiters.shift();
+		if (next !== undefined) {
+			next();
+			return;
+		}
+		sem.inFlight--;
+	}
+
+	/**
+	 * Executes a script through the session's Bash. When the script looks like it invokes
+	 * Python or JS and the session opted into the corresponding runtime, routes through
+	 * the matching global semaphore(s) to cap concurrent WASM workers.
+	 *
+	 * When a script uses both runtimes, semaphores are acquired in a fixed order (python
+	 * first, then js) to avoid deadlock across concurrent callers needing both slots.
+	 */
+	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
+		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
+		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
+
+		if (!usesPython && !usesJs) {
+			return session.bash.exec(script, opts);
+		}
+
+		// Acquire in a fixed order: python → js. Release in reverse.
+		if (usesPython) await this.acquireSlot(this.pythonSem);
+		if (usesJs) {
+			try {
+				await this.acquireSlot(this.jsSem);
+			} catch (e) {
+				// acquireSlot never rejects today, but if it ever does we still need to release python
+				if (usesPython) this.releaseSlot(this.pythonSem);
+				throw e;
+			}
+		}
+
+		try {
+			return await session.bash.exec(script, opts);
+		} finally {
+			if (usesJs) this.releaseSlot(this.jsSem);
+			if (usesPython) this.releaseSlot(this.pythonSem);
 		}
 	}
 }

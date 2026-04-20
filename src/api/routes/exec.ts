@@ -72,7 +72,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			}, timeoutMs);
 
 			try {
-				const result = await session.bash.exec(body.script, {
+				const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 					signal: controller.signal,
 					cwd: body.cwd,
 					env,
@@ -147,7 +147,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 			await sessionManager.withExistingSession(sandboxId, async (session) => {
 				try {
-					const result = await session.bash.exec(body.script, {
+					const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 						signal: controller.signal,
 						cwd: body.cwd,
 						env,

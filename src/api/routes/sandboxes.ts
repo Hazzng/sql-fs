@@ -14,6 +14,8 @@ import type { SessionManager } from "../session-manager.js";
 const createBodySchema = z.object({
 	env: z.record(z.string()).optional(),
 	files: z.record(z.string()).optional(),
+	python: z.boolean().optional(),
+	javascript: z.boolean().optional(),
 });
 
 export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
@@ -21,6 +23,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.post("/", async (c) => {
 		let files: Record<string, string> | undefined;
+		let python = false;
+		let javascript = false;
 
 		// Body is optional — parse if present, ignore if missing/empty
 		try {
@@ -31,6 +35,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
 			}
 			files = result.data.files;
+			python = result.data.python ?? false;
+			javascript = result.data.javascript ?? false;
 		} catch {
 			// No body provided — that's fine
 		}
@@ -39,17 +45,21 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		const sandboxId = crypto.randomUUID();
 		const createdAt = new Date().toISOString();
 
-		await sessionManager.withSession(sandboxId, async (session) => {
-			session.owner = owner;
-			session.createdAt = createdAt;
-			if (files !== undefined) {
-				for (const [path, content] of Object.entries(files)) {
-					await session.fs.writeFile(path, content);
+		await sessionManager.withSession(
+			sandboxId,
+			async (session) => {
+				session.owner = owner;
+				session.createdAt = createdAt;
+				if (files !== undefined) {
+					for (const [path, content] of Object.entries(files)) {
+						await session.fs.writeFile(path, content);
+					}
 				}
-			}
-		});
+			},
+			{ python, javascript },
+		);
 
-		return c.json({ id: sandboxId, owner, createdAt }, 201 as ContentfulStatusCode);
+		return c.json({ id: sandboxId, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);
 	});
 
 	router.get("/:id", (c) => {

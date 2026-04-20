@@ -532,7 +532,9 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 
 ---
 
-### Epic 9: MySQL Dialect
+> **DEFERRED TO FUTURE ROADMAP.** Epics 9, 10, and 11 (MySQL, Azure SQL, Azure FileShare backends) are documented below for future implementation but are NOT part of V1. V1 ships with Postgres only. The `SqlDialect` interface (US-001) was designed to accommodate these dialects, so adding them later is additive and does not require refactoring core SqlFs code. When picking this up, follow the user stories as written — they remain accurate.
+
+### Epic 9: MySQL Dialect *(future roadmap — not V1)*
 
 #### US-043: MySQL dialect — connection and sandbox context
 **Description:** As a developer, I want the MySQL dialect to connect via `mysql2` and set sandbox context per transaction.
@@ -578,7 +580,7 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 
 ---
 
-### Epic 10: Azure SQL Dialect
+### Epic 10: Azure SQL Dialect *(future roadmap — not V1)*
 
 #### US-047: Azure SQL dialect — connection and sandbox context
 **Description:** As a developer, I want the Azure SQL dialect to connect via `mssql` and set sandbox context via SESSION_CONTEXT.
@@ -624,7 +626,7 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 
 ---
 
-### Epic 11: Azure FileShare Backend
+### Epic 11: Azure FileShare Backend *(future roadmap — not V1)*
 
 #### US-051: FileShare sandbox directory creation
 **Description:** As a developer, I want a FileShare-backed sandbox to create an isolated subdirectory with default structure.
@@ -763,6 +765,8 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - [ ] Sandbox `owner` set from auth token
 - [ ] Unit test: create sandbox, verify 201 response with id
 - [ ] Typecheck passes
+
+> Future extension (see US-080a): body will also accept `python?: boolean` and `javascript?: boolean` to opt in to WASM runtimes at sandbox creation time.
 
 #### US-060: GET /v1/sandboxes/:id — get sandbox info
 **Description:** As an API consumer, I want to inspect sandbox metadata.
@@ -970,6 +974,23 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - [ ] Unit test: under-budget session stays resident; over-budget session is marked non-retainable and is evicted when idle
 - [ ] Typecheck passes
 
+#### US-076a: Session manager — withExistingSession (no auto-create)
+**Description:** As a developer, I want a `withExistingSession` method that fails with ENOENT instead of silently creating a new sandbox, so that operation routes (file ops, exec, ingest, export) reject requests for non-existent sandbox IDs instead of creating orphaned, ownerless sandboxes.
+
+**Acceptance Criteria:**
+- [ ] `SessionManager.withExistingSession(sandboxId, fn)` looks up an existing session via `getSession()`; if not found, throws an error with `code: "ENOENT"` and message indicating sandbox not found — it must NOT call `getOrCreate()`
+- [ ] If the session exists but is in `closing` state, throws `ESESSIONCLOSING` (same as current `withSession` behavior)
+- [ ] All HTTP operation routes (`routes/files.ts`, `routes/exec.ts`, `routes/ingest.ts`) are migrated from `withSession` to `withExistingSession`; only `POST /v1/sandboxes` (create) continues to use `withSession`/`getOrCreate`
+- [ ] MCP tools `bash_exec`, `fs_ingest`, `fs_export` are migrated to `withExistingSession`; only `sandbox_create` uses `getOrCreate`
+- [ ] Route-level error handlers map `ENOENT` from `withExistingSession` to HTTP 404 `{ error: "not_found", code: "SANDBOX_NOT_FOUND" }`
+- [ ] MCP tool handlers map `ENOENT` from `withExistingSession` to `{ ok: false, error: "sandbox not found" }`
+- [ ] Unit test: `withExistingSession` with non-existent ID throws ENOENT
+- [ ] Unit test: `withExistingSession` with existing ID succeeds
+- [ ] Unit test: HTTP `POST /v1/sandboxes/:id/exec-sync` with non-existent ID returns 404 (not auto-created)
+- [ ] Unit test: MCP `bash_exec` with non-existent ID returns error (not auto-created)
+- [ ] Typecheck passes
+- [ ] Tests pass
+
 #### US-076: Session manager — explicit destroy
 **Description:** As a developer, I want to explicitly destroy a session and its backend data, while preventing new requests from attaching during teardown.
 
@@ -1005,9 +1026,11 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 
 **Acceptance Criteria:**
 - [ ] Tool name: `sandbox_create`, description: "Create isolated bash sandbox" (under 80 chars)
-- [ ] Params: `{ env?: object }` (minimal)
+- [ ] Params: `{}` (none in V1)
 - [ ] Returns: `{ id: string }`
 - [ ] Typecheck passes
+
+> Future extension (see US-080a): params will include `python?: boolean` and `javascript?: boolean` for runtime opt-in.
 
 #### US-079: MCP tool — sandbox_delete
 **Description:** As an AI agent, I want to delete a sandbox via MCP.
@@ -1025,28 +1048,24 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - [ ] Tool name: `bash_exec`
 - [ ] Tool description (multi-line, shown to agent):
   ```
-  Run a bash script in the sandbox. Use this for all file and directory operations.
+  Execute a bash script in a sandbox. Returns stdout, stderr, and exitCode.
 
-  **Supported:** cat, echo, printf, ls, find, mkdir, rm, mv, cp, touch, chmod,
-  stat, wc, head, tail, grep, sed, awk, sort, uniq, cut, tr, tee, xargs,
-  read, test/[, if/for/while/case, pipes, redirects, heredocs, variables,
-  functions, tar, gzip, base64, md5sum, sha256sum, date, env, pwd, cd, export.
+  Supported: cat, echo, ls, find, mkdir, rm, mv, cp, touch, chmod, stat, grep, sed, awk,
+  sort, wc, head, tail, cut, tr, uniq, diff, pipes (|), redirects (>, >>, <),
+  environment variables, conditionals (if/else), loops (for/while), functions, arithmetic,
+  base64, md5sum, sha256sum, tar, gzip, jq, yq, xan, sqlite3.
 
-  **NOT supported (just-bash is a virtual interpreter — no real OS):**
-  - Networking: curl, wget, ping, ssh, nc, dig, nslookup
-  - Package managers: apt, yum, brew, pip, npm -g, cargo
-  - Interactive commands: vi, vim, nano, less, more, man, top
-  - Background jobs: & (background), nohup, disown, jobs, wait
-  - Process control: kill, pkill, ps, pgrep, nohup
-  - Special filesystems: /proc, /sys, /dev, /run
-  - Symlinks: ln -s (symlinks are disabled by default — use ln for hardlinks to files)
-  - Compilation: gcc, g++, make, cmake, rustc, go build
-  - Interpreter runtimes: node, python, ruby, java, php (unless pre-installed in sandbox)
+  NOT supported: curl/wget (no network), apt/pip/npm (no package managers),
+  vi/vim/nano (no interactive), background jobs (&), kill/ps/top (no process control),
+  /proc /sys /dev (no special filesystems), ln -s (symlinks off by default),
+  gcc/make/rustc (no compilers), interpreters (python, node, ruby), network access of any kind.
   ```
 - [ ] Params: `{ id: string, script: string, timeout?: number }`
 - [ ] Returns: `{ stdout: string, stderr: string, exitCode: number }`
 - [ ] Buffered (not streaming) — full result in one response
 - [ ] Typecheck passes
+
+> Future extension (see US-080a): when runtime opt-in ships, description will add a "Optional runtimes (only if sandbox was created with python:true or javascript:true)" section naming `python3`/`python` and `js-exec`/`node`, and `python3`-containing scripts will route through a process-wide semaphore.
 
 #### US-086: MCP tool — fs_ingest
 **Description:** As an AI agent, I want to upload multiple files into a sandbox in one call. This is the preferred way to seed a sandbox with project files before running bash commands.
@@ -1067,6 +1086,64 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - [ ] Params: `{ id: string, path?: string }` (`path` defaults to `/home/user`)
 - [ ] Returns: `{ files: { [path]: string } }` (utf8 text; binary files as base64 with `"__encoding":"base64"` marker in the map)
 - [ ] Typecheck passes
+
+#### US-080a: Runtime opt-in and Python semaphore *(future roadmap — not V1)*
+**Description:** As a developer, I want Python/JS runtimes to be opt-in per sandbox and Python executions globally throttled to prevent OOM under concurrent load.
+
+**Why this is deferred:** Each `python3` invocation spawns a fresh ~80MB CPython WASM worker (EXIT_RUNTIME, not reusable). `just-bash` keeps a per-`Bash` queue so calls within one sandbox already serialize, but nothing caps Python usage *across* sandboxes. With 100 concurrent sandboxes each running Python we'd peak at ~8GB RAM — well past the 2Gi ACA limit. V1 ships without Python/JS to avoid this risk. When revisiting, follow the guide below exactly.
+
+**Background (must-read before implementing):**
+- `just-bash@2.14.2`'s `python3` command (`node_modules/just-bash/dist/commands/python3/`) spawns `worker_threads` Workers with `EXIT_RUNTIME` — each invocation loads `vendor/cpython-emscripten/python.wasm` (5.7MB) + `python313.zip` stdlib (4.1MB) fresh. CPython WASM has no `import js`, no `os.system`, and stdlib only (no pip). See `node_modules/just-bash/dist/commands/python3/worker.d.ts` for the security model.
+- `just-bash`'s `js-exec` command uses QuickJS WASM with a 64MB per-execution memory cap (lighter than Python — no global throttle needed for V1 of this feature).
+- `just-bash` enables Python / JS via `new Bash({ fs, python: true, javascript: true })`. Without those flags the commands don't exist.
+- The per-`Bash` queue inside just-bash is keyed by a WeakMap on the command object — it is per-sandbox, not global. So the global semaphore must live at the SessionManager level in our code, not inside just-bash.
+
+**Acceptance Criteria:**
+- [ ] Add `RuntimeOptions` interface to `src/api/session-manager.ts`: `{ readonly python: boolean; readonly javascript: boolean }`
+- [ ] Extend `Session` with `readonly runtimeOptions: RuntimeOptions`
+- [ ] Extend `SessionManagerOptions` with `readonly maxConcurrentPython?: number` (default: `MAX_CONCURRENT_PYTHON` env var or 5)
+- [ ] `getOrCreate(sandboxId, runtimeOptions?)` — defaults to `{ python: false, javascript: false }`. On cache miss, passes both flags into `new Bash({ fs, python: runtimeOptions.python || undefined, javascript: runtimeOptions.javascript || undefined })`. Must use `|| undefined` so `false` becomes `undefined` (just-bash treats both as off, but the types differ)
+- [ ] `withSession(sandboxId, fn, runtimeOptions?)` forwards `runtimeOptions` to `getOrCreate`. Note that runtimeOptions are applied only on **cache miss** — the first caller "wins" the runtime flags. Document this clearly in the JSDoc so future callers do not expect to toggle runtimes on a warm session
+- [ ] Add private semaphore state to `SessionManager`:
+  - `pythonInFlight: number` (counter)
+  - `pythonWaiters: Array<() => void>` (FIFO queue of resolvers)
+  - `acquirePythonSlot(): Promise<void>` — if `pythonInFlight < maxConcurrentPython`, increments and resolves immediately; otherwise pushes a resolver and returns a pending promise
+  - `releasePythonSlot(): void` — if queue non-empty, shifts + calls the next resolver (handing over the slot without decrementing); else decrements the counter. **This transfer-on-release pattern avoids a counter race.**
+- [ ] Add public `execWithRuntimeThrottle(session, script, opts?): Promise<BashExecResult>`:
+  - `const usesPython = session.runtimeOptions.python && /\bpython3?\b/.test(script)`
+  - Non-Python path: `return session.bash.exec(script, opts)` (no semaphore)
+  - Python path: `await acquirePythonSlot()`, then `try { return await session.bash.exec(script, opts) } finally { releasePythonSlot() }`
+  - The regex must use word boundaries (`\b`) to avoid false positives like `mypython`
+- [ ] Migrate **all** direct `session.bash.exec(...)` call sites to `sessionManager.execWithRuntimeThrottle(session, ...)`:
+  - `src/api/routes/exec.ts` — both exec-sync and SSE streaming paths
+  - `src/api/routes/ingest.ts` — tar extract (ingest) and tar pack (export) paths, plus the `rm /tmp/_export.tar.gz` cleanup
+  - `src/api/mcp/tools.ts` — the `bash_exec` tool handler
+- [ ] `POST /v1/sandboxes` (HTTP) accepts `python?: boolean, javascript?: boolean` body fields and forwards via `withSession(..., { python, javascript })`. 201 response includes the resolved flags
+- [ ] `sandbox_create` MCP tool accepts the same two boolean params and calls `getOrCreate(id, { python, javascript })`
+- [ ] `bash_exec` MCP tool description updated to add an "Optional runtimes" section listing `python3`/`python` (CPython WASM, stdlib only, no pip) and `js-exec`/`node` (QuickJS WASM, TypeScript supported, no npm), gated on "only if sandbox was created with python:true or javascript:true"
+- [ ] Document `MAX_CONCURRENT_PYTHON` in the env var table in `CLAUDE.md` and any deployment docs
+- [ ] Unit test (`src/api/__tests__/session-manager.test.ts`):
+  - Semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees
+  - Non-Python script bypasses semaphore entirely (`pythonInFlight` never increments)
+  - Slot is released even when `bash.exec` throws — use `try/finally` to verify a failing exec still decrements
+  - Regex does not match `mypython_script` (word boundary check)
+  - Warm session ignores subsequent `runtimeOptions` (cache hit path)
+
+**Testing gotcha:** The in-memory `InMemoryFs` backend doesn't care about runtime flags, but creating `new Bash({ python: true })` in tests actually loads the Python WASM on first `python3` call and adds ~500ms–2s to the test. Prefer mocking `bash.exec` or only invoking Python in a single dedicated integration test.
+
+#### US-087a: MCP tools — per-sandbox ownership enforcement
+**Description:** As a developer, I want MCP tools to enforce per-sandbox ownership so that an authenticated user can only operate on sandboxes they created, matching the authorization model of the HTTP API routes.
+
+**Acceptance Criteria:**
+- [ ] `handleMcpRequest` in `src/api/mcp/server.ts` extracts the authenticated caller identity (e.g., JWT `sub` claim) from the HTTP request and makes it available to tool handlers (via MCP session context, closure, or similar mechanism)
+- [ ] `sandbox_create` sets `session.owner` to the caller identity (matching `POST /v1/sandboxes` behavior in `routes/sandboxes.ts`)
+- [ ] `sandbox_delete`, `bash_exec`, `fs_ingest`, `fs_export` verify that the caller identity matches `session.owner` before proceeding; if `session.owner` is set and does not match, return `{ ok: false, error: "forbidden" }` (or equivalent error content)
+- [ ] When `session.owner` is empty string (legacy/migration case), ownership check is skipped (matches HTTP route `checkOwnership` behavior)
+- [ ] Unit test: create sandbox as user A, attempt `bash_exec` as user B — returns forbidden error
+- [ ] Unit test: create sandbox as user A, `bash_exec` as user A — succeeds
+- [ ] Unit test: `sandbox_create` sets owner on the session
+- [ ] Typecheck passes
+- [ ] Tests pass
 
 ---
 
@@ -1282,18 +1359,24 @@ The core idea: replace `InMemoryFs` with `SqlFs` (backed by Postgres, MySQL, or 
 - FR-24: Container image must be under 300MB and start in under 10 seconds
 - FR-25: Migrations must run automatically on container startup before the HTTP server binds
 
-## Non-Goals (Out of Scope)
+## Non-Goals (Out of Scope for V1)
 
 - No real-time file watching or WebSocket-based file change notifications
 - No auto-expiry or idle timeout for sandboxes (manual delete only in V1)
 - No quota enforcement (max files, max storage per sandbox)
 - No usage metering or billing hooks
 - No multi-region replication or read replicas
-- No Python/JavaScript/SQLite runtime enablement via API (sandboxes use bash commands only in V1)
 - No interactive shell over WebSocket (exec is request/response or SSE, not a persistent terminal)
 - No Neon branching for per-sandbox isolation (RLS only in V1)
 - No S3/R2 offload for large files
 - No schema-per-tenant or database-per-tenant isolation models
+
+### Deferred to Future Roadmap (documented but not in V1)
+
+- **MySQL backend** (Epic 9, US-043 through US-046) — stories remain accurate; enable by implementing `src/fs/sql-fs/dialects/mysql.ts` against the `SqlDialect` interface
+- **Azure SQL backend** (Epic 10, US-047 through US-050) — stories remain accurate; enable by implementing `src/fs/sql-fs/dialects/azure-sql.ts`
+- **Azure FileShare backend** (Epic 11, US-051, US-052) — stories remain accurate; `createSandboxFs` factory already has a stub branch to return `ReadWriteFs({ root: mountPath/sandboxId })`. See `COMPARISON.md` for the FileShare-vs-Postgres tradeoffs that led to deferring this
+- **Python/JavaScript WASM runtime opt-in + global Python semaphore** (US-080a) — stories remain accurate with full implementation guide; enable by following the acceptance criteria on US-080a verbatim
 
 ## Technical Considerations
 

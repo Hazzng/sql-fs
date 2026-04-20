@@ -41,14 +41,31 @@ function checkMcpOwnership(sessionManager: SessionManager, sandboxId: string, ca
 }
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string): void {
-	server.tool("sandbox_create", "Create an isolated bash sandbox with a virtual filesystem", {}, async () => {
-		const id = randomUUID();
-		const session = await sessionManager.getOrCreate(id);
-		session.owner = owner;
-		return {
-			content: [{ type: "text" as const, text: JSON.stringify({ id }) }],
-		};
-	});
+	server.tool(
+		"sandbox_create",
+		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands.",
+		{
+			python: z.boolean().optional(),
+			javascript: z.boolean().optional(),
+		},
+		async (args) => {
+			const id = randomUUID();
+			const runtimeOptions = {
+				python: args.python ?? false,
+				javascript: args.javascript ?? false,
+			};
+			const session = await sessionManager.getOrCreate(id, runtimeOptions);
+			session.owner = owner;
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify({ id, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
+					},
+				],
+			};
+		},
+	);
 
 	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
 		const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
@@ -80,11 +97,19 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"",
 		"Supported: cat, echo, ls, find, mkdir, rm, mv, cp, touch, chmod, stat, grep, sed, awk,",
 		"sort, wc, head, tail, cut, tr, uniq, diff, pipes (|), redirects (>, >>, <),",
-		"environment variables, conditionals (if/else), loops (for/while), functions, arithmetic.",
+		"environment variables, conditionals (if/else), loops (for/while), functions, arithmetic,",
+		"base64, md5sum, sha256sum, tar, gzip, jq, yq, xan, sqlite3.",
 		"",
-		"NOT supported: curl, wget, apt, npm, pip, vi, vim, nano, background jobs (&),",
-		"process control (kill, ps, top), /proc, /sys, symlinks, compilers (gcc, make),",
-		"interpreters (python, node, ruby), network access.",
+		"NOT supported: curl/wget (no network), apt/pip/npm (no package managers),",
+		"vi/vim/nano (no interactive), background jobs (&), kill/ps/top (no process control),",
+		"/proc /sys /dev (no special filesystems), ln -s (symlinks off by default),",
+		"gcc/make/rustc (no compilers), network access of any kind.",
+		"",
+		"Optional runtimes (only if sandbox was created with python:true or javascript:true):",
+		"- python3 / python — CPython WASM, stdlib only (no pip, no network, no os.system).",
+		"  Concurrent python3 executions across the server are capped to prevent OOM; excess",
+		"  scripts queue until a slot frees.",
+		"- js-exec / node — QuickJS WASM. TypeScript supported. No npm, no network.",
 	].join("\n");
 
 	server.tool(
@@ -116,7 +141,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					}, timeoutMs);
 
 					try {
-						const execResult = await session.bash.exec(args.script, { signal: controller.signal });
+						const execResult = await sessionManager.execWithRuntimeThrottle(session, args.script, {
+							signal: controller.signal,
+						});
 						clearTimeout(timer);
 						if (timedOut) {
 							return { stdout: "", stderr: "timeout", exitCode: -1 };

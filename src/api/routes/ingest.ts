@@ -81,7 +81,8 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 				await session.fs.writeFile("/tmp/_ingest.tar.gz", archiveBuffer);
 
 				// Extract via bash (just-bash requires dash-prefixed flags: -xzf not xzf)
-				const extractResult = await session.bash.exec(
+				const extractResult = await sessionManager.execWithRuntimeThrottle(
+					session,
 					`mkdir -p '${basePath}' && cd '${basePath}' && tar -xzf /tmp/_ingest.tar.gz && rm /tmp/_ingest.tar.gz`,
 				);
 				if (extractResult.exitCode !== 0) {
@@ -221,7 +222,10 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 				}
 
 				// Create archive
-				const tarResult = await session.bash.exec(`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`);
+				const tarResult = await sessionManager.execWithRuntimeThrottle(
+					session,
+					`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`,
+				);
 				if (tarResult.exitCode !== 0) {
 					throw Object.assign(new Error(`tar creation failed: ${tarResult.stderr || "unknown error"}`), {
 						code: "EINVAL",
@@ -232,7 +236,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 				const bytes = await session.fs.readFileBuffer("/tmp/_export.tar.gz");
 
 				// Delete temp file (best effort — don't fail if cleanup fails)
-				await session.bash.exec("rm /tmp/_export.tar.gz");
+				await sessionManager.execWithRuntimeThrottle(session, "rm /tmp/_export.tar.gz");
 
 				return bytes;
 			});
