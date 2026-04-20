@@ -2,10 +2,11 @@
  * Unit tests for ingest routes.
  * US-071: POST /v1/sandboxes/:id/ingest — tar.gz upload
  * US-072: POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
+ * US-073: GET /v1/sandboxes/:id/export — tar.gz download
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Hono } from "hono";
@@ -226,5 +227,80 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("INVALID_INPUT");
+	});
+});
+
+describe("GET /v1/sandboxes/:id/export", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = AUTH_SECRET;
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+	});
+
+	it("write files to sandbox, export, verify response is gzip with correct headers", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		// Seed files directly into the sandbox FS before exporting
+		await sessionManager.withSession(SANDBOX_ID, async (session) => {
+			await session.fs.mkdir("/home/user", { recursive: true });
+			await session.fs.writeFile("/home/user/hello.txt", new TextEncoder().encode("hello world"));
+			await session.fs.writeFile("/home/user/foo.js", new TextEncoder().encode("console.log('foo');"));
+		});
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/export?basePath=/home/user`, {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(200);
+		expect(res.headers.get("Content-Type")).toBe("application/gzip");
+		expect(res.headers.get("Content-Disposition")).toBe("attachment; filename=export.tar.gz");
+
+		// Verify body is a valid gzip archive (magic bytes 0x1f 0x8b)
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		expect(bytes[0]).toBe(0x1f);
+		expect(bytes[1]).toBe(0x8b);
+
+		// Verify contents by extracting on the host
+		const tmpDir = mkdtempSync(path.join(os.tmpdir(), "export-test-"));
+		try {
+			const archivePath = path.join(tmpDir, "export.tar.gz");
+			writeFileSync(archivePath, Buffer.from(bytes));
+			execSync(`tar -xzf '${archivePath}' -C '${tmpDir}'`);
+			expect(readFileSync(path.join(tmpDir, "hello.txt"), "utf-8")).toBe("hello world");
+			expect(readFileSync(path.join(tmpDir, "foo.js"), "utf-8")).toBe("console.log('foo');");
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns 404 when basePath does not exist", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/export?basePath=/nonexistent/path`, {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(404);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("ENOENT");
+	});
+
+	it("unauthenticated request returns 401", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/export`, {
+			method: "GET",
+		});
+
+		expect(res.status).toBe(401);
 	});
 });
