@@ -267,6 +267,42 @@ describe("SessionManager.destroy (US-076)", () => {
 	});
 });
 
+describe("SessionManager.withExistingSession (US-076a)", () => {
+	it("throws ENOENT for non-existent sandbox", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await expect(sm.withExistingSession("nonexistent", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("succeeds for existing sandbox", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await sm.getOrCreate("test-existing");
+		const result = await sm.withExistingSession("test-existing", async (session) => {
+			return session.fs.exists("/");
+		});
+		expect(result).toBe(true);
+	});
+
+	it("throws ENOENT after destroy completes", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		await sm.getOrCreate("closing-test");
+		await sm.destroy("closing-test");
+		await expect(sm.withExistingSession("closing-test", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("increments and decrements inFlight", async () => {
+		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		await sm.getOrCreate("sandbox-existing-if");
+		let inFlightDuringExecution = -1;
+		await sm.withExistingSession("sandbox-existing-if", async (session) => {
+			inFlightDuringExecution = session.inFlight;
+		});
+		const session = sm.getSession("sandbox-existing-if");
+		expect(inFlightDuringExecution).toBe(1);
+		expect(session?.inFlight).toBe(0);
+	});
+});
+
 describe("SessionManager idle eviction (US-075)", () => {
 	afterEach(() => {
 		vi.useRealTimers();

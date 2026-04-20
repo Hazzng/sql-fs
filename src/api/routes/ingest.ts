@@ -16,6 +16,17 @@ function isValidBasePath(p: string): boolean {
 	return /^\/[a-zA-Z0-9_\-./]*$/.test(p) && !p.includes("..");
 }
 
+// Validates that a relative path is safe (no traversal, no absolute paths, no null bytes)
+function isValidRelativePath(p: string): boolean {
+	if (p.includes("\0")) return false;
+	if (p.startsWith("/")) return false;
+	const segments = p.split("/");
+	for (const seg of segments) {
+		if (seg === "..") return false;
+	}
+	return true;
+}
+
 /** Returns 403 response if caller does not own the sandbox, undefined otherwise */
 function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
 	const session = sessionManager.getSession(sandboxId);
@@ -56,23 +67,36 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
 
-		await sessionManager.withSession(sandboxId, async (session) => {
-			// Ensure /tmp exists before writing archive
-			try {
-				await session.fs.mkdir("/tmp", { recursive: true });
-			} catch (e) {
-				const code = (e as Error & { code?: string }).code;
-				if (code !== "EEXIST") throw e;
+		try {
+			await sessionManager.withExistingSession(sandboxId, async (session) => {
+				// Ensure /tmp exists before writing archive
+				try {
+					await session.fs.mkdir("/tmp", { recursive: true });
+				} catch (e) {
+					const code = (e as Error & { code?: string }).code;
+					if (code !== "EEXIST") throw e;
+				}
+
+				// Write archive to sandbox FS at /tmp/_ingest.tar.gz
+				await session.fs.writeFile("/tmp/_ingest.tar.gz", archiveBuffer);
+
+				// Extract via bash (just-bash requires dash-prefixed flags: -xzf not xzf)
+				const extractResult = await session.bash.exec(
+					`mkdir -p '${basePath}' && cd '${basePath}' && tar -xzf /tmp/_ingest.tar.gz && rm /tmp/_ingest.tar.gz`,
+				);
+				if (extractResult.exitCode !== 0) {
+					throw Object.assign(new Error(`tar extraction failed: ${extractResult.stderr || "unknown error"}`), {
+						code: "EINVAL",
+					});
+				}
+			});
+		} catch (e) {
+			const code = (e as Error & { code?: string }).code;
+			if (code === "ENOENT") {
+				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}
-
-			// Write archive to sandbox FS at /tmp/_ingest.tar.gz
-			await session.fs.writeFile("/tmp/_ingest.tar.gz", archiveBuffer);
-
-			// Extract via bash (just-bash requires dash-prefixed flags: -xzf not xzf)
-			await session.bash.exec(
-				`mkdir -p '${basePath}' && cd '${basePath}' && tar -xzf /tmp/_ingest.tar.gz && rm /tmp/_ingest.tar.gz`,
-			);
-		});
+			throw e;
+		}
 
 		return c.json({ status: "ok", basePath });
 	});
@@ -113,27 +137,53 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			);
 		}
 
+		// Validate all relative paths before writing any files
+		const invalidPaths: string[] = [];
+		for (const relativePath of Object.keys(files)) {
+			if (!isValidRelativePath(relativePath)) {
+				invalidPaths.push(relativePath);
+			}
+		}
+		if (invalidPaths.length > 0) {
+			return c.json(
+				{
+					error: "validation_error",
+					code: "INVALID_INPUT",
+					details: [`invalid paths: ${invalidPaths.join(", ")}`],
+				},
+				400 as ContentfulStatusCode,
+			);
+		}
+
 		const fileCount = Object.keys(files).length;
 
-		await sessionManager.withSession(sandboxId, async (session) => {
-			for (const [relativePath, base64Content] of Object.entries(files)) {
-				const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
-				const lastSlash = absPath.lastIndexOf("/");
-				const parentDir = lastSlash > 0 ? absPath.slice(0, lastSlash) : "/";
+		try {
+			await sessionManager.withExistingSession(sandboxId, async (session) => {
+				for (const [relativePath, base64Content] of Object.entries(files)) {
+					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
+					const lastSlash = absPath.lastIndexOf("/");
+					const parentDir = lastSlash > 0 ? absPath.slice(0, lastSlash) : "/";
 
-				if (parentDir !== "/") {
-					try {
-						await session.fs.mkdir(parentDir, { recursive: true });
-					} catch (e) {
-						const code = (e as Error & { code?: string }).code;
-						if (code !== "EEXIST") throw e;
+					if (parentDir !== "/") {
+						try {
+							await session.fs.mkdir(parentDir, { recursive: true });
+						} catch (e) {
+							const code = (e as Error & { code?: string }).code;
+							if (code !== "EEXIST") throw e;
+						}
 					}
-				}
 
-				const decoded = Buffer.from(base64Content, "base64");
-				await session.fs.writeFile(absPath, new Uint8Array(decoded));
+					const decoded = Buffer.from(base64Content, "base64");
+					await session.fs.writeFile(absPath, new Uint8Array(decoded));
+				}
+			});
+		} catch (e) {
+			const code = (e as Error & { code?: string }).code;
+			if (code === "ENOENT") {
+				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}
-		});
+			throw e;
+		}
 
 		return c.json({ status: "ok", fileCount });
 	});
@@ -155,7 +205,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		let archiveBytes: Uint8Array;
 		try {
-			archiveBytes = await sessionManager.withSession(sandboxId, async (session) => {
+			archiveBytes = await sessionManager.withExistingSession(sandboxId, async (session) => {
 				// Check basePath exists
 				const exists = await session.fs.exists(basePath);
 				if (!exists) {
@@ -171,12 +221,17 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 				}
 
 				// Create archive
-				await session.bash.exec(`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`);
+				const tarResult = await session.bash.exec(`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`);
+				if (tarResult.exitCode !== 0) {
+					throw Object.assign(new Error(`tar creation failed: ${tarResult.stderr || "unknown error"}`), {
+						code: "EINVAL",
+					});
+				}
 
 				// Read archive bytes
 				const bytes = await session.fs.readFileBuffer("/tmp/_export.tar.gz");
 
-				// Delete temp file
+				// Delete temp file (best effort — don't fail if cleanup fails)
 				await session.bash.exec("rm /tmp/_export.tar.gz");
 
 				return bytes;

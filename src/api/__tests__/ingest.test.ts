@@ -77,6 +77,7 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
+		await sessionManager.getOrCreate(SANDBOX_ID);
 
 		const files = {
 			"hello.txt": "hello world",
@@ -112,6 +113,7 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
+		await sessionManager.getOrCreate(SANDBOX_ID);
 
 		const archiveBytes = createTarGz({ "readme.txt": "hello" });
 		const formData = new FormData();
@@ -158,6 +160,24 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 
 		expect(res.status).toBe(401);
 	});
+
+	it("returns 404 for non-existent sandbox", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const archiveBytes = createTarGz({ "a.txt": "hello" });
+		const formData = new FormData();
+		formData.append("archive", new File([archiveBytes], "archive.tar.gz", { type: "application/gzip" }));
+
+		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000/ingest", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+			body: formData,
+		});
+
+		expect(res.status).toBe(404);
+	});
 });
 
 describe("POST /v1/sandboxes/:id/ingest-files", () => {
@@ -173,6 +193,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
+		await sessionManager.getOrCreate(SANDBOX_ID);
 
 		const files: Record<string, string> = {
 			"hello.txt": Buffer.from("hello world").toString("base64"),
@@ -228,6 +249,23 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("INVALID_INPUT");
 	});
+
+	it("returns 404 for non-existent sandbox", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000/ingest-files", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user",
+				files: { "a.txt": Buffer.from("hello").toString("base64") },
+			}),
+		});
+
+		expect(res.status).toBe(404);
+	});
 });
 
 describe("GET /v1/sandboxes/:id/export", () => {
@@ -278,10 +316,12 @@ describe("GET /v1/sandboxes/:id/export", () => {
 		}
 	});
 
-	it("returns 404 when basePath does not exist", async () => {
+	it("returns 404 when basePath does not exist in sandbox", async () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
+		// Pre-create sandbox so "sandbox not found" is not the reason for 404
+		await sessionManager.getOrCreate(SANDBOX_ID);
 
 		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/export?basePath=/nonexistent/path`, {
 			method: "GET",
@@ -291,6 +331,19 @@ describe("GET /v1/sandboxes/:id/export", () => {
 		expect(res.status).toBe(404);
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("ENOENT");
+	});
+
+	it("returns 404 for non-existent sandbox", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000/export", {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(404);
 	});
 
 	it("unauthenticated request returns 401", async () => {

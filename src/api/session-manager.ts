@@ -148,6 +148,36 @@ export class SessionManager {
 	}
 
 	/**
+	 * Like withSession, but throws ENOENT if the sandbox is not already in the pool.
+	 * Use this for operation routes that should NOT auto-create sandboxes.
+	 */
+	async withExistingSession<T>(sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
+		const session = this.sessions.get(sandboxId);
+		if (session === undefined) {
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+		}
+
+		if (session.state === "closing") {
+			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+		}
+
+		return session.mutex.runExclusive(async () => {
+			if (session.state === "closing") {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+			}
+			session.inFlight++;
+			session.lastUsed = Date.now();
+			try {
+				return await fn(session);
+			} finally {
+				session.inFlight--;
+				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+			}
+		});
+	}
+
+	/**
 	 * Marks the session as closing, waits for any in-flight work to finish, then removes it
 	 * from the pool and destroys backend data. Concurrent calls are idempotent — destroySandbox
 	 * is called exactly once. Returns true if the session was in the pool, false otherwise.

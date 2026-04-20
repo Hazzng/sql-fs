@@ -58,9 +58,10 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 	});
 
 	it(`all ${N} responses are 204 — mutex serializes without dropping any request`, async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-same-path-1";
+		await sm.getOrCreate(sbId);
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -78,9 +79,10 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 	});
 
 	it("final GET returns one of the written values — no corruption in pathCache", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-same-path-2";
+		await sm.getOrCreate(sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -113,9 +115,10 @@ describe("N concurrent PUTs to distinct paths within one sandbox", () => {
 	});
 
 	it(`all ${N} writes succeed and tree lists exactly ${N} files`, async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-distinct-paths";
+		await sm.getOrCreate(sbId);
 
 		const putResults = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -159,9 +162,10 @@ describe("Write-overwrite-read consistency within one sandbox", () => {
 	});
 
 	it("sequential overwrite: each read after a write sees the latest content", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "overwrite-read";
+		await sm.getOrCreate(sbId);
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/v.txt`, {
@@ -181,9 +185,10 @@ describe("Write-overwrite-read consistency within one sandbox", () => {
 	});
 
 	it("N concurrent overwrites then one read — no stale content, no 404", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-overwrite";
+		await sm.getOrCreate(sbId);
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/counter.txt`, {
@@ -226,9 +231,10 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 	});
 
 	it("after deleting a file, all subsequent reads return 404 (no stale pathCache)", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "delete-invalidation";
+		await sm.getOrCreate(sbId);
 
 		// Write a file
 		await app.request(`/v1/sandboxes/${sbId}/files/to-delete.txt`, {
@@ -259,9 +265,10 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 	});
 
 	it("tree listing after deleting half the files shows exactly the remaining files", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "partial-delete";
+		await sm.getOrCreate(sbId);
 		const total = 10;
 		const keep = 5;
 
@@ -314,9 +321,10 @@ describe("N concurrent reads of the same file", () => {
 	});
 
 	it(`all ${N} concurrent reads return the same content`, async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "concurrent-reads";
+		await sm.getOrCreate(sbId);
 
 		await app.request(`/v1/sandboxes/${sbId}/files/stable.txt`, {
 			method: "PUT",
@@ -350,10 +358,11 @@ describe("Cross-sandbox isolation", () => {
 	});
 
 	it("writes to sandbox A are not visible in sandbox B (same path)", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbA = "isolation-sandbox-a";
 		const sbB = "isolation-sandbox-b";
+		await Promise.all([sm.getOrCreate(sbA), sm.getOrCreate(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/shared/data.txt`, {
@@ -384,10 +393,11 @@ describe("Cross-sandbox isolation", () => {
 	});
 
 	it("deleting a path in sandbox A does not affect sandbox B", async () => {
-		const { app } = makeMemoryApp();
+		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbA = "iso-del-a";
 		const sbB = "iso-del-b";
+		await Promise.all([sm.getOrCreate(sbA), sm.getOrCreate(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/common.txt`, {
@@ -517,6 +527,7 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 		const app = makeApp(sm);
 		const token = await makeToken();
 		const sbId = "sqlfs-cache-overwrite";
+		await sm.getOrCreate(sbId);
 
 		// Write WRITES times to the same path — serialized by mutex
 		for (let i = 0; i < WRITES; i++) {
@@ -550,6 +561,7 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 		const app = makeApp(sm);
 		const token = await makeToken();
 		const sbId = "sqlfs-cache-delete";
+		await sm.getOrCreate(sbId);
 
 		// Write a file
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
