@@ -56,3 +56,13 @@ Started: Sun Apr 19 23:23:07 ACST 2026
   - Tools are registered on the McpServer instance before `connect()` — future stories (US-078+) should register tools in a shared `registerTools(server, sessionManager)` call in mcp/server.ts
   - MCP SDK import paths: `@modelcontextprotocol/sdk/server/mcp.js` for McpServer, `@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js` for transport
 ---
+
+## 2026-04-20 - US-078
+- What was implemented: `sandbox_create` MCP tool in `src/api/mcp/tools.ts`; `registerTools(server, sessionManager)` factory registered on McpServer before `connect()`; `handleMcpRequest` updated to accept `SessionManager` param; `server.ts` passes `sessionManager` to `handleMcpRequest`; unit test uses `InMemoryTransport.createLinkedPair()` + MCP `Client` to call tool end-to-end
+- Files changed: src/api/mcp/tools.ts (new), src/api/mcp/server.ts (added registerTools call + sessionManager param), src/api/server.ts (pass sessionManager to handleMcpRequest), src/api/__tests__/mcp.test.ts (added sandbox_create test)
+- **Learnings for future iterations:**
+  - `server.tool(name, description, paramsSchema, handler)` is the full 4-arg signature — `paramsSchema` is a Zod object shape `{ key: z.ZodType }` (not a full `z.object()`)
+  - `InMemoryTransport.createLinkedPair()` from `@modelcontextprotocol/sdk/inMemory.js` creates a linked client/server transport pair for unit testing tools end-to-end without HTTP
+  - `client.callTool(...)` returns `{ content: unknown }` — cast with `as Array<{ type: string; text?: string }>` for TypeScript
+  - All future MCP tools go in `src/api/mcp/tools.ts` inside `registerTools(server, sessionManager)` — no changes to `server.ts` or `server.ts` (api) needed for new tools
+---

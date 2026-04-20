@@ -100,7 +100,7 @@
         "Tests pass"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": "MCP tools use server.tool(name, schema, handler) pattern from the SDK. The handler receives parsed args."
     },
     {
