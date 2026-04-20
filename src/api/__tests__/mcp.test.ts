@@ -3,14 +3,17 @@
  * US-077: MCP server setup and streamable HTTP transport
  * US-078: MCP tool — sandbox_create
  * US-079: MCP tool — sandbox_delete
+ * US-080: MCP tool — bash_exec
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
 import { createMcpServer } from "../mcp/server.js";
 import { registerTools } from "../mcp/tools.js";
+import { SessionManager } from "../session-manager.js";
 import type { Session } from "../session-manager.js";
 
 describe("MCP server", () => {
@@ -131,6 +134,43 @@ describe("MCP tool — sandbox_delete", () => {
 		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
 		expect(parsed.ok).toBe(false);
 		expect(typeof parsed.error).toBe("string");
+
+		await client.close();
+	});
+});
+
+describe("MCP tool — bash_exec", () => {
+	it("executes 'echo hello' and returns { stdout: 'hello\\n', exitCode: 0 }", async () => {
+		const sessionManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+		});
+
+		const server = createMcpServer();
+		registerTools(server, sessionManager);
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		// Create a sandbox first
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		// Execute 'echo hello'
+		const execResult = await client.callTool({
+			name: "bash_exec",
+			arguments: { id: created.id, script: "echo hello" },
+		});
+
+		const content = execResult.content as Array<{ type: string; text?: string }>;
+		expect(content).toHaveLength(1);
+		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
+		expect(parsed.stdout).toBe("hello\n");
+		expect(parsed.exitCode).toBe(0);
 
 		await client.close();
 	});
