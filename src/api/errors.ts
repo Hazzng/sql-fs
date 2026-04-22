@@ -15,6 +15,8 @@
  * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
  * ELOOP          → 400  Bad Request (symlink loop)
  * EINVAL         → 400  Bad Request (invalid argument)
+ * ELOCKTIMEOUT   → 503  Service Unavailable (distributed lock acquire timed out)
+ * ELOCKLOST      → 500  Internal Server Error (distributed lock heartbeat failed mid-operation)
  * others         → 500  Internal Server Error
  */
 export function mapFsErrorToStatus(err: Error): number {
@@ -38,6 +40,10 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 400;
 		case "EINVAL":
 			return 400;
+		case "ELOCKTIMEOUT":
+			return 503;
+		case "ELOCKLOST":
+			return 500;
 		default:
 			return 500;
 	}

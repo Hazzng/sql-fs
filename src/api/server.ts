@@ -8,6 +8,7 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { getRedisClient } from "../redis/client.js";
 import { type AuthVariables, authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
@@ -26,6 +27,12 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 
 const sessionManager = new SessionManager({
 	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
+	redis: getRedisClient(),
+	execLockOptions: {
+		leaseMs: Number(process.env.REDIS_EXEC_LOCK_LEASE_MS ?? 60_000),
+		renewMs: Number(process.env.REDIS_EXEC_LOCK_RENEW_MS ?? 20_000),
+		acquireTimeoutMs: Number(process.env.REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS ?? 300_000),
+	},
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
@@ -99,6 +106,8 @@ app.onError((err, c) => {
 		"ESESSIONCLOSING",
 		"ELOOP",
 		"EINVAL",
+		"ELOCKTIMEOUT",
+		"ELOCKLOST",
 	];
 	const message = knownFsCodes.includes(code) ? err.message : "Internal server error";
 

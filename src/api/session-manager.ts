@@ -4,11 +4,13 @@
  */
 
 import { Mutex } from "async-mutex";
+import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 
 /**
  * Per-sandbox runtime opt-in flags. Runtimes must be declared at session creation
@@ -58,6 +60,14 @@ export interface SessionManagerOptions {
 	readonly maxConcurrentPython?: number;
 	/** Max concurrent JavaScript (js-exec/node) executions across all sessions (default: MAX_CONCURRENT_JS env var or 5) */
 	readonly maxConcurrentJs?: number;
+	/**
+	 * Optional Redis client used to acquire a cross-replica distributed lock
+	 * around every exec/destroy. When undefined the manager runs in
+	 * single-replica mode (no distributed locking).
+	 */
+	readonly redis?: Redis;
+	/** Overrides for the distributed exec lock (lease/renew/acquire timeouts). */
+	readonly execLockOptions?: Partial<DistributedLockOptions>;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -77,6 +87,8 @@ export class SessionManager {
 	private readonly idleMs: number;
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
+	private readonly redis: Redis | undefined;
+	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -96,12 +108,16 @@ export class SessionManager {
 		pathCacheMaxBytes,
 		maxConcurrentPython,
 		maxConcurrentJs,
+		redis,
+		execLockOptions,
 	}: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
 		this.destroySandboxFn = destroySandboxFn ?? destroySandbox;
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
+		this.redis = redis;
+		this.execLockOptions = execLockOptions;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -189,8 +205,20 @@ export class SessionManager {
 	}
 
 	/**
+	 * Runs `fn` while holding the cross-replica distributed lock for `sandboxId`.
+	 * No-op passthrough when no Redis client is configured (single-replica mode).
+	 */
+	private async withExecLock<T>(sandboxId: string, fn: () => Promise<T>): Promise<T> {
+		if (this.redis === undefined) return fn();
+		return withDistributedLock(this.redis, execLockKey(sandboxId), fn, this.execLockOptions);
+	}
+
+	/**
 	 * Acquires the per-sandbox mutex, tracks inFlight, then calls fn(session).
 	 * Same-sandbox operations are serialized — later requests wait for earlier ones.
+	 *
+	 * When a Redis client is configured, a cross-replica distributed lock wraps
+	 * the local mutex so concurrent execs from different replicas also serialize.
 	 *
 	 * `runtimeOptions` are forwarded to `getOrCreate` — applied only on cache miss.
 	 * A warm session ignores subsequent runtimeOptions; the first caller's flags stick.
@@ -200,56 +228,63 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		const session = await this.getOrCreate(sandboxId, runtimeOptions);
+		return this.withExecLock(sandboxId, async () => {
+			const session = await this.getOrCreate(sandboxId, runtimeOptions);
 
-		// Fast-fail: session is being destroyed — don't queue in the mutex
-		if (session.state === "closing") {
-			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-		}
-
-		return session.mutex.runExclusive(async () => {
-			// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
+			// Fast-fail: session is being destroyed — don't queue in the mutex
 			if (session.state === "closing") {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
-			session.inFlight++;
-			try {
-				return await fn(session);
-			} finally {
-				session.inFlight--;
-				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-			}
+
+			return session.mutex.runExclusive(async () => {
+				// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
+				if (session.state === "closing") {
+					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+				}
+				session.inFlight++;
+				try {
+					return await fn(session);
+				} finally {
+					session.inFlight--;
+					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				}
+			});
 		});
 	}
 
 	/**
 	 * Like withSession, but throws ENOENT if the sandbox is not already in the pool.
 	 * Use this for operation routes that should NOT auto-create sandboxes.
+	 *
+	 * The cross-replica distributed lock is acquired before the pool check so a
+	 * sandbox that exists only on another replica can't slip past serialization.
 	 */
 	async withExistingSession<T>(sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-		const session = this.sessions.get(sandboxId);
-		if (session === undefined) {
-			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
-		}
+		return this.withExecLock(sandboxId, async () => {
+			const session = this.sessions.get(sandboxId);
+			if (session === undefined) {
+				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			}
 
-		if (session.state === "closing") {
-			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-		}
-
-		return session.mutex.runExclusive(async () => {
 			if (session.state === "closing") {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
-			session.inFlight++;
-			session.lastUsed = Date.now();
-			try {
-				return await fn(session);
-			} finally {
-				session.inFlight--;
-				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-			}
+
+			return session.mutex.runExclusive(async () => {
+				if (session.state === "closing") {
+					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+				}
+				session.inFlight++;
+				session.lastUsed = Date.now();
+				try {
+					return await fn(session);
+				} finally {
+					session.inFlight--;
+					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				}
+			});
 		});
 	}
 
@@ -258,34 +293,39 @@ export class SessionManager {
 	 * from the pool and destroys backend data. Concurrent calls are idempotent — destroySandbox
 	 * is called exactly once. Returns true if the session was in the pool, false otherwise.
 	 * Even when the session is not in the pool, destroySandbox is still called for DB cleanup.
+	 *
+	 * The cross-replica distributed lock is held for the full destroy flow so a
+	 * concurrent exec on another replica cannot interleave with the teardown.
 	 */
 	async destroy(sandboxId: string): Promise<boolean> {
-		const session = this.sessions.get(sandboxId);
+		return this.withExecLock(sandboxId, async () => {
+			const session = this.sessions.get(sandboxId);
 
-		if (session === undefined) {
-			// Session not in pool — still clean up backend data
-			await this.destroySandboxFn(this.backend, sandboxId);
-			return false;
-		}
+			if (session === undefined) {
+				// Session not in pool — still clean up backend data
+				await this.destroySandboxFn(this.backend, sandboxId);
+				return false;
+			}
 
-		// Idempotent: concurrent destroy calls share the same promise
-		if (session.destroyPromise !== undefined) {
-			await session.destroyPromise;
+			// Idempotent: concurrent destroy calls share the same promise
+			if (session.destroyPromise !== undefined) {
+				await session.destroyPromise;
+				return true;
+			}
+
+			// Mark closing immediately — new withSession calls fail fast without queuing
+			session.state = "closing";
+
+			// Queue cleanup after any currently-running mutex holder finishes
+			const p = session.mutex.runExclusive(async () => {
+				this.sessions.delete(sandboxId);
+				await this.destroySandboxFn(this.backend, sandboxId);
+			});
+			session.destroyPromise = p;
+
+			await p;
 			return true;
-		}
-
-		// Mark closing immediately — new withSession calls fail fast without queuing
-		session.state = "closing";
-
-		// Queue cleanup after any currently-running mutex holder finishes
-		const p = session.mutex.runExclusive(async () => {
-			this.sessions.delete(sandboxId);
-			await this.destroySandboxFn(this.backend, sandboxId);
 		});
-		session.destroyPromise = p;
-
-		await p;
-		return true;
 	}
 
 	/**
