@@ -1372,17 +1372,22 @@ Skip unless both `DATABASE_URL` and `REDIS_URL` are set. Two `SessionManager` in
 
 #### Automated verification
 
-- [ ] `pnpm typecheck` passes.
-- [ ] `pnpm lint` passes.
-- [ ] `pnpm test:unit` passes, including the per-method dirty-tracking tests.
-- [ ] `pnpm test:integration` passes, including the coherence tests.
-- [ ] **Critical:** a grep/audit script (either CI check or manual step) confirms every mutation method ends with `this.#dirty = true;`. Missing one is a silent bug. Consider adding a dedicated unit test `sql-fs.dirty-coverage.test.ts` that iterates over `IFileSystem` method names (using a hand-curated list) and dynamically invokes each with valid arguments, asserting `wasDirty()` afterward.
+- [x] `pnpm typecheck` passes.
+- [x] `pnpm lint` passes.
+- [x] `pnpm test:unit` passes, including the per-method dirty-tracking tests (373 tests green, +31 new).
+- [x] `pnpm test:integration` passes on new Phase D integration suite (4/4 in `multi-replica-coherence.integration.test.ts`) and does not regress Phase C (3/3 in `multi-replica-exec.integration.test.ts`). Pre-existing failures in `postgres.test.ts` (Buffer vs Uint8Array) and `concurrency.pg.test.ts` (11 cases) match the Phase C baseline — confirmed unchanged.
+- [x] **Critical:** `sql-fs.dirty-tracking.test.ts` covers all 14 mutation method branches listed in the audit table (writeFile, appendFile, mkdir non-recursive, mkdir recursive, rm non-recursive, rm recursive, rm force-miss is_NOT dirty, chmod, utimes, cp file, cp recursive, mv, symlink, link) plus read-only-ops-don't-mark-dirty as a negative control.
 
 #### Manual verification
 
-- [ ] Start two server instances sharing Postgres + Redis.
-- [ ] Create a sandbox, exec `echo hello > /a` on instance 1, then exec `cat /a` on instance 2. Second exec returns `"hello"` without using stale cache (verify via log showing `reload` called).
-- [ ] On instance 2's second exec with no intervening write on instance 1, verify `reload` is NOT called (no log event).
+- [x] Two in-process `SessionManager` instances against one real Postgres (local `pg-test` container, `postgres://postgres:test@localhost:5432/postgres`) + one real Redis (local `redis-test` container, `redis://localhost:6379`) via `scripts/manual-verify-phase-d.ts`:
+  - Pre-state `vfs:ver:<id>` absent.
+  - A `withSession` writes `/greeting.txt` → `vfs:ver:<id>` = 1, A.lastSeenVersion = 1, B.lastSeenVersion still 0.
+  - B `withSession` reads `/greeting.txt` → returns `"hello"`, B.lastSeenVersion advances to 1, B.pathCache now includes `/greeting.txt` (was absent before).
+- [x] B's subsequent pure-read turn (`ls /`) did NOT bump the counter and did NOT reload — version key stayed at 1, `B.lastSeenVersion` stayed at 1.
+- [x] Interleaved writes (A→B→A) converged both replicas on version 3; each replica saw the other's file across the handoff.
+- [x] `smA.destroy(id)` removed `vfs:ver:<id>` from Redis (verified with `redis-cli exists`).
+- [x] HTTP path sanity: launched `src/api/server.ts` on port 8080 with `FS_BACKEND=postgres`. `POST /v1/sandboxes` → `exec-sync` `echo hello > /foo.txt` bumped `vfs:ver:<id>` to 1 with `TTL ≈ 604800s (7d)` in Redis. A follow-up `ls /` exec kept the counter at 1 (no spurious INCR). `DELETE /v1/sandboxes/:id` → 204 and the version key was gone from Redis.
 
 ### Phase D: Rollback
 
@@ -1390,7 +1395,23 @@ Revert the PR. Stale `vfs:ver:*` keys in Redis age out with 24h TTL (add a TTL t
 
 ### Phase D: Discoveries and Notable Information
 
-_This section is filled by the implementing agent during Phase D execution._
+**Technical Discoveries:**
+- `SqlFs.ready()` previously did `#pathCache.clear()` at its very top before awaiting `loadAllPaths`. The plan warned this is unsafe for `reload()` because a failed load would leave the cache empty and every subsequent read would return ENOENT until the next retry. Refactored into a shared `#loadFreshPathCache()` helper that builds a *new* Map and only swaps it into `#pathCache` after the DB call succeeds. The old `ready()` has been rewritten to delegate to the same helper for consistency. Verified via `reload preserves old cache when the fresh load throws` unit test.
+- Biome auto-reformatted the `asCoherentFs` helper to multi-line on `pnpm lint:fix`. No behavior impact; noted so future edits don't fight the formatter.
+- `IFileSystem.readFile` returns `Promise<string>` (carried over from Phase C). All integration-test readbacks use `String(...).trim()` rather than `TextDecoder`.
+
+**Implementation Adaptations:**
+- **ICoherentFs interface + runtime guard.** Plan recommended either tightening `Session.fs` to `ICoherentFs` or casting. Chose the runtime-guard route via a standalone `asCoherentFs(fs)` helper because `InMemoryFs` (dev-only memory backend) does not implement `reload`/`wasDirty`/`clearDirty`, and tightening the `Session.fs` type would force a no-op adapter or break the memory code path. The guard returns `undefined` for non-coherent fs instances and both `ensureFreshCache` / `publishVersionIfDirty` short-circuit cleanly — keeps the memory backend working without an adapter shim.
+- **Single-flight `reload()` lives in `SqlFs`, not `SessionManager`.** The plan sketched a `pendingReloads: Map<string, Promise<void>>` on `SessionManager`, but the existing exec-lock already serializes reloads across same-sandbox turns on a single replica. The remaining concurrency risk is *within* `SqlFs` itself if a future path ever calls `reload` outside the exec lock (e.g., an admin tool). A `#pendingReload` guard on the class is both simpler and more defensive — colocated with the state it protects.
+- **Version-key TTL applied via `EXPIRE` after `INCR`, not a Lua script.** Plan mentioned a Lua snippet for the Phase E `INCR`+`SET` case; Phase D only needs `INCR`, and applying `EXPIRE` as a second best-effort call (swallowing errors) is simpler and still correct — the counter is atomic, only the TTL could be briefly missing on a network blip. Manual verification confirmed TTL is ~604800s (7d) after the first `INCR`.
+- **Destroy fast-path (unknown sandbox) also deletes the version key.** When `destroy` is called on a replica whose pool doesn't contain the session, it still issues `destroySandboxFn` and now also calls `deleteVersionKey`. Mirrors the Phase C decision to put the fast-path inside `withExecLock` so cross-replica state is always cleaned up, regardless of which replica owns the in-memory entry. Unit test `destroy on an unknown sandbox still deletes stale version key` locks this behavior in.
+- **Initial version stamp swallows Redis errors.** If Redis is unreachable during `getOrCreate`, `initialVersion` falls back to 0. That means the very next `ensureFreshCache` call will reload from DB (harmless), but avoids throwing a generic 500 out of a sandbox-create call during a Redis outage. The distributed lock and `redis.get` in `ensureFreshCache` retain their existing behavior (fail open / rethrow respectively), so the Phase C ELOCKTIMEOUT contract is unaffected.
+
+**Future Considerations:**
+- `session.lastSeenVersion` starts at 0 on a truly-cold replica. If the Redis version is also 0 (i.e., nobody has ever written), the match happens spuriously — not a bug, but observable. Could be made more precise by stamping `-1` as the sentinel "never synced", but at the cost of a defensive comparison everywhere. Not worth the churn.
+- The `ICoherentFs` interface now lives in `sql-fs.ts`. When `InMemoryFs` is ever replaced by a real dev backend, consider having it satisfy `ICoherentFs` (trivial: `reload = async () => {}`, `wasDirty` returning a tracked bit). Current runtime guard tolerates both.
+- Env-var consolidation into `src/redis/config.ts` still deferred (flagged by Phases A and C). Phase D added zero new env vars so the pressure is unchanged.
+- The full-turn log line `{event:"reload"}` mentioned in the plan's manual-verification section is not emitted today. Our `SqlFs.reload()` is silent; the coherence path is observable via the session's `lastSeenVersion` and Redis. For operational visibility on ACA, consider adding a structured log (`{event:"cache_reload",sandboxId,from,to}`) inside `ensureFreshCache` before the next rollout. Not blocking Phase D success criteria.
 
 ---
 

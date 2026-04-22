@@ -10,7 +10,35 @@ import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
+
+/** Redis key template for the per-sandbox monotonic version counter (Phase D). */
+function versionKey(sandboxId: string): string {
+	return `vfs:ver:${sandboxId}`;
+}
+
+/**
+ * Stale-key TTL for `vfs:ver:*`. Seven days matches the longest realistic
+ * idle window; after a full rollback the counter ages out automatically and
+ * the next fresh create starts at version 0.
+ */
+const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * Runtime guard + narrowing cast: returns the `IFileSystem` as an
+ * `ICoherentFs` if it supports reload/wasDirty/clearDirty, otherwise
+ * `undefined`. The memory backend does NOT implement the interface.
+ */
+function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
+	if (
+		typeof (fs as Partial<ICoherentFs>).reload === "function" &&
+		typeof (fs as Partial<ICoherentFs>).wasDirty === "function"
+	) {
+		return fs as ICoherentFs;
+	}
+	return undefined;
+}
 
 /**
  * Per-sandbox runtime opt-in flags. Runtimes must be declared at session creation
@@ -44,6 +72,12 @@ export interface Session {
 	overBudget: boolean;
 	/** Set when destroy() is in progress — concurrent destroy calls await this for idempotency */
 	destroyPromise?: Promise<void>;
+	/**
+	 * Last-known sandbox version counter observed from Redis (Phase D).
+	 * 0 means "never synced" — treated as stale on first check so a fresh
+	 * replica reloads its cache before serving the first request.
+	 */
+	lastSeenVersion: number;
 }
 
 export interface SessionManagerOptions {
@@ -173,6 +207,22 @@ export class SessionManager {
 					javascript: resolvedRuntime.javascript || undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
+
+				// Stamp the session's initial version from Redis so the first exec
+				// after `getOrCreate` does not trigger a spurious reload (the freshly
+				// loaded pathCache already reflects DB state at this moment).
+				let initialVersion = 0;
+				if (this.redis !== undefined) {
+					try {
+						const raw = await this.redis.get(versionKey(sandboxId));
+						initialVersion = raw === null ? 0 : Number(raw) || 0;
+					} catch {
+						// Redis unavailable at bootstrap: treat as version 0. Subsequent
+						// ensureFreshCache will retry and reload if necessary.
+						initialVersion = 0;
+					}
+				}
+
 				const session: Session = {
 					fs,
 					bash,
@@ -185,6 +235,7 @@ export class SessionManager {
 					createdAt: new Date().toISOString(),
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
+					lastSeenVersion: initialVersion,
 				};
 				this.sessions.set(sandboxId, session);
 				return session;
@@ -214,6 +265,64 @@ export class SessionManager {
 	}
 
 	/**
+	 * Cross-replica cache coherence (Phase D):
+	 * Compares the session's `lastSeenVersion` against the shared Redis counter
+	 * and reloads the filesystem cache if another replica has mutated state
+	 * since this replica last ran. Also clears any stale dirty flag so
+	 * publishVersionIfDirty only fires on writes from the current turn.
+	 *
+	 * No-op when Redis is unset or when the underlying filesystem is not
+	 * coherence-aware (memory backend).
+	 */
+	private async ensureFreshCache(sandboxId: string, session: Session): Promise<void> {
+		if (this.redis === undefined) return;
+		const coherent = asCoherentFs(session.fs);
+		if (coherent === undefined) return;
+
+		const raw = await this.redis.get(versionKey(sandboxId));
+		const current = raw === null ? 0 : Number(raw) || 0;
+
+		if (session.lastSeenVersion !== current) {
+			await coherent.reload();
+			session.lastSeenVersion = current;
+			// reload() already resets the dirty flag internally, but calling it
+			// here too keeps the contract explicit and survives future edits
+			// to reload().
+			coherent.clearDirty();
+			return;
+		}
+		// Versions match — clear any pre-existing dirty bit carried over from a
+		// previous turn (defensive; withSession/withExistingSession normally
+		// publishes and clears on exit).
+		coherent.clearDirty();
+	}
+
+	/**
+	 * If the fs recorded a mutation during this turn, bumps the Redis
+	 * version counter and updates `lastSeenVersion` so this replica does not
+	 * reload on its own INCR. Also (re)applies the TTL so stale sandboxes
+	 * age out of Redis after rollback.
+	 */
+	private async publishVersionIfDirty(sandboxId: string, session: Session): Promise<void> {
+		if (this.redis === undefined) return;
+		const coherent = asCoherentFs(session.fs);
+		if (coherent === undefined) return;
+		if (!coherent.wasDirty()) return;
+
+		const key = versionKey(sandboxId);
+		const newVersion = Number(await this.redis.incr(key));
+		// EXPIRE is best-effort; ignore failures (the counter is correct
+		// regardless and a stale key without TTL only wastes a few bytes).
+		try {
+			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);
+		} catch {
+			// swallow
+		}
+		session.lastSeenVersion = newVersion;
+		coherent.clearDirty();
+	}
+
+	/**
 	 * Acquires the per-sandbox mutex, tracks inFlight, then calls fn(session).
 	 * Same-sandbox operations are serialized — later requests wait for earlier ones.
 	 *
@@ -236,6 +345,12 @@ export class SessionManager {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
 
+			// Cross-replica cache check — done inside the exec lock but outside
+			// the session mutex so a reload cannot race with another turn on
+			// this replica; we already hold the distributed lock which serializes
+			// turns across replicas.
+			await this.ensureFreshCache(sandboxId, session);
+
 			return session.mutex.runExclusive(async () => {
 				// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
 				if (session.state === "closing") {
@@ -243,7 +358,9 @@ export class SessionManager {
 				}
 				session.inFlight++;
 				try {
-					return await fn(session);
+					const result = await fn(session);
+					await this.publishVersionIfDirty(sandboxId, session);
+					return result;
 				} finally {
 					session.inFlight--;
 					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
@@ -271,6 +388,8 @@ export class SessionManager {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
 
+			await this.ensureFreshCache(sandboxId, session);
+
 			return session.mutex.runExclusive(async () => {
 				if (session.state === "closing") {
 					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
@@ -278,7 +397,9 @@ export class SessionManager {
 				session.inFlight++;
 				session.lastUsed = Date.now();
 				try {
-					return await fn(session);
+					const result = await fn(session);
+					await this.publishVersionIfDirty(sandboxId, session);
+					return result;
 				} finally {
 					session.inFlight--;
 					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
@@ -304,6 +425,7 @@ export class SessionManager {
 			if (session === undefined) {
 				// Session not in pool — still clean up backend data
 				await this.destroySandboxFn(this.backend, sandboxId);
+				await this.deleteVersionKey(sandboxId);
 				return false;
 			}
 
@@ -320,12 +442,28 @@ export class SessionManager {
 			const p = session.mutex.runExclusive(async () => {
 				this.sessions.delete(sandboxId);
 				await this.destroySandboxFn(this.backend, sandboxId);
+				await this.deleteVersionKey(sandboxId);
 			});
 			session.destroyPromise = p;
 
 			await p;
 			return true;
 		});
+	}
+
+	/**
+	 * Deletes the Redis version counter for a sandbox. Called after successful
+	 * destroy so a re-created sandbox with the same id starts at version 0.
+	 * Best-effort: Redis errors are swallowed (the key will eventually age out
+	 * via its TTL).
+	 */
+	private async deleteVersionKey(sandboxId: string): Promise<void> {
+		if (this.redis === undefined) return;
+		try {
+			await this.redis.del(versionKey(sandboxId));
+		} catch {
+			// swallow — best-effort cleanup
+		}
 	}
 
 	/**

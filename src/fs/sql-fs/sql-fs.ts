@@ -68,12 +68,35 @@ interface SqlFsOptions<Tx> {
 	readonly allowSymlinks?: boolean;
 }
 
-export class SqlFs<Tx = unknown> implements IFileSystem {
+/**
+ * Narrow extension of `IFileSystem` with cache-coherence affordances used by
+ * `SessionManager` for cross-replica reload-on-handoff (Phase D).
+ *
+ * `SqlFs` satisfies this interface. The `memory` backend (InMemoryFs) does
+ * NOT — call sites must guard via `"reload" in fs` before casting.
+ */
+export interface ICoherentFs extends IFileSystem {
+	/** Drops all in-memory caches and repopulates from the source of truth. */
+	reload(): Promise<void>;
+	/** True iff at least one mutation has run since the last clearDirty. */
+	wasDirty(): boolean;
+	/** Resets the dirty flag — called after publishing a new version. */
+	clearDirty(): void;
+}
+
+export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
+	#dirty = false;
+	/**
+	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
+	 * so a thundering herd across callers does not issue N loadAllPaths queries
+	 * against the DB simultaneously.
+	 */
+	#pendingReload: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -84,6 +107,21 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
 			sizeCalculation: (value) => value.byteLength,
 		});
+	}
+
+	// ── Dirty tracking (Phase D) ──────────────────────────────────────────────
+
+	/** @internal Used by tests to simulate a mutation. */
+	_markDirty(): void {
+		this.#dirty = true;
+	}
+
+	wasDirty(): boolean {
+		return this.#dirty;
+	}
+
+	clearDirty(): void {
+		this.#dirty = false;
 	}
 
 	// ── Content cache helpers (for use by readFile/writeFile in later stories) ──
@@ -185,18 +223,61 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	}
 
 	/**
-	 * Initialises the in-memory pathCache by loading all paths from the DB
-	 * via a single recursive CTE query.  Must be called once before any FS op.
+	 * Loads the full path tree from the DB without touching in-memory caches.
+	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
+	 * On error the caller's caches are left untouched.
 	 */
-	async ready(): Promise<void> {
+	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
 		const entries = await this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await this.#dialect.loadAllPaths(tx);
 		});
-		this.#pathCache.clear();
+		const fresh = new Map<string, PathCacheEntry>();
 		for (const { path, ...entry } of entries) {
-			this.#pathCache.set(path, entry);
+			fresh.set(path, entry);
 		}
+		return fresh;
+	}
+
+	/**
+	 * Initialises the in-memory pathCache by loading all paths from the DB
+	 * via a single recursive CTE query.  Must be called once before any FS op.
+	 */
+	async ready(): Promise<void> {
+		const fresh = await this.#loadFreshPathCache();
+		this.#pathCache.clear();
+		for (const [p, e] of fresh) this.#pathCache.set(p, e);
+	}
+
+	/**
+	 * Drops the in-memory caches and repopulates `#pathCache` from the database.
+	 * Used on cross-replica cache-version mismatch (Phase D).
+	 *
+	 * Atomicity: the fresh snapshot is loaded BEFORE the existing caches are
+	 * cleared. If the DB call throws, the old caches remain intact so readers
+	 * do not see a temporary empty state (which would return ENOENT for
+	 * everything until the next successful reload).
+	 *
+	 * Concurrency: deduplicated via `#pendingReload` so simultaneous callers
+	 * share a single DB round trip.
+	 */
+	async reload(): Promise<void> {
+		if (this.#pendingReload !== undefined) {
+			return this.#pendingReload;
+		}
+		const p = (async (): Promise<void> => {
+			try {
+				const fresh = await this.#loadFreshPathCache();
+				this.#pathCache.clear();
+				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
+				this.#contentCache.clear();
+				this.#dirty = false;
+			} finally {
+				this.#pendingReload = undefined;
+			}
+		})();
+		this.#pendingReload = p;
+		return p;
 	}
 
 	// ── IFileSystem: cache-served methods ────────────────────────────────────────
@@ -242,6 +323,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			symlinkTarget: null,
 		});
 		if (bytes.byteLength > 0) this.#contentCache.set(inodeId, bytes);
+		this.#dirty = true;
 	}
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
@@ -297,6 +379,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: sha256,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async mkdir(inputPath: string, options?: MkdirOptions): Promise<void> {
@@ -335,6 +418,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 				}
 				current = next;
 			}
+			this.#dirty = true;
 			return;
 		}
 
@@ -362,6 +446,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: null,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async rm(inputPath: string, options?: RmOptions): Promise<void> {
@@ -411,6 +496,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 				if (e) this.#contentCache.delete(e.inodeId);
 				this.#pathCache.delete(p);
 			}
+			this.#dirty = true;
 			return;
 		}
 
@@ -427,6 +513,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#contentCache.delete(entry.inodeId);
 		this.#pathCache.delete(path);
+		this.#dirty = true;
 	}
 
 	async chmod(inputPath: string, mode: number): Promise<void> {
@@ -439,6 +526,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(path, { ...entry, mode });
+		this.#dirty = true;
 	}
 
 	async utimes(inputPath: string, _atime: Date, mtime: Date): Promise<void> {
@@ -451,6 +539,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(path, { ...entry, mtime });
+		this.#dirty = true;
 	}
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
@@ -609,6 +698,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 				const srcE = this.#pathCache.get(srcPath)!;
 				this.#pathCache.set(destPath, { ...srcE, inodeId, mtime });
 			}
+			this.#dirty = true;
 			return;
 		}
 
@@ -642,6 +732,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: srcEntry.contentSha256,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async mv(inputSrc: string, inputDest: string): Promise<void> {
@@ -702,6 +793,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		for (const [oldPath, entry] of snapshot) {
 			this.#pathCache.set(dest + oldPath.slice(src.length), entry);
 		}
+		this.#dirty = true;
 	}
 
 	resolvePath(base: string, path: string): string {
@@ -741,6 +833,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: null,
 			symlinkTarget: target,
 		});
+		this.#dirty = true;
 	}
 
 	async link(inputExistingPath: string, inputNewPath: string): Promise<void> {
@@ -759,6 +852,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(newPath, { ...srcEntry });
+		this.#dirty = true;
 	}
 
 	async readlink(inputPath: string): Promise<string> {
