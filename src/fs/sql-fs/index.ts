@@ -10,6 +10,7 @@ import { InMemoryFs } from "just-bash";
 import { getRedisClient } from "../../redis/client.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
+import { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
@@ -36,6 +37,12 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 							maxBytes: Number(process.env.REDIS_BLOB_MAX_BYTES ?? 8 * 1024 * 1024),
 						})
 					: undefined;
+			const pathSnapshotEnabled = redis && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+			const pathSnapshot = pathSnapshotEnabled
+				? new RedisPathSnapshot(redis, {
+						ttlMs: Number(process.env.REDIS_PATH_SNAPSHOT_TTL_MS ?? 60 * 60 * 1000),
+					})
+				: undefined;
 			const dialect = new PostgresDialect(databaseUrl, blobCache);
 			await dialect.connect();
 			// Initialize the sandbox in the DB (creates root inode structure).
@@ -48,7 +55,12 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 				const sqlErr = e as { code?: string };
 				if (sqlErr.code !== "23505") throw e;
 			}
-			const fs = new SqlFs({ dialect, sandboxId });
+			const fs = new SqlFs({
+				dialect,
+				sandboxId,
+				redis: redis ?? undefined,
+				pathSnapshot,
+			});
 			await fs.ready();
 			return fs;
 		}

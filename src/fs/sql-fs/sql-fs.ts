@@ -8,6 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
@@ -20,6 +21,7 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
+import type { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
@@ -66,6 +68,19 @@ interface SqlFsOptions<Tx> {
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
+	/**
+	 * Optional Redis client used to read the per-sandbox version counter
+	 * (`vfs:ver:{sandboxId}`) during cold-start / reload. Required together
+	 * with `pathSnapshot` for snapshot-backed cold starts (Phase E).
+	 */
+	readonly redis?: Redis;
+	/**
+	 * Optional Redis path snapshot. When both `redis` and `pathSnapshot` are
+	 * provided, `#loadFreshPathCache` attempts a snapshot read before falling
+	 * back to `dialect.loadAllPaths`. Strict version equality against the
+	 * counter is required (Edge Case §3).
+	 */
+	readonly pathSnapshot?: RedisPathSnapshot;
 }
 
 /**
@@ -90,6 +105,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
+	readonly #redis: Redis | undefined;
+	readonly #pathSnapshot: RedisPathSnapshot | undefined;
 	#dirty = false;
 	/**
 	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
@@ -102,11 +119,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
+		this.#redis = opts.redis;
+		this.#pathSnapshot = opts.pathSnapshot;
 		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
 			sizeCalculation: (value) => value.byteLength,
 		});
+	}
+
+	/** @internal exposed for the Redis path-snapshot writer (Phase E). */
+	_getPathCache(): Map<string, PathCacheEntry> {
+		return this.#pathCache;
 	}
 
 	// ── Dirty tracking (Phase D) ──────────────────────────────────────────────
@@ -226,8 +250,46 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * Loads the full path tree from the DB without touching in-memory caches.
 	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
 	 * On error the caller's caches are left untouched.
+	 *
+	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
+	 * snapshot read first. The embedded `version` must equal the current
+	 * `vfs:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
+	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
 	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
+		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
+		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
+			try {
+				const raw = await this.#redis.get(`vfs:ver:${this.#sandboxId}`);
+				const currentVersion = raw === null ? 0 : Number(raw) || 0;
+				const snap = await this.#pathSnapshot.read(this.#sandboxId);
+				if (snap === null) {
+					missReason = "no_key";
+				} else if (snap.version !== currentVersion) {
+					missReason = "version_mismatch";
+				} else {
+					console.log(
+						JSON.stringify({
+							event: "path_snapshot_hit",
+							sandboxId: this.#sandboxId,
+							version: currentVersion,
+							entries: snap.entries.size,
+						}),
+					);
+					return snap.entries;
+				}
+			} catch (err) {
+				missReason = "error";
+				console.error(
+					JSON.stringify({
+						event: "snapshot_version_check_error",
+						sandboxId: this.#sandboxId,
+						error: (err as Error).message,
+					}),
+				);
+			}
+		}
+		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
 		const entries = await this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await this.#dialect.loadAllPaths(tx);

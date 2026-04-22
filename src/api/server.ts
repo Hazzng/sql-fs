@@ -8,6 +8,7 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import { getRedisClient } from "../redis/client.js";
 import { type AuthVariables, authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
@@ -25,14 +26,24 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 
 // ── Session manager (lazy — no DB access until first request) ─────────────────
 
+const redisClient = getRedisClient();
+const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+const pathSnapshot =
+	pathSnapshotEnabled && redisClient
+		? new RedisPathSnapshot(redisClient, {
+				ttlMs: Number(process.env.REDIS_PATH_SNAPSHOT_TTL_MS ?? 60 * 60 * 1000),
+			})
+		: undefined;
+
 const sessionManager = new SessionManager({
 	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
-	redis: getRedisClient(),
+	redis: redisClient,
 	execLockOptions: {
 		leaseMs: Number(process.env.REDIS_EXEC_LOCK_LEASE_MS ?? 60_000),
 		renewMs: Number(process.env.REDIS_EXEC_LOCK_RENEW_MS ?? 20_000),
 		acquireTimeoutMs: Number(process.env.REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS ?? 300_000),
 	},
+	pathSnapshot,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────

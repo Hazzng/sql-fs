@@ -10,8 +10,22 @@ import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import type { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
+import type { PathCacheEntry } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
+
+/**
+ * Internal structural type: the subset of `SqlFs` the session manager touches
+ * for Phase E snapshot writes. Declared here (rather than exported from sql-fs)
+ * to keep the cross-module surface narrow.
+ */
+type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
+
+/** Narrowing helper: returns the fs as a snapshot writer if the hook is present. */
+function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
+	return typeof (fs as Partial<SnapshotWriterFs>)._getPathCache === "function" ? (fs as SnapshotWriterFs) : undefined;
+}
 
 /** Redis key template for the per-sandbox monotonic version counter (Phase D). */
 function versionKey(sandboxId: string): string {
@@ -102,6 +116,12 @@ export interface SessionManagerOptions {
 	readonly redis?: Redis;
 	/** Overrides for the distributed exec lock (lease/renew/acquire timeouts). */
 	readonly execLockOptions?: Partial<DistributedLockOptions>;
+	/**
+	 * Optional Redis path-snapshot cache (Phase E). When provided, the manager
+	 * writes a fresh snapshot after each version bump and deletes the snapshot
+	 * on sandbox destroy.
+	 */
+	readonly pathSnapshot?: RedisPathSnapshot;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -123,6 +143,7 @@ export class SessionManager {
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
+	private readonly pathSnapshot: RedisPathSnapshot | undefined;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -144,6 +165,7 @@ export class SessionManager {
 		maxConcurrentJs,
 		redis,
 		execLockOptions,
+		pathSnapshot,
 	}: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
@@ -152,6 +174,7 @@ export class SessionManager {
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.redis = redis;
 		this.execLockOptions = execLockOptions;
+		this.pathSnapshot = pathSnapshot;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -318,6 +341,16 @@ export class SessionManager {
 		} catch {
 			// swallow
 		}
+		// Phase E: persist the pathCache snapshot tagged with the new version so
+		// other replicas can cold-start without hitting the DB. Non-atomic with
+		// INCR — strict version-equality in the reader catches the window.
+		// `write` swallows Redis errors internally (fail open).
+		if (this.pathSnapshot !== undefined) {
+			const writer = asSnapshotWriter(coherent);
+			if (writer !== undefined) {
+				await this.pathSnapshot.write(sandboxId, newVersion, writer._getPathCache());
+			}
+		}
 		session.lastSeenVersion = newVersion;
 		coherent.clearDirty();
 	}
@@ -426,6 +459,9 @@ export class SessionManager {
 				// Session not in pool — still clean up backend data
 				await this.destroySandboxFn(this.backend, sandboxId);
 				await this.deleteVersionKey(sandboxId);
+				if (this.pathSnapshot !== undefined) {
+					await this.pathSnapshot.delete(sandboxId);
+				}
 				return false;
 			}
 
@@ -443,6 +479,9 @@ export class SessionManager {
 				this.sessions.delete(sandboxId);
 				await this.destroySandboxFn(this.backend, sandboxId);
 				await this.deleteVersionKey(sandboxId);
+				if (this.pathSnapshot !== undefined) {
+					await this.pathSnapshot.delete(sandboxId);
+				}
 			});
 			session.destroyPromise = p;
 
