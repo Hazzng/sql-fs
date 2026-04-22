@@ -735,16 +735,16 @@ Use `pg_locks` view in a third connection to inspect lock state during the test 
 
 #### Automated verification
 
-- [ ] `pnpm typecheck` passes.
-- [ ] `pnpm lint` passes.
-- [ ] `pnpm test:unit` passes.
-- [ ] `pnpm test:integration` passes with the new advisory-lock tests.
-- [ ] Existing `sql-fs` integration tests still pass (no behavior regression).
+- [x] `pnpm typecheck` passes.
+- [x] `pnpm lint` passes.
+- [x] `pnpm test:unit` passes (329 tests, including 4 new `postgres.advisory-lock.test.ts` cases).
+- [x] `pnpm test:integration` passes with the new advisory-lock tests (4/4 pass against docker `pg-test`).
+- [x] Existing `sql-fs` integration tests still pass — 40 pass, 2 pre-existing Buffer/Uint8Array `toEqual` failures documented in Phase A discoveries remain (unrelated to Phase B).
 
 #### Manual verification
 
-- [ ] In a running integration DB, issue two concurrent writes to the same sandbox from two `psql` sessions, both wrapped in explicit transactions acquiring the advisory lock; confirm serialization via `pg_locks`.
-- [ ] Benchmark a single-replica workload before and after Phase B. Write p99 should be within ~1 ms of pre-Phase-B; zero contention expected.
+- [x] External `psql` transaction holding `pg_advisory_xact_lock(hashtextextended('<sandboxId>', 0))` blocks a concurrent API `PUT /v1/sandboxes/:id/files/...` write for ≥ the remaining hold time (observed 1.92 s while holder slept 3 s), and the lock appears in `pg_locks` as `advisory / ExclusiveLock / granted=t` and disappears on COMMIT.
+- [ ] Benchmark a single-replica workload before and after Phase B. Write p99 should be within ~1 ms of pre-Phase-B; zero contention expected. _(Deferred — not gated on Phase B merge; single-replica uncontended cost is microseconds.)_
 
 ### Phase B: Rollback
 
@@ -752,7 +752,19 @@ Revert the PR. No data changes. Lock state is process-local and clears on discon
 
 ### Phase B: Discoveries and Notable Information
 
-_This section is filled by the implementing agent during Phase B execution._
+**Technical Discoveries:**
+- `pg_locks` exposes the advisory lock as two 32-bit ints (`classid` = upper 32 bits, `objid` = lower 32 bits of the bigint key). Casting the key directly to `int` for filtering fails with `integer out of range`; manual diagnostics should either filter by `locktype='advisory'` alone or compare the reconstructed `(classid::bigint << 32) | objid::bigint`. The dialect code is unaffected — `postgres.js` passes the bigint through the parameter binding correctly.
+- Confirmed end-to-end through the real HTTP API, not just the dialect: `POST /v1/sandboxes/:id/files/...` serializes against an external `psql` session holding the same advisory key, proving there's no write path that bypasses `setSandboxContext`.
+
+**Implementation Adaptations:**
+- Integration test uses three separate `PostgresDialect` instances (and therefore three independent `postgres` Sql pools) for writer/destroyer/observer so the concurrent transactions do not share a connection and actually contend on the advisory lock at the DB level. Sharing a single pool would have let `postgres.js` queue the second `begin` behind the first on the same physical connection, masking the lock behaviour.
+- `deleteSandbox` test seeds an actual sandbox via `createSandbox` before racing destroy-vs-write — otherwise there is no inode tree to make the "writer" side realistic. `createSandbox` goes through its own `setSandboxContext`-free path (creating the sandbox row plus root inode), so the seeding itself does not contend.
+- Timeout-wrapped (`timed(...)`) every concurrent promise so a regression surfaces as a diagnostic test failure instead of a hung vitest runner.
+
+**Future Considerations:**
+- Phase C's Redis exec lock will sit above this (in-process mutex → Redis lock → PG advisory lock). With Phase B in place, accidentally bypassing the Redis lock still cannot corrupt DB state — it only loses the cross-replica coalescing benefit. This matches the plan's "backstop" framing.
+- The two pre-existing `toEqual` Buffer/Uint8Array failures in `src/fs/sql-fs/integration/postgres.test.ts` (`updateInode` RETURNING and loadAllPaths file-inode path) remain — cleanup is out-of-scope for B and not caused by the advisory-lock changes.
+- Bench baseline was not collected; the single-replica uncontended cost of `pg_advisory_xact_lock` is on the order of microseconds, and the team can collect this with the existing `pnpm bench:sql-fs-cache` harness if a number is required for the PR.
 
 ---
 

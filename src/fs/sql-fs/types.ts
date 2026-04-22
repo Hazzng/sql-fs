@@ -109,9 +109,12 @@ export interface SqlDialect<Tx = unknown> {
 	// ── Sandbox context ──────────────────────────────────────────────────────────
 
 	/**
-	 * Sets the per-transaction sandbox context so that RLS policies and stored
-	 * procedures can scope queries to the current sandbox.
-	 * Executes SET LOCAL app.sandbox_id = $1 inside the given transaction.
+	 * Sets the per-transaction sandbox context so RLS policies and stored procedures
+	 * can scope queries to the current sandbox, and acquires a per-sandbox advisory lock
+	 * (pg_advisory_xact_lock) so cross-replica writers serialize at the DB layer.
+	 *
+	 * The advisory lock is transaction-scoped — automatically released on COMMIT/ROLLBACK.
+	 * Compatible with transaction-mode connection pooling (pgbouncer, Neon pooler).
 	 */
 	setSandboxContext(tx: Tx, sandboxId: string): Promise<void>;
 
