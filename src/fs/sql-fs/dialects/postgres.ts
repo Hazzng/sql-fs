@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { createEnoent, translateSqlError } from "../errors.js";
+import type { RedisBlobCache } from "../redis-blob-cache.js";
 import type {
 	BulkIngestFile,
 	CreateInodeOpts,
@@ -24,9 +25,11 @@ type PgTx = postgres.TransactionSql;
 export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
+	readonly #blobCache: RedisBlobCache | undefined;
 
-	constructor(connectionString: string) {
+	constructor(connectionString: string, blobCache?: RedisBlobCache) {
 		this.connectionString = connectionString;
+		this.#blobCache = blobCache;
 	}
 
 	// ── Connection ────────────────────────────────────────────────────────────────
@@ -277,11 +280,24 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			VALUES (${sha256}, ${data}, ${data.length})
 			ON CONFLICT (sha256) DO NOTHING
 		`;
+		if (this.#blobCache) {
+			await this.#blobCache.set(sha256, data);
+		}
 	}
 
 	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
+		if (this.#blobCache) {
+			const cached = await this.#blobCache.get(sha256);
+			if (cached !== null) return cached;
+		}
 		const rows = await tx<{ data: Buffer }[]>`SELECT data FROM blobs WHERE sha256 = ${sha256}`;
-		return rows[0]?.data ?? null;
+		const data = rows[0]?.data;
+		if (!data) return null;
+		const bytes = new Uint8Array(data);
+		if (this.#blobCache) {
+			await this.#blobCache.set(sha256, bytes);
+		}
+		return bytes;
 	}
 
 	// US-014

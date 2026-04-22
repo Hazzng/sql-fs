@@ -7,7 +7,9 @@
 
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
+import { getRedisClient } from "../../redis/client.js";
 import { PostgresDialect } from "./dialects/postgres.js";
+import { RedisBlobCache } from "./redis-blob-cache.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
@@ -25,7 +27,16 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			if (!databaseUrl) {
 				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
 			}
-			const dialect = new PostgresDialect(databaseUrl);
+			const redis = getRedisClient();
+			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+			const blobCache =
+				redis && blobCacheEnabled
+					? new RedisBlobCache(redis, {
+							ttlMs: Number(process.env.REDIS_BLOB_CACHE_TTL_MS ?? 24 * 60 * 60 * 1000),
+							maxBytes: Number(process.env.REDIS_BLOB_MAX_BYTES ?? 8 * 1024 * 1024),
+						})
+					: undefined;
+			const dialect = new PostgresDialect(databaseUrl, blobCache);
 			await dialect.connect();
 			// Initialize the sandbox in the DB (creates root inode structure).
 			// Ignore unique violation (23505) — sandbox already exists on reconnect.
