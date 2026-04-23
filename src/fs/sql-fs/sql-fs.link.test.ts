@@ -38,6 +38,7 @@ describe("SqlFs.link() — hardlink creation", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [dirEntry("/", 1n), dirEntry("/home", 2n), fileEntry("/home/file.txt", 3n)]),
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),

@@ -47,6 +47,7 @@ describe("SqlFs.rm (recursive) — post-order hardlink-safe deletion", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			// 3-level nested structure: /deep (dir) → /deep/mid (dir) → /deep/mid/leaf.txt + /deep/mid/other.txt (files)
 			loadAllPaths: vi.fn(async () => [
 				dirEntry("/", 1n),
@@ -162,6 +163,7 @@ describe("SqlFs.rm (recursive) — hardlink preservation", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [
 				dirEntry("/", 1n),
 				dirEntry("/dir", 10n),

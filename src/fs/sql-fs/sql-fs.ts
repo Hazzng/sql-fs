@@ -8,6 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
@@ -20,6 +21,7 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
+import type { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
@@ -66,24 +68,84 @@ interface SqlFsOptions<Tx> {
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
+	/**
+	 * Optional Redis client used to read the per-sandbox version counter
+	 * (`vfs:ver:{sandboxId}`) during cold-start / reload. Required together
+	 * with `pathSnapshot` for snapshot-backed cold starts (Phase E).
+	 */
+	readonly redis?: Redis;
+	/**
+	 * Optional Redis path snapshot. When both `redis` and `pathSnapshot` are
+	 * provided, `#loadFreshPathCache` attempts a snapshot read before falling
+	 * back to `dialect.loadAllPaths`. Strict version equality against the
+	 * counter is required (Edge Case §3).
+	 */
+	readonly pathSnapshot?: RedisPathSnapshot;
 }
 
-export class SqlFs<Tx = unknown> implements IFileSystem {
+/**
+ * Narrow extension of `IFileSystem` with cache-coherence affordances used by
+ * `SessionManager` for cross-replica reload-on-handoff (Phase D).
+ *
+ * `SqlFs` satisfies this interface. The `memory` backend (InMemoryFs) does
+ * NOT — call sites must guard via `"reload" in fs` before casting.
+ */
+export interface ICoherentFs extends IFileSystem {
+	/** Drops all in-memory caches and repopulates from the source of truth. */
+	reload(): Promise<void>;
+	/** True iff at least one mutation has run since the last clearDirty. */
+	wasDirty(): boolean;
+	/** Resets the dirty flag — called after publishing a new version. */
+	clearDirty(): void;
+}
+
+export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
+	readonly #redis: Redis | undefined;
+	readonly #pathSnapshot: RedisPathSnapshot | undefined;
+	#dirty = false;
+	/**
+	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
+	 * so a thundering herd across callers does not issue N loadAllPaths queries
+	 * against the DB simultaneously.
+	 */
+	#pendingReload: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
+		this.#redis = opts.redis;
+		this.#pathSnapshot = opts.pathSnapshot;
 		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
 			sizeCalculation: (value) => value.byteLength,
 		});
+	}
+
+	/** @internal exposed for the Redis path-snapshot writer (Phase E). */
+	_getPathCache(): Map<string, PathCacheEntry> {
+		return this.#pathCache;
+	}
+
+	// ── Dirty tracking (Phase D) ──────────────────────────────────────────────
+
+	/** @internal Used by tests to simulate a mutation. */
+	_markDirty(): void {
+		this.#dirty = true;
+	}
+
+	wasDirty(): boolean {
+		return this.#dirty;
+	}
+
+	clearDirty(): void {
+		this.#dirty = false;
 	}
 
 	// ── Content cache helpers (for use by readFile/writeFile in later stories) ──
@@ -106,6 +168,20 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		// Writers: acquire the per-sandbox advisory lock alongside RLS context so
+		// concurrent mutators across replicas serialize at the DB layer.
+		return this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+			return await fn(tx);
+		});
+	}
+
+	/**
+	 * Read-only transaction helper. Sets the RLS sandbox context but skips the
+	 * advisory lock so pure reads do NOT queue behind concurrent writers on the
+	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
+	 */
+	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		return this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await fn(tx);
@@ -161,8 +237,10 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		if (!entry) throw createEnoent(path);
 		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
 
-		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally
-		const resolvedId = await this.#withTx((tx) => this.#dialect.resolvePath(tx, path, true));
+		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally.
+		// Read-only resolution: skip the per-sandbox advisory lock so reads
+		// don't queue behind writers.
+		const resolvedId = await this.#withReadTx((tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [, e] of this.#pathCache) {
 			if (e.inodeId === resolvedId) return e;
 		}
@@ -185,18 +263,99 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 	}
 
 	/**
-	 * Initialises the in-memory pathCache by loading all paths from the DB
-	 * via a single recursive CTE query.  Must be called once before any FS op.
+	 * Loads the full path tree from the DB without touching in-memory caches.
+	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
+	 * On error the caller's caches are left untouched.
+	 *
+	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
+	 * snapshot read first. The embedded `version` must equal the current
+	 * `vfs:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
+	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
-	async ready(): Promise<void> {
+	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
+		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
+		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
+			try {
+				const raw = await this.#redis.get(`vfs:ver:${this.#sandboxId}`);
+				const currentVersion = raw === null ? 0 : Number(raw) || 0;
+				const snap = await this.#pathSnapshot.read(this.#sandboxId);
+				if (snap === null) {
+					missReason = "no_key";
+				} else if (snap.version !== currentVersion) {
+					missReason = "version_mismatch";
+				} else {
+					console.log(
+						JSON.stringify({
+							event: "path_snapshot_hit",
+							sandboxId: this.#sandboxId,
+							version: currentVersion,
+							entries: snap.entries.size,
+						}),
+					);
+					return snap.entries;
+				}
+			} catch (err) {
+				missReason = "error";
+				console.error(
+					JSON.stringify({
+						event: "snapshot_version_check_error",
+						sandboxId: this.#sandboxId,
+						error: (err as Error).message,
+					}),
+				);
+			}
+		}
+		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
 		const entries = await this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await this.#dialect.loadAllPaths(tx);
 		});
-		this.#pathCache.clear();
+		const fresh = new Map<string, PathCacheEntry>();
 		for (const { path, ...entry } of entries) {
-			this.#pathCache.set(path, entry);
+			fresh.set(path, entry);
 		}
+		return fresh;
+	}
+
+	/**
+	 * Initialises the in-memory pathCache by loading all paths from the DB
+	 * via a single recursive CTE query.  Must be called once before any FS op.
+	 */
+	async ready(): Promise<void> {
+		const fresh = await this.#loadFreshPathCache();
+		this.#pathCache.clear();
+		for (const [p, e] of fresh) this.#pathCache.set(p, e);
+	}
+
+	/**
+	 * Drops the in-memory caches and repopulates `#pathCache` from the database.
+	 * Used on cross-replica cache-version mismatch (Phase D).
+	 *
+	 * Atomicity: the fresh snapshot is loaded BEFORE the existing caches are
+	 * cleared. If the DB call throws, the old caches remain intact so readers
+	 * do not see a temporary empty state (which would return ENOENT for
+	 * everything until the next successful reload).
+	 *
+	 * Concurrency: deduplicated via `#pendingReload` so simultaneous callers
+	 * share a single DB round trip.
+	 */
+	async reload(): Promise<void> {
+		if (this.#pendingReload !== undefined) {
+			return this.#pendingReload;
+		}
+		const p = (async (): Promise<void> => {
+			try {
+				const fresh = await this.#loadFreshPathCache();
+				this.#pathCache.clear();
+				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
+				this.#contentCache.clear();
+				this.#dirty = false;
+			} finally {
+				this.#pendingReload = undefined;
+			}
+		})();
+		this.#pendingReload = p;
+		return p;
 	}
 
 	// ── IFileSystem: cache-served methods ────────────────────────────────────────
@@ -242,6 +401,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			symlinkTarget: null,
 		});
 		if (bytes.byteLength > 0) this.#contentCache.set(inodeId, bytes);
+		this.#dirty = true;
 	}
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
@@ -297,6 +457,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: sha256,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async mkdir(inputPath: string, options?: MkdirOptions): Promise<void> {
@@ -308,11 +469,16 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			// Walk from root, creating missing segments
 			const segments = path.split("/").filter(Boolean);
 			let current = "/";
+			let created = false;
 			for (const seg of segments) {
 				const next = current === "/" ? `/${seg}` : `${current}/${seg}`;
 				if (!this.#pathCache.has(next)) {
 					const parentEntry = this.#pathCache.get(current);
 					if (!parentEntry) throw createEnoent(current);
+					// Reject non-directory ancestors before any DB work. Otherwise
+					// mkdir -p /a/b with /a as a file would silently insert a
+					// dirent under the file's inode (dirents has no FK on kind).
+					if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
 					const inodeId = await this.#withTx(async (tx) => {
 						const id = await this.#dialect.createInode(tx, {
 							sandboxId: this.#sandboxId,
@@ -332,9 +498,11 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 						contentSha256: null,
 						symlinkTarget: null,
 					});
+					created = true;
 				}
 				current = next;
 			}
+			if (created) this.#dirty = true;
 			return;
 		}
 
@@ -362,6 +530,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: null,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async rm(inputPath: string, options?: RmOptions): Promise<void> {
@@ -411,6 +580,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 				if (e) this.#contentCache.delete(e.inodeId);
 				this.#pathCache.delete(p);
 			}
+			this.#dirty = true;
 			return;
 		}
 
@@ -427,6 +597,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 		this.#contentCache.delete(entry.inodeId);
 		this.#pathCache.delete(path);
+		this.#dirty = true;
 	}
 
 	async chmod(inputPath: string, mode: number): Promise<void> {
@@ -439,6 +610,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(path, { ...entry, mode });
+		this.#dirty = true;
 	}
 
 	async utimes(inputPath: string, _atime: Date, mtime: Date): Promise<void> {
@@ -451,6 +623,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(path, { ...entry, mtime });
+		this.#dirty = true;
 	}
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
@@ -465,8 +638,9 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return new TextDecoder().decode(cached);
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
-		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
+		// Read-only: skip the advisory lock.
+		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return new TextDecoder().decode(bytes);
@@ -482,8 +656,9 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
-		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
+		// Read-only: skip the advisory lock.
+		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
@@ -609,6 +784,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 				const srcE = this.#pathCache.get(srcPath)!;
 				this.#pathCache.set(destPath, { ...srcE, inodeId, mtime });
 			}
+			this.#dirty = true;
 			return;
 		}
 
@@ -642,6 +818,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: srcEntry.contentSha256,
 			symlinkTarget: null,
 		});
+		this.#dirty = true;
 	}
 
 	async mv(inputSrc: string, inputDest: string): Promise<void> {
@@ -702,6 +879,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		for (const [oldPath, entry] of snapshot) {
 			this.#pathCache.set(dest + oldPath.slice(src.length), entry);
 		}
+		this.#dirty = true;
 	}
 
 	resolvePath(base: string, path: string): string {
@@ -741,6 +919,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 			contentSha256: null,
 			symlinkTarget: target,
 		});
+		this.#dirty = true;
 	}
 
 	async link(inputExistingPath: string, inputNewPath: string): Promise<void> {
@@ -759,6 +938,7 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 		});
 
 		this.#pathCache.set(newPath, { ...srcEntry });
+		this.#dirty = true;
 	}
 
 	async readlink(inputPath: string): Promise<string> {
@@ -771,7 +951,8 @@ export class SqlFs<Tx = unknown> implements IFileSystem {
 
 	async realpath(inputPath: string): Promise<string> {
 		const path = validatePath(inputPath);
-		const resolvedInodeId = await this.#withTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
+		// Read-only: skip the advisory lock.
+		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
 			if (entry.inodeId === resolvedInodeId) return p;
 		}

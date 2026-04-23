@@ -7,7 +7,11 @@
 
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
+import { getRedisClient } from "../../redis/client.js";
+import { parseNonNegativeInt } from "../../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
+import { RedisBlobCache } from "./redis-blob-cache.js";
+import { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
@@ -25,7 +29,22 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			if (!databaseUrl) {
 				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
 			}
-			const dialect = new PostgresDialect(databaseUrl);
+			const redis = getRedisClient();
+			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+			const blobCache =
+				redis && blobCacheEnabled
+					? new RedisBlobCache(redis, {
+							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
+							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
+						})
+					: undefined;
+			const pathSnapshotEnabled = redis && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+			const pathSnapshot = pathSnapshotEnabled
+				? new RedisPathSnapshot(redis, {
+						ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
+					})
+				: undefined;
+			const dialect = new PostgresDialect(databaseUrl, blobCache);
 			await dialect.connect();
 			// Initialize the sandbox in the DB (creates root inode structure).
 			// Ignore unique violation (23505) — sandbox already exists on reconnect.
@@ -37,7 +56,12 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 				const sqlErr = e as { code?: string };
 				if (sqlErr.code !== "23505") throw e;
 			}
-			const fs = new SqlFs({ dialect, sandboxId });
+			const fs = new SqlFs({
+				dialect,
+				sandboxId,
+				redis: redis ?? undefined,
+				pathSnapshot,
+			});
 			await fs.ready();
 			return fs;
 		}

@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { createEnoent, translateSqlError } from "../errors.js";
+import type { RedisBlobCache } from "../redis-blob-cache.js";
 import type {
 	BulkIngestFile,
 	CreateInodeOpts,
@@ -24,9 +25,11 @@ type PgTx = postgres.TransactionSql;
 export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
+	readonly #blobCache: RedisBlobCache | undefined;
 
-	constructor(connectionString: string) {
+	constructor(connectionString: string, blobCache?: RedisBlobCache) {
 		this.connectionString = connectionString;
+		this.#blobCache = blobCache;
 	}
 
 	// ── Connection ────────────────────────────────────────────────────────────────
@@ -49,7 +52,17 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Sandbox context ───────────────────────────────────────────────────────────
 
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
+		// RLS context only — no advisory lock. Read-only paths (cold-start load,
+		// cache reload) use this to avoid serializing against unrelated writers.
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
+	}
+
+	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
+		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
+		// Cross-replica write serialization at the DB layer.
+		// Transaction-scoped; auto-released on COMMIT/ROLLBACK.
+		// Works with transaction-mode pooling (Neon/pgbouncer) — session-scoped would not.
+		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 	}
 
 	// ── Private helpers ───────────────────────────────────────────────────────────
@@ -91,6 +104,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<void> {
+		// Acquire advisory lock before any destructive SQL so in-flight writes
+		// (from other replicas or code paths that bypass withSession) serialize first.
+		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
 	}
 
@@ -277,11 +293,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			VALUES (${sha256}, ${data}, ${data.length})
 			ON CONFLICT (sha256) DO NOTHING
 		`;
+		// Fire-and-forget: don't hold the PG transaction (and the per-sandbox
+		// advisory lock acquired in setSandboxContext) open on Redis latency.
+		// RedisBlobCache.set() swallows its own errors so this promise cannot
+		// reject. Safe under races: blobs are content-addressable and the PG
+		// insert is ON CONFLICT DO NOTHING, so a concurrent SET with identical
+		// bytes is a no-op.
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, data);
+		}
 	}
 
 	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
+		if (this.#blobCache !== undefined) {
+			const cached = await this.#blobCache.get(sha256);
+			if (cached !== null) return cached;
+		}
 		const rows = await tx<{ data: Buffer }[]>`SELECT data FROM blobs WHERE sha256 = ${sha256}`;
-		return rows[0]?.data ?? null;
+		const data = rows[0]?.data;
+		if (!data) return null;
+		const bytes = new Uint8Array(data);
+		// Fire-and-forget backfill — see upsertBlob. The next reader hits Redis;
+		// if the SET hasn't finished yet they pay one more PG round-trip, which
+		// is strictly better than holding the advisory lock on every writer.
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, bytes);
+		}
+		return bytes;
 	}
 
 	// US-014

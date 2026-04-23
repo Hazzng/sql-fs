@@ -8,6 +8,9 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
+import { getRedisClient } from "../redis/client.js";
+import { parseNonNegativeInt } from "../redis/config.js";
 import { type AuthVariables, authMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
@@ -24,8 +27,30 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 
 // ── Session manager (lazy — no DB access until first request) ─────────────────
 
+const redisClient = getRedisClient();
+// Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
+// them unconditionally would abort startup on a malformed Redis option even
+// in deployments that never touch Redis (REDIS_URL unset).
+const execLockOptions = redisClient
+	? {
+			leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
+			renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
+			acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
+		}
+	: undefined;
+const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+const pathSnapshot =
+	pathSnapshotEnabled && redisClient
+		? new RedisPathSnapshot(redisClient, {
+				ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
+			})
+		: undefined;
+
 const sessionManager = new SessionManager({
 	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
+	redis: redisClient,
+	execLockOptions,
+	pathSnapshot,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
@@ -99,6 +124,8 @@ app.onError((err, c) => {
 		"ESESSIONCLOSING",
 		"ELOOP",
 		"EINVAL",
+		"ELOCKTIMEOUT",
+		"ELOCKLOST",
 	];
 	const message = knownFsCodes.includes(code) ? err.message : "Internal server error";
 
