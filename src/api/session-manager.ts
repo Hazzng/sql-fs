@@ -45,9 +45,11 @@ const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
  * `undefined`. The memory backend does NOT implement the interface.
  */
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
+	const partial = fs as Partial<ICoherentFs>;
 	if (
-		typeof (fs as Partial<ICoherentFs>).reload === "function" &&
-		typeof (fs as Partial<ICoherentFs>).wasDirty === "function"
+		typeof partial.reload === "function" &&
+		typeof partial.wasDirty === "function" &&
+		typeof partial.clearDirty === "function"
 	) {
 		return fs as ICoherentFs;
 	}

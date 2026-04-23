@@ -427,4 +427,30 @@ describe("SessionManager version counter (Phase D)", () => {
 		// No version key created because the fs is not coherence-aware.
 		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
 	});
+
+	it("partial fs missing clearDirty is rejected by the guard (no runtime crash)", async () => {
+		// Regression guard: if the runtime check only tested for reload/wasDirty,
+		// publishVersionIfDirty would later call coherent.clearDirty() and throw.
+		const redis = new FakeRedis();
+		const partial: Partial<IFileSystem> & Record<string, unknown> = {
+			getAllPaths: () => [],
+			reload: async () => {},
+			wasDirty: () => true,
+			// clearDirty intentionally omitted
+		};
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: vi.fn(async () => partial as IFileSystem),
+			redis: asRedis(redis),
+		});
+
+		await expect(
+			sm.withSession("sbx", async () => {
+				/* nothing */
+			}),
+		).resolves.toBeUndefined();
+
+		// Treated as non-coherent: no INCR, no reload attempt.
+		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+	});
 });
