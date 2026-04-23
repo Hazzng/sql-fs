@@ -176,6 +176,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		});
 	}
 
+	/**
+	 * Read-only transaction helper. Sets the RLS sandbox context but skips the
+	 * advisory lock so pure reads do NOT queue behind concurrent writers on the
+	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
+	 */
+	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		return this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+			return await fn(tx);
+		});
+	}
+
 	// ── Path helpers ──────────────────────────────────────────────────────────────
 
 	/** Returns the parent path of an absolute path. '/' has no parent. */
@@ -225,8 +237,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		if (!entry) throw createEnoent(path);
 		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
 
-		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally
-		const resolvedId = await this.#withTx((tx) => this.#dialect.resolvePath(tx, path, true));
+		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally.
+		// Read-only resolution: skip the per-sandbox advisory lock so reads
+		// don't queue behind writers.
+		const resolvedId = await this.#withReadTx((tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [, e] of this.#pathCache) {
 			if (e.inodeId === resolvedId) return e;
 		}
@@ -620,8 +634,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return new TextDecoder().decode(cached);
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
-		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
+		// Read-only: skip the advisory lock.
+		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return new TextDecoder().decode(bytes);
@@ -637,8 +652,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId
-		const data = await this.#withTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
+		// Read-only: skip the advisory lock.
+		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
@@ -931,7 +947,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async realpath(inputPath: string): Promise<string> {
 		const path = validatePath(inputPath);
-		const resolvedInodeId = await this.#withTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
+		// Read-only: skip the advisory lock.
+		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
 			if (entry.inodeId === resolvedInodeId) return p;
 		}
