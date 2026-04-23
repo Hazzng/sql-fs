@@ -8,6 +8,7 @@
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
 import { getRedisClient } from "../../redis/client.js";
+import { parseNonNegativeInt } from "../../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
 import { RedisPathSnapshot } from "./redis-path-snapshot.js";
@@ -33,14 +34,14 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			const blobCache =
 				redis && blobCacheEnabled
 					? new RedisBlobCache(redis, {
-							ttlMs: Number(process.env.REDIS_BLOB_CACHE_TTL_MS ?? 24 * 60 * 60 * 1000),
-							maxBytes: Number(process.env.REDIS_BLOB_MAX_BYTES ?? 8 * 1024 * 1024),
+							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
+							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
 						})
 					: undefined;
 			const pathSnapshotEnabled = redis && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
 			const pathSnapshot = pathSnapshotEnabled
 				? new RedisPathSnapshot(redis, {
-						ttlMs: Number(process.env.REDIS_PATH_SNAPSHOT_TTL_MS ?? 60 * 60 * 1000),
+						ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
 					})
 				: undefined;
 			const dialect = new PostgresDialect(databaseUrl, blobCache);
