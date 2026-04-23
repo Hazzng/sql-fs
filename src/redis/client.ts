@@ -43,17 +43,3 @@ export function getRedisClient(): Redis | undefined {
 	});
 	return client;
 }
-
-export async function disconnectRedis(): Promise<void> {
-	if (client) {
-		await client.quit();
-		client = undefined;
-		initialized = false;
-	}
-}
-
-/** Test-only: resets the singleton state so a fresh client can be constructed. */
-export function __resetRedisForTests(): void {
-	client = undefined;
-	initialized = false;
-}
