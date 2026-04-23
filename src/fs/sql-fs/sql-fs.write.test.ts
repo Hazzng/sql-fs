@@ -271,6 +271,21 @@ describe("SqlFs.mkdir — pathCache updates", () => {
 	it("mkdir -p does not throw when path already exists", async () => {
 		await expect(fs.mkdir("/home/user", { recursive: true })).resolves.toBeUndefined();
 	});
+
+	it("mkdir -p throws ENOTDIR when an intermediate ancestor is a file", async () => {
+		// Seed: /home/user/note.txt is a regular file.
+		await fs.writeFile("/home/user/note.txt", "hello");
+
+		// /home/user/note.txt/inside would require treating note.txt as a
+		// directory. Without a kind check, the recursive path would silently
+		// insert a dirent under the file's inode and corrupt the tree.
+		await expect(fs.mkdir("/home/user/note.txt/inside", { recursive: true })).rejects.toMatchObject({
+			code: "ENOTDIR",
+		});
+
+		// And no dirent was inserted for the would-be child.
+		expect(fs.getAllPaths()).not.toContain("/home/user/note.txt/inside");
+	});
 });
 
 // ── appendFile ────────────────────────────────────────────────────────────────

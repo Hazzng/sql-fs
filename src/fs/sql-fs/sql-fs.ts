@@ -475,6 +475,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				if (!this.#pathCache.has(next)) {
 					const parentEntry = this.#pathCache.get(current);
 					if (!parentEntry) throw createEnoent(current);
+					// Reject non-directory ancestors before any DB work. Otherwise
+					// mkdir -p /a/b with /a as a file would silently insert a
+					// dirent under the file's inode (dirents has no FK on kind).
+					if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
 					const inodeId = await this.#withTx(async (tx) => {
 						const id = await this.#dialect.createInode(tx, {
 							sandboxId: this.#sandboxId,
