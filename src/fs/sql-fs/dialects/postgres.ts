@@ -293,13 +293,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			VALUES (${sha256}, ${data}, ${data.length})
 			ON CONFLICT (sha256) DO NOTHING
 		`;
-		if (this.#blobCache) {
-			await this.#blobCache.set(sha256, data);
+		// Fire-and-forget: don't hold the PG transaction (and the per-sandbox
+		// advisory lock acquired in setSandboxContext) open on Redis latency.
+		// RedisBlobCache.set() swallows its own errors so this promise cannot
+		// reject. Safe under races: blobs are content-addressable and the PG
+		// insert is ON CONFLICT DO NOTHING, so a concurrent SET with identical
+		// bytes is a no-op.
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, data);
 		}
 	}
 
 	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
-		if (this.#blobCache) {
+		if (this.#blobCache !== undefined) {
 			const cached = await this.#blobCache.get(sha256);
 			if (cached !== null) return cached;
 		}
@@ -307,8 +313,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		const data = rows[0]?.data;
 		if (!data) return null;
 		const bytes = new Uint8Array(data);
-		if (this.#blobCache) {
-			await this.#blobCache.set(sha256, bytes);
+		// Fire-and-forget backfill — see upsertBlob. The next reader hits Redis;
+		// if the SET hasn't finished yet they pay one more PG round-trip, which
+		// is strictly better than holding the advisory lock on every writer.
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, bytes);
 		}
 		return bytes;
 	}

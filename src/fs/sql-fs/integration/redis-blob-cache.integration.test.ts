@@ -6,11 +6,28 @@
  */
 
 import { Redis } from "ioredis";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PostgresDialect } from "../dialects/postgres.js";
 import { RedisBlobCache } from "../redis-blob-cache.js";
 
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;
+
+/**
+ * Poll Redis for a blob-cache key until it materializes. Cache writes are
+ * fire-and-forget inside the dialect (so the PG advisory lock releases
+ * immediately on commit), so tests cannot assume the SET has completed by the
+ * time `dialect.transaction(...)` resolves.
+ */
+async function waitForCachedBlob(redis: Redis, sha256: Uint8Array): Promise<Buffer> {
+	return await vi.waitFor(
+		async () => {
+			const buf = await redis.getBuffer(RedisBlobCache.key(sha256));
+			if (buf === null) throw new Error("cache key not yet populated");
+			return buf;
+		},
+		{ timeout: 2_000, interval: 20 },
+	);
+}
 
 describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 	const redis = new Redis(process.env.REDIS_URL!, { lazyConnect: true, maxRetriesPerRequest: 1 });
@@ -44,9 +61,8 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 			await dialect.upsertBlob(tx, sha256, data);
 		});
 
-		const cached = await redis.getBuffer(RedisBlobCache.key(sha256));
-		expect(cached).not.toBeNull();
-		expect(Uint8Array.from(cached as Buffer)).toEqual(data);
+		const cached = await waitForCachedBlob(redis, sha256);
+		expect(Uint8Array.from(cached)).toEqual(data);
 	});
 
 	it("getBlob backfills Redis after a cache miss", async () => {
@@ -58,6 +74,10 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 		await dialect.transaction(async (tx) => {
 			await dialect.upsertBlob(tx, sha256, data);
 		});
+		// Wait for the write-through cache to populate from the seed upsert
+		// before deleting it, otherwise a late-arriving fire-and-forget SET
+		// could repopulate the key and mask the miss we want to test.
+		await waitForCachedBlob(redis, sha256);
 		await redis.del(RedisBlobCache.key(sha256));
 		expect(await redis.getBuffer(RedisBlobCache.key(sha256))).toBeNull();
 
@@ -65,9 +85,8 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 		expect(result).not.toBeNull();
 		expect(result).toEqual(data);
 
-		const cached = await redis.getBuffer(RedisBlobCache.key(sha256));
-		expect(cached).not.toBeNull();
-		expect(Uint8Array.from(cached as Buffer)).toEqual(data);
+		const cached = await waitForCachedBlob(redis, sha256);
+		expect(Uint8Array.from(cached)).toEqual(data);
 	});
 
 	it("does not cache blobs larger than maxBytes", async () => {
