@@ -311,6 +311,103 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(stub.reloadCount).toBe(0);
 	});
 
+	it("swallows transient INCR error, preserves dirty flag for next-turn retry", async () => {
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeFsFactory(stub),
+			redis: asRedis(redis),
+		});
+
+		// Warm the session (no INCR because not dirty).
+		await sm.withSession("sbx", async () => {});
+
+		// Next turn: mutation happens, but INCR throws once.
+		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValueOnce(new Error("ECONNRESET"));
+
+		await expect(
+			sm.withSession("sbx", async () => {
+				stub.dirty = true;
+			}),
+		).resolves.toBeUndefined();
+
+		// Dirty flag must survive — the publish failed and the next turn needs
+		// to retry the bump.
+		expect(stub.dirty).toBe(true);
+		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(0);
+		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+
+		// Next turn: INCR works, the pending bump flushes.
+		incrSpy.mockRestore();
+		await sm.withSession("sbx", async () => {
+			// dirty still set from the prior failed turn — no new mutation needed.
+		});
+
+		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(stub.dirty).toBe(false);
+	});
+
+	it("ensureFreshCache tolerates transient GET error without failing the turn", async () => {
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeFsFactory(stub),
+			redis: asRedis(redis),
+		});
+
+		// Warm the session.
+		await sm.withSession("sbx", async () => {});
+
+		// First GET fails (stub; getOrCreate already succeeded, so no
+		// fallback-on-init interaction). The subsequent INCR for the mutation
+		// should still succeed and advance the counter.
+		const getSpy = vi.spyOn(redis, "get").mockRejectedValueOnce(new Error("ECONNRESET"));
+
+		await expect(
+			sm.withSession("sbx", async () => {
+				stub.dirty = true;
+			}),
+		).resolves.toBeUndefined();
+
+		getSpy.mockRestore();
+
+		// Reload was skipped (no throw, no reload count bump on best-effort GET failure).
+		expect(stub.reloadCount).toBe(0);
+		// INCR still ran at end-of-turn.
+		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+	});
+
+	it("ensureFreshCache no longer strands the dirty flag on version match", async () => {
+		// Regression guard for the bug where ensureFreshCache unconditionally
+		// cleared dirty in the match branch, masking a failed prior publish.
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeFsFactory(stub),
+			redis: asRedis(redis),
+		});
+
+		// Pre-seed a dirty flag as if a prior publish failed.
+		await sm.withSession("sbx", async () => {});
+		stub.dirty = true;
+		const session = sm.getSession("sbx");
+		if (session === undefined) throw new Error("expected session");
+		session.lastSeenVersion = 0; // matches current redis value
+
+		await sm.withSession("sbx", async () => {
+			/* no new mutation */
+		});
+
+		// The pending dirty bit must have triggered a real INCR, not been
+		// silently swallowed by ensureFreshCache.
+		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+	});
+
 	it("non-coherent fs (memory backend) skips reload/publish but exec still works", async () => {
 		const redis = new FakeRedis();
 		// A plain IFileSystem without reload/wasDirty

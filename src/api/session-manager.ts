@@ -302,8 +302,18 @@ export class SessionManager {
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 
-		const raw = await this.redis.get(versionKey(sandboxId));
-		const current = raw === null ? 0 : Number(raw) || 0;
+		let current: number;
+		try {
+			const raw = await this.redis.get(versionKey(sandboxId));
+			current = raw === null ? 0 : Number(raw) || 0;
+		} catch (err) {
+			// Redis transiently unavailable — freshness check is a best-effort
+			// optimization. Skip the reload and let publishVersionIfDirty retry
+			// the INCR at end-of-turn. Preserve any outstanding dirty bit so a
+			// prior failed publish retries instead of being masked.
+			console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
+			return;
+		}
 
 		if (session.lastSeenVersion !== current) {
 			await coherent.reload();
@@ -314,10 +324,10 @@ export class SessionManager {
 			coherent.clearDirty();
 			return;
 		}
-		// Versions match — clear any pre-existing dirty bit carried over from a
-		// previous turn (defensive; withSession/withExistingSession normally
-		// publishes and clears on exit).
-		coherent.clearDirty();
+		// Versions match — do NOT clear the dirty flag here. If a previous
+		// publishVersionIfDirty failed mid-turn (e.g., transient Redis error on
+		// INCR), the flag must survive into end-of-turn publish so the pending
+		// version bump retries rather than being silently dropped.
 	}
 
 	/**
@@ -333,7 +343,18 @@ export class SessionManager {
 		if (!coherent.wasDirty()) return;
 
 		const key = versionKey(sandboxId);
-		const newVersion = Number(await this.redis.incr(key));
+		let newVersion: number;
+		try {
+			newVersion = Number(await this.redis.incr(key));
+		} catch (err) {
+			// Mutation is already committed to Postgres. A transient Redis INCR
+			// failure must NOT propagate up to the caller — the write succeeded.
+			// Leave the dirty bit set so the next turn's publish retries the
+			// bump. Other replicas will see stale caches until a subsequent
+			// successful INCR (acceptable degradation under Redis outage).
+			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
+			return;
+		}
 		// EXPIRE is best-effort; ignore failures (the counter is correct
 		// regardless and a stale key without TTL only wastes a few bytes).
 		try {

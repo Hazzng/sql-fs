@@ -117,6 +117,21 @@ describe("SqlFs dirty-tracking: mutations flip wasDirty", () => {
 		expect(fs.wasDirty()).toBe(true);
 	});
 
+	it("mkdir (recursive) no-op does NOT mark dirty when every segment already exists", async () => {
+		// Create the tree first and clear the dirty bit.
+		await fs.mkdir("/home/user/a/b/c", { recursive: true });
+		fs.clearDirty();
+		expect(fs.wasDirty()).toBe(false);
+
+		// Re-running mkdir -p on the exact same path creates nothing.
+		await fs.mkdir("/home/user/a/b/c", { recursive: true });
+		expect(fs.wasDirty()).toBe(false);
+
+		// Parent-only mkdir -p on an existing path is also a no-op.
+		await fs.mkdir("/home/user/a", { recursive: true });
+		expect(fs.wasDirty()).toBe(false);
+	});
+
 	it("rm (non-recursive) marks dirty", async () => {
 		await fs.rm("/home/user/file.txt");
 		expect(fs.wasDirty()).toBe(true);

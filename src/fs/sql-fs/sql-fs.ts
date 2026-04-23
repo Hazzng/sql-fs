@@ -453,6 +453,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			// Walk from root, creating missing segments
 			const segments = path.split("/").filter(Boolean);
 			let current = "/";
+			let created = false;
 			for (const seg of segments) {
 				const next = current === "/" ? `/${seg}` : `${current}/${seg}`;
 				if (!this.#pathCache.has(next)) {
@@ -477,10 +478,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 						contentSha256: null,
 						symlinkTarget: null,
 					});
+					created = true;
 				}
 				current = next;
 			}
-			this.#dirty = true;
+			if (created) this.#dirty = true;
 			return;
 		}
 
