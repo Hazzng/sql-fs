@@ -28,6 +28,16 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 // ── Session manager (lazy — no DB access until first request) ─────────────────
 
 const redisClient = getRedisClient();
+// Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
+// them unconditionally would abort startup on a malformed Redis option even
+// in deployments that never touch Redis (REDIS_URL unset).
+const execLockOptions = redisClient
+	? {
+			leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
+			renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
+			acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
+		}
+	: undefined;
 const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
 const pathSnapshot =
 	pathSnapshotEnabled && redisClient
@@ -39,11 +49,7 @@ const pathSnapshot =
 const sessionManager = new SessionManager({
 	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
 	redis: redisClient,
-	execLockOptions: {
-		leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
-		renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
-		acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
-	},
+	execLockOptions,
 	pathSnapshot,
 });
 
