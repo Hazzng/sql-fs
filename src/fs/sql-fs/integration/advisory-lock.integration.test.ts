@@ -1,7 +1,7 @@
 /**
  * Integration tests for PostgresDialect per-sandbox advisory lock (Phase B).
  *
- * Verifies that setSandboxContext + deleteSandbox serialize concurrent mutators
+ * Verifies that setSandboxContextWithLock + deleteSandbox serialize concurrent mutators
  * on the same sandboxId via pg_advisory_xact_lock(hashtextextended(sandboxId, 0)),
  * and that unrelated sandboxes do not contend.
  *
@@ -65,7 +65,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 
 		const firstStart = Date.now();
 		const first = dialectA.transaction(async (tx) => {
-			await dialectA.setSandboxContext(tx, sandboxId);
+			await dialectA.setSandboxContextWithLock(tx, sandboxId);
 			firstHasLock();
 			await new Promise((r) => setTimeout(r, holdMs));
 			return "first-done";
@@ -76,7 +76,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 
 		const secondStart = Date.now();
 		const second = dialectB.transaction(async (tx) => {
-			await dialectB.setSandboxContext(tx, sandboxId);
+			await dialectB.setSandboxContextWithLock(tx, sandboxId);
 			return Date.now() - secondStart;
 		});
 
@@ -101,7 +101,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 			timed(
 				"sandboxA",
 				dialectA.transaction(async (tx) => {
-					await dialectA.setSandboxContext(tx, sandboxA);
+					await dialectA.setSandboxContextWithLock(tx, sandboxA);
 					await new Promise((r) => setTimeout(r, holdMs));
 					return Date.now() - started;
 				}),
@@ -109,7 +109,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 			timed(
 				"sandboxB",
 				dialectB.transaction(async (tx) => {
-					await dialectB.setSandboxContext(tx, sandboxB);
+					await dialectB.setSandboxContextWithLock(tx, sandboxB);
 					await new Promise((r) => setTimeout(r, holdMs));
 					return Date.now() - started;
 				}),
@@ -136,7 +136,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 		});
 
 		const writer = dialectA.transaction(async (tx) => {
-			await dialectA.setSandboxContext(tx, sandboxId);
+			await dialectA.setSandboxContextWithLock(tx, sandboxId);
 			writerHasLock();
 			await new Promise((r) => setTimeout(r, holdMs));
 			return "writer-done";
@@ -168,7 +168,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 		// First transaction acquires the lock then throws, forcing a ROLLBACK.
 		await expect(
 			dialectA.transaction(async (tx) => {
-				await dialectA.setSandboxContext(tx, sandboxId);
+				await dialectA.setSandboxContextWithLock(tx, sandboxId);
 				throw new Error("boom");
 			}),
 		).rejects.toThrow("boom");
@@ -178,10 +178,43 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 		await timed(
 			"post-rollback",
 			dialectB.transaction(async (tx) => {
-				await dialectB.setSandboxContext(tx, sandboxId);
+				await dialectB.setSandboxContextWithLock(tx, sandboxId);
 			}),
 		);
 		const waitMs = Date.now() - start;
 		expect(waitMs).toBeLessThan(500);
+	});
+
+	it("read-only setSandboxContext does NOT block a concurrent writer", async () => {
+		const sandboxId = `lock-read-free-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const holdMs = 500;
+
+		// Reader acquires lock-free context and holds the transaction open.
+		let readerReady!: () => void;
+		const readerReadyPromise = new Promise<void>((resolve) => {
+			readerReady = resolve;
+		});
+		const reader = dialectA.transaction(async (tx) => {
+			await dialectA.setSandboxContext(tx, sandboxId);
+			readerReady();
+			await new Promise((r) => setTimeout(r, holdMs));
+		});
+
+		await readerReadyPromise;
+
+		// Writer must proceed without waiting on the reader.
+		const writerStart = Date.now();
+		await timed(
+			"writer-unblocked",
+			dialectB.transaction(async (tx) => {
+				await dialectB.setSandboxContextWithLock(tx, sandboxId);
+			}),
+		);
+		const writerWaitMs = Date.now() - writerStart;
+
+		await reader;
+
+		// Well under the reader's hold: the writer was not serialized on it.
+		expect(writerWaitMs).toBeLessThan(holdMs / 2);
 	});
 });

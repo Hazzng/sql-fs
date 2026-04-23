@@ -52,6 +52,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Sandbox context ───────────────────────────────────────────────────────────
 
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
+		// RLS context only — no advisory lock. Read-only paths (cold-start load,
+		// cache reload) use this to avoid serializing against unrelated writers.
+		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
+	}
+
+	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
 		// Cross-replica write serialization at the DB layer.
 		// Transaction-scoped; auto-released on COMMIT/ROLLBACK.

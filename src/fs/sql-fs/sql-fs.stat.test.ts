@@ -18,6 +18,7 @@ function makeDialect(): SqlDialect<unknown> {
 		disconnect: vi.fn(),
 		transaction: transactionMock,
 		setSandboxContext: vi.fn(),
+		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => []),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),

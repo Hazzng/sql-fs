@@ -58,6 +58,7 @@ describe("SqlFs.ready() — pathCache initialization", () => {
 			disconnect: vi.fn(),
 			transaction: transactionMock,
 			setSandboxContext: setSandboxContextMock,
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: loadAllPathsMock,
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),

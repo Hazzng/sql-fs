@@ -44,6 +44,7 @@ describe("SqlFs.mv() — pathCache rebuild", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [
 				dirEntry("/", 1n),
 				dirEntry("/a", 2n),
@@ -166,6 +167,7 @@ describe("SqlFs.mv() — move over existing destination", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [
 				dirEntry("/", 1n),
 				fileEntry("/src.txt", 2n, 10),

@@ -33,6 +33,7 @@ function makeFs(
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
+		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => entries),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),

@@ -110,13 +110,25 @@ export interface SqlDialect<Tx = unknown> {
 
 	/**
 	 * Sets the per-transaction sandbox context so RLS policies and stored procedures
-	 * can scope queries to the current sandbox, and acquires a per-sandbox advisory lock
-	 * (pg_advisory_xact_lock) so cross-replica writers serialize at the DB layer.
+	 * can scope queries to the current sandbox. Does NOT acquire any advisory lock —
+	 * safe to call from read-only paths (cold-start loads, cache reloads) without
+	 * serializing against unrelated writers.
 	 *
-	 * The advisory lock is transaction-scoped — automatically released on COMMIT/ROLLBACK.
-	 * Compatible with transaction-mode connection pooling (pgbouncer, Neon pooler).
+	 * Writers must call `setSandboxContextWithLock` instead.
 	 */
 	setSandboxContext(tx: Tx, sandboxId: string): Promise<void>;
+
+	/**
+	 * Like `setSandboxContext` but also acquires the per-sandbox advisory lock
+	 * (`pg_advisory_xact_lock`) so cross-replica writers serialize at the DB layer.
+	 *
+	 * The lock is transaction-scoped — auto-released on COMMIT/ROLLBACK — and
+	 * compatible with transaction-mode connection pooling (pgbouncer, Neon pooler).
+	 *
+	 * Call this from every write path. Read-only paths should use
+	 * `setSandboxContext` to avoid blocking writers unnecessarily.
+	 */
+	setSandboxContextWithLock(tx: Tx, sandboxId: string): Promise<void>;
 
 	// ── Sandbox lifecycle ─────────────────────────────────────────────────────────
 

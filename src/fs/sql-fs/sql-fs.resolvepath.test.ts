@@ -13,6 +13,7 @@ function makeFs(): SqlFs<unknown> {
 		disconnect: async () => {},
 		transaction: async <T>(_fn: (tx: unknown) => Promise<T>) => _fn({}),
 		setSandboxContext: async () => {},
+		setSandboxContextWithLock: async () => {},
 		createSandbox: async () => ({ rootInodeId: 1n }),
 		deleteSandbox: async () => {},
 		createInode: async () => 1n,

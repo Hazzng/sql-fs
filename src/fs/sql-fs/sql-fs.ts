@@ -168,8 +168,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		// Writers: acquire the per-sandbox advisory lock alongside RLS context so
+		// concurrent mutators across replicas serialize at the DB layer.
 		return this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
 			return await fn(tx);
 		});
 	}

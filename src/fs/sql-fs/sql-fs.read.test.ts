@@ -25,6 +25,7 @@ function makeDialect(getBlobImpl: () => Promise<Uint8Array | null>): {
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
+		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => []),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),

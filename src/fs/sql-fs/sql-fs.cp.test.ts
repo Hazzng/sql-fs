@@ -50,6 +50,7 @@ describe("SqlFs.cp() — single file", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [
 				dirEntry("/", 1n),
 				dirEntry("/home", 2n),
@@ -192,6 +193,7 @@ describe("SqlFs.cp() — recursive directory", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => [
 				makeEntry("/", 1n, 2),
 				makeEntry("/destParent", 2n, 2),

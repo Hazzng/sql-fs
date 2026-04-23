@@ -473,6 +473,7 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 			disconnect: vi.fn(),
 			transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 			setSandboxContext: vi.fn(),
+			setSandboxContextWithLock: vi.fn(),
 			loadAllPaths: vi.fn(async () => {
 				const entry = (path: string, inodeId: bigint, kind: 1 | 2): { path: string } & PathCacheEntry => ({
 					path,
