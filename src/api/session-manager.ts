@@ -414,10 +414,28 @@ export class SessionManager {
 				}
 				session.inFlight++;
 				try {
-					const result = await fn(session);
-					await this.publishVersionIfDirty(sandboxId, session);
-					return result;
+					return await fn(session);
 				} finally {
+					// Publish even when fn threw: each SqlFs mutation is already
+					// committed to Postgres before its dirty bit flips, so a
+					// partially-completed exec can leave the DB ahead of every
+					// peer's cache. Skipping the bump here would leave other
+					// replicas serving stale reads until this replica happens to
+					// run another successful turn.
+					try {
+						await this.publishVersionIfDirty(sandboxId, session);
+					} catch (err) {
+						// Defensive: publishVersionIfDirty already swallows INCR
+						// errors internally, but never let a finally-block hide
+						// the primary error from fn.
+						console.error(
+							JSON.stringify({
+								event: "publish_version_finally_error",
+								sandboxId,
+								error: (err as Error).message,
+							}),
+						);
+					}
 					session.inFlight--;
 					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
@@ -453,10 +471,20 @@ export class SessionManager {
 				session.inFlight++;
 				session.lastUsed = Date.now();
 				try {
-					const result = await fn(session);
-					await this.publishVersionIfDirty(sandboxId, session);
-					return result;
+					return await fn(session);
 				} finally {
+					// Publish even when fn threw — see comment in withSession.
+					try {
+						await this.publishVersionIfDirty(sandboxId, session);
+					} catch (err) {
+						console.error(
+							JSON.stringify({
+								event: "publish_version_finally_error",
+								sandboxId,
+								error: (err as Error).message,
+							}),
+						);
+					}
 					session.inFlight--;
 					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;

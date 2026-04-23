@@ -408,6 +408,56 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
 	});
 
+	it("publishes version even when fn throws after a committed mutation", async () => {
+		// Regression guard: mutations in SqlFs commit to Postgres BEFORE the dirty
+		// bit flips. If a multi-step exec writes successfully and then fails on a
+		// later command, peers must still observe the INCR so they invalidate
+		// their caches.
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeFsFactory(stub),
+			redis: asRedis(redis),
+		});
+
+		await expect(
+			sm.withSession("sbx", async () => {
+				stub.dirty = true; // simulate a successful mutation
+				throw Object.assign(new Error("ENOENT: later step failed"), { code: "ENOENT" });
+			}),
+		).rejects.toThrow("ENOENT");
+
+		// The counter must have bumped despite the throw; other replicas will
+		// see v=1 and reload on their next turn.
+		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(stub.dirty).toBe(false);
+	});
+
+	it("withExistingSession also publishes on fn throw", async () => {
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: makeFsFactory(stub),
+			redis: asRedis(redis),
+		});
+
+		// Warm the session so withExistingSession finds it.
+		await sm.withSession("sbx", async () => {});
+
+		await expect(
+			sm.withExistingSession("sbx", async () => {
+				stub.dirty = true;
+				throw new Error("boom");
+			}),
+		).rejects.toThrow("boom");
+
+		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+	});
+
 	it("non-coherent fs (memory backend) skips reload/publish but exec still works", async () => {
 		const redis = new FakeRedis();
 		// A plain IFileSystem without reload/wasDirty
