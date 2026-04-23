@@ -27,9 +27,14 @@ describe("parseNonNegativeInt", () => {
 		expect(parseNonNegativeInt(TEST_VAR, 5)).toBe(0);
 	});
 
-	it("parses a valid finite float", () => {
+	it("rejects floats — caller contract is integer-only", () => {
 		process.env[TEST_VAR] = "1500.5";
-		expect(parseNonNegativeInt(TEST_VAR, 0)).toBe(1500.5);
+		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
+	});
+
+	it("rejects negative floats too (not just positive floats)", () => {
+		process.env[TEST_VAR] = "-0.5";
+		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
 	});
 
 	it("throws on non-numeric input", () => {
@@ -39,16 +44,16 @@ describe("parseNonNegativeInt", () => {
 
 	it("throws on negative numbers", () => {
 		process.env[TEST_VAR] = "-1";
-		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a finite, non-negative number/);
+		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
 	});
 
 	it("throws on Infinity", () => {
 		process.env[TEST_VAR] = "Infinity";
-		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a finite, non-negative number/);
+		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
 	});
 
 	it("throws on NaN literal", () => {
 		process.env[TEST_VAR] = "NaN";
-		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a finite, non-negative number/);
+		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
 	});
 });

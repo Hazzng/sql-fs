@@ -164,7 +164,7 @@ describe("SessionManager + distributed exec lock", () => {
 			backend: "memory",
 			createFs: makeCreateFs(),
 			redis: asRedis(redis),
-			execLockOptions: { acquireTimeoutMs: 100, acquireRetryMs: 20, leaseMs: 5_000, renewMs: 60_000 },
+			execLockOptions: { acquireTimeoutMs: 100, acquireRetryMs: 20, leaseMs: 5_000, renewMs: 1_000 },
 		});
 
 		await expect(sm.withSession("sbx-T", async () => "nope")).rejects.toMatchObject({ code: "ELOCKTIMEOUT" });

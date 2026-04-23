@@ -104,7 +104,7 @@ describe("withDistributedLock", () => {
 				await new Promise((res) => setTimeout(res, 80));
 				order.push("first-end");
 			},
-			{ acquireRetryMs: 10, leaseMs: 1000, renewMs: 10_000, acquireTimeoutMs: 5_000 },
+			{ acquireRetryMs: 10, leaseMs: 1000, renewMs: 900, acquireTimeoutMs: 5_000 },
 		);
 
 		// Give the first call a tick to acquire before we launch the second
@@ -116,7 +116,7 @@ describe("withDistributedLock", () => {
 			async () => {
 				order.push("second-start");
 			},
-			{ acquireRetryMs: 10, leaseMs: 1000, renewMs: 10_000, acquireTimeoutMs: 5_000 },
+			{ acquireRetryMs: 10, leaseMs: 1000, renewMs: 900, acquireTimeoutMs: 5_000 },
 		);
 
 		await Promise.all([first, second]);
@@ -136,7 +136,7 @@ describe("withDistributedLock", () => {
 			async () => {
 				await hold;
 			},
-			{ leaseMs: 5_000, renewMs: 60_000, acquireTimeoutMs: 1_000, acquireRetryMs: 20 },
+			{ leaseMs: 5_000, renewMs: 4_000, acquireTimeoutMs: 1_000, acquireRetryMs: 20 },
 		);
 
 		// Give first a chance to grab the lock
@@ -145,7 +145,7 @@ describe("withDistributedLock", () => {
 		await expect(
 			withDistributedLock(asRedis(r), KEY, async () => "nope", {
 				leaseMs: 5_000,
-				renewMs: 60_000,
+				renewMs: 4_000,
 				acquireTimeoutMs: 150,
 				acquireRetryMs: 20,
 			}),
@@ -195,7 +195,7 @@ describe("withDistributedLock", () => {
 
 		const first = withDistributedLock(asRedis(r), KEY, async () => "noop", {
 			leaseMs: 500,
-			renewMs: 60_000,
+			renewMs: 400,
 			acquireTimeoutMs: 50,
 			acquireRetryMs: 10,
 		});
@@ -215,6 +215,50 @@ describe("withDistributedLock", () => {
 		expect(r.store.has(KEY)).toBe(false);
 	});
 
+	describe("option validation", () => {
+		it("rejects renewMs >= leaseMs (mutex invariant)", async () => {
+			await expect(
+				withDistributedLock(asRedis(fake()), KEY, async () => "ok", {
+					leaseMs: 1_000,
+					renewMs: 1_000,
+				}),
+			).rejects.toThrow(/renewMs .* must be strictly less than leaseMs/);
+
+			await expect(
+				withDistributedLock(asRedis(fake()), KEY, async () => "ok", {
+					leaseMs: 1_000,
+					renewMs: 2_000,
+				}),
+			).rejects.toThrow(/renewMs .* must be strictly less than leaseMs/);
+		});
+
+		it("rejects non-positive leaseMs, renewMs, acquireRetryMs", async () => {
+			await expect(withDistributedLock(asRedis(fake()), KEY, async () => "ok", { leaseMs: 0 })).rejects.toThrow(
+				/leaseMs must be > 0/,
+			);
+
+			await expect(withDistributedLock(asRedis(fake()), KEY, async () => "ok", { renewMs: 0 })).rejects.toThrow(
+				/renewMs must be > 0/,
+			);
+
+			await expect(withDistributedLock(asRedis(fake()), KEY, async () => "ok", { acquireRetryMs: 0 })).rejects.toThrow(
+				/acquireRetryMs must be > 0/,
+			);
+		});
+
+		it("rejects negative acquireTimeoutMs", async () => {
+			await expect(
+				withDistributedLock(asRedis(fake()), KEY, async () => "ok", { acquireTimeoutMs: -1 }),
+			).rejects.toThrow(/acquireTimeoutMs must be >= 0/);
+		});
+
+		it("accepts the defaults unchanged", async () => {
+			// Should not throw — defaults satisfy every invariant.
+			const result = await withDistributedLock(asRedis(fake()), KEY, async () => "ok");
+			expect(result).toBe("ok");
+		});
+	});
+
 	it("logs but does not throw when release eval fails", async () => {
 		const r = fake();
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -232,7 +276,7 @@ describe("withDistributedLock", () => {
 				await fnDone;
 				return "ok";
 			},
-			{ leaseMs: 5_000, renewMs: 60_000, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
+			{ leaseMs: 5_000, renewMs: 4_000, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
 		);
 		expect(result).toBe("ok");
 		// At least one call that contains lock_release_error
