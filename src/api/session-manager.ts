@@ -124,6 +124,12 @@ export interface SessionManagerOptions {
 	 * on sandbox destroy.
 	 */
 	readonly pathSnapshot?: RedisPathSnapshot;
+	/**
+	 * Checks whether a sandbox exists in the persistent store (Postgres).
+	 * Required for withSessionOrRehydrate to distinguish "evicted" from "deleted".
+	 * When undefined, withSessionOrRehydrate falls back to withExistingSession behavior.
+	 */
+	readonly sandboxExistsFn?: (sandboxId: string) => Promise<boolean>;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -146,6 +152,7 @@ export class SessionManager {
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
+	private readonly sandboxExistsFn?: (sandboxId: string) => Promise<boolean>;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -168,6 +175,7 @@ export class SessionManager {
 		redis,
 		execLockOptions,
 		pathSnapshot,
+		sandboxExistsFn,
 	}: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
@@ -177,6 +185,7 @@ export class SessionManager {
 		this.redis = redis;
 		this.execLockOptions = execLockOptions;
 		this.pathSnapshot = pathSnapshot;
+		this.sandboxExistsFn = sandboxExistsFn;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -290,6 +299,54 @@ export class SessionManager {
 	}
 
 	/**
+	 * Shared entry logic for all session wrappers.
+	 * Must be called inside the distributed exec lock.
+	 *
+	 * 1. Checks session isn't closing
+	 * 2. Runs cross-replica cache coherence (Phase D)
+	 * 3. Acquires local mutex, tracks inFlight
+	 * 4. Calls fn(session)
+	 * 5. Publishes version if dirty (Phase D/E)
+	 */
+	private async withSessionEntry<T>(
+		sandboxId: string,
+		session: Session,
+		fn: (session: Session) => Promise<T>,
+	): Promise<T> {
+		if (session.state === "closing") {
+			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+		}
+
+		await this.ensureFreshCache(sandboxId, session);
+
+		return session.mutex.runExclusive(async () => {
+			if (session.state === "closing") {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+			}
+			session.inFlight++;
+			session.lastUsed = Date.now();
+			try {
+				return await fn(session);
+			} finally {
+				try {
+					await this.publishVersionIfDirty(sandboxId, session);
+				} catch (err) {
+					console.error(
+						JSON.stringify({
+							event: "publish_version_finally_error",
+							sandboxId,
+							error: (err as Error).message,
+						}),
+					);
+				}
+				session.inFlight--;
+				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+			}
+		});
+	}
+
+	/**
 	 * Cross-replica cache coherence (Phase D):
 	 * Compares the session's `lastSeenVersion` against the shared Redis counter
 	 * and reloads the filesystem cache if another replica has mutated state
@@ -395,52 +452,7 @@ export class SessionManager {
 	): Promise<T> {
 		return this.withExecLock(sandboxId, async () => {
 			const session = await this.getOrCreate(sandboxId, runtimeOptions);
-
-			// Fast-fail: session is being destroyed — don't queue in the mutex
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-
-			// Cross-replica cache check — done inside the exec lock but outside
-			// the session mutex so a reload cannot race with another turn on
-			// this replica; we already hold the distributed lock which serializes
-			// turns across replicas.
-			await this.ensureFreshCache(sandboxId, session);
-
-			return session.mutex.runExclusive(async () => {
-				// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
-				if (session.state === "closing") {
-					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-				}
-				session.inFlight++;
-				try {
-					return await fn(session);
-				} finally {
-					// Publish even when fn threw: each SqlFs mutation is already
-					// committed to Postgres before its dirty bit flips, so a
-					// partially-completed exec can leave the DB ahead of every
-					// peer's cache. Skipping the bump here would leave other
-					// replicas serving stale reads until this replica happens to
-					// run another successful turn.
-					try {
-						await this.publishVersionIfDirty(sandboxId, session);
-					} catch (err) {
-						// Defensive: publishVersionIfDirty already swallows INCR
-						// errors internally, but never let a finally-block hide
-						// the primary error from fn.
-						console.error(
-							JSON.stringify({
-								event: "publish_version_finally_error",
-								sandboxId,
-								error: (err as Error).message,
-							}),
-						);
-					}
-					session.inFlight--;
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
-			});
+			return this.withSessionEntry(sandboxId, session, fn);
 		});
 	}
 
@@ -457,40 +469,73 @@ export class SessionManager {
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
-
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-
-			await this.ensureFreshCache(sandboxId, session);
-
-			return session.mutex.runExclusive(async () => {
-				if (session.state === "closing") {
-					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-				}
-				session.inFlight++;
-				session.lastUsed = Date.now();
-				try {
-					return await fn(session);
-				} finally {
-					// Publish even when fn threw — see comment in withSession.
-					try {
-						await this.publishVersionIfDirty(sandboxId, session);
-					} catch (err) {
-						console.error(
-							JSON.stringify({
-								event: "publish_version_finally_error",
-								sandboxId,
-								error: (err as Error).message,
-							}),
-						);
-					}
-					session.inFlight--;
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
-			});
+			return this.withSessionEntry(sandboxId, session, fn);
 		});
+	}
+
+	/**
+	 * Like withExistingSession, but falls back to Postgres to check if the sandbox
+	 * exists before throwing ENOENT. If the sandbox is in Postgres but not in the
+	 * pool (evicted by reaper, or created on another replica), rehydrates it via
+	 * getOrCreate — leveraging Phase E snapshot for fast cold-start.
+	 *
+	 * Fast path: pool check outside distributed lock (no Redis RTT for warm hits).
+	 * Cold path: lock -> double-check -> PG exists -> getOrCreate.
+	 *
+	 * Falls back to withExistingSession behavior when sandboxExistsFn is undefined.
+	 */
+	async withSessionOrRehydrate<T>(
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		// Fast path: warm pool hit — skip straight to exec lock + entry
+		const warm = this.sessions.get(sandboxId);
+		if (warm !== undefined && warm.state !== "closing") {
+			return this.withExecLock(sandboxId, async () => {
+				// Re-check under lock (may have been evicted between check and lock acquisition)
+				const session = this.sessions.get(sandboxId);
+				if (session !== undefined && session.state !== "closing") {
+					return this.withSessionEntry(sandboxId, session, fn);
+				}
+				return this.rehydrateAndExec(sandboxId, fn, runtimeOptions);
+			});
+		}
+
+		// Cold path: need to check Postgres
+		return this.withExecLock(sandboxId, async () => {
+			// Double-check under lock
+			const session = this.sessions.get(sandboxId);
+			if (session !== undefined && session.state !== "closing") {
+				return this.withSessionEntry(sandboxId, session, fn);
+			}
+			return this.rehydrateAndExec(sandboxId, fn, runtimeOptions);
+		});
+	}
+
+	/**
+	 * Cold-path helper: checks PG existence, rehydrates via getOrCreate, then executes.
+	 * Must be called inside the distributed exec lock.
+	 */
+	private async rehydrateAndExec<T>(
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		if (this.sandboxExistsFn !== undefined) {
+			const exists = await this.sandboxExistsFn(sandboxId);
+			if (!exists) {
+				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			}
+		} else {
+			// No existence check configured — strict pool-only behavior
+			const session = this.sessions.get(sandboxId);
+			if (session === undefined) {
+				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			}
+		}
+		const session = await this.getOrCreate(sandboxId, runtimeOptions);
+		return this.withSessionEntry(sandboxId, session, fn);
 	}
 
 	/**

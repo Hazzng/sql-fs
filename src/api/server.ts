@@ -7,6 +7,7 @@ import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import { getRedisClient } from "../redis/client.js";
@@ -46,11 +47,31 @@ const pathSnapshot =
 			})
 		: undefined;
 
+const backend = (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory";
+
+// Postgres existence check for session rehydration on cold replicas.
+// Uses a single long-lived dialect (connection-pooled internally by the postgres driver).
+let sandboxExistsFn: ((sandboxId: string) => Promise<boolean>) | undefined;
+if (backend === "postgres" && process.env.DATABASE_URL) {
+	const existsDialect = new PostgresDialect(process.env.DATABASE_URL);
+	let connected = false;
+	sandboxExistsFn = async (sandboxId: string): Promise<boolean> => {
+		if (!connected) {
+			await existsDialect.connect();
+			connected = true;
+		}
+		return existsDialect.transaction(async (tx) => {
+			return existsDialect.sandboxExists(tx, sandboxId);
+		});
+	};
+}
+
 const sessionManager = new SessionManager({
-	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
+	backend,
 	redis: redisClient,
 	execLockOptions,
 	pathSnapshot,
+	sandboxExistsFn,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────

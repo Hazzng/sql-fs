@@ -624,19 +624,22 @@ function makeSessionManager(): SessionManager {
 ### Phase 4: Success Criteria
 
 #### Phase 4: Automated Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test -- src/api/__tests__/session-manager.rehydrate.test.ts` passes (all tests green)
-- [ ] `pnpm test:unit` passes (no regressions — withSession/withExistingSession still work)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes (auto-fixed 2 files — formatting only)
+- [x] `pnpm test -- src/api/__tests__/session-manager.rehydrate.test.ts` passes (all 6 tests green)
+- [x] `pnpm test:unit` passes (414 tests green, no regressions)
 
 #### Phase 4: Manual Verification
-- [ ] Review `withSessionEntry` captures exact same behavior as original inline code
-- [ ] Review `withSessionOrRehydrate` fast path skips Redis lock on warm hit
-- [ ] Review `rehydrateAndExec` prevents resurrection of deleted sandboxes
-- [ ] Confirm `withExistingSession` is preserved for internal use (reaper, strict tests)
+- [x] Review `withSessionEntry` captures exact same behavior as original inline code
+- [x] Review `withSessionOrRehydrate` fast path skips Redis lock on warm hit
+- [x] Review `rehydrateAndExec` prevents resurrection of deleted sandboxes
+- [x] Confirm `withExistingSession` is preserved for internal use (reaper, strict tests)
 
 ### Phase 4: Discoveries and Notable Information
-[Filled during execution]
+- The original `withSession` set `lastUsed` in `getOrCreate` (line 212) but NOT inside the mutex, while `withExistingSession` set `lastUsed = Date.now()` inside the mutex (line 472/480). The `withSessionEntry` helper puts `lastUsed` inside the mutex, which is correct for both paths — `getOrCreate` also sets it, so the warm path gets a redundant but harmless extra update.
+- The plan's `server.ts` wiring suggested creating a new PostgresDialect per existence check. Instead, implemented a single long-lived dialect with lazy connection (connected on first call), matching the connection-pooled pattern of the `postgres` driver. This avoids the overhead of `connect()/disconnect()` per check.
+- Biome auto-fixed formatting in `session-manager.ts` and the test file — no semantic changes, just whitespace/indent adjustments from the tab-based style.
+- The `withSessionOrRehydrate` fast path (warm pool check outside the lock) is an optimization that avoids the distributed lock RTT for the common case. The cold path always double-checks under the lock to handle the race where the session was evicted between the unlocked check and lock acquisition.
 
 ---
 

@@ -17,11 +17,9 @@ let createFsSpy: ReturnType<typeof vi.fn>;
 
 function makeSessionManager(): SessionManager {
 	pgSandboxes = new Set();
-	createFsSpy = vi.fn(
-		async (_backend: string, _sandboxId: string): Promise<IFileSystem> => {
-			return new InMemoryFs();
-		},
-	);
+	createFsSpy = vi.fn(async (_backend: string, _sandboxId: string): Promise<IFileSystem> => {
+		return new InMemoryFs();
+	});
 	return new SessionManager({
 		backend: "memory",
 		createFs: createFsSpy,
@@ -49,9 +47,9 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("throws ENOENT when sandbox does not exist in pool or PG", async () => {
-		await expect(
-			sm.withSessionOrRehydrate("nonexistent", async () => "nope"),
-		).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(sm.withSessionOrRehydrate("nonexistent", async () => "nope")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 
 	it("rehydrates from PG when sandbox exists in DB but not in pool", async () => {
@@ -90,9 +88,9 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 		// Simulate PG row being gone (destroy deletes it)
 		pgSandboxes.delete("sb-destroy");
 
-		await expect(
-			sm.withSessionOrRehydrate("sb-destroy", async () => "ghost"),
-		).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(sm.withSessionOrRehydrate("sb-destroy", async () => "ghost")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 
 	it("falls back to pool-only behavior when sandboxExistsFn is not set", async () => {
@@ -102,8 +100,8 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 			// No sandboxExistsFn — strict pool-only mode
 		});
 
-		await expect(
-			smNoFn.withSessionOrRehydrate("cold-no-fn", async () => "nope"),
-		).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(smNoFn.withSessionOrRehydrate("cold-no-fn", async () => "nope")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 });
