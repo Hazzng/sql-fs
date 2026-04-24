@@ -20,9 +20,10 @@ import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../fs/sql-fs/types.js";
-import { type AuthVariables, authMiddleware } from "../auth.js";
+import { type AuthVariables, createAuthMiddleware } from "../auth.js";
 import { fileRoutes } from "../routes/files.js";
 import { SessionManager } from "../session-manager.js";
+import { stubTenantConfig } from "./helpers/tenant.js";
 
 // ── Shared test infrastructure ────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ async function makeToken(): Promise<string> {
 
 function makeApp(sm: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", authMiddleware);
+	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
 	app.route("/v1/sandboxes", fileRoutes(sm));
 	return app;
 }

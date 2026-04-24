@@ -2,7 +2,7 @@
  * Admin routes.
  * US-057c: Token generation admin endpoint.
  *
- * POST /v1/admin/tokens — generate a JWT for a given sub.
+ * POST /v1/admin/tokens — generate a JWT for a given sub (and optional tenant).
  * Requires auth (applied at /v1/* level in server.ts).
  * Additionally requires ADMIN_SECRET header for authorization.
  */
@@ -16,6 +16,10 @@ import { validateBody } from "../validation.js";
 
 const tokenBodySchema = z.object({
 	sub: z.string().min(1, "sub is required"),
+	tenant: z
+		.string()
+		.regex(/^[A-Za-z0-9_.-]+$/, "tenant must match [A-Za-z0-9_.-]+")
+		.optional(),
 	expiresIn: z.enum(["30d", "1y", "24h", "never"]).optional(),
 });
 
@@ -33,10 +37,10 @@ adminRoutes.post("/tokens", validateBody(tokenBodySchema), async (c) => {
 		return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 	}
 
-	const { sub, expiresIn = "30d" } = c.get("body");
+	const { sub, tenant, expiresIn = "30d" } = c.get("body");
 	const secret = process.env.AUTH_SECRET ?? "";
 
-	const token = await signToken({ sub, expiresIn, secret });
+	const token = await signToken({ sub, tenant, expiresIn, secret });
 
 	// Calculate expiresAt from expiresIn instead of re-verifying the just-signed token
 	let expiresAt: string | null = null;
@@ -46,5 +50,5 @@ adminRoutes.post("/tokens", validateBody(tokenBodySchema), async (c) => {
 		expiresAt = new Date(Date.now() + seconds * 1000).toISOString();
 	}
 
-	return c.json({ token, sub, expiresAt }, 201 as ContentfulStatusCode);
+	return c.json({ token, sub, tenant, expiresAt }, 201 as ContentfulStatusCode);
 });

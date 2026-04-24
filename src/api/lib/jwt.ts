@@ -7,6 +7,8 @@ import { SignJWT, jwtVerify } from "jose";
 
 export interface SignTokenOptions {
 	sub: string;
+	/** Tenant id claim. Omitted when not set, so legacy single-tenant tokens remain compact. */
+	tenant?: string;
 	expiresIn?: string; // e.g. "30d", "1y", "24h", "never" or undefined = no expiry
 	secret: string;
 }
@@ -18,17 +20,28 @@ export interface VerifyTokenOptions {
 
 export interface TokenPayload {
 	sub: string;
+	tenant?: string;
 	iat?: number;
 	exp?: number;
 }
 
 /**
  * Sign a JWT with HS256.
- * Returns the signed token string.
+ *
+ * @param opts.sub - Subject (owner) claim.
+ * @param opts.tenant - Optional tenant id claim. When omitted, the resulting token
+ *                      has no `tenant` claim and auth middleware will resolve it to the default tenant.
+ * @param opts.expiresIn - Expiry string (e.g. "30d", "1y", "24h", "never") or undefined for no expiry.
+ * @param opts.secret - HS256 signing secret.
+ * @returns The signed token string.
  */
-export async function signToken({ sub, expiresIn, secret }: SignTokenOptions): Promise<string> {
+export async function signToken({ sub, tenant, expiresIn, secret }: SignTokenOptions): Promise<string> {
 	const key = new TextEncoder().encode(secret);
-	const jwt = new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).setIssuedAt();
+	const body: Record<string, unknown> = { sub };
+	if (tenant !== undefined) {
+		body.tenant = tenant;
+	}
+	const jwt = new SignJWT(body).setProtectedHeader({ alg: "HS256" }).setIssuedAt();
 
 	if (expiresIn && expiresIn !== "never") {
 		jwt.setExpirationTime(expiresIn);

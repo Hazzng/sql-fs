@@ -25,9 +25,10 @@ import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type AuthVariables, authMiddleware } from "../auth.js";
+import { type AuthVariables, createAuthMiddleware } from "../auth.js";
 import { fileRoutes } from "../routes/files.js";
 import { SessionManager } from "../session-manager.js";
+import { stubTenantConfig } from "./helpers/tenant.js";
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -44,7 +45,7 @@ function makeEnv(): {
 } {
 	const sm = new SessionManager({ backend: "memory", createFs: async () => new InMemoryFs() });
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", authMiddleware);
+	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
 	app.route("/v1/sandboxes", fileRoutes(sm));
 	return { app, sm };
 }

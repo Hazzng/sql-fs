@@ -13,9 +13,10 @@ import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type AuthVariables, authMiddleware } from "../auth.js";
+import { type AuthVariables, createAuthMiddleware } from "../auth.js";
 import { fileRoutes } from "../routes/files.js";
 import { SessionManager } from "../session-manager.js";
+import { stubTenantConfig } from "./helpers/tenant.js";
 
 const AUTH_SECRET = "test-secret-for-files-tests-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -36,7 +37,7 @@ async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFil
 
 function makeTestApp(sessionManager: SessionManager) {
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", authMiddleware);
+	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
 	app.route("/v1/sandboxes", fileRoutes(sessionManager));
 	return app;
 }
