@@ -146,6 +146,12 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	deleteSandbox(tx: Tx, sandboxId: string): Promise<void>;
 
+	/**
+	 * Returns true if a sandbox row with the given ID exists in the database.
+	 * Does not require sandbox context (no RLS dependency) — queries sandboxes table directly.
+	 */
+	sandboxExists(tx: Tx, sandboxId: string): Promise<boolean>;
+
 	// ── Inode CRUD ────────────────────────────────────────────────────────────────
 
 	/**

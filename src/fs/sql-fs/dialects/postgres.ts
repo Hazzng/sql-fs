@@ -110,6 +110,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
 	}
 
+	async sandboxExists(tx: PgTx, sandboxId: string): Promise<boolean> {
+		const rows = await tx<{ exists: boolean }[]>`
+			SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
+		`;
+		return rows[0]?.exists ?? false;
+	}
+
 	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */
 	async #createDirInode(tx: PgTx, sandboxId: string, parentInodeId: bigint, name: string): Promise<bigint> {
 		const rows = await tx<{ id: string }[]>`
