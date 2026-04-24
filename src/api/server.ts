@@ -19,6 +19,7 @@ import { type AuthVariables, createAuthMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest } from "./mcp/server.js";
+import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
@@ -157,8 +158,18 @@ app.onError((err, c) => {
 const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""));
 
 if (isMain) {
-	const port = Number(process.env.PORT ?? "8080");
-	serve({ fetch: app.fetch, port }, () => {
-		console.log(JSON.stringify({ event: "server_start", port }));
-	});
+	void (async () => {
+		try {
+			if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
+				await runMigrations(tenantConfig);
+			}
+			const port = Number(process.env.PORT ?? "8080");
+			serve({ fetch: app.fetch, port }, () => {
+				console.log(JSON.stringify({ event: "server_start", port, tenantCount: tenantConfig.tenantIds.length }));
+			});
+		} catch (err) {
+			console.error(err);
+			process.exit(1);
+		}
+	})();
 }

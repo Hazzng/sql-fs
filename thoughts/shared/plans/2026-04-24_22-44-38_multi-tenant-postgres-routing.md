@@ -872,10 +872,10 @@ if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
 
 #### Phase 4: Automated Verification
 
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] New integration test `src/api/__tests__/integration/migrations.integration.test.ts`: fresh empty Postgres database → `runMigrations` succeeds → tables exist → second call is a no-op
-- [ ] Existing `src/fs/sql-fs/integration/*` tests pass (they already migrate their own databases)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes
+- [x] New integration test `src/api/__tests__/integration/migrations.integration.test.ts`: fresh empty Postgres database → `runMigrations` succeeds → tables exist → second call is a no-op
+- [x] Existing `src/fs/sql-fs/integration/*` tests pass (they already migrate their own databases)
 
 #### Phase 4: Manual Verification
 
@@ -925,7 +925,16 @@ if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
 
 ### Phase 4: Discoveries and Notable Information
 
-[Filled by the implementing agent during Phase 4 execution.]
+**Technical Discoveries:**
+- Vitest still invokes the `describe.skipIf` callback body during collection when the suite is skipped, so any top-level code that calls `new URL(process.env.DATABASE_URL)` throws before skip applies. The migration integration test must defer URL parsing and `CREATE DATABASE` to `beforeAll` only.
+
+**Implementation Adaptations:**
+- `pnpm test:integration` previously used `vitest run src/**/integration/**`, which matched **no files** (Vitest does not treat that as a recursive glob). The script now passes explicit directories so integration tests are actually discovered.
+- `migrationFiles()` joins paths with `path.join` for Windows-safe `.sql` paths; log lines use only the filename (`file`) for stable, readable JSON.
+- `tsc` does not emit `.sql` files; `pnpm build` runs `scripts/copy-postgres-migrations.mjs` after `tsc` so `node dist/api/server.js` and the Docker image still find `dist/fs/sql-fs/migrations/postgres/*.sql`.
+
+**Future Considerations:**
+- `CREATE DATABASE` against the admin DB (`…/postgres`) requires sufficient Postgres privileges; hosted providers without `CREATEDB` may need a dedicated migration-test URL or continued skip-when-no-DB behavior.
 
 ---
 
