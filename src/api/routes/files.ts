@@ -77,8 +77,13 @@ function parentDir(filePath: string): string {
 }
 
 /** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
-	const session = sessionManager.getSession(sandboxId);
+function checkOwnership(
+	sessionManager: SessionManager,
+	tenantId: string,
+	sandboxId: string,
+	caller: string,
+): Response | undefined {
+	const session = sessionManager.getSession(tenantId, sandboxId);
 	if (session?.owner && session.owner !== caller) {
 		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
 	}
@@ -91,9 +96,10 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// GET /v1/sandboxes/:id/files/* — read file content
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
 	router.get("/:id/files/:path{.*}", async (c) => {
-		const ownershipErr = checkOwnership(sessionManager, c.req.param("id"), c.get("owner"));
-		if (ownershipErr) return ownershipErr;
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
+		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
@@ -102,7 +108,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			| { kind: "not_found" }
 			| { kind: "eisdir" };
 
-		const result = await sessionManager.withExistingSession<ReadResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withExistingSession<ReadResult>(tenant, sandboxId, async (session) => {
 			let stat: FsStat;
 			try {
 				stat = await session.fs.stat(filePath);
@@ -153,8 +159,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	// PUT /v1/sandboxes/:id/files/* — write raw file content
 	router.put("/:id/files/:path{.*}", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
@@ -162,7 +169,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
+		await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 			const parent = parentDir(filePath);
 			if (parent !== "/") {
 				try {
@@ -180,8 +187,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
 	router.delete("/:id/files/:path{.*}", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
@@ -189,7 +197,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type DeleteResult = { kind: "ok" } | { kind: "not_found" } | { kind: "not_empty" };
 
-		const result = await sessionManager.withExistingSession<DeleteResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withExistingSession<DeleteResult>(tenant, sandboxId, async (session) => {
 			try {
 				await session.fs.rm(filePath, { recursive });
 				return { kind: "ok" };
@@ -217,8 +225,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	});
 
 	router.post("/:id/writeFiles", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof writeFilesBodySchema>;
@@ -239,7 +248,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const { files } = body;
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
+		await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 			for (const [filePath, content] of Object.entries(files)) {
 				const parent = parentDir(filePath);
 				if (parent !== "/") {
@@ -264,8 +273,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	});
 
 	router.post("/:id/mkdir", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof mkdirBodySchema>;
@@ -288,7 +298,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type MkdirResult = { kind: "ok" } | { kind: "exists" };
 
-		const result = await sessionManager.withExistingSession<MkdirResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withExistingSession<MkdirResult>(tenant, sandboxId, async (session) => {
 			try {
 				await session.fs.mkdir(dirPath, { recursive });
 				return { kind: "ok" };
@@ -313,8 +323,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	});
 
 	router.get("/:id/tree", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		const queryResult = treeQuerySchema.safeParse(c.req.query());
@@ -329,7 +340,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type TreeEntry = { path: string; kind: string; size: number; mtime: string };
 
-		const entries = await sessionManager.withExistingSession<TreeEntry[]>(sandboxId, async (session) => {
+		const entries = await sessionManager.withExistingSession<TreeEntry[]>(tenant, sandboxId, async (session) => {
 			const allPaths = session.fs.getAllPaths();
 			const result: TreeEntry[] = [];
 

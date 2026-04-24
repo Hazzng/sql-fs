@@ -22,8 +22,13 @@ const execBodySchema = z.object({
 });
 
 /** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
-	const session = sessionManager.getSession(sandboxId);
+function checkOwnership(
+	sessionManager: SessionManager,
+	tenantId: string,
+	sandboxId: string,
+	caller: string,
+): Response | undefined {
+	const session = sessionManager.getSession(tenantId, sandboxId);
 	if (session?.owner && session.owner !== caller) {
 		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
 	}
@@ -35,8 +40,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	// POST /v1/sandboxes/:id/exec-sync — buffered (non-streaming) bash execution
 	router.post("/:id/exec-sync", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof execBodySchema>;
@@ -62,7 +68,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type ExecSyncResult = { kind: "ok"; stdout: string; stderr: string; exitCode: number } | { kind: "timeout" };
 
-		const execResult = await sessionManager.withExistingSession<ExecSyncResult>(sandboxId, async (session) => {
+		const execResult = await sessionManager.withExistingSession<ExecSyncResult>(tenant, sandboxId, async (session) => {
 			const controller = new AbortController();
 			let timedOut = false;
 
@@ -107,8 +113,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
 	router.post("/:id/exec", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		let body: z.infer<typeof execBodySchema>;
@@ -145,7 +152,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				controller.abort();
 			}, timeoutMs);
 
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				try {
 					const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 						signal: controller.signal,

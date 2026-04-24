@@ -29,7 +29,6 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
-		backend: "memory",
 		createFs: async () => fs,
 	});
 	return { sessionManager, fs };
@@ -78,7 +77,7 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate(SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
 
 		const files = {
 			"hello.txt": "hello world",
@@ -103,7 +102,7 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		expect(body.basePath).toBe("/home/user/project");
 
 		// Verify files are readable in the sandbox
-		const session = await sessionManager.getOrCreate(SANDBOX_ID);
+		const session = await sessionManager.getOrCreate("default", SANDBOX_ID);
 		for (const [name, expectedContent] of Object.entries(files)) {
 			const content = await session.fs.readFile(`/home/user/project/${name}`);
 			expect(content).toBe(expectedContent);
@@ -114,7 +113,7 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate(SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
 
 		const archiveBytes = createTarGz({ "readme.txt": "hello" });
 		const formData = new FormData();
@@ -194,7 +193,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate(SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
 
 		const files: Record<string, string> = {
 			"hello.txt": Buffer.from("hello world").toString("base64"),
@@ -213,7 +212,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(body.status).toBe("ok");
 		expect(body.fileCount).toBe(3);
 
-		const session = await sessionManager.getOrCreate(SANDBOX_ID);
+		const session = await sessionManager.getOrCreate("default", SANDBOX_ID);
 		expect(await session.fs.readFile("/home/user/project/hello.txt")).toBe("hello world");
 		expect(await session.fs.readFile("/home/user/project/foo.js")).toBe("console.log('foo');");
 		expect(await session.fs.readFile("/home/user/project/sub/bar.md")).toBe("# Bar\nSome content");
@@ -284,7 +283,7 @@ describe("GET /v1/sandboxes/:id/export", () => {
 		const token = await makeToken();
 
 		// Seed files directly into the sandbox FS before exporting
-		await sessionManager.withSession(SANDBOX_ID, async (session) => {
+		await sessionManager.withSession("default", SANDBOX_ID, async (session) => {
 			await session.fs.mkdir("/home/user", { recursive: true });
 			await session.fs.writeFile("/home/user/hello.txt", new TextEncoder().encode("hello world"));
 			await session.fs.writeFile("/home/user/foo.js", new TextEncoder().encode("console.log('foo');"));
@@ -322,7 +321,7 @@ describe("GET /v1/sandboxes/:id/export", () => {
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
 		// Pre-create sandbox so "sandbox not found" is not the reason for 404
-		await sessionManager.getOrCreate(SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
 
 		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/export?basePath=/nonexistent/path`, {
 			method: "GET",

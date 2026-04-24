@@ -42,7 +42,7 @@ function makeApp(sm: SessionManager): Hono<{ Variables: AuthVariables }> {
 }
 
 function makeMemoryApp(): { app: Hono<{ Variables: AuthVariables }>; sm: SessionManager } {
-	const sm = new SessionManager({ backend: "memory", createFs: async () => new InMemoryFs() });
+	const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 	return { app: makeApp(sm), sm };
 }
 
@@ -62,7 +62,7 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-same-path-1";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -83,7 +83,7 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-same-path-2";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -119,7 +119,7 @@ describe("N concurrent PUTs to distinct paths within one sandbox", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-distinct-paths";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		const putResults = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -166,7 +166,7 @@ describe("Write-overwrite-read consistency within one sandbox", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "overwrite-read";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/v.txt`, {
@@ -189,7 +189,7 @@ describe("Write-overwrite-read consistency within one sandbox", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "conc-overwrite";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/counter.txt`, {
@@ -235,7 +235,7 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "delete-invalidation";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		// Write a file
 		await app.request(`/v1/sandboxes/${sbId}/files/to-delete.txt`, {
@@ -269,7 +269,7 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "partial-delete";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 		const total = 10;
 		const keep = 5;
 
@@ -325,7 +325,7 @@ describe("N concurrent reads of the same file", () => {
 		const { app, sm } = makeMemoryApp();
 		const token = await makeToken();
 		const sbId = "concurrent-reads";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		await app.request(`/v1/sandboxes/${sbId}/files/stable.txt`, {
 			method: "PUT",
@@ -363,7 +363,7 @@ describe("Cross-sandbox isolation", () => {
 		const token = await makeToken();
 		const sbA = "isolation-sandbox-a";
 		const sbB = "isolation-sandbox-b";
-		await Promise.all([sm.getOrCreate(sbA), sm.getOrCreate(sbB)]);
+		await Promise.all([sm.getOrCreate("default", sbA), sm.getOrCreate("default", sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/shared/data.txt`, {
@@ -398,7 +398,7 @@ describe("Cross-sandbox isolation", () => {
 		const token = await makeToken();
 		const sbA = "iso-del-a";
 		const sbB = "iso-del-b";
-		await Promise.all([sm.getOrCreate(sbA), sm.getOrCreate(sbB)]);
+		await Promise.all([sm.getOrCreate("default", sbA), sm.getOrCreate("default", sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/common.txt`, {
@@ -523,13 +523,12 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 		await sqlFs.ready();
 
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: async () => sqlFs,
 		});
 		const app = makeApp(sm);
 		const token = await makeToken();
 		const sbId = "sqlfs-cache-overwrite";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		// Write WRITES times to the same path — serialized by mutex
 		for (let i = 0; i < WRITES; i++) {
@@ -557,13 +556,12 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 		await sqlFs.ready();
 
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: async () => sqlFs,
 		});
 		const app = makeApp(sm);
 		const token = await makeToken();
 		const sbId = "sqlfs-cache-delete";
-		await sm.getOrCreate(sbId);
+		await sm.getOrCreate("default", sbId);
 
 		// Write a file
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {

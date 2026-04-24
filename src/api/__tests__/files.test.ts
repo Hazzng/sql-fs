@@ -28,10 +28,9 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFileSystem }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
-		backend: "memory",
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate(SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID);
 	return { sessionManager, fs };
 }
 

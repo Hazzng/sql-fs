@@ -7,8 +7,10 @@ import type { IFileSystem } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../session-manager.js";
 
+const T = "default";
+
 function makeCreateFs(impl?: () => Promise<IFileSystem>) {
-	return vi.fn((_backend: string, _sandboxId: string): Promise<IFileSystem> => {
+	return vi.fn((_tenantId: string, _sandboxId: string): Promise<IFileSystem> => {
 		if (impl) return impl();
 		return Promise.resolve(new InMemoryFs());
 	});
@@ -17,10 +19,10 @@ function makeCreateFs(impl?: () => Promise<IFileSystem>) {
 describe("SessionManager.getOrCreate", () => {
 	it("first getOrCreate creates a new session, second call reuses it", async () => {
 		const createFs = makeCreateFs();
-		const sm = new SessionManager({ backend: "memory", createFs });
+		const sm = new SessionManager({ createFs });
 
-		const s1 = await sm.getOrCreate("sandbox-1");
-		const s2 = await sm.getOrCreate("sandbox-1");
+		const s1 = await sm.getOrCreate(T, "sandbox-1");
+		const s2 = await sm.getOrCreate(T, "sandbox-1");
 
 		expect(s1).toBe(s2);
 		expect(createFs).toHaveBeenCalledTimes(1);
@@ -32,13 +34,13 @@ describe("SessionManager.getOrCreate", () => {
 			resolveFsCreation = resolve;
 		});
 
-		const createFs = vi.fn((_backend: string, _sandboxId: string) => fsPromise);
+		const createFs = vi.fn((_tenantId: string, _sandboxId: string) => fsPromise);
 
-		const sm = new SessionManager({ backend: "memory", createFs });
+		const sm = new SessionManager({ createFs });
 
 		// Start both concurrently before the first resolves
-		const p1 = sm.getOrCreate("sandbox-a");
-		const p2 = sm.getOrCreate("sandbox-a");
+		const p1 = sm.getOrCreate(T, "sandbox-a");
+		const p2 = sm.getOrCreate(T, "sandbox-a");
 
 		// Resolve the underlying fs creation
 		resolveFsCreation(new InMemoryFs());
@@ -51,10 +53,10 @@ describe("SessionManager.getOrCreate", () => {
 
 	it("different sandboxIds get independent sessions", async () => {
 		const createFs = makeCreateFs();
-		const sm = new SessionManager({ backend: "memory", createFs });
+		const sm = new SessionManager({ createFs });
 
-		const s1 = await sm.getOrCreate("sandbox-x");
-		const s2 = await sm.getOrCreate("sandbox-y");
+		const s1 = await sm.getOrCreate(T, "sandbox-x");
+		const s2 = await sm.getOrCreate(T, "sandbox-y");
 
 		expect(s1).not.toBe(s2);
 		expect(createFs).toHaveBeenCalledTimes(2);
@@ -63,7 +65,7 @@ describe("SessionManager.getOrCreate", () => {
 
 describe("SessionManager.withSession", () => {
 	it("two concurrent withSession calls execute sequentially (not in parallel)", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		const sm = new SessionManager({ createFs: makeCreateFs() });
 
 		const executionOrder: string[] = [];
 		let resolveFirst!: () => void;
@@ -76,7 +78,7 @@ describe("SessionManager.withSession", () => {
 		});
 
 		// First call: signals it started, then waits for the blocker
-		const call1 = sm.withSession("sandbox-seq", async () => {
+		const call1 = sm.withSession(T, "sandbox-seq", async () => {
 			executionOrder.push("call1-start");
 			resolveFirst();
 			await firstBlocker;
@@ -86,7 +88,7 @@ describe("SessionManager.withSession", () => {
 		// Wait for call1 to start, then launch call2
 		await firstStarted;
 
-		const call2 = sm.withSession("sandbox-seq", async () => {
+		const call2 = sm.withSession(T, "sandbox-seq", async () => {
 			executionOrder.push("call2-start");
 			executionOrder.push("call2-end");
 		});
@@ -99,14 +101,14 @@ describe("SessionManager.withSession", () => {
 	});
 
 	it("withSession increments and decrements inFlight", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
+		const sm = new SessionManager({ createFs: makeCreateFs() });
 
 		let inFlightDuringExecution = -1;
-		await sm.withSession("sandbox-if", async (session) => {
+		await sm.withSession(T, "sandbox-if", async (session) => {
 			inFlightDuringExecution = session.inFlight;
 		});
 
-		const session = await sm.getOrCreate("sandbox-if");
+		const session = await sm.getOrCreate(T, "sandbox-if");
 		expect(inFlightDuringExecution).toBe(1);
 		expect(session.inFlight).toBe(0);
 	});
@@ -121,20 +123,19 @@ describe("SessionManager pathCache memory budget (US-075a)", () => {
 		vi.useFakeTimers();
 		// Very large budget and very long idle — session should not be evicted
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			idleMs: 1_000_000,
 			pathCacheMaxBytes: 100 * 1024 * 1024,
 		});
 		sm.startReaper(2000);
 
-		await sm.getOrCreate("sandbox-underbudget");
-		expect(sm.getSession("sandbox-underbudget")).toBeDefined();
+		await sm.getOrCreate(T, "sandbox-underbudget");
+		expect(sm.getSession(T, "sandbox-underbudget")).toBeDefined();
 
 		// Reaper fires multiple times — session is under-budget and not idle
 		vi.advanceTimersByTime(10_000);
 
-		expect(sm.getSession("sandbox-underbudget")).toBeDefined();
+		expect(sm.getSession(T, "sandbox-underbudget")).toBeDefined();
 
 		sm.stopReaper();
 	});
@@ -143,20 +144,19 @@ describe("SessionManager pathCache memory budget (US-075a)", () => {
 		vi.useFakeTimers();
 		// pathCacheMaxBytes=1 means any non-empty pathCache is immediately over-budget
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			idleMs: 1_000_000,
 			pathCacheMaxBytes: 1,
 		});
 		sm.startReaper(2000);
 
-		await sm.getOrCreate("sandbox-overbudget");
-		expect(sm.getSession("sandbox-overbudget")).toBeDefined();
+		await sm.getOrCreate(T, "sandbox-overbudget");
+		expect(sm.getSession(T, "sandbox-overbudget")).toBeDefined();
 
 		// Reaper fires at 2000ms — session is over-budget and inFlight=0, evict regardless of idle timeout
 		vi.advanceTimersByTime(3000);
 
-		expect(sm.getSession("sandbox-overbudget")).toBeUndefined();
+		expect(sm.getSession(T, "sandbox-overbudget")).toBeUndefined();
 
 		sm.stopReaper();
 	});
@@ -165,31 +165,31 @@ describe("SessionManager pathCache memory budget (US-075a)", () => {
 describe("SessionManager.destroy (US-076)", () => {
 	it("destroy removes session from Map and calls destroySandbox", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
 
-		await sm.getOrCreate("sandbox-destroy-basic");
-		expect(sm.getSession("sandbox-destroy-basic")).toBeDefined();
+		await sm.getOrCreate(T, "sandbox-destroy-basic");
+		expect(sm.getSession(T, "sandbox-destroy-basic")).toBeDefined();
 
-		const result = await sm.destroy("sandbox-destroy-basic");
+		const result = await sm.destroy(T, "sandbox-destroy-basic");
 
 		expect(result).toBe(true);
-		expect(sm.getSession("sandbox-destroy-basic")).toBeUndefined();
-		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-destroy-basic");
+		expect(sm.getSession(T, "sandbox-destroy-basic")).toBeUndefined();
+		expect(destroySandboxFn).toHaveBeenCalledWith(T, "sandbox-destroy-basic");
 	});
 
 	it("destroy calls destroySandbox even when session is not in pool", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
 
-		const result = await sm.destroy("sandbox-never-created");
+		const result = await sm.destroy(T, "sandbox-never-created");
 
 		expect(result).toBe(false);
-		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-never-created");
+		expect(destroySandboxFn).toHaveBeenCalledWith(T, "sandbox-never-created");
 	});
 
 	it("destroy waits for in-flight work before calling destroySandbox", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
 
 		let releaseWork!: () => void;
 		let workStartedResolve!: () => void;
@@ -201,7 +201,7 @@ describe("SessionManager.destroy (US-076)", () => {
 		});
 
 		// Start a withSession that blocks inside the mutex
-		const workPromise = sm.withSession("sandbox-destroy-wait", async () => {
+		const workPromise = sm.withSession(T, "sandbox-destroy-wait", async () => {
 			workStartedResolve();
 			await workBlocker;
 		});
@@ -210,7 +210,7 @@ describe("SessionManager.destroy (US-076)", () => {
 		await workStarted;
 
 		// Destroy is called while work is in-flight
-		const destroyPromise = sm.destroy("sandbox-destroy-wait");
+		const destroyPromise = sm.destroy(T, "sandbox-destroy-wait");
 
 		// destroySandbox should not have been called yet — destroy is waiting on the mutex
 		expect(destroySandboxFn).not.toHaveBeenCalled();
@@ -219,13 +219,13 @@ describe("SessionManager.destroy (US-076)", () => {
 		releaseWork();
 		await Promise.all([workPromise, destroyPromise]);
 
-		expect(destroySandboxFn).toHaveBeenCalledWith("memory", "sandbox-destroy-wait");
-		expect(sm.getSession("sandbox-destroy-wait")).toBeUndefined();
+		expect(destroySandboxFn).toHaveBeenCalledWith(T, "sandbox-destroy-wait");
+		expect(sm.getSession(T, "sandbox-destroy-wait")).toBeUndefined();
 	});
 
 	it("request arriving during destroy is rejected with error", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
 
 		let releaseWork!: () => void;
 		let workStartedResolve!: () => void;
@@ -237,7 +237,7 @@ describe("SessionManager.destroy (US-076)", () => {
 		});
 
 		// Start a long-running withSession that holds the mutex
-		const workPromise = sm.withSession("sandbox-reject-destroy", async () => {
+		const workPromise = sm.withSession(T, "sandbox-reject-destroy", async () => {
 			workStartedResolve();
 			await workBlocker;
 		});
@@ -245,10 +245,10 @@ describe("SessionManager.destroy (US-076)", () => {
 		await workStarted;
 
 		// Call destroy — marks state='closing' immediately (before queuing in mutex)
-		const destroyPromise = sm.destroy("sandbox-reject-destroy");
+		const destroyPromise = sm.destroy(T, "sandbox-reject-destroy");
 
 		// New request arriving while destroy is pending: state='closing' → fail fast
-		await expect(sm.withSession("sandbox-reject-destroy", async () => {})).rejects.toThrow("ESESSIONCLOSING");
+		await expect(sm.withSession(T, "sandbox-reject-destroy", async () => {})).rejects.toThrow("ESESSIONCLOSING");
 
 		// Finish blocked work so destroy can complete
 		releaseWork();
@@ -257,11 +257,11 @@ describe("SessionManager.destroy (US-076)", () => {
 
 	it("concurrent destroy calls are idempotent — destroySandbox called exactly once", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
 
-		await sm.getOrCreate("sandbox-idem-destroy");
+		await sm.getOrCreate(T, "sandbox-idem-destroy");
 
-		await Promise.all([sm.destroy("sandbox-idem-destroy"), sm.destroy("sandbox-idem-destroy")]);
+		await Promise.all([sm.destroy(T, "sandbox-idem-destroy"), sm.destroy(T, "sandbox-idem-destroy")]);
 
 		expect(destroySandboxFn).toHaveBeenCalledTimes(1);
 	});
@@ -269,14 +269,14 @@ describe("SessionManager.destroy (US-076)", () => {
 
 describe("SessionManager.withExistingSession (US-076a)", () => {
 	it("throws ENOENT for non-existent sandbox", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
-		await expect(sm.withExistingSession("nonexistent", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+		const sm = new SessionManager({ createFs: makeCreateFs() });
+		await expect(sm.withExistingSession(T, "nonexistent", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("succeeds for existing sandbox", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
-		await sm.getOrCreate("test-existing");
-		const result = await sm.withExistingSession("test-existing", async (session) => {
+		const sm = new SessionManager({ createFs: makeCreateFs() });
+		await sm.getOrCreate(T, "test-existing");
+		const result = await sm.withExistingSession(T, "test-existing", async (session) => {
 			return session.fs.exists("/");
 		});
 		expect(result).toBe(true);
@@ -284,20 +284,20 @@ describe("SessionManager.withExistingSession (US-076a)", () => {
 
 	it("throws ENOENT after destroy completes", async () => {
 		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), destroySandboxFn });
-		await sm.getOrCreate("closing-test");
-		await sm.destroy("closing-test");
-		await expect(sm.withExistingSession("closing-test", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
+		await sm.getOrCreate(T, "closing-test");
+		await sm.destroy(T, "closing-test");
+		await expect(sm.withExistingSession(T, "closing-test", async () => {})).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("increments and decrements inFlight", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
-		await sm.getOrCreate("sandbox-existing-if");
+		const sm = new SessionManager({ createFs: makeCreateFs() });
+		await sm.getOrCreate(T, "sandbox-existing-if");
 		let inFlightDuringExecution = -1;
-		await sm.withExistingSession("sandbox-existing-if", async (session) => {
+		await sm.withExistingSession(T, "sandbox-existing-if", async (session) => {
 			inFlightDuringExecution = session.inFlight;
 		});
-		const session = sm.getSession("sandbox-existing-if");
+		const session = sm.getSession(T, "sandbox-existing-if");
 		expect(inFlightDuringExecution).toBe(1);
 		expect(session?.inFlight).toBe(0);
 	});
@@ -315,16 +315,16 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 	}
 
 	it("warm session ignores subsequent runtimeOptions (cache-hit path)", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
-		const first = await sm.getOrCreate("sandbox-warm", { python: true, javascript: false });
-		const second = await sm.getOrCreate("sandbox-warm", { python: false, javascript: true });
+		const sm = new SessionManager({ createFs: makeCreateFs() });
+		const first = await sm.getOrCreate(T, "sandbox-warm", { python: true, javascript: false });
+		const second = await sm.getOrCreate(T, "sandbox-warm", { python: false, javascript: true });
 		expect(second).toBe(first);
 		expect(second.runtimeOptions).toEqual({ python: true, javascript: false });
 	});
 
 	it("non-Python script bypasses semaphore entirely", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate("sandbox-no-py", { python: true, javascript: false });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-no-py", { python: true, javascript: false });
 		stubBashExec(session, async () => ({ stdout: "hi", stderr: "", exitCode: 0, env: {} }));
 
 		await sm.execWithRuntimeThrottle(session, "echo hi");
@@ -337,8 +337,8 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 	});
 
 	it("session without python runtime does NOT throttle even if script mentions python3", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate("sandbox-no-runtime");
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-no-runtime");
 		let execCount = 0;
 		stubBashExec(session, async () => {
 			execCount++;
@@ -356,8 +356,8 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 	});
 
 	it("regex does not match mypython_script or python-config (word boundary)", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate("sandbox-regex", { python: true, javascript: false });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-regex", { python: true, javascript: false });
 
 		let running = 0;
 		let peak = 0;
@@ -380,8 +380,8 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 	});
 
 	it("semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 2 });
-		const session = await sm.getOrCreate("sandbox-sem", { python: true, javascript: false });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 2 });
+		const session = await sm.getOrCreate(T, "sandbox-sem", { python: true, javascript: false });
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -413,8 +413,8 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 	});
 
 	it("slot is released even when bash.exec throws", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate("sandbox-throw", { python: true, javascript: false });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-throw", { python: true, javascript: false });
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -444,8 +444,8 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 	}
 
 	it("session without javascript runtime does NOT throttle even if script mentions js-exec/node", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate("sandbox-js-off");
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-js-off");
 		let execCount = 0;
 		stubBashExec(session, async () => {
 			execCount++;
@@ -461,8 +461,8 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 	});
 
 	it("JS regex does not match mynode/nodejs_tool/js-exec-helper etc (word boundary)", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate("sandbox-js-regex", { python: false, javascript: true });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-js-regex", { python: false, javascript: true });
 
 		let running = 0;
 		let peak = 0;
@@ -483,8 +483,8 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 	});
 
 	it("12 parallel js-exec scripts with cap=4 run in 3 batches of 4", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 4 });
-		const session = await sm.getOrCreate("sandbox-js-12", { python: false, javascript: true });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 4 });
+		const session = await sm.getOrCreate(T, "sandbox-js-12", { python: false, javascript: true });
 
 		let running = 0;
 		let peak = 0;
@@ -508,8 +508,8 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 	});
 
 	it("semaphore allows up to N concurrent JS executions, queues the (N+1)th until a slot frees", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 2 });
-		const session = await sm.getOrCreate("sandbox-js-sem", { python: false, javascript: true });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 2 });
+		const session = await sm.getOrCreate(T, "sandbox-js-sem", { python: false, javascript: true });
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -538,8 +538,8 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 	});
 
 	it("JS slot is released even when bash.exec throws", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate("sandbox-js-throw", { python: false, javascript: true });
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
+		const session = await sm.getOrCreate(T, "sandbox-js-throw", { python: false, javascript: true });
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -568,12 +568,11 @@ describe("SessionManager combined python + js semaphores", () => {
 
 	it("combined-runtime script eventually holds both slots; other callers on each semaphore queue correctly", async () => {
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate("sandbox-both", { python: true, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-both", { python: true, javascript: true });
 
 		const releasers: Array<() => void> = [];
 		stubBashExec(session, async () => {
@@ -608,12 +607,11 @@ describe("SessionManager combined python + js semaphores", () => {
 
 	it("acquisition order python→js avoids deadlock when two scripts each need both slots", async () => {
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate("sandbox-deadlock", { python: true, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-deadlock", { python: true, javascript: true });
 
 		let peak = 0;
 		let running = 0;
@@ -644,35 +642,76 @@ describe("SessionManager idle eviction (US-075)", () => {
 
 	it("session idle longer than idleMs with inFlight=0 is evicted from Map", async () => {
 		vi.useFakeTimers();
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), idleMs: 1000 });
+		const sm = new SessionManager({ createFs: makeCreateFs(), idleMs: 1000 });
 		// Reaper runs every 2000ms
 		sm.startReaper(2000);
 
-		await sm.getOrCreate("sandbox-idle");
-		expect(sm.getSession("sandbox-idle")).toBeDefined();
+		await sm.getOrCreate(T, "sandbox-idle");
+		expect(sm.getSession(T, "sandbox-idle")).toBeDefined();
 
 		// Advance 3000ms — reaper fires at 2000ms; lastUsed=0, now=2000 → 2000 > 1000 → evict
 		vi.advanceTimersByTime(3000);
 
-		expect(sm.getSession("sandbox-idle")).toBeUndefined();
+		expect(sm.getSession(T, "sandbox-idle")).toBeUndefined();
 
 		sm.stopReaper();
 	});
 
 	it("busy session (inFlight > 0) past idle threshold is NOT evicted", async () => {
 		vi.useFakeTimers();
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), idleMs: 1000 });
+		const sm = new SessionManager({ createFs: makeCreateFs(), idleMs: 1000 });
 		sm.startReaper(2000);
 
-		const session = await sm.getOrCreate("sandbox-busy");
+		const session = await sm.getOrCreate(T, "sandbox-busy");
 		// Simulate an active in-flight operation
 		session.inFlight = 1;
 
 		// Advance past idle threshold — reaper fires at 2000ms but inFlight=1 so skip
 		vi.advanceTimersByTime(3000);
 
-		expect(sm.getSession("sandbox-busy")).toBeDefined();
+		expect(sm.getSession(T, "sandbox-busy")).toBeDefined();
 
 		sm.stopReaper();
+	});
+});
+
+describe("SessionManager multi-tenant isolation (Phase 2)", () => {
+	it("same sandboxId across tenants creates two independent sessions (composite key)", async () => {
+		const createFs = makeCreateFs();
+		const sm = new SessionManager({ createFs });
+
+		const sA = await sm.getOrCreate("tenant-a", "sb-1");
+		const sB = await sm.getOrCreate("tenant-b", "sb-1");
+
+		expect(sA).not.toBe(sB);
+		expect(sA.tenantId).toBe("tenant-a");
+		expect(sB.tenantId).toBe("tenant-b");
+		expect(createFs).toHaveBeenCalledTimes(2);
+		expect(createFs).toHaveBeenNthCalledWith(1, "tenant-a", "sb-1");
+		expect(createFs).toHaveBeenNthCalledWith(2, "tenant-b", "sb-1");
+	});
+
+	it("destroy on one tenant leaves the other tenant's session with the same sandboxId intact", async () => {
+		const destroySandboxFn = vi.fn().mockResolvedValue(undefined);
+		const sm = new SessionManager({ createFs: makeCreateFs(), destroySandboxFn });
+
+		await sm.getOrCreate("tenant-a", "dup");
+		await sm.getOrCreate("tenant-b", "dup");
+
+		await sm.destroy("tenant-a", "dup");
+
+		expect(sm.getSession("tenant-a", "dup")).toBeUndefined();
+		expect(sm.getSession("tenant-b", "dup")).toBeDefined();
+		expect(destroySandboxFn).toHaveBeenCalledWith("tenant-a", "dup");
+		expect(destroySandboxFn).not.toHaveBeenCalledWith("tenant-b", "dup");
+	});
+
+	it("filesystem factory receives the tenantId so tenant-aware backends can route correctly", async () => {
+		const createFs = makeCreateFs();
+		const sm = new SessionManager({ createFs });
+
+		await sm.withSession("tenant-x", "abc", async () => {});
+
+		expect(createFs).toHaveBeenCalledWith("tenant-x", "abc");
 	});
 });

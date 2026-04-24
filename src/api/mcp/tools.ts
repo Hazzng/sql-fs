@@ -32,15 +32,20 @@ function isValidRelativePath(p: string): boolean {
  * Returns an error message if the caller does not own the sandbox, null if OK.
  * Matches HTTP route checkOwnership behavior: empty owner means no enforcement.
  */
-function checkMcpOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): string | null {
-	const session = sessionManager.getSession(sandboxId);
+function checkMcpOwnership(
+	sessionManager: SessionManager,
+	tenantId: string,
+	sandboxId: string,
+	caller: string,
+): string | null {
+	const session = sessionManager.getSession(tenantId, sandboxId);
 	if (session?.owner && session.owner !== caller) {
 		return "forbidden";
 	}
 	return null;
 }
 
-export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string): void {
+export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
 		"sandbox_create",
 		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands.",
@@ -54,7 +59,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
 			};
-			const session = await sessionManager.getOrCreate(id, runtimeOptions);
+			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions);
 			session.owner = owner;
 			return {
 				content: [
@@ -68,14 +73,14 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 	);
 
 	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
-		const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+		const ownershipErr = checkMcpOwnership(sessionManager, tenant, args.id, owner);
 		if (ownershipErr) {
 			return {
 				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
 			};
 		}
 		try {
-			const existed = await sessionManager.destroy(args.id);
+			const existed = await sessionManager.destroy(tenant, args.id);
 			if (!existed) {
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
@@ -121,7 +126,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			timeout: z.number().int().positive().optional(),
 		},
 		async (args) => {
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			const ownershipErr = checkMcpOwnership(sessionManager, tenant, args.id, owner);
 			if (ownershipErr) {
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: "forbidden", exitCode: 1 }) }],
@@ -131,7 +136,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const result = await sessionManager.withExistingSession(args.id, async (session) => {
+				const result = await sessionManager.withExistingSession(tenant, args.id, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 
@@ -206,7 +211,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				}
 			}
 
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			const ownershipErr = checkMcpOwnership(sessionManager, tenant, args.id, owner);
 			if (ownershipErr) {
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
@@ -214,7 +219,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				await sessionManager.withExistingSession(args.id, async (session) => {
+				await sessionManager.withExistingSession(tenant, args.id, async (session) => {
 					for (const [relativePath, content] of Object.entries(args.files)) {
 						const absPath = `${basePath}/${relativePath}`;
 						const lastSlash = absPath.lastIndexOf("/");
@@ -252,7 +257,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const basePath = args.basePath ?? "/home/user";
 			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
+			const ownershipErr = checkMcpOwnership(sessionManager, tenant, args.id, owner);
 			if (ownershipErr) {
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
@@ -260,7 +265,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				const { files, errors } = await sessionManager.withExistingSession(args.id, async (session) => {
+				const { files, errors } = await sessionManager.withExistingSession(tenant, args.id, async (session) => {
 					const allPaths = session.fs.getAllPaths();
 					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
 					const result: Record<string, string> = Object.create(null);

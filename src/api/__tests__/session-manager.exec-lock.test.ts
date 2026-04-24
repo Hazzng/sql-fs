@@ -63,17 +63,19 @@ function asRedis(f: FakeRedis): Redis {
 	return f as unknown as Redis;
 }
 
+const T = "default";
+
 function makeCreateFs() {
-	return vi.fn((_backend: string, _sandboxId: string): Promise<IFileSystem> => Promise.resolve(new InMemoryFs()));
+	return vi.fn((_tenantId: string, _sandboxId: string): Promise<IFileSystem> => Promise.resolve(new InMemoryFs()));
 }
 
 describe("SessionManager + distributed exec lock", () => {
 	it("withSession takes and releases the Redis lock around fn", async () => {
 		const redis = new FakeRedis();
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs(), redis: asRedis(redis) });
+		const sm = new SessionManager({ createFs: makeCreateFs(), redis: asRedis(redis) });
 
 		let observedLock: Entry | undefined;
-		await sm.withSession("sbx-A", async () => {
+		await sm.withSession(T, "sbx-A", async () => {
 			observedLock = redis.store.get(execLockKey("sbx-A"));
 		});
 
@@ -83,12 +85,12 @@ describe("SessionManager + distributed exec lock", () => {
 
 	it("two SessionManagers sharing the same Redis serialize concurrent withSession", async () => {
 		const redis = new FakeRedis();
-		const smA = new SessionManager({ backend: "memory", createFs: makeCreateFs(), redis: asRedis(redis) });
-		const smB = new SessionManager({ backend: "memory", createFs: makeCreateFs(), redis: asRedis(redis) });
+		const smA = new SessionManager({ createFs: makeCreateFs(), redis: asRedis(redis) });
+		const smB = new SessionManager({ createFs: makeCreateFs(), redis: asRedis(redis) });
 
 		const order: string[] = [];
 
-		const callA = smA.withSession("sbx-shared", async () => {
+		const callA = smA.withSession(T, "sbx-shared", async () => {
 			order.push("A-start");
 			await new Promise((r) => setTimeout(r, 80));
 			order.push("A-end");
@@ -97,7 +99,7 @@ describe("SessionManager + distributed exec lock", () => {
 		// Give A a chance to acquire before launching B
 		await new Promise((r) => setTimeout(r, 5));
 
-		const callB = smB.withSession("sbx-shared", async () => {
+		const callB = smB.withSession(T, "sbx-shared", async () => {
 			order.push("B-start");
 			order.push("B-end");
 		});
@@ -110,13 +112,11 @@ describe("SessionManager + distributed exec lock", () => {
 		const redis = new FakeRedis();
 		const destroyFn = vi.fn().mockResolvedValue(undefined);
 		const smA = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			destroySandboxFn: destroyFn,
 			redis: asRedis(redis),
 		});
 		const smB = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			destroySandboxFn: destroyFn,
 			redis: asRedis(redis),
@@ -125,7 +125,7 @@ describe("SessionManager + distributed exec lock", () => {
 		const events: string[] = [];
 
 		// Pre-warm a session in smA so destroy actually tears down local state
-		await smA.withSession("sbx-D", async () => {
+		await smA.withSession(T, "sbx-D", async () => {
 			events.push("prewarm");
 		});
 
@@ -135,7 +135,7 @@ describe("SessionManager + distributed exec lock", () => {
 		});
 
 		// smB kicks off a withSession holding the lock
-		const execCall = smB.withSession("sbx-D", async () => {
+		const execCall = smB.withSession(T, "sbx-D", async () => {
 			events.push("exec-start");
 			await execGate;
 			events.push("exec-end");
@@ -143,7 +143,7 @@ describe("SessionManager + distributed exec lock", () => {
 
 		await new Promise((r) => setTimeout(r, 5));
 
-		const destroyCall = smA.destroy("sbx-D");
+		const destroyCall = smA.destroy(T, "sbx-D");
 
 		// Let destroy attempt to acquire — it should be blocked behind exec
 		await new Promise((r) => setTimeout(r, 30));
@@ -161,18 +161,17 @@ describe("SessionManager + distributed exec lock", () => {
 		redis.store.set(execLockKey("sbx-T"), { value: "owned-by-someone-else", expiresAt: Date.now() + 60_000 });
 
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeCreateFs(),
 			redis: asRedis(redis),
 			execLockOptions: { acquireTimeoutMs: 100, acquireRetryMs: 20, leaseMs: 5_000, renewMs: 1_000 },
 		});
 
-		await expect(sm.withSession("sbx-T", async () => "nope")).rejects.toMatchObject({ code: "ELOCKTIMEOUT" });
+		await expect(sm.withSession(T, "sbx-T", async () => "nope")).rejects.toMatchObject({ code: "ELOCKTIMEOUT" });
 	});
 
 	it("single-replica (no Redis) mode skips the distributed lock", async () => {
-		const sm = new SessionManager({ backend: "memory", createFs: makeCreateFs() });
-		const result = await sm.withSession("sbx-solo", async () => "solo-ok");
+		const sm = new SessionManager({ createFs: makeCreateFs() });
+		const result = await sm.withSession(T, "sbx-solo", async () => "solo-ok");
 		expect(result).toBe("solo-ok");
 	});
 });

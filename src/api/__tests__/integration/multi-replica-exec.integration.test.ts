@@ -18,6 +18,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../fs/sql-fs/index.js";
 import { execLockKey } from "../../distributed-lock.js";
 import { SessionManager } from "../../session-manager.js";
+import { loadTenantConfig } from "../../tenants.js";
+
+const TENANT = "default";
 
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;
 
@@ -58,7 +61,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 
 	function makeSm(): SessionManager {
 		return new SessionManager({
-			backend: "postgres",
+			tenantConfig: loadTenantConfig(),
 			redis,
 			execLockOptions: {
 				leaseMs: 5_000,
@@ -83,7 +86,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		const events: string[] = [];
 		const holdMs = 300;
 
-		const execA = smA.withSession(sandboxId, async (s) => {
+		const execA = smA.withSession(TENANT, sandboxId, async (s) => {
 			events.push("A-start");
 			await s.bash.exec(`sleep ${holdMs / 1000} && echo A > /from-a.txt`);
 			events.push("A-end");
@@ -92,7 +95,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		// Give A a head-start so it wins the acquire race.
 		await new Promise((r) => setTimeout(r, 50));
 
-		const execB = smB.withSession(sandboxId, async (s) => {
+		const execB = smB.withSession(TENANT, sandboxId, async (s) => {
 			events.push("B-start");
 			await s.bash.exec("echo B > /from-b.txt");
 			events.push("B-end");
@@ -105,7 +108,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 
 		// Both files present: A's write was durable across replicas.
 		const verify = makeSm();
-		await verify.withSession(sandboxId, async (s) => {
+		await verify.withSession(TENANT, sandboxId, async (s) => {
 			const a = await s.fs.readFile("/from-a.txt");
 			const b = await s.fs.readFile("/from-b.txt");
 			expect(String(a).trim()).toBe("A");
@@ -119,7 +122,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		const smB = makeSm();
 
 		// Warm A so the sandbox exists in its pool (destroy path requires it for full cleanup).
-		await smA.withSession(sandboxId, async () => {
+		await smA.withSession(TENANT, sandboxId, async () => {
 			/* warm up */
 		});
 
@@ -129,7 +132,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 			releaseExec = resolve;
 		});
 
-		const execA = smA.withSession(sandboxId, async () => {
+		const execA = smA.withSession(TENANT, sandboxId, async () => {
 			events.push("exec-start");
 			await execGate;
 			events.push("exec-end");
@@ -141,7 +144,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		// Also warm B so destroy on B finds the sandbox in its own pool (destroy only
 		// removes the in-memory entry on the replica that holds it — the PG row is
 		// deleted unconditionally inside the lock).
-		const destroyB = smB.destroy(sandboxId);
+		const destroyB = smB.destroy(TENANT, sandboxId);
 
 		// Destroy should be blocked behind exec. Give it a moment then release.
 		await new Promise((r) => setTimeout(r, 100));
@@ -164,7 +167,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		const start = Date.now();
 		await timed(
 			"post-expiry-acquire",
-			sm.withSession(sandboxId, async () => {
+			sm.withSession(TENANT, sandboxId, async () => {
 				/* noop */
 			}),
 			leaseMs + 5_000,

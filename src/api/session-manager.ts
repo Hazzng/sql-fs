@@ -1,6 +1,13 @@
 /**
  * Session Manager — US-074
- * Maintains a pool of warm Bash sessions, one per sandboxId.
+ * Maintains a pool of warm Bash sessions, keyed by (tenantId, sandboxId).
+ *
+ * Multi-tenant Phase 2: each tenant maps to its own Postgres database via
+ * `TenantConfig`. Postgres backends (connection string + optional blob cache)
+ * are lazily constructed per tenant; the session map is keyed by
+ * `${tenantId}:${sandboxId}` so two tenants with colliding sandbox ids stay
+ * isolated. Redis keys are NOT yet tenant-prefixed in this phase — Phase 3
+ * threads the tenant id through the four Redis keyspaces.
  */
 
 import { Mutex } from "async-mutex";
@@ -8,12 +15,13 @@ import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
-import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
-import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
+import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import type { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
+import type { TenantConfig } from "./tenants.js";
 
 /**
  * Internal structural type: the subset of `SqlFs` the session manager touches
@@ -76,6 +84,7 @@ export interface Session {
 	readonly fs: IFileSystem;
 	readonly bash: Bash;
 	readonly runtimeOptions: RuntimeOptions;
+	readonly tenantId: string;
 	lastUsed: number;
 	inFlight: number;
 	readonly mutex: Mutex;
@@ -96,12 +105,23 @@ export interface Session {
 	lastSeenVersion: number;
 }
 
+/** Per-tenant lazy Postgres backend state. */
+interface PerTenantBackend {
+	readonly connectionString: string;
+	readonly blobCache: RedisBlobCache | undefined;
+}
+
 export interface SessionManagerOptions {
-	readonly backend: StorageBackend;
-	readonly databaseUrl?: string;
-	readonly createFs?: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
-	/** Override for destroySandbox — used for dependency injection in tests */
-	readonly destroySandboxFn?: (backend: StorageBackend, sandboxId: string) => Promise<void>;
+	/**
+	 * Tenant configuration used to resolve a tenant id → Postgres connection
+	 * string. Required unless a `createFs` override is supplied (tests can
+	 * bypass the real backend by injecting their own filesystem factory).
+	 */
+	readonly tenantConfig?: TenantConfig;
+	/** Override for createPostgresSandboxFs — used by tests and non-Postgres backends. */
+	readonly createFs?: (tenantId: string, sandboxId: string) => Promise<IFileSystem>;
+	/** Override for destroyPostgresSandbox — used for dependency injection in tests. */
+	readonly destroySandboxFn?: (tenantId: string, sandboxId: string) => Promise<void>;
 	/** Idle timeout in ms before a session is eligible for eviction (default: SESSION_IDLE_MS env var or 600000) */
 	readonly idleMs?: number;
 	/** Max pathCache bytes per session before it is marked over-budget (default: 50MB) */
@@ -124,6 +144,12 @@ export interface SessionManagerOptions {
 	 * on sandbox destroy.
 	 */
 	readonly pathSnapshot?: RedisPathSnapshot;
+	/**
+	 * Factory constructing a per-tenant RedisBlobCache. Called at most once
+	 * per tenant on first access (lazy). Phase 3 will widen the signature to
+	 * accept the tenant id so the cache can tenant-prefix its keys.
+	 */
+	readonly blobCacheFactory?: () => RedisBlobCache | undefined;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -134,18 +160,22 @@ interface Semaphore {
 }
 
 export class SessionManager {
+	/** Keyed by `${tenantId}:${sandboxId}` to isolate colliding sandbox ids across tenants. */
 	private readonly sessions: Map<string, Session> = new Map();
-	/** Single-flight map: tracks in-progress session creation */
+	/** Single-flight map: tracks in-progress session creation, keyed by `${tenantId}:${sandboxId}`. */
 	private readonly pending: Map<string, Promise<Session>> = new Map();
-	private readonly backend: StorageBackend;
-	private readonly createFs: (backend: StorageBackend, sandboxId: string) => Promise<IFileSystem>;
-	private readonly destroySandboxFn: (backend: StorageBackend, sandboxId: string) => Promise<void>;
+	/** Lazy per-tenant backend (connection string + blob cache). Keyed by tenantId. */
+	private readonly backends: Map<string, PerTenantBackend> = new Map();
+	private readonly tenantConfig: TenantConfig | undefined;
+	private readonly createFsOverride: ((tenantId: string, sandboxId: string) => Promise<IFileSystem>) | undefined;
+	private readonly destroySandboxFn: (tenantId: string, sandboxId: string) => Promise<void>;
 	private readonly idleMs: number;
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
+	private readonly blobCacheFactory: (() => RedisBlobCache | undefined) | undefined;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -158,7 +188,7 @@ export class SessionManager {
 	private readonly jsSem: Semaphore;
 
 	constructor({
-		backend,
+		tenantConfig,
 		createFs,
 		destroySandboxFn,
 		idleMs,
@@ -168,15 +198,25 @@ export class SessionManager {
 		redis,
 		execLockOptions,
 		pathSnapshot,
+		blobCacheFactory,
 	}: SessionManagerOptions) {
-		this.backend = backend;
-		this.createFs = createFs ?? createSandboxFs;
-		this.destroySandboxFn = destroySandboxFn ?? destroySandbox;
+		this.tenantConfig = tenantConfig;
+		this.createFsOverride = createFs;
+		this.destroySandboxFn =
+			destroySandboxFn ??
+			((tenantId, sandboxId) => {
+				// No tenantConfig means tests supplied a createFs override without a real
+				// Postgres backend — destroy is a no-op at the storage layer in that case.
+				if (this.tenantConfig === undefined) return Promise.resolve();
+				const backend = this.getOrInitBackend(tenantId);
+				return destroyPostgresSandbox(backend.connectionString, sandboxId);
+			});
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.redis = redis;
 		this.execLockOptions = execLockOptions;
 		this.pathSnapshot = pathSnapshot;
+		this.blobCacheFactory = blobCacheFactory;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -187,6 +227,49 @@ export class SessionManager {
 			inFlight: 0,
 			waiters: [],
 		};
+	}
+
+	/** Compose the internal session map key. */
+	private sessionKey(tenantId: string, sandboxId: string): string {
+		return `${tenantId}:${sandboxId}`;
+	}
+
+	/**
+	 * Lazily materialize the per-tenant backend on first use. Throws if the
+	 * tenant is unknown to the configured `TenantConfig`.
+	 */
+	private getOrInitBackend(tenantId: string): PerTenantBackend {
+		const existing = this.backends.get(tenantId);
+		if (existing !== undefined) return existing;
+		if (this.tenantConfig === undefined) {
+			throw new Error(
+				`SessionManager: tenantConfig required to resolve tenant "${tenantId}" (no createFs override configured)`,
+			);
+		}
+		const connectionString = this.tenantConfig.getConnectionString(tenantId);
+		const backend: PerTenantBackend = {
+			connectionString,
+			blobCache: this.blobCacheFactory?.(),
+		};
+		this.backends.set(tenantId, backend);
+		return backend;
+	}
+
+	/** Construct the underlying filesystem for a new session. */
+	private async buildFs(tenantId: string, sandboxId: string): Promise<IFileSystem> {
+		if (this.createFsOverride !== undefined) {
+			return this.createFsOverride(tenantId, sandboxId);
+		}
+		const backend = this.getOrInitBackend(tenantId);
+		return createPostgresSandboxFs(
+			{
+				connectionString: backend.connectionString,
+				blobCache: backend.blobCache,
+				redis: this.redis,
+				pathSnapshot: this.pathSnapshot,
+			},
+			sandboxId,
+		);
 	}
 
 	/** Estimate bytes used by the pathCache: path.length + 100 overhead per entry */
@@ -201,20 +284,26 @@ export class SessionManager {
 
 	/**
 	 * Returns an existing session or creates a new one.
-	 * Concurrent calls for the same sandboxId are coalesced into a single creation (single-flight).
+	 * Concurrent calls for the same (tenantId, sandboxId) pair are coalesced into a single
+	 * creation (single-flight).
 	 *
 	 * `runtimeOptions` are applied only on **cache miss** — the first caller "wins" the runtime flags.
 	 * Subsequent callers receive the warm session regardless of the flags they pass.
+	 *
+	 * @param tenantId - Tenant identifier from the JWT claim / config.
+	 * @param sandboxId - Sandbox id scoped within the tenant.
+	 * @param runtimeOptions - Optional runtime opt-ins; only honored on first creation.
 	 */
-	async getOrCreate(sandboxId: string, runtimeOptions?: RuntimeOptions): Promise<Session> {
-		const existing = this.sessions.get(sandboxId);
+	async getOrCreate(tenantId: string, sandboxId: string, runtimeOptions?: RuntimeOptions): Promise<Session> {
+		const key = this.sessionKey(tenantId, sandboxId);
+		const existing = this.sessions.get(key);
 		if (existing !== undefined) {
 			existing.lastUsed = Date.now();
 			return existing;
 		}
 
 		// If another getOrCreate is already creating this session, reuse its promise
-		const inProgress = this.pending.get(sandboxId);
+		const inProgress = this.pending.get(key);
 		if (inProgress !== undefined) {
 			return inProgress;
 		}
@@ -223,7 +312,7 @@ export class SessionManager {
 
 		const creationPromise = (async (): Promise<Session> => {
 			try {
-				const fs = await this.createFs(this.backend, sandboxId);
+				const fs = await this.buildFs(tenantId, sandboxId);
 				// just-bash treats `false` and `undefined` both as off, but the types distinguish them —
 				// `|| undefined` keeps types happy without changing behavior.
 				const bash = new Bash({
@@ -252,6 +341,7 @@ export class SessionManager {
 					fs,
 					bash,
 					runtimeOptions: resolvedRuntime,
+					tenantId,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					mutex: new Mutex(),
@@ -262,22 +352,22 @@ export class SessionManager {
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
 				};
-				this.sessions.set(sandboxId, session);
+				this.sessions.set(key, session);
 				return session;
 			} finally {
-				this.pending.delete(sandboxId);
+				this.pending.delete(key);
 			}
 		})();
 
-		this.pending.set(sandboxId, creationPromise);
+		this.pending.set(key, creationPromise);
 		return creationPromise;
 	}
 
 	/**
-	 * Returns the session for the given sandboxId, or undefined if not found.
+	 * Returns the session for the given (tenantId, sandboxId), or undefined if not found.
 	 */
-	getSession(sandboxId: string): Session | undefined {
-		return this.sessions.get(sandboxId);
+	getSession(tenantId: string, sandboxId: string): Session | undefined {
+		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
 	}
 
 	/**
@@ -387,14 +477,18 @@ export class SessionManager {
 	 *
 	 * `runtimeOptions` are forwarded to `getOrCreate` — applied only on cache miss.
 	 * A warm session ignores subsequent runtimeOptions; the first caller's flags stick.
+	 *
+	 * @param tenantId - Tenant identifier.
+	 * @param sandboxId - Sandbox id scoped within the tenant.
 	 */
 	async withSession<T>(
+		tenantId: string,
 		sandboxId: string,
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
 		return this.withExecLock(sandboxId, async () => {
-			const session = await this.getOrCreate(sandboxId, runtimeOptions);
+			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions);
 
 			// Fast-fail: session is being destroyed — don't queue in the mutex
 			if (session.state === "closing") {
@@ -451,9 +545,9 @@ export class SessionManager {
 	 * The cross-replica distributed lock is acquired before the pool check so a
 	 * sandbox that exists only on another replica can't slip past serialization.
 	 */
-	async withExistingSession<T>(sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
+	async withExistingSession<T>(tenantId: string, sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
 		return this.withExecLock(sandboxId, async () => {
-			const session = this.sessions.get(sandboxId);
+			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
@@ -502,13 +596,14 @@ export class SessionManager {
 	 * The cross-replica distributed lock is held for the full destroy flow so a
 	 * concurrent exec on another replica cannot interleave with the teardown.
 	 */
-	async destroy(sandboxId: string): Promise<boolean> {
+	async destroy(tenantId: string, sandboxId: string): Promise<boolean> {
 		return this.withExecLock(sandboxId, async () => {
-			const session = this.sessions.get(sandboxId);
+			const key = this.sessionKey(tenantId, sandboxId);
+			const session = this.sessions.get(key);
 
 			if (session === undefined) {
 				// Session not in pool — still clean up backend data
-				await this.destroySandboxFn(this.backend, sandboxId);
+				await this.destroySandboxFn(tenantId, sandboxId);
 				await this.deleteVersionKey(sandboxId);
 				if (this.pathSnapshot !== undefined) {
 					await this.pathSnapshot.delete(sandboxId);
@@ -527,8 +622,8 @@ export class SessionManager {
 
 			// Queue cleanup after any currently-running mutex holder finishes
 			const p = session.mutex.runExclusive(async () => {
-				this.sessions.delete(sandboxId);
-				await this.destroySandboxFn(this.backend, sandboxId);
+				this.sessions.delete(key);
+				await this.destroySandboxFn(tenantId, sandboxId);
 				await this.deleteVersionKey(sandboxId);
 				if (this.pathSnapshot !== undefined) {
 					await this.pathSnapshot.delete(sandboxId);
@@ -578,12 +673,12 @@ export class SessionManager {
 
 	private runReaper(): void {
 		const now = Date.now();
-		for (const [sandboxId, session] of this.sessions) {
+		for (const [key, session] of this.sessions) {
 			if (session.state === "closing") continue;
 			if (session.inFlight !== 0) continue;
 			// Over-budget sessions are evicted immediately when idle (no idle timeout)
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
-				this.sessions.delete(sandboxId);
+				this.sessions.delete(key);
 			}
 		}
 	}

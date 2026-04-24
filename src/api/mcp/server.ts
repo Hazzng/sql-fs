@@ -26,8 +26,16 @@ export function createMcpServer(): McpServer {
 /**
  * Handles an incoming MCP HTTP request (POST or GET SSE).
  * Reuses the existing transport for known sessions; creates a new one otherwise.
+ *
+ * @param tenant - Tenant id resolved by the auth middleware; scopes every
+ *   SessionManager call for the lifetime of this MCP session.
  */
-export async function handleMcpRequest(req: Request, sessionManager: SessionManager, owner: string): Promise<Response> {
+export async function handleMcpRequest(
+	req: Request,
+	sessionManager: SessionManager,
+	owner: string,
+	tenant: string,
+): Promise<Response> {
 	const sessionId = req.headers.get("mcp-session-id") ?? undefined;
 
 	if (sessionId !== undefined && sessions.has(sessionId)) {
@@ -36,7 +44,7 @@ export async function handleMcpRequest(req: Request, sessionManager: SessionMana
 	}
 
 	const server = createMcpServer();
-	registerTools(server, sessionManager, owner);
+	registerTools(server, sessionManager, owner, tenant);
 	const transport = new WebStandardStreamableHTTPServerTransport({
 		sessionIdGenerator: () => randomUUID(),
 		onsessioninitialized: (id) => {

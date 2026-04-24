@@ -28,8 +28,13 @@ function isValidRelativePath(p: string): boolean {
 }
 
 /** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
-	const session = sessionManager.getSession(sandboxId);
+function checkOwnership(
+	sessionManager: SessionManager,
+	tenantId: string,
+	sandboxId: string,
+	caller: string,
+): Response | undefined {
+	const session = sessionManager.getSession(tenantId, sandboxId);
 	if (session?.owner && session.owner !== caller) {
 		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
 	}
@@ -41,8 +46,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 	// POST /v1/sandboxes/:id/ingest — upload tar.gz and extract into sandbox
 	router.post("/:id/ingest", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		const body = await c.req.parseBody();
@@ -68,7 +74,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
 
 		try {
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				// Ensure /tmp exists before writing archive
 				try {
 					await session.fs.mkdir("/tmp", { recursive: true });
@@ -109,8 +115,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 	});
 
 	router.post("/:id/ingest-files", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		let raw: unknown;
@@ -159,7 +166,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const fileCount = Object.keys(files).length;
 
 		try {
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				for (const [relativePath, base64Content] of Object.entries(files)) {
 					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
 					const lastSlash = absPath.lastIndexOf("/");
@@ -191,8 +198,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 	// GET /v1/sandboxes/:id/export — download sandbox contents as tar.gz
 	router.get("/:id/export", async (c) => {
+		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
+		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
 		if (ownershipErr) return ownershipErr;
 
 		const basePath = c.req.query("basePath") ?? "/home/user";
@@ -206,7 +214,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		let archiveBytes: Uint8Array;
 		try {
-			archiveBytes = await sessionManager.withExistingSession(sandboxId, async (session) => {
+			archiveBytes = await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				// Check basePath exists
 				const exists = await session.fs.exists(basePath);
 				if (!exists) {

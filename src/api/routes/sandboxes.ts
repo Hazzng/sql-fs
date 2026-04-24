@@ -42,10 +42,12 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		}
 
 		const owner = c.get("owner");
+		const tenant = c.get("tenant");
 		const sandboxId = crypto.randomUUID();
 		const createdAt = new Date().toISOString();
 
 		await sessionManager.withSession(
+			tenant,
 			sandboxId,
 			async (session) => {
 				session.owner = owner;
@@ -64,7 +66,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.get("/:id", (c) => {
 		const id = c.req.param("id");
-		const session = sessionManager.getSession(id);
+		const tenant = c.get("tenant");
+		const session = sessionManager.getSession(tenant, id);
 		if (session === undefined) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 		}
@@ -83,15 +86,16 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.delete("/:id", async (c) => {
 		const id = c.req.param("id");
+		const tenant = c.get("tenant");
 		// Check ownership before destroying
-		const session = sessionManager.getSession(id);
+		const session = sessionManager.getSession(tenant, id);
 		if (session !== undefined) {
 			const caller = c.get("owner");
 			if (session.owner && session.owner !== caller) {
 				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 			}
 		}
-		const found = await sessionManager.destroy(id);
+		const found = await sessionManager.destroy(tenant, id);
 		if (!found) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 		}

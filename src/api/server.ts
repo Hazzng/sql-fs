@@ -1,17 +1,21 @@
 /**
  * Hono HTTP server entry point.
  * US-056: Hono server bootstrap
+ *
+ * Multi-tenant Phase 2: the server loads `TenantConfig` at startup and passes
+ * it both to the tenant-aware auth middleware and the `SessionManager` so every
+ * request routes to the correct tenant's Postgres database.
  */
 
 import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import { getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
-import { type AuthVariables, authMiddleware } from "./auth.js";
+import { type AuthVariables, createAuthMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest } from "./mcp/server.js";
@@ -22,10 +26,13 @@ import { fileRoutes } from "./routes/files.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
+import { loadTenantConfig } from "./tenants.js";
 
 export const app = new Hono<{ Variables: AuthVariables }>();
 
-// ── Session manager (lazy — no DB access until first request) ─────────────────
+// ── Tenant config + session manager ───────────────────────────────────────────
+
+const tenantConfig = loadTenantConfig();
 
 const redisClient = getRedisClient();
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
@@ -46,15 +53,26 @@ const pathSnapshot =
 			})
 		: undefined;
 
+const blobCacheEnabled = redisClient && process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const blobCacheOptions = blobCacheEnabled
+	? {
+			ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
+			maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
+		}
+	: undefined;
+
 const sessionManager = new SessionManager({
-	backend: (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory",
+	tenantConfig,
 	redis: redisClient,
 	execLockOptions,
 	pathSnapshot,
+	blobCacheFactory:
+		redisClient && blobCacheOptions ? () => new RedisBlobCache(redisClient, blobCacheOptions) : undefined,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
+const authMiddleware = createAuthMiddleware(tenantConfig);
 app.use("/v1/*", authMiddleware);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -77,7 +95,7 @@ app.use("/mcp", async (c, next) => {
 	}
 });
 app.use("/mcp", authMiddleware);
-app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner")));
+app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"), c.get("tenant")));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
