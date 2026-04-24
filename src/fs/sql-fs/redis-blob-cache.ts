@@ -19,25 +19,27 @@ export interface RedisBlobCacheOptions {
 
 export class RedisBlobCache {
 	readonly #client: Redis;
+	readonly #tenantId: string;
 	readonly #ttlMs: number;
 	readonly #maxBytes: number;
 	readonly #enabled: boolean;
 
-	constructor(client: Redis, opts: RedisBlobCacheOptions = {}) {
+	constructor(client: Redis, tenantId: string, opts: RedisBlobCacheOptions = {}) {
 		this.#client = client;
+		this.#tenantId = tenantId;
 		this.#ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
 		this.#maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
 		this.#enabled = opts.enabled ?? true;
 	}
 
-	static key(sha256: Uint8Array): string {
-		return `vfs:blob:${Buffer.from(sha256).toString("hex")}`;
+	#key(sha256: Uint8Array): string {
+		return `vfs:${this.#tenantId}:blob:${Buffer.from(sha256).toString("hex")}`;
 	}
 
 	async get(sha256: Uint8Array): Promise<Uint8Array | null> {
 		if (!this.#enabled) return null;
 		try {
-			const buf = await this.#client.getBuffer(RedisBlobCache.key(sha256));
+			const buf = await this.#client.getBuffer(this.#key(sha256));
 			return buf ? new Uint8Array(buf) : null;
 		} catch (err) {
 			console.error(JSON.stringify({ event: "redis_blob_get_error", error: (err as Error).message }));
@@ -49,7 +51,7 @@ export class RedisBlobCache {
 		if (!this.#enabled) return;
 		if (data.byteLength > this.#maxBytes) return;
 		try {
-			await this.#client.set(RedisBlobCache.key(sha256), Buffer.from(data), "PX", this.#ttlMs);
+			await this.#client.set(this.#key(sha256), Buffer.from(data), "PX", this.#ttlMs);
 		} catch (err) {
 			console.error(JSON.stringify({ event: "redis_blob_set_error", error: (err as Error).message }));
 		}

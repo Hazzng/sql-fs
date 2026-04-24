@@ -30,6 +30,7 @@ export type { InodeKind, StorageBackend } from "./types.js";
  */
 export interface PostgresBackendOptions {
 	readonly connectionString: string;
+	readonly tenantId?: string;
 	readonly blobCache?: RedisBlobCache;
 	readonly pathSnapshot?: RedisPathSnapshot;
 	readonly redis?: Redis;
@@ -62,6 +63,7 @@ export async function createPostgresSandboxFs(opts: PostgresBackendOptions, sand
 	const fs = new SqlFs({
 		dialect,
 		sandboxId,
+		tenantId: opts.tenantId,
 		redis: opts.redis,
 		pathSnapshot: opts.pathSnapshot,
 	});
@@ -104,7 +106,7 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
 			const blobCache =
 				redis && blobCacheEnabled
-					? new RedisBlobCache(redis, {
+					? new RedisBlobCache(redis, "default", {
 							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
 							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
 						})

@@ -55,7 +55,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 			} catch {
 				/* ignore */
 			}
-			await redis.del(execLockKey(id));
+			await redis.del(execLockKey(TENANT, id));
 		}
 	});
 
@@ -162,7 +162,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 
 		// Simulate a dead replica still holding the lock: plant a foreign token with a short TTL.
 		const leaseMs = 1_500;
-		await redis.set(execLockKey(sandboxId), "dead-replica-token", "PX", leaseMs);
+		await redis.set(execLockKey(TENANT, sandboxId), "dead-replica-token", "PX", leaseMs);
 
 		const start = Date.now();
 		await timed(

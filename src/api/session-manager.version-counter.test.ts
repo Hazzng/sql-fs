@@ -119,7 +119,7 @@ describe("SessionManager version counter (Phase D)", () => {
 	it("stamps initial lastSeenVersion from Redis at session creation", async () => {
 		const redis = new FakeRedis();
 		// Seed a pre-existing version (e.g., another replica previously published v7)
-		redis.store.set("vfs:ver:sbx", { value: "7", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "7", expiresAt: Date.now() + 60_000 });
 
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
@@ -152,7 +152,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		});
 
 		expect(stub.reloadCount).toBe(0);
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false); // no INCR because never dirty
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false); // no INCR because never dirty
 	});
 
 	it("reloads and updates lastSeenVersion when Redis version is ahead", async () => {
@@ -168,7 +168,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
 
 		// Simulate another replica bumping the version externally
-		redis.store.set("vfs:ver:sbx", { value: "5", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "5", expiresAt: Date.now() + 60_000 });
 
 		await sm.withSession("default", "sbx", async () => {
 			// During this turn, ensureFreshCache should have reloaded.
@@ -190,7 +190,7 @@ describe("SessionManager version counter (Phase D)", () => {
 			stub.dirty = true; // simulate a mutation
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
@@ -206,7 +206,7 @@ describe("SessionManager version counter (Phase D)", () => {
 			// Pure read turn
 		});
 
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("sequential dirty turns bump the counter each time", async () => {
@@ -227,7 +227,7 @@ describe("SessionManager version counter (Phase D)", () => {
 			stub.dirty = true;
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("3");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("3");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(3);
 		// No spurious reloads since the same replica did all three.
 		expect(stub.reloadCount).toBe(0);
@@ -245,16 +245,16 @@ describe("SessionManager version counter (Phase D)", () => {
 		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
-		expect(redis.store.has("vfs:ver:sbx")).toBe(true);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(true);
 
 		await sm.destroy("default", "sbx");
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("destroy on an unknown sandbox still deletes stale version key", async () => {
 		const redis = new FakeRedis();
 		// Stale key left behind by a previous incarnation
-		redis.store.set("vfs:ver:sbx", { value: "42", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "42", expiresAt: Date.now() + 60_000 });
 
 		const sm = new SessionManager({
 			createFs: makeFsFactory(new StubCoherentFs()),
@@ -263,7 +263,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		});
 
 		await sm.destroy("default", "sbx");
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("withExistingSession applies the same version check", async () => {
@@ -279,7 +279,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
 
 		// External bump
-		redis.store.set("vfs:ver:sbx", { value: "9", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "9", expiresAt: Date.now() + 60_000 });
 
 		await sm.withExistingSession("default", "sbx", async () => {
 			expect(stub.reloadCount).toBe(1);
@@ -325,7 +325,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		// to retry the bump.
 		expect(stub.dirty).toBe(true);
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 
 		// Next turn: INCR works, the pending bump flushes.
 		incrSpy.mockRestore();
@@ -333,7 +333,7 @@ describe("SessionManager version counter (Phase D)", () => {
 			// dirty still set from the prior failed turn — no new mutation needed.
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 		expect(stub.dirty).toBe(false);
 	});
@@ -365,7 +365,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Reload was skipped (no throw, no reload count bump on best-effort GET failure).
 		expect(stub.reloadCount).toBe(0);
 		// INCR still ran at end-of-turn.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 	});
 
 	it("ensureFreshCache no longer strands the dirty flag on version match", async () => {
@@ -391,7 +391,7 @@ describe("SessionManager version counter (Phase D)", () => {
 
 		// The pending dirty bit must have triggered a real INCR, not been
 		// silently swallowed by ensureFreshCache.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
@@ -416,7 +416,7 @@ describe("SessionManager version counter (Phase D)", () => {
 
 		// The counter must have bumped despite the throw; other replicas will
 		// see v=1 and reload on their next turn.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 		expect(stub.dirty).toBe(false);
 	});
@@ -439,7 +439,7 @@ describe("SessionManager version counter (Phase D)", () => {
 			}),
 		).rejects.toThrow("boom");
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
@@ -459,7 +459,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		});
 
 		// No version key created because the fs is not coherence-aware.
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("partial fs missing clearDirty is rejected by the guard (no runtime crash)", async () => {
@@ -484,6 +484,6 @@ describe("SessionManager version counter (Phase D)", () => {
 		).resolves.toBeUndefined();
 
 		// Treated as non-coherent: no INCR, no reload attempt.
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 });

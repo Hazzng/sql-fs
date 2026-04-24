@@ -75,7 +75,7 @@ function asRedis(f: FakeRedis): Redis {
 	return f as unknown as Redis;
 }
 
-const KEY = execLockKey("sbx-test");
+const KEY = execLockKey("default", "sbx-test");
 
 describe("withDistributedLock", () => {
 	beforeEach(() => {

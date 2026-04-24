@@ -12,16 +12,22 @@ import { RedisBlobCache } from "../redis-blob-cache.js";
 
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;
 
+const DEFAULT_TENANT = "default";
+
+function blobKey(sha256: Uint8Array, tenantId = DEFAULT_TENANT): string {
+	return `vfs:${tenantId}:blob:${Buffer.from(sha256).toString("hex")}`;
+}
+
 /**
  * Poll Redis for a blob-cache key until it materializes. Cache writes are
  * fire-and-forget inside the dialect (so the PG advisory lock releases
  * immediately on commit), so tests cannot assume the SET has completed by the
  * time `dialect.transaction(...)` resolves.
  */
-async function waitForCachedBlob(redis: Redis, sha256: Uint8Array): Promise<Buffer> {
+async function waitForCachedBlob(redis: Redis, sha256: Uint8Array, tenantId = DEFAULT_TENANT): Promise<Buffer> {
 	return await vi.waitFor(
 		async () => {
-			const buf = await redis.getBuffer(RedisBlobCache.key(sha256));
+			const buf = await redis.getBuffer(blobKey(sha256, tenantId));
 			if (buf === null) throw new Error("cache key not yet populated");
 			return buf;
 		},
@@ -31,7 +37,7 @@ async function waitForCachedBlob(redis: Redis, sha256: Uint8Array): Promise<Buff
 
 describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 	const redis = new Redis(process.env.REDIS_URL!, { lazyConnect: true, maxRetriesPerRequest: 1 });
-	const cache = new RedisBlobCache(redis);
+	const cache = new RedisBlobCache(redis, DEFAULT_TENANT);
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!, cache);
 	const insertedSha256s: Uint8Array[] = [];
 
@@ -46,7 +52,7 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 			await dialect.transaction(async (tx) => {
 				await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
 			});
-			await redis.del(RedisBlobCache.key(sha256));
+			await redis.del(blobKey(sha256));
 		}
 		await dialect.disconnect();
 		await redis.quit();
@@ -78,8 +84,8 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 		// before deleting it, otherwise a late-arriving fire-and-forget SET
 		// could repopulate the key and mask the miss we want to test.
 		await waitForCachedBlob(redis, sha256);
-		await redis.del(RedisBlobCache.key(sha256));
-		expect(await redis.getBuffer(RedisBlobCache.key(sha256))).toBeNull();
+		await redis.del(blobKey(sha256));
+		expect(await redis.getBuffer(blobKey(sha256))).toBeNull();
 
 		const result = await dialect.transaction(async (tx) => dialect.getBlob(tx, sha256));
 		expect(result).not.toBeNull();
@@ -90,7 +96,7 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 	});
 
 	it("does not cache blobs larger than maxBytes", async () => {
-		const smallCache = new RedisBlobCache(redis, { maxBytes: 4 });
+		const smallCache = new RedisBlobCache(redis, DEFAULT_TENANT, { maxBytes: 4 });
 		const smallDialect = new PostgresDialect(process.env.DATABASE_URL!, smallCache);
 		await smallDialect.connect();
 		try {
@@ -102,13 +108,13 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 				await smallDialect.upsertBlob(tx, sha256, data);
 			});
 
-			const cached = await redis.getBuffer(RedisBlobCache.key(sha256));
+			const cached = await redis.getBuffer(blobKey(sha256));
 			expect(cached).toBeNull();
 
 			// But PG still has it and getBlob returns from PG (and won't cache it).
 			const result = await smallDialect.transaction(async (tx) => smallDialect.getBlob(tx, sha256));
 			expect(result).toEqual(data);
-			expect(await redis.getBuffer(RedisBlobCache.key(sha256))).toBeNull();
+			expect(await redis.getBuffer(blobKey(sha256))).toBeNull();
 		} finally {
 			await smallDialect.disconnect();
 		}
@@ -127,7 +133,7 @@ describe.skipIf(SKIP)("PostgresDialect + RedisBlobCache", () => {
 		badRedis.on("error", () => {
 			/* swallow — we expect failure */
 		});
-		const brittleCache = new RedisBlobCache(badRedis);
+		const brittleCache = new RedisBlobCache(badRedis, DEFAULT_TENANT);
 		const brittleDialect = new PostgresDialect(process.env.DATABASE_URL!, brittleCache);
 		await brittleDialect.connect();
 		try {

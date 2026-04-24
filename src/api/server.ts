@@ -67,7 +67,9 @@ const sessionManager = new SessionManager({
 	execLockOptions,
 	pathSnapshot,
 	blobCacheFactory:
-		redisClient && blobCacheOptions ? () => new RedisBlobCache(redisClient, blobCacheOptions) : undefined,
+		redisClient && blobCacheOptions
+			? (tenantId: string) => new RedisBlobCache(redisClient, tenantId, blobCacheOptions)
+			: undefined,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────

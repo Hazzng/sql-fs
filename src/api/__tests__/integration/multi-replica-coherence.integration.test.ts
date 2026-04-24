@@ -33,7 +33,7 @@ function timed<T>(label: string, p: Promise<T>, timeoutMs = DEFAULT_TIMEOUT_MS):
 }
 
 function versionKey(sandboxId: string): string {
-	return `vfs:ver:${sandboxId}`;
+	return `vfs:${TENANT}:ver:${sandboxId}`;
 }
 
 describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
@@ -56,7 +56,7 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 			} catch {
 				/* ignore */
 			}
-			await redis.del(execLockKey(id));
+			await redis.del(execLockKey(TENANT, id));
 			await redis.del(versionKey(id));
 		}
 	});

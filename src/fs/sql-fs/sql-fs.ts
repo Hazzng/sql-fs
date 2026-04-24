@@ -64,14 +64,16 @@ const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 interface SqlFsOptions<Tx> {
 	readonly dialect: SqlDialect<Tx>;
 	readonly sandboxId: string;
+	/** Tenant identifier — used to build tenant-prefixed Redis keys (Phase 3). */
+	readonly tenantId?: string;
 	/** Max total byte budget for the content cache. Default: 50 MB. */
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
 	/**
 	 * Optional Redis client used to read the per-sandbox version counter
-	 * (`vfs:ver:{sandboxId}`) during cold-start / reload. Required together
-	 * with `pathSnapshot` for snapshot-backed cold starts (Phase E).
+	 * (`vfs:{tenantId}:ver:{sandboxId}`) during cold-start / reload. Required
+	 * together with `pathSnapshot` for snapshot-backed cold starts (Phase E).
 	 */
 	readonly redis?: Redis;
 	/**
@@ -102,6 +104,7 @@ export interface ICoherentFs extends IFileSystem {
 export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
+	readonly #tenantId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
@@ -118,6 +121,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
+		this.#tenantId = opts.tenantId ?? "default";
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
 		this.#redis = opts.redis;
 		this.#pathSnapshot = opts.pathSnapshot;
@@ -276,9 +280,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
-				const raw = await this.#redis.get(`vfs:ver:${this.#sandboxId}`);
+				const raw = await this.#redis.get(`vfs:${this.#tenantId}:ver:${this.#sandboxId}`);
 				const currentVersion = raw === null ? 0 : Number(raw) || 0;
-				const snap = await this.#pathSnapshot.read(this.#sandboxId);
+				const snap = await this.#pathSnapshot.read(this.#tenantId, this.#sandboxId);
 				if (snap === null) {
 					missReason = "no_key";
 				} else if (snap.version !== currentVersion) {

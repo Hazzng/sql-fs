@@ -36,8 +36,8 @@ function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
 }
 
 /** Redis key template for the per-sandbox monotonic version counter (Phase D). */
-function versionKey(sandboxId: string): string {
-	return `vfs:ver:${sandboxId}`;
+function versionKey(tenantId: string, sandboxId: string): string {
+	return `vfs:${tenantId}:ver:${sandboxId}`;
 }
 
 /**
@@ -145,11 +145,10 @@ export interface SessionManagerOptions {
 	 */
 	readonly pathSnapshot?: RedisPathSnapshot;
 	/**
-	 * Factory constructing a per-tenant RedisBlobCache. Called at most once
-	 * per tenant on first access (lazy). Phase 3 will widen the signature to
-	 * accept the tenant id so the cache can tenant-prefix its keys.
+	 * Factory constructing a per-tenant RedisBlobCache keyed by tenant id.
+	 * Called at most once per tenant on first access (lazy).
 	 */
-	readonly blobCacheFactory?: () => RedisBlobCache | undefined;
+	readonly blobCacheFactory?: (tenantId: string) => RedisBlobCache | undefined;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -175,7 +174,7 @@ export class SessionManager {
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
-	private readonly blobCacheFactory: (() => RedisBlobCache | undefined) | undefined;
+	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -249,7 +248,7 @@ export class SessionManager {
 		const connectionString = this.tenantConfig.getConnectionString(tenantId);
 		const backend: PerTenantBackend = {
 			connectionString,
-			blobCache: this.blobCacheFactory?.(),
+			blobCache: this.blobCacheFactory?.(tenantId),
 		};
 		this.backends.set(tenantId, backend);
 		return backend;
@@ -264,6 +263,7 @@ export class SessionManager {
 		return createPostgresSandboxFs(
 			{
 				connectionString: backend.connectionString,
+				tenantId,
 				blobCache: backend.blobCache,
 				redis: this.redis,
 				pathSnapshot: this.pathSnapshot,
@@ -328,7 +328,7 @@ export class SessionManager {
 				let initialVersion = 0;
 				if (this.redis !== undefined) {
 					try {
-						const raw = await this.redis.get(versionKey(sandboxId));
+						const raw = await this.redis.get(versionKey(tenantId, sandboxId));
 						initialVersion = raw === null ? 0 : Number(raw) || 0;
 					} catch {
 						// Redis unavailable at bootstrap: treat as version 0. Subsequent
@@ -371,12 +371,12 @@ export class SessionManager {
 	}
 
 	/**
-	 * Runs `fn` while holding the cross-replica distributed lock for `sandboxId`.
+	 * Runs `fn` while holding the cross-replica distributed lock for `(tenantId, sandboxId)`.
 	 * No-op passthrough when no Redis client is configured (single-replica mode).
 	 */
-	private async withExecLock<T>(sandboxId: string, fn: () => Promise<T>): Promise<T> {
+	private async withExecLock<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
 		if (this.redis === undefined) return fn();
-		return withDistributedLock(this.redis, execLockKey(sandboxId), fn, this.execLockOptions);
+		return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
 	}
 
 	/**
@@ -389,14 +389,14 @@ export class SessionManager {
 	 * No-op when Redis is unset or when the underlying filesystem is not
 	 * coherence-aware (memory backend).
 	 */
-	private async ensureFreshCache(sandboxId: string, session: Session): Promise<void> {
+	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 
 		let current: number;
 		try {
-			const raw = await this.redis.get(versionKey(sandboxId));
+			const raw = await this.redis.get(versionKey(tenantId, sandboxId));
 			current = raw === null ? 0 : Number(raw) || 0;
 		} catch (err) {
 			// Redis transiently unavailable — freshness check is a best-effort
@@ -428,13 +428,13 @@ export class SessionManager {
 	 * reload on its own INCR. Also (re)applies the TTL so stale sandboxes
 	 * age out of Redis after rollback.
 	 */
-	private async publishVersionIfDirty(sandboxId: string, session: Session): Promise<void> {
+	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 		if (!coherent.wasDirty()) return;
 
-		const key = versionKey(sandboxId);
+		const key = versionKey(tenantId, sandboxId);
 		let newVersion: number;
 		try {
 			newVersion = Number(await this.redis.incr(key));
@@ -461,7 +461,7 @@ export class SessionManager {
 		if (this.pathSnapshot !== undefined) {
 			const writer = asSnapshotWriter(coherent);
 			if (writer !== undefined) {
-				await this.pathSnapshot.write(sandboxId, newVersion, writer._getPathCache());
+				await this.pathSnapshot.write(tenantId, sandboxId, newVersion, writer._getPathCache());
 			}
 		}
 		session.lastSeenVersion = newVersion;
@@ -487,7 +487,7 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		return this.withExecLock(sandboxId, async () => {
+		return this.withExecLock(tenantId, sandboxId, async () => {
 			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions);
 
 			// Fast-fail: session is being destroyed — don't queue in the mutex
@@ -499,7 +499,7 @@ export class SessionManager {
 			// the session mutex so a reload cannot race with another turn on
 			// this replica; we already hold the distributed lock which serializes
 			// turns across replicas.
-			await this.ensureFreshCache(sandboxId, session);
+			await this.ensureFreshCache(tenantId, sandboxId, session);
 
 			return session.mutex.runExclusive(async () => {
 				// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
@@ -517,7 +517,7 @@ export class SessionManager {
 					// replicas serving stale reads until this replica happens to
 					// run another successful turn.
 					try {
-						await this.publishVersionIfDirty(sandboxId, session);
+						await this.publishVersionIfDirty(tenantId, sandboxId, session);
 					} catch (err) {
 						// Defensive: publishVersionIfDirty already swallows INCR
 						// errors internally, but never let a finally-block hide
@@ -546,7 +546,7 @@ export class SessionManager {
 	 * sandbox that exists only on another replica can't slip past serialization.
 	 */
 	async withExistingSession<T>(tenantId: string, sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-		return this.withExecLock(sandboxId, async () => {
+		return this.withExecLock(tenantId, sandboxId, async () => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
@@ -556,7 +556,7 @@ export class SessionManager {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
 
-			await this.ensureFreshCache(sandboxId, session);
+			await this.ensureFreshCache(tenantId, sandboxId, session);
 
 			return session.mutex.runExclusive(async () => {
 				if (session.state === "closing") {
@@ -569,7 +569,7 @@ export class SessionManager {
 				} finally {
 					// Publish even when fn threw — see comment in withSession.
 					try {
-						await this.publishVersionIfDirty(sandboxId, session);
+						await this.publishVersionIfDirty(tenantId, sandboxId, session);
 					} catch (err) {
 						console.error(
 							JSON.stringify({
@@ -597,16 +597,16 @@ export class SessionManager {
 	 * concurrent exec on another replica cannot interleave with the teardown.
 	 */
 	async destroy(tenantId: string, sandboxId: string): Promise<boolean> {
-		return this.withExecLock(sandboxId, async () => {
+		return this.withExecLock(tenantId, sandboxId, async () => {
 			const key = this.sessionKey(tenantId, sandboxId);
 			const session = this.sessions.get(key);
 
 			if (session === undefined) {
 				// Session not in pool — still clean up backend data
 				await this.destroySandboxFn(tenantId, sandboxId);
-				await this.deleteVersionKey(sandboxId);
+				await this.deleteVersionKey(tenantId, sandboxId);
 				if (this.pathSnapshot !== undefined) {
-					await this.pathSnapshot.delete(sandboxId);
+					await this.pathSnapshot.delete(tenantId, sandboxId);
 				}
 				return false;
 			}
@@ -624,9 +624,9 @@ export class SessionManager {
 			const p = session.mutex.runExclusive(async () => {
 				this.sessions.delete(key);
 				await this.destroySandboxFn(tenantId, sandboxId);
-				await this.deleteVersionKey(sandboxId);
+				await this.deleteVersionKey(tenantId, sandboxId);
 				if (this.pathSnapshot !== undefined) {
-					await this.pathSnapshot.delete(sandboxId);
+					await this.pathSnapshot.delete(tenantId, sandboxId);
 				}
 			});
 			session.destroyPromise = p;
@@ -642,10 +642,10 @@ export class SessionManager {
 	 * Best-effort: Redis errors are swallowed (the key will eventually age out
 	 * via its TTL).
 	 */
-	private async deleteVersionKey(sandboxId: string): Promise<void> {
+	private async deleteVersionKey(tenantId: string, sandboxId: string): Promise<void> {
 		if (this.redis === undefined) return;
 		try {
-			await this.redis.del(versionKey(sandboxId));
+			await this.redis.del(versionKey(tenantId, sandboxId));
 		} catch {
 			// swallow — best-effort cleanup
 		}

@@ -76,11 +76,11 @@ describe("SessionManager + distributed exec lock", () => {
 
 		let observedLock: Entry | undefined;
 		await sm.withSession(T, "sbx-A", async () => {
-			observedLock = redis.store.get(execLockKey("sbx-A"));
+			observedLock = redis.store.get(execLockKey(T, "sbx-A"));
 		});
 
 		expect(observedLock).toBeDefined();
-		expect(redis.store.has(execLockKey("sbx-A"))).toBe(false);
+		expect(redis.store.has(execLockKey(T, "sbx-A"))).toBe(false);
 	});
 
 	it("two SessionManagers sharing the same Redis serialize concurrent withSession", async () => {
@@ -158,7 +158,7 @@ describe("SessionManager + distributed exec lock", () => {
 	it("ELOCKTIMEOUT propagates when acquire times out", async () => {
 		const redis = new FakeRedis();
 		// Plant a foreign lock that will never release within the acquire window.
-		redis.store.set(execLockKey("sbx-T"), { value: "owned-by-someone-else", expiresAt: Date.now() + 60_000 });
+		redis.store.set(execLockKey(T, "sbx-T"), { value: "owned-by-someone-else", expiresAt: Date.now() + 60_000 });
 
 		const sm = new SessionManager({
 			createFs: makeCreateFs(),
