@@ -62,6 +62,7 @@ describe("SqlFs.ready() — pathCache initialization", () => {
 			loadAllPaths: loadAllPathsMock,
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			sandboxExists: vi.fn(),
 			createInode: vi.fn(),
 			getInode: vi.fn(),
 			updateInode: vi.fn(),
