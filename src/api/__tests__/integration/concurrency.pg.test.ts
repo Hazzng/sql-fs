@@ -15,6 +15,7 @@
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PostgresDialect } from "../../../fs/sql-fs/dialects/postgres.js";
 import { createSandboxFs, destroySandbox } from "../../../fs/sql-fs/index.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { fileRoutes } from "../../routes/files.js";
@@ -55,10 +56,39 @@ async function flushCleanup(): Promise<void> {
 	await Promise.allSettled(ids.map((id) => destroySandbox("postgres", id)));
 }
 
+/** Create a sandbox row in Postgres without warming the SessionManager pool. */
+async function createSandboxInPg(sandboxId: string): Promise<void> {
+	const dialect = new PostgresDialect(DB_URL!);
+	await dialect.connect();
+	try {
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, sandboxId);
+		});
+	} catch (e) {
+		const sqlErr = e as { code?: string };
+		if (sqlErr.code !== "23505") throw e;
+	} finally {
+		await dialect.disconnect();
+	}
+}
+
 function makePgEnv() {
+	const existsDialect = new PostgresDialect(DB_URL!);
+	let connected = false;
+	const sandboxExistsFn = async (sandboxId: string): Promise<boolean> => {
+		if (!connected) {
+			await existsDialect.connect();
+			connected = true;
+		}
+		return existsDialect.transaction(async (tx) => {
+			return existsDialect.sandboxExists(tx, sandboxId);
+		});
+	};
+
 	const sm = new SessionManager({
 		backend: "postgres",
 		createFs: (backend, sandboxId) => createSandboxFs(backend, sandboxId),
+		sandboxExistsFn,
 	});
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);
@@ -98,6 +128,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -118,6 +149,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -155,6 +187,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -191,6 +224,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
 			method: "PUT",
@@ -219,6 +253,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 		const total = 10;
 		const keep = 5;
 
@@ -266,6 +301,7 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/v.txt`, {
@@ -285,6 +321,7 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await createSandboxInPg(sbId);
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/counter.txt`, {
@@ -330,6 +367,7 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
+		await Promise.all([createSandboxInPg(sbA), createSandboxInPg(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/shared.txt`, {
@@ -364,6 +402,7 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
+		await Promise.all([createSandboxInPg(sbA), createSandboxInPg(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/common.txt`, {
@@ -418,6 +457,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		// so the write always succeeds regardless of whether mkdir ran first.
 		for (const label of ["mkdir-first", "write-first"] as const) {
 			const sbId = newId();
+			await createSandboxInPg(sbId);
 			const ops =
 				label === "mkdir-first"
 					? ([
@@ -446,8 +486,10 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 						] as const);
 
 			const [r1, r2] = await Promise.all(ops);
-			expect(r1.status, `${label} op1`).toBe(204);
-			// mkdir may return 409 EEXIST if write auto-created the dir first
+			// Both ops are concurrent and serialized by session mutex — either
+			// can win the race. Write always succeeds (PUT auto-creates parents).
+			// Mkdir may get 409 (EEXIST) if write's auto-mkdir ran first.
+			expect([204, 409], `${label} op1`).toContain(r1.status);
 			expect([204, 409], `${label} op2`).toContain(r2.status);
 
 			const paths = await treePaths(app, sbId, "/home/user/a", token);
@@ -544,6 +586,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 		for (const label of ["delete-first", "read-first"] as const) {
 			const sbId = newId();
+			await createSandboxInPg(sbId);
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
@@ -573,13 +616,18 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 			const [first, second] = await Promise.all(ops);
 
+			// Both ops are concurrent and serialized by session mutex — either
+			// can acquire the lock first regardless of Promise.all position.
+			// DELETE always returns 204; GET returns 200 or 404 depending on race.
 			if (label === "delete-first") {
-				expect(first.status).toBe(204); // delete
-				expect(second.status).toBe(404); // read sees deleted file
+				expect(first.status).toBe(204); // delete always succeeds
+				expect([200, 404]).toContain(second.status); // read depends on race
 			} else {
-				expect(first.status).toBe(200); // read
-				expect(await first.text()).toBe("original");
-				expect(second.status).toBe(204); // delete
+				expect([200, 404]).toContain(first.status); // read depends on race
+				if (first.status === 200) {
+					expect(await first.text()).toBe("original");
+				}
+				expect(second.status).toBe(204); // delete always succeeds
 			}
 
 			const final = await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {

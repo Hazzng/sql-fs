@@ -822,19 +822,24 @@ This simulates the real-world scenario: sandbox was created on Replica A, and Re
 ### Phase 6: Success Criteria
 
 #### Phase 6: Automated Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test:unit` passes (all unit tests green)
-- [ ] `pnpm test:integration` passes (all 17 concurrency.pg tests green)
-- [ ] `pnpm test` passes (full suite)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes (no fixes needed)
+- [x] `pnpm test:unit` passes (414 tests green, 4 skipped)
+- [ ] `pnpm test:integration` passes (all 17 concurrency.pg tests green) — requires DATABASE_URL
+- [ ] `pnpm test` passes (full suite) — requires DATABASE_URL
 
 #### Phase 6: Manual Verification
-- [ ] Confirm each of the 17 tests passes individually (not just the suite)
-- [ ] No new test files left in failing state
-- [ ] `withExistingSession` is no longer called from any route (only from internal SessionManager code)
+- [ ] Confirm each of the 17 tests passes individually (not just the suite) — requires DATABASE_URL
+- [x] No new test files left in failing state
+- [x] `withExistingSession` is no longer called from any route (only from internal SessionManager code)
 
 ### Phase 6: Discoveries and Notable Information
-[Filled during execution]
+- Used a lazy-connect `PostgresDialect` in `makePgEnv()` (matching server.ts pattern) rather than the plan's per-call connect/disconnect approach. This avoids connection overhead when `sandboxExistsFn` is called multiple times within a single test.
+- Added `createSandboxInPg()` helper that creates the sandbox row in PG without warming the SessionManager pool — simulates the multi-replica scenario where Replica A created the sandbox and Replica B (this test's SM) has a cold pool.
+- 11 HTTP-route tests needed `createSandboxInPg(sbId)` calls. The 6 `sm.withSession()` tests in Section 6 did NOT need changes because `withSession` → `getOrCreate` creates the sandbox automatically.
+- Section 5 tests (cross-sandbox isolation) create two sandboxes per test — used `Promise.all([createSandboxInPg(sbA), createSandboxInPg(sbB)])` for parallel pre-creation.
+- The `createSandboxFs` factory (index.ts:51-58) already handles `23505` unique violations, so re-creating an already-existing sandbox during `getOrCreate` rehydration is a no-op INSERT that silently succeeds.
+- Integration test verification (DATABASE_URL-dependent) deferred to user — unit tests and typecheck confirm correctness of all non-DB code paths.
 
 ---
 
