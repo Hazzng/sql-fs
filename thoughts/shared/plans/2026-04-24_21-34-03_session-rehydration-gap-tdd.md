@@ -367,15 +367,19 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 ### Phase 3: Success Criteria
 
 #### Phase 3: Automated Verification
-- [ ] `pnpm typecheck` fails (method doesn't exist on SessionManager yet — expected RED)
-- [ ] Tests fail with "withSessionOrRehydrate is not a function" or similar
+- [x] `pnpm typecheck` fails (11 TS errors: `sandboxExistsFn` unknown in options + `withSessionOrRehydrate` not on SessionManager — expected RED)
+- [x] Tests fail with "TypeError: sm.withSessionOrRehydrate is not a function" (all 6 tests)
 
 #### Phase 3: Manual Verification
-- [ ] Confirm tests cover all three code paths (warm, cold-exists, cold-absent)
-- [ ] Confirm no mocking of internals that would make tests brittle
+- [x] Confirm tests cover all three code paths (warm, cold-exists, cold-absent)
+- [x] Confirm no mocking of internals that would make tests brittle
 
 ### Phase 3: Discoveries and Notable Information
-[Filled during execution]
+- Used `InMemoryFs` from just-bash (established pattern in session-manager.test.ts) instead of the plan's manual `stubFs()`. This provides real `getAllPaths()` for `estimatePathCacheBytes` and avoids `as unknown as IFileSystem` casts.
+- Added two extra tests beyond the plan's four: (1) destroyed sandbox stays ENOENT after PG row removal, (2) falls back to pool-only ENOENT when `sandboxExistsFn` is not set. These cover the destroy-race and no-fn-fallback paths from Phase 4's design.
+- The `sandboxExistsFn` constructor option doesn't exist yet (TS2353), confirming the RED signal comes from both the interface gap and the missing method.
+- All 408 existing unit tests pass — no regressions from adding the new test file.
+- The `pnpm test` runner includes the new file automatically (Vitest glob picks up `*.test.ts` in `__tests__/`).
 
 ---
 
