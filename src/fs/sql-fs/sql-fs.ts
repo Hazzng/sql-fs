@@ -21,7 +21,7 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
-import type { RedisPathSnapshot } from "./redis-path-snapshot.js";
+import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
 import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
@@ -68,18 +68,9 @@ interface SqlFsOptions<Tx> {
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
-	/**
-	 * Optional Redis client used to read the per-sandbox version counter
-	 * (`vfs:ver:{sandboxId}`) during cold-start / reload. Required together
-	 * with `pathSnapshot` for snapshot-backed cold starts (Phase E).
-	 */
+	/** Redis client for reading the version counter during snapshot-backed cold starts. */
 	readonly redis?: Redis;
-	/**
-	 * Optional Redis path snapshot. When both `redis` and `pathSnapshot` are
-	 * provided, `#loadFreshPathCache` attempts a snapshot read before falling
-	 * back to `dialect.loadAllPaths`. Strict version equality against the
-	 * counter is required (Edge Case §3).
-	 */
+	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
 	readonly pathSnapshot?: RedisPathSnapshot;
 }
 
@@ -263,20 +254,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	}
 
 	/**
-	 * Loads the full path tree from the DB without touching in-memory caches.
-	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
-	 * On error the caller's caches are left untouched.
-	 *
-	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
-	 * snapshot read first. The embedded `version` must equal the current
-	 * `vfs:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
-	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
+	 * Loads the full path tree without touching in-memory caches.
+	 * Tries Redis snapshot first (strict version equality); falls through
+	 * to `dialect.loadAllPaths` on miss, mismatch, or error.
 	 */
 	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
-				const raw = await this.#redis.get(`vfs:ver:${this.#sandboxId}`);
+				const raw = await this.#redis.get(versionKey(this.#sandboxId));
 				const currentVersion = raw === null ? 0 : Number(raw) || 0;
 				const snap = await this.#pathSnapshot.read(this.#sandboxId);
 				if (snap === null) {

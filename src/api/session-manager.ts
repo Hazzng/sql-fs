@@ -10,26 +10,15 @@ import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
-import type { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
+import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 
-/**
- * Internal structural type: the subset of `SqlFs` the session manager touches
- * for Phase E snapshot writes. Declared here (rather than exported from sql-fs)
- * to keep the cross-module surface narrow.
- */
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
-/** Narrowing helper: returns the fs as a snapshot writer if the hook is present. */
 function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
 	return typeof (fs as Partial<SnapshotWriterFs>)._getPathCache === "function" ? (fs as SnapshotWriterFs) : undefined;
-}
-
-/** Redis key template for the per-sandbox monotonic version counter (Phase D). */
-function versionKey(sandboxId: string): string {
-	return `vfs:ver:${sandboxId}`;
 }
 
 /**
@@ -298,16 +287,7 @@ export class SessionManager {
 		return withDistributedLock(this.redis, execLockKey(sandboxId), fn, this.execLockOptions);
 	}
 
-	/**
-	 * Shared entry logic for all session wrappers.
-	 * Must be called inside the distributed exec lock.
-	 *
-	 * 1. Checks session isn't closing
-	 * 2. Runs cross-replica cache coherence (Phase D)
-	 * 3. Acquires local mutex, tracks inFlight
-	 * 4. Calls fn(session)
-	 * 5. Publishes version if dirty (Phase D/E)
-	 */
+	/** Shared entry logic for all session wrappers. Must be called inside the distributed exec lock. */
 	private async withSessionEntry<T>(
 		sandboxId: string,
 		session: Session,
@@ -328,6 +308,7 @@ export class SessionManager {
 			try {
 				return await fn(session);
 			} finally {
+				const wasDirty = asCoherentFs(session.fs)?.wasDirty() ?? false;
 				try {
 					await this.publishVersionIfDirty(sandboxId, session);
 				} catch (err) {
@@ -340,8 +321,10 @@ export class SessionManager {
 					);
 				}
 				session.inFlight--;
-				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				if (wasDirty) {
+					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				}
 			}
 		});
 	}
@@ -477,34 +460,15 @@ export class SessionManager {
 	 * Like withExistingSession, but falls back to Postgres to check if the sandbox
 	 * exists before throwing ENOENT. If the sandbox is in Postgres but not in the
 	 * pool (evicted by reaper, or created on another replica), rehydrates it via
-	 * getOrCreate — leveraging Phase E snapshot for fast cold-start.
-	 *
-	 * Fast path: pool check outside distributed lock (no Redis RTT for warm hits).
-	 * Cold path: lock -> double-check -> PG exists -> getOrCreate.
-	 *
-	 * Falls back to withExistingSession behavior when sandboxExistsFn is undefined.
+	 * getOrCreate. Falls back to withExistingSession behavior when sandboxExistsFn
+	 * is undefined.
 	 */
 	async withSessionOrRehydrate<T>(
 		sandboxId: string,
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		// Fast path: warm pool hit — skip straight to exec lock + entry
-		const warm = this.sessions.get(sandboxId);
-		if (warm !== undefined && warm.state !== "closing") {
-			return this.withExecLock(sandboxId, async () => {
-				// Re-check under lock (may have been evicted between check and lock acquisition)
-				const session = this.sessions.get(sandboxId);
-				if (session !== undefined && session.state !== "closing") {
-					return this.withSessionEntry(sandboxId, session, fn);
-				}
-				return this.rehydrateAndExec(sandboxId, fn, runtimeOptions);
-			});
-		}
-
-		// Cold path: need to check Postgres
 		return this.withExecLock(sandboxId, async () => {
-			// Double-check under lock
 			const session = this.sessions.get(sandboxId);
 			if (session !== undefined && session.state !== "closing") {
 				return this.withSessionEntry(sandboxId, session, fn);
