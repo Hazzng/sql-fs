@@ -131,7 +131,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const result = await sessionManager.withExistingSession(args.id, async (session) => {
+				const result = await sessionManager.withSessionOrRehydrate(args.id, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 
@@ -214,7 +214,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				await sessionManager.withExistingSession(args.id, async (session) => {
+				await sessionManager.withSessionOrRehydrate(args.id, async (session) => {
 					for (const [relativePath, content] of Object.entries(args.files)) {
 						const absPath = `${basePath}/${relativePath}`;
 						const lastSlash = absPath.lastIndexOf("/");
@@ -260,7 +260,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				const { files, errors } = await sessionManager.withExistingSession(args.id, async (session) => {
+				const { files, errors } = await sessionManager.withSessionOrRehydrate(args.id, async (session) => {
 					const allPaths = session.fs.getAllPaths();
 					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
 					const result: Record<string, string> = Object.create(null);

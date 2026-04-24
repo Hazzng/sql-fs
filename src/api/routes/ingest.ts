@@ -68,7 +68,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
 
 		try {
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
 				// Ensure /tmp exists before writing archive
 				try {
 					await session.fs.mkdir("/tmp", { recursive: true });
@@ -159,7 +159,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const fileCount = Object.keys(files).length;
 
 		try {
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
 				for (const [relativePath, base64Content] of Object.entries(files)) {
 					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
 					const lastSlash = absPath.lastIndexOf("/");
@@ -206,7 +206,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		let archiveBytes: Uint8Array;
 		try {
-			archiveBytes = await sessionManager.withExistingSession(sandboxId, async (session) => {
+			archiveBytes = await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
 				// Check basePath exists
 				const exists = await session.fs.exists(basePath);
 				if (!exists) {

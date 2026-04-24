@@ -102,7 +102,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			| { kind: "not_found" }
 			| { kind: "eisdir" };
 
-		const result = await sessionManager.withExistingSession<ReadResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withSessionOrRehydrate<ReadResult>(sandboxId, async (session) => {
 			let stat: FsStat;
 			try {
 				stat = await session.fs.stat(filePath);
@@ -162,7 +162,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
+		await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
 			const parent = parentDir(filePath);
 			if (parent !== "/") {
 				try {
@@ -189,7 +189,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type DeleteResult = { kind: "ok" } | { kind: "not_found" } | { kind: "not_empty" };
 
-		const result = await sessionManager.withExistingSession<DeleteResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withSessionOrRehydrate<DeleteResult>(sandboxId, async (session) => {
 			try {
 				await session.fs.rm(filePath, { recursive });
 				return { kind: "ok" };
@@ -239,7 +239,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const { files } = body;
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
+		await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
 			for (const [filePath, content] of Object.entries(files)) {
 				const parent = parentDir(filePath);
 				if (parent !== "/") {
@@ -288,7 +288,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type MkdirResult = { kind: "ok" } | { kind: "exists" };
 
-		const result = await sessionManager.withExistingSession<MkdirResult>(sandboxId, async (session) => {
+		const result = await sessionManager.withSessionOrRehydrate<MkdirResult>(sandboxId, async (session) => {
 			try {
 				await session.fs.mkdir(dirPath, { recursive });
 				return { kind: "ok" };
@@ -329,7 +329,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type TreeEntry = { path: string; kind: string; size: number; mtime: string };
 
-		const entries = await sessionManager.withExistingSession<TreeEntry[]>(sandboxId, async (session) => {
+		const entries = await sessionManager.withSessionOrRehydrate<TreeEntry[]>(sandboxId, async (session) => {
 			const allPaths = session.fs.getAllPaths();
 			const result: TreeEntry[] = [];
 

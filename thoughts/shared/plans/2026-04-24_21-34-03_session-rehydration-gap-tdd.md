@@ -709,18 +709,20 @@ This is safe because the method signatures are compatible:
 ### Phase 5: Success Criteria
 
 #### Phase 5: Automated Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test:unit` passes
-- [ ] `grep -r 'withExistingSession' src/api/routes/ src/api/mcp/` returns 0 matches (all rewired)
-- [ ] `grep -r 'withSessionOrRehydrate' src/api/routes/ src/api/mcp/` returns 13 matches
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes (no fixes needed)
+- [x] `pnpm test:unit` passes (414 tests green, 4 skipped)
+- [x] `grep -r 'withExistingSession' src/api/routes/ src/api/mcp/` returns 0 matches (all rewired)
+- [x] `grep -r 'withSessionOrRehydrate' src/api/routes/ src/api/mcp/` returns 14 matches
 
 #### Phase 5: Manual Verification
-- [ ] Verify `withExistingSession` still exists in `session-manager.ts` (kept for internal use)
-- [ ] Verify no route accidentally passes `runtimeOptions` (it shouldn't)
+- [x] Verify `withExistingSession` still exists in `session-manager.ts` (kept for internal use)
+- [x] Verify no route accidentally passes `runtimeOptions` (it shouldn't)
 
 ### Phase 5: Discoveries and Notable Information
-[Filled during execution]
+- The plan estimated 13 replacements (11 unique + 2 additional). Actual count is 14: exec.ts (2), files.ts (6), ingest.ts (3), tools.ts (3). The plan missed the `writeFiles` route at files.ts:242 in its initial count of "5 call sites" for files.ts.
+- The replacement is fully mechanical — `withSessionOrRehydrate` has the same `(sandboxId, fn)` signature as `withExistingSession`, and no call site passes `runtimeOptions`.
+- Biome required zero formatting fixes, confirming the method name swap is purely lexical with no indentation or line-length impact.
 
 ---
 
