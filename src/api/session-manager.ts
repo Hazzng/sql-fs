@@ -41,7 +41,7 @@ function versionKey(tenantId: string, sandboxId: string): string {
 }
 
 /**
- * Stale-key TTL for `vfs:ver:*`. Seven days matches the longest realistic
+ * Stale-key TTL for `vfs:{tenantId}:ver:*`. Seven days matches the longest realistic
  * idle window; after a full rollback the counter ages out automatically and
  * the next fresh create starts at version 0.
  */

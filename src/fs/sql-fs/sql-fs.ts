@@ -273,7 +273,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 *
 	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
 	 * snapshot read first. The embedded `version` must equal the current
-	 * `vfs:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
+	 * `vfs:{tenantId}:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
 	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
 	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {

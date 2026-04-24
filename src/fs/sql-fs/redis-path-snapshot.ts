@@ -2,8 +2,8 @@
  * Redis path-snapshot cache (Phase E).
  *
  * Persists the full pathCache for a sandbox as a msgpack-encoded blob keyed
- * `vfs:snap:{sandboxId}`, with the sandbox version counter embedded so readers
- * can reject stale snapshots via strict-equality check against `vfs:ver:{X}`.
+ * `vfs:{tenantId}:snap:{sandboxId}`, with the sandbox version counter embedded so readers
+ * can reject stale snapshots via strict-equality check against `vfs:{tenantId}:ver:{sandboxId}`.
  *
  * All Redis failures fail open: `read` returns `null`, `write`/`delete` return
  * quietly. Callers fall back to `loadAllPaths`.

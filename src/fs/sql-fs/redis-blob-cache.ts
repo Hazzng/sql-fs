@@ -1,8 +1,8 @@
 /**
  * Content-addressable blob cache backed by Redis.
  *
- * Blobs are keyed by sha256 (`vfs:blob:<hex>`), so the cache is safe across
- * sandboxes and replicas — a sha256 collision would mean bit-identical data.
+ * Blobs are keyed by tenant + sha256 (`vfs:{tenantId}:blob:<hex>`), so the cache is
+ * isolated per tenant and safe across sandboxes within a tenant; a sha256 collision would mean bit-identical data.
  * All Redis failures fail open: the caller falls back to Postgres.
  */
 
