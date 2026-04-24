@@ -39,6 +39,7 @@ describe("MCP tool — sandbox_create", () => {
 				return session;
 			},
 			getSession: (id: string): Session | undefined => sessions.get(id),
+			persistSandboxMeta: async () => {},
 		};
 
 		const server = createMcpServer();
@@ -106,6 +107,7 @@ describe("MCP tool — sandbox_delete", () => {
 				return session;
 			},
 			getSession: (id: string): Session | undefined => sessions.get(id),
+			persistSandboxMeta: async () => {},
 			destroy: async (id: string): Promise<boolean> => {
 				if (!sessions.has(id)) {
 					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
@@ -147,6 +149,7 @@ describe("MCP tool — sandbox_delete", () => {
 		const mockSessionManager = {
 			getOrCreate: async (id: string): Promise<Session> => ({ id, owner: "" }) as unknown as Session,
 			getSession: (_id: string): Session | undefined => undefined,
+			persistSandboxMeta: async () => {},
 			destroy: async (_id: string): Promise<boolean> => {
 				throw Object.assign(new Error("ENOENT: sandbox not found"), { code: "ENOENT" });
 			},

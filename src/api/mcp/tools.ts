@@ -56,6 +56,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			};
 			const session = await sessionManager.getOrCreate(id, runtimeOptions);
 			session.owner = owner;
+			await sessionManager.persistSandboxMeta(id, {
+				owner,
+				python: runtimeOptions.python,
+				javascript: runtimeOptions.javascript,
+			});
 			return {
 				content: [
 					{

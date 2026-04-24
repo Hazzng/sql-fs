@@ -73,22 +73,26 @@ async function createSandboxInPg(sandboxId: string): Promise<void> {
 }
 
 function makePgEnv() {
-	const existsDialect = new PostgresDialect(DB_URL!);
+	const metaDialect = new PostgresDialect(DB_URL!);
 	let connected = false;
-	const sandboxExistsFn = async (sandboxId: string): Promise<boolean> => {
+	const ensureConnected = async () => {
 		if (!connected) {
-			await existsDialect.connect();
+			await metaDialect.connect();
 			connected = true;
 		}
-		return existsDialect.transaction(async (tx) => {
-			return existsDialect.sandboxExists(tx, sandboxId);
-		});
 	};
 
 	const sm = new SessionManager({
 		backend: "postgres",
 		createFs: (backend, sandboxId) => createSandboxFs(backend, sandboxId),
-		sandboxExistsFn,
+		getSandboxMetaFn: async (sandboxId) => {
+			await ensureConnected();
+			return metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
+		},
+		persistSandboxMetaFn: async (sandboxId, meta) => {
+			await ensureConnected();
+			await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
+		},
 	});
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);

@@ -12,7 +12,7 @@ import { createSandboxFs, destroySandbox } from "../fs/sql-fs/index.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
-import type { PathCacheEntry } from "../fs/sql-fs/types.js";
+import type { PathCacheEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
@@ -114,11 +114,16 @@ export interface SessionManagerOptions {
 	 */
 	readonly pathSnapshot?: RedisPathSnapshot;
 	/**
-	 * Checks whether a sandbox exists in the persistent store (Postgres).
-	 * Required for withSessionOrRehydrate to distinguish "evicted" from "deleted".
-	 * When undefined, withSessionOrRehydrate falls back to withExistingSession behavior.
+	 * Reads sandbox metadata from the persistent store (Postgres).
+	 * Returns null when the sandbox doesn't exist. Required for
+	 * withSessionOrRehydrate to restore owner + runtimeOptions on cold replicas.
 	 */
-	readonly sandboxExistsFn?: (sandboxId: string) => Promise<boolean>;
+	readonly getSandboxMetaFn?: (sandboxId: string) => Promise<SandboxMeta | null>;
+	/**
+	 * Persists sandbox metadata (owner, runtime flags) to the persistent store.
+	 * Called from `persistSandboxMeta` after sandbox creation.
+	 */
+	readonly persistSandboxMetaFn?: (sandboxId: string, meta: SandboxMeta) => Promise<void>;
 }
 
 /** Internal FIFO-semaphore state shared by the python and js throttles. */
@@ -141,7 +146,8 @@ export class SessionManager {
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
-	private readonly sandboxExistsFn?: (sandboxId: string) => Promise<boolean>;
+	private readonly getSandboxMetaFn?: (sandboxId: string) => Promise<SandboxMeta | null>;
+	private readonly persistSandboxMetaFn?: (sandboxId: string, meta: SandboxMeta) => Promise<void>;
 
 	// --- Runtime throttle semaphores (US-080a) ---
 	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
@@ -164,7 +170,8 @@ export class SessionManager {
 		redis,
 		execLockOptions,
 		pathSnapshot,
-		sandboxExistsFn,
+		getSandboxMetaFn,
+		persistSandboxMetaFn,
 	}: SessionManagerOptions) {
 		this.backend = backend;
 		this.createFs = createFs ?? createSandboxFs;
@@ -174,7 +181,8 @@ export class SessionManager {
 		this.redis = redis;
 		this.execLockOptions = execLockOptions;
 		this.pathSnapshot = pathSnapshot;
-		this.sandboxExistsFn = sandboxExistsFn;
+		this.getSandboxMetaFn = getSandboxMetaFn;
+		this.persistSandboxMetaFn = persistSandboxMetaFn;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -349,11 +357,11 @@ export class SessionManager {
 			const raw = await this.redis.get(versionKey(sandboxId));
 			current = raw === null ? 0 : Number(raw) || 0;
 		} catch (err) {
-			// Redis transiently unavailable — freshness check is a best-effort
-			// optimization. Skip the reload and let publishVersionIfDirty retry
-			// the INCR at end-of-turn. Preserve any outstanding dirty bit so a
-			// prior failed publish retries instead of being masked.
+			// Redis unavailable — can't determine whether the cache is fresh.
+			// Reload from Postgres so we don't serve stale data. Leave
+			// lastSeenVersion unchanged so the next turn retries the check.
 			console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
+			await coherent.reload();
 			return;
 		}
 
@@ -486,20 +494,38 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		if (this.sandboxExistsFn !== undefined) {
-			const exists = await this.sandboxExistsFn(sandboxId);
-			if (!exists) {
+		let meta: SandboxMeta | null | undefined;
+		if (this.getSandboxMetaFn !== undefined) {
+			meta = await this.getSandboxMetaFn(sandboxId);
+			if (meta === null) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
 		} else {
-			// No existence check configured — strict pool-only behavior
+			// No metadata function configured — strict pool-only behavior
 			const session = this.sessions.get(sandboxId);
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
 		}
-		const session = await this.getOrCreate(sandboxId, runtimeOptions);
+		const resolvedRuntime: RuntimeOptions = meta
+			? { python: meta.python, javascript: meta.javascript }
+			: runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS;
+		const session = await this.getOrCreate(sandboxId, resolvedRuntime);
+		if (meta?.owner) {
+			session.owner = meta.owner;
+		}
 		return this.withSessionEntry(sandboxId, session, fn);
+	}
+
+	/**
+	 * Persists sandbox metadata (owner, runtime flags) to the persistent store.
+	 * Call from route handlers after creating a sandbox to ensure cold replicas
+	 * can restore ownership and runtime support on rehydration.
+	 */
+	async persistSandboxMeta(sandboxId: string, meta: SandboxMeta): Promise<void> {
+		if (this.persistSandboxMetaFn !== undefined) {
+			await this.persistSandboxMetaFn(sandboxId, meta);
+		}
 	}
 
 	/**

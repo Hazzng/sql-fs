@@ -50,6 +50,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			async (session) => {
 				session.owner = owner;
 				session.createdAt = createdAt;
+				await sessionManager.persistSandboxMeta(sandboxId, { owner, python, javascript });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);

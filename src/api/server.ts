@@ -49,29 +49,36 @@ const pathSnapshot =
 
 const backend = (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory";
 
-// Postgres existence check for session rehydration on cold replicas.
+// Postgres metadata functions for session rehydration on cold replicas.
 // Uses a single long-lived dialect (connection-pooled internally by the postgres driver).
-let sandboxExistsFn: ((sandboxId: string) => Promise<boolean>) | undefined;
-if (backend === "postgres" && process.env.DATABASE_URL) {
-	const existsDialect = new PostgresDialect(process.env.DATABASE_URL);
+const metaFns = (() => {
+	if (backend !== "postgres" || !process.env.DATABASE_URL) return {};
+	const metaDialect = new PostgresDialect(process.env.DATABASE_URL);
 	let connected = false;
-	sandboxExistsFn = async (sandboxId: string): Promise<boolean> => {
+	const ensureConnected = async (): Promise<void> => {
 		if (!connected) {
-			await existsDialect.connect();
+			await metaDialect.connect();
 			connected = true;
 		}
-		return existsDialect.transaction(async (tx) => {
-			return existsDialect.sandboxExists(tx, sandboxId);
-		});
 	};
-}
+	return {
+		getSandboxMetaFn: async (sandboxId: string) => {
+			await ensureConnected();
+			return metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
+		},
+		persistSandboxMetaFn: async (sandboxId: string, meta: import("../fs/sql-fs/types.js").SandboxMeta) => {
+			await ensureConnected();
+			await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
+		},
+	};
+})();
 
 const sessionManager = new SessionManager({
 	backend,
 	redis: redisClient,
 	execLockOptions,
 	pathSnapshot,
-	sandboxExistsFn,
+	...metaFns,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────

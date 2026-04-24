@@ -15,6 +15,7 @@ import type {
 	InodeKind,
 	InodeRow,
 	PathCacheEntry,
+	SandboxMeta,
 	SqlDialect,
 	UpdateInodeOpts,
 } from "../types.js";
@@ -115,6 +116,23 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
 		`;
 		return rows[0]?.exists ?? false;
+	}
+
+	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
+		const rows = await tx<{ owner: string | null; python: boolean; javascript: boolean }[]>`
+			SELECT owner, python, javascript FROM sandboxes WHERE id = ${sandboxId}
+		`;
+		if (rows.length === 0) return null;
+		const r = rows[0]!;
+		return { owner: r.owner, python: r.python, javascript: r.javascript };
+	}
+
+	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
+		await tx`
+			UPDATE sandboxes
+			SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
+			WHERE id = ${sandboxId}
+		`;
 	}
 
 	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */
