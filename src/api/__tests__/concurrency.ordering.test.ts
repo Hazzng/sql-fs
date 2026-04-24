@@ -189,59 +189,50 @@ describe("S2 — concurrent delete and read of the same file", () => {
 		process.env.AUTH_SECRET = "";
 	});
 
-	it("HTTP API: whichever runs first, delete always 204 and final state is file-absent", async () => {
+	it("HTTP API: concurrent delete + read — delete always 204, final state file-absent", async () => {
 		const { app, sm } = makeEnv();
 		const token = await makeToken();
 
-		for (const [sbId, label] of [
-			["s2-http-delete-first", "delete-first"],
-			["s2-http-read-first", "read-first"],
+		// Same as S3: Promise.all does not order which request hits the per-sandbox mutex first.
+		// We only fix client-side array order ([DELETE, GET] vs [GET, DELETE]) and assert all
+		// admissible (first, second) pairs, then a definitive final read.
+		for (const [sbId, delFirstInArray] of [
+			["s2-http-delete-then-get-array", true],
+			["s2-http-get-then-delete-array", false],
 		] as const) {
 			await sm.getOrCreate("default", sbId);
-			// Setup: create the file
 			await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
 				body: "original",
 			});
 
-			const ops =
-				label === "delete-first"
-					? ([
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								method: "DELETE",
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-						] as const)
-					: ([
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								method: "DELETE",
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-						] as const);
+			const del = app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				method: "DELETE",
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const get = app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const [first, second] = await Promise.all(delFirstInArray ? [del, get] : [get, del]);
 
-			const [first, second] = await Promise.all(ops);
-
-			if (label === "delete-first") {
-				expect(first.status, "delete status").toBe(204);
-				expect(second.status, "read-after-delete status").toBe(404);
+			if (delFirstInArray) {
+				expect(first.status, "DELETE response status").toBe(204);
+				expect([404, 200], "GET sees delete-first → 404, read-first → 200").toContain(second.status);
+				if (second.status === 200) expect(await second.text()).toBe("original");
 			} else {
-				expect(first.status, "read status").toBe(200);
-				expect(await first.text()).toBe("original");
-				expect(second.status, "delete-after-read status").toBe(204);
+				expect(second.status, "DELETE response status").toBe(204);
+				if (first.status === 200) {
+					expect(await first.text()).toBe("original");
+				} else {
+					expect(first.status, "GET when delete won mutex first").toBe(404);
+				}
 			}
 
-			// In both orderings: file must be absent after both ops complete
 			const finalRead = await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
-			expect(finalRead.status, `${label}: file must be gone`).toBe(404);
+			expect(finalRead.status, `${sbId}: file must be gone`).toBe(404);
 		}
 	});
 
