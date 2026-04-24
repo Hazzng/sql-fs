@@ -128,11 +128,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
-		await tx`
+		const rows = await tx<{ id: string }[]>`
 			UPDATE sandboxes
 			SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
 			WHERE id = ${sandboxId}
+			RETURNING id
 		`;
+		if (rows.length === 0) {
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+		}
 	}
 
 	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */

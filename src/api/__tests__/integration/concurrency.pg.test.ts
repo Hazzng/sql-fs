@@ -44,6 +44,7 @@ function errCode(e: unknown): string {
 // ── Per-describe sandbox tracking ─────────────────────────────────────────────
 
 let cleanup: string[] = [];
+let envCleanups: Array<() => Promise<void>> = [];
 
 function newId(): string {
 	const id = crypto.randomUUID();
@@ -54,6 +55,11 @@ function newId(): string {
 async function flushCleanup(): Promise<void> {
 	const ids = cleanup.splice(0);
 	await Promise.allSettled(ids.map((id) => destroySandbox("postgres", id)));
+}
+
+async function flushEnvCleanups(): Promise<void> {
+	const cleanups = envCleanups.splice(0);
+	await Promise.allSettled(cleanups.map((close) => close()));
 }
 
 /** Create a sandbox row in Postgres without warming the SessionManager pool. */
@@ -97,6 +103,13 @@ function makePgEnv() {
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", fileRoutes(sm));
+	const close = async () => {
+		if (connected) {
+			connected = false;
+			await metaDialect.disconnect();
+		}
+	};
+	envCleanups.push(close);
 	return { app, sm };
 }
 
@@ -122,9 +135,11 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -181,9 +196,11 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -218,9 +235,11 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -295,9 +314,11 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -360,9 +381,11 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -445,9 +468,11 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
+		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
+		await flushEnvCleanups();
 		await flushCleanup();
 	});
 

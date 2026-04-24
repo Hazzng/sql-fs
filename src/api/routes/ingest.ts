@@ -9,6 +9,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 // Validates that a basePath is a safe absolute path (no shell metacharacters)
@@ -27,24 +28,12 @@ function isValidRelativePath(p: string): boolean {
 	return true;
 }
 
-/** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
-	const session = sessionManager.getSession(sandboxId);
-	if (session?.owner && session.owner !== caller) {
-		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
-	}
-	return undefined;
-}
-
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// POST /v1/sandboxes/:id/ingest — upload tar.gz and extract into sandbox
 	router.post("/:id/ingest", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		const body = await c.req.parseBody();
 		const archiveField = body.archive;
 		const basePathField = body.basePath;
@@ -68,7 +57,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
 
 		try {
-			await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
 				// Ensure /tmp exists before writing archive
 				try {
 					await session.fs.mkdir("/tmp", { recursive: true });
@@ -93,6 +82,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			});
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;
+			if (isForbiddenError(e)) {
+				return forbiddenResponse();
+			}
 			if (code === "ENOENT") {
 				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}
@@ -110,9 +102,6 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 	router.post("/:id/ingest-files", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		let raw: unknown;
 		try {
 			raw = await c.req.json();
@@ -159,7 +148,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const fileCount = Object.keys(files).length;
 
 		try {
-			await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
 				for (const [relativePath, base64Content] of Object.entries(files)) {
 					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
 					const lastSlash = absPath.lastIndexOf("/");
@@ -180,6 +169,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			});
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;
+			if (isForbiddenError(e)) {
+				return forbiddenResponse();
+			}
 			if (code === "ENOENT") {
 				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}
@@ -192,9 +184,6 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 	// GET /v1/sandboxes/:id/export — download sandbox contents as tar.gz
 	router.get("/:id/export", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		const basePath = c.req.query("basePath") ?? "/home/user";
 
 		if (!isValidBasePath(basePath)) {
@@ -206,7 +195,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		let archiveBytes: Uint8Array;
 		try {
-			archiveBytes = await sessionManager.withSessionOrRehydrate(sandboxId, async (session) => {
+			archiveBytes = await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
 				// Check basePath exists
 				const exists = await session.fs.exists(basePath);
 				if (!exists) {
@@ -242,6 +231,9 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			});
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;
+			if (isForbiddenError(e)) {
+				return forbiddenResponse();
+			}
 			if (code === "ENOENT") {
 				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}

@@ -698,7 +698,7 @@ Replace at lines:
 #### Total: 13 replacements (11 unique call sites + 2 additional found in files.ts at lines 242 and 291)
 
 **Search-and-replace pattern**:
-```
+```text
 withExistingSession  →  withSessionOrRehydrate
 ```
 

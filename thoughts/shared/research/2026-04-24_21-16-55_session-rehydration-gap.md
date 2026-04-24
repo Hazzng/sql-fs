@@ -149,9 +149,9 @@ Key patterns:
 
 ---
 
-### 4. All withExistingSession Call Sites (11 total)
+### 4. All withExistingSession Call Sites (12 total)
 
-#### HTTP Routes (8 call sites):
+#### HTTP Routes (9 call sites):
 
 | File | Route | Line | HTTP Method |
 |------|-------|------|-------------|
@@ -420,3 +420,4 @@ The ~10ms cold-hit cost is paid once per replica per sandbox, amortized across a
 4. **MySQL/Azure SQL dialects**: `sandboxExists` is trivial for both but deferred. V1 targets Postgres only.
 
 5. **Metrics**: Should `vfs.session.rehydrate_total` and `vfs.session.rehydrate_duration_ms` be added in the main PR or as a follow-up?
+

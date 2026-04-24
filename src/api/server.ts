@@ -148,6 +148,7 @@ app.onError((err, c) => {
 		"EISDIR",
 		"ENOTDIR",
 		"EPERM",
+		"FORBIDDEN",
 		"ENOTEMPTY",
 		"ESESSIONCLOSING",
 		"ELOOP",

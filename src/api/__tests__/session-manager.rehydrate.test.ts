@@ -24,6 +24,9 @@ function makeSessionManager(): SessionManager {
 	return new SessionManager({
 		backend: "memory",
 		createFs: createFsSpy,
+		destroySandboxFn: async (_backend: string, sandboxId: string) => {
+			pgSandboxes.delete(sandboxId);
+		},
 		getSandboxMetaFn: async (sandboxId: string) => pgSandboxes.get(sandboxId) ?? null,
 		persistSandboxMetaFn: async (sandboxId: string, meta: SandboxMeta) => {
 			pgSandboxes.set(sandboxId, meta);
@@ -83,7 +86,6 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 		await sm.withSessionOrRehydrate("sb-destroy", async () => "alive");
 
 		await sm.destroy("sb-destroy");
-		pgSandboxes.delete("sb-destroy");
 
 		await expect(sm.withSessionOrRehydrate("sb-destroy", async () => "ghost")).rejects.toMatchObject({
 			code: "ENOENT",

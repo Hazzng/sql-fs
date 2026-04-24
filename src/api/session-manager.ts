@@ -502,14 +502,11 @@ export class SessionManager {
 			}
 		} else {
 			// No metadata function configured — strict pool-only behavior
-			const session = this.sessions.get(sandboxId);
-			if (session === undefined) {
-				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
-			}
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
 			? { python: meta.python, javascript: meta.javascript }
-			: runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS;
+			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(sandboxId, resolvedRuntime);
 		if (meta?.owner) {
 			session.owner = meta.owner;
