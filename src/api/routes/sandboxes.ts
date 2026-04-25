@@ -9,6 +9,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const createBodySchema = z.object({
@@ -50,6 +51,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			async (session) => {
 				session.owner = owner;
 				session.createdAt = createdAt;
+				await sessionManager.persistSandboxMeta(sandboxId, { owner, python, javascript });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);
@@ -83,13 +85,17 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.delete("/:id", async (c) => {
 		const id = c.req.param("id");
-		// Check ownership before destroying
-		const session = sessionManager.getSession(id);
-		if (session !== undefined) {
-			const caller = c.get("owner");
-			if (session.owner && session.owner !== caller) {
-				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
+		try {
+			await withOwnedSessionOrRehydrate(sessionManager, id, c.get("owner"), async () => undefined);
+		} catch (err) {
+			const code = (err as Error & { code?: string }).code;
+			if (isForbiddenError(err)) {
+				return forbiddenResponse();
 			}
+			if (code === "ENOENT") {
+				return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+			}
+			throw err;
 		}
 		const found = await sessionManager.destroy(id);
 		if (!found) {

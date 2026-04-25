@@ -117,6 +117,26 @@ describe("SessionManager pathCache memory budget (US-075a)", () => {
 		vi.useRealTimers();
 	});
 
+	it("recomputes pathCacheBytes after writes on non-coherent backends", async () => {
+		const fs = new InMemoryFs();
+		const sm = new SessionManager({
+			backend: "memory",
+			createFs: async () => fs,
+		});
+
+		const session = await sm.getOrCreate("sandbox-budget-refresh");
+		const initialBytes = session.pathCacheBytes;
+
+		await sm.withSession("sandbox-budget-refresh", async (activeSession) => {
+			for (let i = 0; i < 4; i++) {
+				await activeSession.fs.writeFile(`/budget-${i}.txt`, "x");
+			}
+		});
+
+		const updated = sm.getSession("sandbox-budget-refresh");
+		expect(updated?.pathCacheBytes).toBeGreaterThan(initialBytes);
+	});
+
 	it("under-budget session stays resident after operations", async () => {
 		vi.useFakeTimers();
 		// Very large budget and very long idle — session should not be evicted

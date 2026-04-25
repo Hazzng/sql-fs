@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -28,18 +29,6 @@ function isValidRelativePath(p: string): boolean {
 	return true;
 }
 
-/**
- * Returns an error message if the caller does not own the sandbox, null if OK.
- * Matches HTTP route checkOwnership behavior: empty owner means no enforcement.
- */
-function checkMcpOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): string | null {
-	const session = sessionManager.getSession(sandboxId);
-	if (session?.owner && session.owner !== caller) {
-		return "forbidden";
-	}
-	return null;
-}
-
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string): void {
 	server.tool(
 		"sandbox_create",
@@ -56,6 +45,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			};
 			const session = await sessionManager.getOrCreate(id, runtimeOptions);
 			session.owner = owner;
+			await sessionManager.persistSandboxMeta(id, {
+				owner,
+				python: runtimeOptions.python,
+				javascript: runtimeOptions.javascript,
+			});
 			return {
 				content: [
 					{
@@ -68,13 +62,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 	);
 
 	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
-		const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
-		if (ownershipErr) {
-			return {
-				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-			};
-		}
 		try {
+			await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async () => undefined);
 			const existed = await sessionManager.destroy(args.id);
 			if (!existed) {
 				return {
@@ -85,6 +74,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				content: [{ type: "text" as const, text: JSON.stringify({ ok: true }) }],
 			};
 		} catch (err) {
+			const code = (err as Error & { code?: string }).code;
+			if (code === "FORBIDDEN") {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+				};
+			}
+			if (code === "ENOENT") {
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+				};
+			}
 			const message = err instanceof Error ? err.message : String(err);
 			return {
 				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
@@ -121,17 +121,10 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			timeout: z.number().int().positive().optional(),
 		},
 		async (args) => {
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
-			if (ownershipErr) {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: "forbidden", exitCode: 1 }) }],
-				};
-			}
-
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const result = await sessionManager.withExistingSession(args.id, async (session) => {
+				const result = await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 
@@ -163,6 +156,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") {
+					return {
+						content: [
+							{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: "forbidden", exitCode: 1 }) },
+						],
+					};
+				}
 				if (code === "ENOENT") {
 					return {
 						content: [
@@ -206,15 +206,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				}
 			}
 
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
-			if (ownershipErr) {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-				};
-			}
-
 			try {
-				await sessionManager.withExistingSession(args.id, async (session) => {
+				await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
 					for (const [relativePath, content] of Object.entries(args.files)) {
 						const absPath = `${basePath}/${relativePath}`;
 						const lastSlash = absPath.lastIndexOf("/");
@@ -233,6 +226,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+					};
+				}
 				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
@@ -252,15 +250,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const basePath = args.basePath ?? "/home/user";
 			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
-			const ownershipErr = checkMcpOwnership(sessionManager, args.id, owner);
-			if (ownershipErr) {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-				};
-			}
-
 			try {
-				const { files, errors } = await sessionManager.withExistingSession(args.id, async (session) => {
+				const { files, errors } = await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
 					const allPaths = session.fs.getAllPaths();
 					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
 					const result: Record<string, string> = Object.create(null);
@@ -301,6 +292,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+					};
+				}
 				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],

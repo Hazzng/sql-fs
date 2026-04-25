@@ -57,6 +57,13 @@ export interface PathCacheEntry {
 	readonly symlinkTarget: string | null;
 }
 
+/** Persisted sandbox metadata needed for session rehydration on cold replicas. */
+export interface SandboxMeta {
+	readonly owner: string | null;
+	readonly python: boolean;
+	readonly javascript: boolean;
+}
+
 /** Options for creating a new inode row */
 export interface CreateInodeOpts {
 	readonly sandboxId: string;
@@ -145,6 +152,18 @@ export interface SqlDialect<Tx = unknown> {
 	 * by deleting the sandbox row (CASCADE removes child rows).
 	 */
 	deleteSandbox(tx: Tx, sandboxId: string): Promise<void>;
+
+	/**
+	 * Returns true if a sandbox row with the given ID exists in the database.
+	 * Does not require sandbox context (no RLS dependency) — queries sandboxes table directly.
+	 */
+	sandboxExists(tx: Tx, sandboxId: string): Promise<boolean>;
+
+	/** Returns persisted metadata for a sandbox, or null if the sandbox doesn't exist. */
+	getSandboxMeta(tx: Tx, sandboxId: string): Promise<SandboxMeta | null>;
+
+	/** Writes owner and runtime-option metadata to the sandbox row. */
+	updateSandboxMeta(tx: Tx, sandboxId: string, meta: SandboxMeta): Promise<void>;
 
 	// ── Inode CRUD ────────────────────────────────────────────────────────────────
 

@@ -13,6 +13,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { FsStat } from "just-bash";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 // Simple extension → MIME type map (null-prototype to prevent prototype pollution)
@@ -76,23 +77,12 @@ function parentDir(filePath: string): string {
 	return lastSlash <= 0 ? "/" : filePath.slice(0, lastSlash);
 }
 
-/** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(sessionManager: SessionManager, sandboxId: string, caller: string): Response | undefined {
-	const session = sessionManager.getSession(sandboxId);
-	if (session?.owner && session.owner !== caller) {
-		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
-	}
-	return undefined;
-}
-
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// GET /v1/sandboxes/:id/files/* — read file content
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
 	router.get("/:id/files/:path{.*}", async (c) => {
-		const ownershipErr = checkOwnership(sessionManager, c.req.param("id"), c.get("owner"));
-		if (ownershipErr) return ownershipErr;
 		const sandboxId = c.req.param("id");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
@@ -102,39 +92,50 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			| { kind: "not_found" }
 			| { kind: "eisdir" };
 
-		const result = await sessionManager.withExistingSession<ReadResult>(sandboxId, async (session) => {
-			let stat: FsStat;
-			try {
-				stat = await session.fs.stat(filePath);
-			} catch (e) {
-				const code = extractErrCode(e);
-				if (code === "ENOENT") return { kind: "not_found" };
-				throw e;
-			}
+		let result: ReadResult;
+		try {
+			result = await withOwnedSessionOrRehydrate<ReadResult>(
+				sessionManager,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					let stat: FsStat;
+					try {
+						stat = await session.fs.stat(filePath);
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code === "ENOENT") return { kind: "not_found" };
+						throw e;
+					}
 
-			if (stat.isDirectory) {
-				return { kind: "eisdir" };
-			}
+					if (stat.isDirectory) {
+						return { kind: "eisdir" };
+					}
 
-			const statHeader = {
-				kind: toKind(stat),
-				mode: stat.mode,
-				size: stat.size,
-				mtime: stat.mtime.toISOString(),
-			};
+					const statHeader = {
+						kind: toKind(stat),
+						mode: stat.mode,
+						size: stat.size,
+						mtime: stat.mtime.toISOString(),
+					};
 
-			// Use readFileBuffer if available (SqlFs), otherwise fall back to text-based readFile
-			const fs = session.fs as { readFileBuffer?: (path: string) => Promise<Uint8Array> };
-			let body: Uint8Array;
-			if (typeof fs.readFileBuffer === "function") {
-				body = await fs.readFileBuffer(filePath);
-			} else {
-				const content = await session.fs.readFile(filePath);
-				body = new TextEncoder().encode(content);
-			}
+					// Use readFileBuffer if available (SqlFs), otherwise fall back to text-based readFile
+					const fs = session.fs as { readFileBuffer?: (path: string) => Promise<Uint8Array> };
+					let body: Uint8Array;
+					if (typeof fs.readFileBuffer === "function") {
+						body = await fs.readFileBuffer(filePath);
+					} else {
+						const content = await session.fs.readFile(filePath);
+						body = new TextEncoder().encode(content);
+					}
 
-			return { kind: "ok", body, statHeader };
-		});
+					return { kind: "ok", body, statHeader };
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		if (result.kind === "not_found") {
 			return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
@@ -154,26 +155,29 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// PUT /v1/sandboxes/:id/files/* — write raw file content
 	router.put("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
-			const parent = parentDir(filePath);
-			if (parent !== "/") {
-				try {
-					await session.fs.mkdir(parent, { recursive: true });
-				} catch (e) {
-					const code = extractErrCode(e);
-					if (code !== "EEXIST") throw e;
+		try {
+			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+				const parent = parentDir(filePath);
+				if (parent !== "/") {
+					try {
+						await session.fs.mkdir(parent, { recursive: true });
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code !== "EEXIST") throw e;
+					}
 				}
-			}
-			await session.fs.writeFile(filePath, content);
-		});
+				await session.fs.writeFile(filePath, content);
+			});
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		return c.body(null, 204);
 	});
@@ -181,25 +185,34 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
 	router.delete("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 		const recursive = c.req.query("recursive") === "true";
 
 		type DeleteResult = { kind: "ok" } | { kind: "not_found" } | { kind: "not_empty" };
 
-		const result = await sessionManager.withExistingSession<DeleteResult>(sandboxId, async (session) => {
-			try {
-				await session.fs.rm(filePath, { recursive });
-				return { kind: "ok" };
-			} catch (e) {
-				const code = extractErrCode(e);
-				if (code === "ENOENT") return { kind: "not_found" };
-				if (code === "ENOTEMPTY") return { kind: "not_empty" };
-				throw e;
-			}
-		});
+		let result: DeleteResult;
+		try {
+			result = await withOwnedSessionOrRehydrate<DeleteResult>(
+				sessionManager,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					try {
+						await session.fs.rm(filePath, { recursive });
+						return { kind: "ok" };
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code === "ENOENT") return { kind: "not_found" };
+						if (code === "ENOTEMPTY") return { kind: "not_empty" };
+						throw e;
+					}
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		if (result.kind === "not_found") {
 			return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
@@ -218,9 +231,6 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/writeFiles", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		let body: z.infer<typeof writeFilesBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -239,20 +249,25 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const { files } = body;
 
-		await sessionManager.withExistingSession(sandboxId, async (session) => {
-			for (const [filePath, content] of Object.entries(files)) {
-				const parent = parentDir(filePath);
-				if (parent !== "/") {
-					try {
-						await session.fs.mkdir(parent, { recursive: true });
-					} catch (e) {
-						const code = extractErrCode(e);
-						if (code !== "EEXIST") throw e;
+		try {
+			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+				for (const [filePath, content] of Object.entries(files)) {
+					const parent = parentDir(filePath);
+					if (parent !== "/") {
+						try {
+							await session.fs.mkdir(parent, { recursive: true });
+						} catch (e) {
+							const code = extractErrCode(e);
+							if (code !== "EEXIST") throw e;
+						}
 					}
+					await session.fs.writeFile(filePath, content);
 				}
-				await session.fs.writeFile(filePath, content);
-			}
-		});
+			});
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		return c.body(null, 204);
 	});
@@ -265,9 +280,6 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/mkdir", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		let body: z.infer<typeof mkdirBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -288,16 +300,27 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type MkdirResult = { kind: "ok" } | { kind: "exists" };
 
-		const result = await sessionManager.withExistingSession<MkdirResult>(sandboxId, async (session) => {
-			try {
-				await session.fs.mkdir(dirPath, { recursive });
-				return { kind: "ok" };
-			} catch (e) {
-				const code = extractErrCode(e);
-				if (code === "EEXIST") return { kind: "exists" };
-				throw e;
-			}
-		});
+		let result: MkdirResult;
+		try {
+			result = await withOwnedSessionOrRehydrate<MkdirResult>(
+				sessionManager,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					try {
+						await session.fs.mkdir(dirPath, { recursive });
+						return { kind: "ok" };
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code === "EEXIST") return { kind: "exists" };
+						throw e;
+					}
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		if (result.kind === "exists") {
 			return c.json({ error: "already_exists", code: "EEXIST" }, 409 as ContentfulStatusCode);
@@ -314,9 +337,6 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.get("/:id/tree", async (c) => {
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
 		const queryResult = treeQuerySchema.safeParse(c.req.query());
 		if (!queryResult.success) {
 			const details = queryResult.error.issues.map((i) => i.message);
@@ -329,41 +349,52 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type TreeEntry = { path: string; kind: string; size: number; mtime: string };
 
-		const entries = await sessionManager.withExistingSession<TreeEntry[]>(sandboxId, async (session) => {
-			const allPaths = session.fs.getAllPaths();
-			const result: TreeEntry[] = [];
+		let entries: TreeEntry[];
+		try {
+			entries = await withOwnedSessionOrRehydrate<TreeEntry[]>(
+				sessionManager,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					const allPaths = session.fs.getAllPaths();
+					const result: TreeEntry[] = [];
 
-			for (const p of allPaths) {
-				// Skip the prefix dir itself
-				if (p === normalizedPrefix) continue;
+					for (const p of allPaths) {
+						// Skip the prefix dir itself
+						if (p === normalizedPrefix) continue;
 
-				// Filter by prefix
-				if (normalizedPrefix !== "/") {
-					if (!p.startsWith(`${normalizedPrefix}/`)) continue;
-				}
+						// Filter by prefix
+						if (normalizedPrefix !== "/") {
+							if (!p.startsWith(`${normalizedPrefix}/`)) continue;
+						}
 
-				// Filter by depth (relative segments below prefix)
-				if (depth !== undefined) {
-					const relative = normalizedPrefix === "/" ? p.slice(1) : p.slice(normalizedPrefix.length + 1);
-					const segments = relative.split("/").filter(Boolean).length;
-					if (segments > depth) continue;
-				}
+						// Filter by depth (relative segments below prefix)
+						if (depth !== undefined) {
+							const relative = normalizedPrefix === "/" ? p.slice(1) : p.slice(normalizedPrefix.length + 1);
+							const segments = relative.split("/").filter(Boolean).length;
+							if (segments > depth) continue;
+						}
 
-				try {
-					const stat = await session.fs.stat(p);
-					result.push({
-						path: p,
-						kind: toKind(stat),
-						size: stat.size,
-						mtime: stat.mtime.toISOString(),
-					});
-				} catch {
-					// Skip paths that can't be stat'd
-				}
-			}
+						try {
+							const stat = await session.fs.stat(p);
+							result.push({
+								path: p,
+								kind: toKind(stat),
+								size: stat.size,
+								mtime: stat.mtime.toISOString(),
+							});
+						} catch {
+							// Skip paths that can't be stat'd
+						}
+					}
 
-			return result;
-		});
+					return result;
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		return c.json(entries);
 	});

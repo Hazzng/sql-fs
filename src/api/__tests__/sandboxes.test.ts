@@ -7,6 +7,7 @@ import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { SandboxMeta } from "../../fs/sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../auth.js";
 import { sandboxRoutes } from "../routes/sandboxes.js";
 import { SessionManager } from "../session-manager.js";
@@ -132,6 +133,42 @@ describe("DELETE /v1/sandboxes/:id", () => {
 		const body = (await res.json()) as { error: string; code: string };
 		expect(body.error).toBe("not_found");
 		expect(body.code).toBe("SANDBOX_NOT_FOUND");
+	});
+
+	it("delete returns 403 on a cold replica when another owner created the sandbox", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		const ownerApp = makeTestApp(ownerManager);
+		const ownerToken = await makeToken("owner-a");
+		const createRes = await ownerApp.request("/v1/sandboxes", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${ownerToken}` },
+		});
+		const { id } = (await createRes.json()) as { id: string };
+
+		const coldReplica = new SessionManager({
+			backend: "memory",
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const app = makeTestApp(coldReplica);
+		const otherToken = await makeToken("owner-b");
+
+		const res = await app.request(`/v1/sandboxes/${id}`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${otherToken}` },
+		});
+
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "forbidden", code: "FORBIDDEN" });
 	});
 });
 
