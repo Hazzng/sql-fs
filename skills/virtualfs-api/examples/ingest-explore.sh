@@ -11,11 +11,23 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io}"
+BASE_URL="${BASE_URL:?BASE_URL env var required (e.g. https://your-app.azurecontainerapps.io)}"
 TOKEN="${TOKEN:?TOKEN env var required}"
 SRC_DIR="${SRC_DIR:?SRC_DIR env var required — path to local source directory}"
 MAX_FILES="${MAX_FILES:-25}"    # keep under ACA 240s timeout (~2s/file on Neon)
 SANDBOX_BASE_PATH="/home/user/src"
+
+SB=""
+KEEP_SANDBOX="${KEEP_SANDBOX:-false}"
+
+cleanup_sandbox() {
+  if [[ -n "$SB" && "$KEEP_SANDBOX" != "true" ]]; then
+    curl -fsS -X DELETE "$BASE_URL/v1/sandboxes/$SB" \
+      -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+    echo "Cleanup: deleted sandbox $SB"
+  fi
+}
+trap cleanup_sandbox EXIT
 
 echo "=== VirtualFS Codebase Exploration ==="
 echo "Source: $SRC_DIR"
@@ -25,18 +37,22 @@ echo ""
 # ── Helper: run a bash script in the sandbox ──────────────────────────────────
 exec_sync() {
   local script="$1"
-  curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+  curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg s "$script" '{script: $s}')" | jq -r '.stdout'
+    -d "$(jq -n --arg s "$script" '{script: $s}')" | jq -er '.stdout'
 }
 
 # ── 1. Create sandbox ─────────────────────────────────────────────────────────
 echo "--- Creating sandbox ---"
-SB=$(curl -s -X POST "$BASE_URL/v1/sandboxes" \
+SB=$(curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{}' | jq -r '.id')
+  -d '{}' | jq -er '.id')
+if [[ -z "$SB" || "$SB" == "null" ]]; then
+  echo "Failed to create sandbox: SB='$SB'" >&2
+  exit 1
+fi
 echo "Sandbox: $SB"
 echo ""
 
@@ -68,7 +84,7 @@ echo ""
 
 # ── 3. Ingest ─────────────────────────────────────────────────────────────────
 echo "--- Ingesting files (this takes ~2s/file on Neon) ---"
-INGEST_RESULT=$(echo "$PAYLOAD" | curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/ingest-files" \
+INGEST_RESULT=$(echo "$PAYLOAD" | curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/ingest-files" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary @-)
@@ -81,7 +97,7 @@ exec_sync "find $SANDBOX_BASE_PATH -type f | sort"
 echo ""
 
 echo "--- Line counts ---"
-exec_sync "find $SANDBOX_BASE_PATH -name '*.ts' | xargs wc -l 2>/dev/null | sort -rn | head -20"
+exec_sync "find $SANDBOX_BASE_PATH -name '*.ts' | xargs -r wc -l 2>/dev/null | sort -rn | head -20"
 echo ""
 
 echo "--- Exported classes ---"
@@ -101,24 +117,30 @@ exec_sync "grep -rn 'TODO\|FIXME\|HACK\|XXX' $SANDBOX_BASE_PATH 2>/dev/null" || 
 echo ""
 
 # ── 5. Interactive: run custom commands ───────────────────────────────────────
-echo "--- Run your own commands (Ctrl+C to stop) ---"
+echo "--- Run your own commands ---"
 echo "Sandbox: $SB"
 echo "Files at: $SANDBOX_BASE_PATH"
 echo ""
 echo "Example:"
-echo "  curl -s -X POST \"$BASE_URL/v1/sandboxes/$SB/exec-sync\" \\"
+echo "  curl -fsS -X POST \"$BASE_URL/v1/sandboxes/$SB/exec-sync\" \\"
 echo "    -H \"Authorization: Bearer \$TOKEN\" \\"
 echo "    -H \"Content-Type: application/json\" \\"
 echo "    -d '{\"script\": \"cat $SANDBOX_BASE_PATH/index.ts\"}' | jq -r '.stdout'"
 echo ""
 
-# ── 6. Cleanup prompt ─────────────────────────────────────────────────────────
-read -p "Delete sandbox $SB? [y/N] " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  curl -s -X DELETE "$BASE_URL/v1/sandboxes/$SB" -H "Authorization: Bearer $TOKEN"
-  echo "Sandbox deleted."
+# ── 6. Cleanup decision (TTY-aware) ───────────────────────────────────────────
+if [[ -t 0 ]]; then
+  read -p "Delete sandbox $SB? [y/N] " -n 1 -r REPLY || REPLY="n"
+  echo ""
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    KEEP_SANDBOX=true
+    echo "Sandbox kept. Delete later with:"
+    echo "  curl -fsS -X DELETE \"$BASE_URL/v1/sandboxes/$SB\" -H \"Authorization: Bearer \$TOKEN\""
+  fi
 else
-  echo "Sandbox kept. Delete later with:"
-  echo "  curl -s -X DELETE \"$BASE_URL/v1/sandboxes/$SB\" -H \"Authorization: Bearer \$TOKEN\""
+  # Non-interactive (CI, piped) — keep the sandbox by default; set KEEP_SANDBOX=false to override.
+  KEEP_SANDBOX=true
+  echo "Non-interactive run — keeping sandbox $SB."
+  echo "Set KEEP_SANDBOX=false to auto-delete in non-interactive mode."
 fi
+# Cleanup runs via EXIT trap (skipped when KEEP_SANDBOX=true)

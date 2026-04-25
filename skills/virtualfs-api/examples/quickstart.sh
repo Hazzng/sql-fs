@@ -5,8 +5,18 @@
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io}"
+BASE_URL="${BASE_URL:?BASE_URL env var required (e.g. https://your-app.azurecontainerapps.io)}"
 TOKEN="${TOKEN:?TOKEN env var required}"
+
+SB=""
+cleanup_sandbox() {
+  if [[ -n "$SB" ]]; then
+    curl -fsS -X DELETE "$BASE_URL/v1/sandboxes/$SB" \
+      -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+    echo "Cleanup: deleted sandbox $SB"
+  fi
+}
+trap cleanup_sandbox EXIT
 
 echo "=== VirtualFS Quickstart ==="
 echo "Base URL: $BASE_URL"
@@ -14,21 +24,21 @@ echo ""
 
 # 1. Health check
 echo "--- Health check ---"
-curl -s "$BASE_URL/healthz" | jq
+curl -fsS "$BASE_URL/healthz" | jq
 echo ""
 
 # 2. Create sandbox
 echo "--- Creating sandbox ---"
-SB=$(curl -s -X POST "$BASE_URL/v1/sandboxes" \
+SB=$(curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{}' | jq -r '.id')
+  -d '{}' | jq -er '.id')
 echo "Sandbox ID: $SB"
 echo ""
 
 # 3. Write a file
 echo "--- Writing /home/user/hello.txt ---"
-curl -s -X PUT "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
+curl -fsS -X PUT "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
   -H "Authorization: Bearer $TOKEN" \
   --data-binary "Hello from VirtualFS!"
 echo "(204 = success)"
@@ -36,7 +46,7 @@ echo ""
 
 # 4. Execute bash
 echo "--- Executing bash ---"
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"script": "echo Hello && cat /home/user/hello.txt && echo && uname -a"}' | jq
@@ -44,7 +54,7 @@ echo ""
 
 # 5. Bulk write multiple files
 echo "--- Bulk writing files ---"
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/writeFiles" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/writeFiles" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -59,42 +69,37 @@ echo ""
 
 # 6. List file tree
 echo "--- File tree ---"
-curl -s "$BASE_URL/v1/sandboxes/$SB/tree?prefix=/home/user" \
+curl -fsS "$BASE_URL/v1/sandboxes/$SB/tree?prefix=/home/user" \
   -H "Authorization: Bearer $TOKEN" | jq '[.[] | {path, kind, size}]'
 echo ""
 
 # 7. Run grep across files
 echo "--- Search across files ---"
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"script": "grep -r \"file\" /home/user/ 2>/dev/null"}' | jq -r '.stdout'
+  -d '{"script": "grep -r \"file\" /home/user/ 2>/dev/null"}' | jq -er '.stdout'
 echo ""
 
 # 8. Shell state persists
 echo "--- Shell state persistence ---"
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"script": "export MY_STATE=hello"}' > /dev/null
 
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"script": "echo MY_STATE=$MY_STATE"}' | jq -r '.stdout'
+  -d '{"script": "echo MY_STATE=$MY_STATE"}' | jq -er '.stdout'
 echo ""
 
 # 9. Read a file back
 echo "--- Reading file back ---"
-curl -s "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
+curl -fsS "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
   -H "Authorization: Bearer $TOKEN"
 echo ""
 echo ""
 
-# 10. Cleanup
-echo "--- Deleting sandbox ---"
-curl -s -X DELETE "$BASE_URL/v1/sandboxes/$SB" \
-  -H "Authorization: Bearer $TOKEN"
-echo "Sandbox $SB deleted (204 = success)"
-echo ""
+# Cleanup runs via EXIT trap
 echo "=== Done ==="

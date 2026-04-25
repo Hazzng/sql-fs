@@ -325,7 +325,7 @@ tar xzf export.tar.gz   # extract
 
 ---
 
-## Admin
+## Admin Maintenance
 
 ### POST /v1/admin/gc — Garbage collect orphaned blobs
 

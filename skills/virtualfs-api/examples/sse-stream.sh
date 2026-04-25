@@ -4,20 +4,35 @@
 # Demonstrates the POST /exec endpoint that streams stdout/stderr as
 # Server-Sent Events in real time. Useful for long-running scripts.
 #
-# Usage: BASE_URL=... TOKEN=... SB=<sandbox-id> bash sse-stream.sh
+# Usage: BASE_URL=... TOKEN=... [SB=<sandbox-id>] bash sse-stream.sh
 
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io}"
+BASE_URL="${BASE_URL:?BASE_URL env var required}"
 TOKEN="${TOKEN:?TOKEN env var required}"
+
+CLEANUP=false
+
+cleanup_sandbox() {
+  if [[ "$CLEANUP" == "true" && -n "${SB:-}" ]]; then
+    curl -fsS -X DELETE "$BASE_URL/v1/sandboxes/$SB" \
+      -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
+    echo "Cleanup: deleted sandbox $SB"
+  fi
+}
+trap cleanup_sandbox EXIT
 
 # ── Create a sandbox if SB is not set ─────────────────────────────────────────
 if [[ -z "${SB:-}" ]]; then
   echo "Creating sandbox..."
-  SB=$(curl -s -X POST "$BASE_URL/v1/sandboxes" \
+  SB=$(curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{}' | jq -r '.id')
+    -d '{}' | jq -er '.id')
+  if [[ -z "$SB" || "$SB" == "null" ]]; then
+    echo "Failed to create sandbox: SB='$SB'" >&2
+    exit 1
+  fi
   echo "Sandbox: $SB"
   CLEANUP=true
 fi
@@ -29,7 +44,7 @@ echo ""
 
 # ── Example 1: Simple loop with progress ──────────────────────────────────────
 echo "--- Counting with progress ---"
-curl -N -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
+curl -N -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -40,7 +55,7 @@ echo ""
 
 # ── Example 2: Parse SSE events with awk ──────────────────────────────────────
 echo "--- Parsed SSE events ---"
-curl -N -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
+curl -N -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -58,7 +73,7 @@ echo ""
 
 # ── Example 3: Long-running with custom timeout ───────────────────────────────
 echo "--- Long script with 60s timeout ---"
-curl -N -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
+curl -N -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -70,11 +85,11 @@ echo ""
 
 # ── Example 4: Capture exit code from SSE stream ──────────────────────────────
 echo "--- Capture exit code ---"
-EXIT_CODE=$(curl -N -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
+EXIT_CODE=$(curl -N -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"script": "exit 7"}' \
-  | grep '^data:' | tail -1 | sed 's/^data: //' | jq -r '.exitCode')
+  | grep '^data:' | tail -1 | sed 's/^data: //' | jq -er '.exitCode')
 echo "Exit code was: $EXIT_CODE"
 echo ""
 
@@ -95,9 +110,4 @@ Types:
 Client disconnect (Ctrl+C) cancels the running script immediately.
 EOF
 echo ""
-
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-if [[ "${CLEANUP:-false}" == "true" ]]; then
-  curl -s -X DELETE "$BASE_URL/v1/sandboxes/$SB" -H "Authorization: Bearer $TOKEN"
-  echo "Sandbox deleted."
-fi
+# Cleanup runs via EXIT trap

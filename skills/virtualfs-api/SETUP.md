@@ -10,10 +10,11 @@
 
 ## Step 1 — Generate an admin token (one-time bootstrap)
 
-Run this from the **project root** (`/Users/nguyendangquang/master/Web-Dev/virtualFS`):
+Run this from the **project root** (e.g. `<repo-root>/virtualFS`):
 
 ```bash
-export AUTH_SECRET="b882d28f4ddeb27d778c1f11e75ad96703ff3830b327dabd5c158e9942237d04"
+# Pull AUTH_SECRET from your secret store / .env — never commit the real value
+export AUTH_SECRET="<YOUR_AUTH_SECRET>"
 export BASE_URL="https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io"
 
 export TOKEN=$(AUTH_SECRET=$AUTH_SECRET pnpm token:create -- --sub admin --expires 30d 2>/dev/null | tail -1)
@@ -29,10 +30,12 @@ Available expiry values: `24h`, `7d`, `30d`, `1y`, `never`.
 ## Step 2 — Verify the token works
 
 ```bash
-curl -s "$BASE_URL/healthz"
+export BASE_URL="<YOUR_BASE_URL>"   # set to your deployment URL
+
+curl -fsS "$BASE_URL/healthz"
 # → {"status":"ok"}
 
-curl -s -X POST "$BASE_URL/v1/sandboxes" \
+curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}' | jq
@@ -78,40 +81,13 @@ echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq
 ## Environment setup (put in ~/.zshrc or .env)
 
 ```bash
-export VIRTUALFS_BASE_URL="https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io"
-export VIRTUALFS_AUTH_SECRET="b882d28f4ddeb27d778c1f11e75ad96703ff3830b327dabd5c158e9942237d04"
+export VIRTUALFS_BASE_URL="<YOUR_BASE_URL>"          # e.g. https://your-app.azurecontainerapps.io
+export VIRTUALFS_AUTH_SECRET="<YOUR_AUTH_SECRET>"   # never commit the real value
 export VIRTUALFS_TOKEN="<your-generated-token>"
 
 # Convenience aliases
-alias vfs-sandbox-create='curl -s -X POST "$VIRTUALFS_BASE_URL/v1/sandboxes" -H "Authorization: Bearer $VIRTUALFS_TOKEN" -H "Content-Type: application/json"'
-alias vfs-health='curl -s "$VIRTUALFS_BASE_URL/healthz"'
-```
-
----
-
-## MCP server setup (Claude Code integration)
-
-Add to `~/.claude/settings.json` under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "virtualfs": {
-      "type": "http",
-      "url": "https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io/mcp",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-Available MCP tools: `sandbox_create`, `sandbox_delete`, `bash_exec`, `fs_ingest`, `fs_export`.
-
-Verify in Claude Code:
-```
-/mcp  →  should list "virtualfs" with 5 tools
+alias vfs-sandbox-create='curl -fsS -X POST "$VIRTUALFS_BASE_URL/v1/sandboxes" -H "Authorization: Bearer $VIRTUALFS_TOKEN" -H "Content-Type: application/json"'
+alias vfs-health='curl -fsS "$VIRTUALFS_BASE_URL/healthz"'
 ```
 
 ---

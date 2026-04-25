@@ -119,8 +119,8 @@ After session eviction (10 min idle) or on a cold replica:
 # Always quote variables to handle spaces
 script="cat '${filepath}'"
 
-# Use set -e to fail fast
-script="set -e && npm run build && npm test"
+# Use set -e to fail fast (npm/pip/etc are NOT available — call shipped scripts instead)
+script="set -e && ./scripts/build.sh && ./scripts/test.sh"
 
 # Capture both stdout and stderr
 script="cmd 2>&1"
