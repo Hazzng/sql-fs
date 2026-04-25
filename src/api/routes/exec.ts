@@ -28,6 +28,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// POST /v1/sandboxes/:id/exec-sync — buffered (non-streaming) bash execution
 	router.post("/:id/exec-sync", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof execBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -55,6 +56,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			execResult = await withOwnedSessionOrRehydrate<ExecSyncResult>(
 				sessionManager,
+				tenant,
 				sandboxId,
 				c.get("owner"),
 				async (session) => {
@@ -108,6 +110,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
 	router.post("/:id/exec", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof execBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -127,7 +130,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async () => undefined);
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			throw err;
@@ -148,7 +151,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				controller.abort();
 			}, timeoutMs);
 
-			await sessionManager.withExistingSession(sandboxId, async (session) => {
+			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				try {
 					const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
 						signal: controller.signal,

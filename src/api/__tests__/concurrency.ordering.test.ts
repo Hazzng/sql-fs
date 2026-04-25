@@ -25,9 +25,10 @@ import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type AuthVariables, authMiddleware } from "../auth.js";
+import { type AuthVariables, createAuthMiddleware } from "../auth.js";
 import { fileRoutes } from "../routes/files.js";
 import { SessionManager } from "../session-manager.js";
+import { stubTenantConfig } from "./helpers/tenant.js";
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
@@ -42,9 +43,9 @@ function makeEnv(): {
 	app: Hono<{ Variables: AuthVariables }>;
 	sm: SessionManager;
 } {
-	const sm = new SessionManager({ backend: "memory", createFs: async () => new InMemoryFs() });
+	const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", authMiddleware);
+	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
 	app.route("/v1/sandboxes", fileRoutes(sm));
 	return { app, sm };
 }
@@ -100,7 +101,7 @@ describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
 		const token = await makeToken();
 
 		for (const sbId of ["s1-http-mkdir-first", "s1-http-write-first"]) {
-			await sm.getOrCreate(sbId);
+			await sm.getOrCreate("default", sbId);
 			const [mkRes, wRes] = await Promise.all([
 				app.request(`/v1/sandboxes/${sbId}/mkdir`, {
 					method: "POST",
@@ -133,13 +134,13 @@ describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
 		// ── Ordering A: mkdir first ──
 		const sbA = "s1-raw-mkdir-first";
 		const [mkA, wA] = await Promise.all([
-			sm.withSession(sbA, (s) =>
+			sm.withSession("default", sbA, (s) =>
 				s.fs
 					.mkdir("/a")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbA, (s) =>
+			sm.withSession("default", sbA, (s) =>
 				s.fs
 					.writeFile("/a/x.txt", "hi")
 					.then(() => "ok")
@@ -148,18 +149,18 @@ describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
 		]);
 		expect(mkA).toBe("ok"); // mkdir wins first slot
 		expect(wA).toBe("ok"); // write succeeds — parent exists
-		expect(await sm.withSession(sbA, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbA, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
 
 		// ── Ordering B: write first ──
 		const sbB = "s1-raw-write-first";
 		const [wB, mkB] = await Promise.all([
-			sm.withSession(sbB, (s) =>
+			sm.withSession("default", sbB, (s) =>
 				s.fs
 					.writeFile("/a/x.txt", "hi")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbB, (s) =>
+			sm.withSession("default", sbB, (s) =>
 				s.fs
 					.mkdir("/a")
 					.then(() => "ok")
@@ -170,8 +171,8 @@ describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
 		// mkdir may return ok or EEXIST (InMemoryFs created /a for the write already)
 		expect(["ok", "EEXIST"]).toContain(mkB);
 		// Consistency: /a and /a/x.txt both exist regardless of ordering
-		expect(await sm.withSession(sbB, (s) => s.fs.exists("/a"))).toBe(true);
-		expect(await sm.withSession(sbB, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbB, (s) => s.fs.exists("/a"))).toBe(true);
+		expect(await sm.withSession("default", sbB, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
 	});
 });
 
@@ -188,59 +189,50 @@ describe("S2 — concurrent delete and read of the same file", () => {
 		process.env.AUTH_SECRET = "";
 	});
 
-	it("HTTP API: whichever runs first, delete always 204 and final state is file-absent", async () => {
+	it("HTTP API: concurrent delete + read — delete always 204, final state file-absent", async () => {
 		const { app, sm } = makeEnv();
 		const token = await makeToken();
 
-		for (const [sbId, label] of [
-			["s2-http-delete-first", "delete-first"],
-			["s2-http-read-first", "read-first"],
+		// Same as S3: Promise.all does not order which request hits the per-sandbox mutex first.
+		// We only fix client-side array order ([DELETE, GET] vs [GET, DELETE]) and assert all
+		// admissible (first, second) pairs, then a definitive final read.
+		for (const [sbId, delFirstInArray] of [
+			["s2-http-delete-then-get-array", true],
+			["s2-http-get-then-delete-array", false],
 		] as const) {
-			await sm.getOrCreate(sbId);
-			// Setup: create the file
+			await sm.getOrCreate("default", sbId);
 			await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
 				body: "original",
 			});
 
-			const ops =
-				label === "delete-first"
-					? ([
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								method: "DELETE",
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-						] as const)
-					: ([
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-							app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
-								method: "DELETE",
-								headers: { Authorization: `Bearer ${token}` },
-							}),
-						] as const);
+			const del = app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				method: "DELETE",
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const get = app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
+				headers: { Authorization: `Bearer ${token}` },
+			});
+			const [first, second] = await Promise.all(delFirstInArray ? [del, get] : [get, del]);
 
-			const [first, second] = await Promise.all(ops);
-
-			if (label === "delete-first") {
-				expect(first.status, "delete status").toBe(204);
-				expect(second.status, "read-after-delete status").toBe(404);
+			if (delFirstInArray) {
+				expect(first.status, "DELETE response status").toBe(204);
+				expect([404, 200], "GET sees delete-first → 404, read-first → 200").toContain(second.status);
+				if (second.status === 200) expect(await second.text()).toBe("original");
 			} else {
-				expect(first.status, "read status").toBe(200);
-				expect(await first.text()).toBe("original");
-				expect(second.status, "delete-after-read status").toBe(204);
+				expect(second.status, "DELETE response status").toBe(204);
+				if (first.status === 200) {
+					expect(await first.text()).toBe("original");
+				} else {
+					expect(first.status, "GET when delete won mutex first").toBe(404);
+				}
 			}
 
-			// In both orderings: file must be absent after both ops complete
 			const finalRead = await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
-			expect(finalRead.status, `${label}: file must be gone`).toBe(404);
+			expect(finalRead.status, `${sbId}: file must be gone`).toBe(404);
 		}
 	});
 
@@ -250,26 +242,26 @@ describe("S2 — concurrent delete and read of the same file", () => {
 
 		// ── delete first ──
 		const sbDel = "s2-raw-delete-first";
-		await sm.withSession(sbDel, (s) => s.fs.writeFile("/file.txt", "data"));
+		await sm.withSession("default", sbDel, (s) => s.fs.writeFile("/file.txt", "data"));
 		const [del, rd] = await Promise.all([
-			sm.withSession(sbDel, (s) =>
+			sm.withSession("default", sbDel, (s) =>
 				s.fs
 					.rm("/file.txt")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbDel, (s) => s.fs.readFile("/file.txt").catch(errCode)),
+			sm.withSession("default", sbDel, (s) => s.fs.readFile("/file.txt").catch(errCode)),
 		]);
 		expect(del).toBe("ok");
 		expect(rd).toBe("ENOENT"); // delete won the lock first — pathCache cleared before read ran
-		expect(await sm.withSession(sbDel, (s) => s.fs.exists("/file.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbDel, (s) => s.fs.exists("/file.txt"))).toBe(false);
 
 		// ── read first ──
 		const sbRead = "s2-raw-read-first";
-		await sm.withSession(sbRead, (s) => s.fs.writeFile("/file.txt", "data"));
+		await sm.withSession("default", sbRead, (s) => s.fs.writeFile("/file.txt", "data"));
 		const [content, delR] = await Promise.all([
-			sm.withSession(sbRead, (s) => s.fs.readFile("/file.txt").catch(errCode)),
-			sm.withSession(sbRead, (s) =>
+			sm.withSession("default", sbRead, (s) => s.fs.readFile("/file.txt").catch(errCode)),
+			sm.withSession("default", sbRead, (s) =>
 				s.fs
 					.rm("/file.txt")
 					.then(() => "ok")
@@ -278,7 +270,7 @@ describe("S2 — concurrent delete and read of the same file", () => {
 		]);
 		expect(content).toBe("data"); // read won the lock — saw file before delete ran
 		expect(delR).toBe("ok");
-		expect(await sm.withSession(sbRead, (s) => s.fs.exists("/file.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbRead, (s) => s.fs.exists("/file.txt"))).toBe(false);
 	});
 });
 
@@ -300,7 +292,7 @@ describe("S3 — concurrent writes with different content (last-write-wins)", ()
 		const token = await makeToken();
 
 		for (const sbId of ["s3-http-a-first", "s3-http-b-first"] as const) {
-			await sm.getOrCreate(sbId);
+			await sm.getOrCreate("default", sbId);
 			const [r1, r2] = await Promise.all([
 				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
 					method: "PUT",
@@ -329,18 +321,18 @@ describe("S3 — concurrent writes with different content (last-write-wins)", ()
 		// A-first (A runs first, B queued second → B is final)
 		const sbAB = "s3-raw-ab";
 		await Promise.all([
-			sm.withSession(sbAB, (s) => s.fs.writeFile("/f.txt", "A")),
-			sm.withSession(sbAB, (s) => s.fs.writeFile("/f.txt", "B")),
+			sm.withSession("default", sbAB, (s) => s.fs.writeFile("/f.txt", "A")),
+			sm.withSession("default", sbAB, (s) => s.fs.writeFile("/f.txt", "B")),
 		]);
-		expect(await sm.withSession(sbAB, (s) => s.fs.readFile("/f.txt"))).toBe("B");
+		expect(await sm.withSession("default", sbAB, (s) => s.fs.readFile("/f.txt"))).toBe("B");
 
 		// B-first (B runs first, A queued second → A is final)
 		const sbBA = "s3-raw-ba";
 		await Promise.all([
-			sm.withSession(sbBA, (s) => s.fs.writeFile("/f.txt", "B")),
-			sm.withSession(sbBA, (s) => s.fs.writeFile("/f.txt", "A")),
+			sm.withSession("default", sbBA, (s) => s.fs.writeFile("/f.txt", "B")),
+			sm.withSession("default", sbBA, (s) => s.fs.writeFile("/f.txt", "A")),
 		]);
-		expect(await sm.withSession(sbBA, (s) => s.fs.readFile("/f.txt"))).toBe("A");
+		expect(await sm.withSession("default", sbBA, (s) => s.fs.readFile("/f.txt"))).toBe("A");
 	});
 });
 
@@ -365,16 +357,16 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 	it("mv-first: mv succeeds, InMemoryFs auto-recreates /a for write; /b and /a/x.txt both exist", async () => {
 		const { sm } = makeEnv();
 		const sbId = "s4-mv-first";
-		await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+		await sm.withSession("default", sbId, (s) => s.fs.mkdir("/a"));
 
 		const [mvRes, wRes] = await Promise.all([
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.mv("/a", "/b")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.writeFile("/a/x.txt", "content")
 					.then(() => "ok")
@@ -386,26 +378,26 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 		// InMemoryFs auto-creates /a for the write (unlike SqlFs which would ENOENT)
 		expect(wRes).toBe("ok");
 
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b"))).toBe(true);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/b"))).toBe(true);
 		// /a was re-created by InMemoryFs auto-mkdir; /a/x.txt was written there
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/a/x.txt"))).toBe(true);
 		// /b/x.txt absent — x.txt was written to the newly auto-created /a, not the original
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(false);
 	});
 
 	it("write-first: write succeeds, mv moves the whole /a subtree to /b; /b/x.txt exists", async () => {
 		const { sm } = makeEnv();
 		const sbId = "s4-write-first";
-		await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+		await sm.withSession("default", sbId, (s) => s.fs.mkdir("/a"));
 
 		const [wRes, mvRes] = await Promise.all([
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.writeFile("/a/x.txt", "content")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.mv("/a", "/b")
 					.then(() => "ok")
@@ -417,9 +409,9 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 		expect(mvRes).toBe("ok");
 
 		// /a (with x.txt) was moved to /b — /b/x.txt exists, /a is gone
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/a"))).toBe(false);
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(true);
-		expect(await sm.withSession(sbId, (s) => s.fs.readFile("/b/x.txt"))).toBe("content");
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/a"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/b/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.readFile("/b/x.txt"))).toBe("content");
 	});
 
 	it("both orderings are consistent: x.txt exists exactly once and /b always exists", async () => {
@@ -435,18 +427,18 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 		];
 
 		for (const [label, sbId] of orderings) {
-			await sm.withSession(sbId, (s) => s.fs.mkdir("/a"));
+			await sm.withSession("default", sbId, (s) => s.fs.mkdir("/a"));
 
 			const ops =
 				label === "mv-first"
 					? ([
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.mv("/a", "/b")
 									.then(() => "ok")
 									.catch(errCode),
 							),
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.writeFile("/a/x.txt", "content")
 									.then(() => "ok")
@@ -454,13 +446,13 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 							),
 						] as const)
 					: ([
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.writeFile("/a/x.txt", "content")
 									.then(() => "ok")
 									.catch(errCode),
 							),
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.mv("/a", "/b")
 									.then(() => "ok")
@@ -473,17 +465,17 @@ describe("S4 — concurrent mv /a→/b and writeFile /a/x.txt", () => {
 			expect(r2, `${label} op2`).toBe("ok");
 
 			// /b must always exist (mv always runs)
-			expect(await sm.withSession(sbId, (s) => s.fs.exists("/b")), `${label}: /b must exist`).toBe(true);
+			expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/b")), `${label}: /b must exist`).toBe(true);
 
 			// x.txt must exist exactly once — either at /a/x.txt or /b/x.txt (not both, not neither)
-			const inA = await sm.withSession(sbId, (s) => s.fs.exists("/a/x.txt"));
-			const inB = await sm.withSession(sbId, (s) => s.fs.exists("/b/x.txt"));
+			const inA = await sm.withSession("default", sbId, (s) => s.fs.exists("/a/x.txt"));
+			const inB = await sm.withSession("default", sbId, (s) => s.fs.exists("/b/x.txt"));
 			expect(inA || inB, `${label}: x.txt must exist somewhere`).toBe(true);
 			expect(inA && inB, `${label}: x.txt must not exist in both places`).toBe(false);
 
 			// Content must be intact wherever it landed
 			const where = inB ? "/b/x.txt" : "/a/x.txt";
-			expect(await sm.withSession(sbId, (s) => s.fs.readFile(where))).toBe("content");
+			expect(await sm.withSession("default", sbId, (s) => s.fs.readFile(where))).toBe("content");
 		}
 	});
 });

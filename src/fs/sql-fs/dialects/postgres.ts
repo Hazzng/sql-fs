@@ -76,9 +76,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Stubs — implemented in subsequent user stories ────────────────────────────
 
 	// US-005
-	async createSandbox(tx: PgTx, sandboxId: string): Promise<{ rootInodeId: bigint }> {
+	async createSandbox(tx: PgTx, sandboxId: string, owner = ""): Promise<{ rootInodeId: bigint }> {
 		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK
-		await tx`INSERT INTO sandboxes (id, root_inode) VALUES (${sandboxId}, NULL)`;
+		await tx`INSERT INTO sandboxes (id, root_inode, owner) VALUES (${sandboxId}, NULL, ${owner})`;
 
 		// 2. Insert root directory inode (kind=2, mode=0o755)
 		const rootRows = await tx<{ id: string }[]>`

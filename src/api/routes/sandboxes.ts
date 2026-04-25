@@ -43,15 +43,17 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		}
 
 		const owner = c.get("owner");
+		const tenant = c.get("tenant");
 		const sandboxId = crypto.randomUUID();
 		const createdAt = new Date().toISOString();
 
 		await sessionManager.withSession(
+			tenant,
 			sandboxId,
 			async (session) => {
-				session.owner = owner;
+				if (!session.owner) session.owner = owner;
 				session.createdAt = createdAt;
-				await sessionManager.persistSandboxMeta(sandboxId, { owner, python, javascript });
+				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, python, javascript });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);
@@ -59,6 +61,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				}
 			},
 			{ python, javascript },
+			owner,
 		);
 
 		return c.json({ id: sandboxId, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);
@@ -66,11 +69,11 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.get("/:id", (c) => {
 		const id = c.req.param("id");
-		const session = sessionManager.getSession(id);
+		const tenant = c.get("tenant");
+		const session = sessionManager.getSession(tenant, id);
 		if (session === undefined) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 		}
-		// Enforce ownership
 		const caller = c.get("owner");
 		if (session.owner && session.owner !== caller) {
 			return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
@@ -85,8 +88,9 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 	router.delete("/:id", async (c) => {
 		const id = c.req.param("id");
+		const tenant = c.get("tenant");
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, id, c.get("owner"), async () => undefined);
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, id, c.get("owner"), async () => undefined);
 		} catch (err) {
 			const code = (err as Error & { code?: string }).code;
 			if (isForbiddenError(err)) {
@@ -97,7 +101,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			}
 			throw err;
 		}
-		const found = await sessionManager.destroy(id);
+		const found = await sessionManager.destroy(tenant, id);
 		if (!found) {
 			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 		}

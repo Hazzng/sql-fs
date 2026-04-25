@@ -3,8 +3,16 @@
  * US-053: createSandboxFs factory function
  * US-054: loadBackendConfig
  * US-055: destroySandbox
+ *
+ * Multi-tenant Phase 2: adds tenant-aware factories
+ *   - createPostgresSandboxFs(opts, sandboxId) — explicit connection string + options
+ *   - destroyPostgresSandbox(connectionString, sandboxId) — explicit connection string
+ *
+ * The legacy env-reading `createSandboxFs(backend, sandboxId)` / `destroySandbox(backend, sandboxId)`
+ * remain for benchmarks and integration tests that rely on a single `DATABASE_URL`.
  */
 
+import type { Redis } from "ioredis";
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
 import { getRedisClient } from "../../redis/client.js";
@@ -18,9 +26,81 @@ import type { StorageBackend } from "./types.js";
 export type { InodeKind, StorageBackend } from "./types.js";
 
 /**
+ * Options passed to the tenant-aware Postgres factory.
+ */
+export interface PostgresBackendOptions {
+	readonly connectionString: string;
+	readonly tenantId?: string;
+	readonly blobCache?: RedisBlobCache;
+	readonly pathSnapshot?: RedisPathSnapshot;
+	readonly redis?: Redis;
+}
+
+/**
+ * Tenant-aware constructor: builds a `SqlFs` against an explicit Postgres
+ * connection string. Used by the multi-tenant `SessionManager` so each
+ * tenant's sandboxes talk to the correct database.
+ *
+ * @param opts.connectionString - Postgres connection URL for this tenant's database.
+ * @param opts.blobCache - Optional tenant-scoped RedisBlobCache (Phase 3 makes keys tenant-prefixed).
+ * @param opts.pathSnapshot - Optional RedisPathSnapshot (shared instance in Phase 2).
+ * @param opts.redis - Optional Redis client forwarded to SqlFs for coherence counters.
+ * @param sandboxId - Sandbox identifier scoped within this tenant's database.
+ */
+export async function createPostgresSandboxFs(
+	opts: PostgresBackendOptions,
+	sandboxId: string,
+	owner = "",
+): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
+	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
+	await dialect.connect();
+	// Initialize the sandbox in the DB (creates root inode structure).
+	// On unique violation (23505) the sandbox already exists — read its owner back.
+	let resolvedOwner = owner;
+	try {
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, sandboxId, owner);
+		});
+	} catch (e) {
+		const sqlErr = e as { code?: string };
+		if (sqlErr.code !== "23505") throw e;
+		const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
+		resolvedOwner = meta?.owner ?? "";
+	}
+	const fs = new SqlFs({
+		dialect,
+		sandboxId,
+		tenantId: opts.tenantId,
+		redis: opts.redis,
+		pathSnapshot: opts.pathSnapshot,
+	});
+	await fs.ready();
+	return { fs, resolvedOwner };
+}
+
+/**
+ * Tenant-aware destroy: connects to the tenant's Postgres database with the
+ * given connection string and deletes the sandbox row + subtree.
+ */
+export async function destroyPostgresSandbox(connectionString: string, sandboxId: string): Promise<void> {
+	const dialect = new PostgresDialect(connectionString);
+	await dialect.connect();
+	try {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+	} finally {
+		await dialect.disconnect();
+	}
+}
+
+/**
  * Creates an IFileSystem instance for the given backend and sandbox ID.
  * For SQL backends, reads DATABASE_URL from process.env.
  * Calls dialect.connect() and fs.ready() before returning.
+ *
+ * Kept for backward compatibility (benchmarks, integration tests). New
+ * multi-tenant code paths should use `createPostgresSandboxFs` instead.
  */
 export async function createSandboxFs(backend: StorageBackend, sandboxId: string): Promise<IFileSystem> {
 	switch (backend) {
@@ -33,7 +113,7 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
 			const blobCache =
 				redis && blobCacheEnabled
-					? new RedisBlobCache(redis, {
+					? new RedisBlobCache(redis, "default", {
 							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
 							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
 						})
@@ -44,25 +124,10 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 						ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
 					})
 				: undefined;
-			const dialect = new PostgresDialect(databaseUrl, blobCache);
-			await dialect.connect();
-			// Initialize the sandbox in the DB (creates root inode structure).
-			// Ignore unique violation (23505) — sandbox already exists on reconnect.
-			try {
-				await dialect.transaction(async (tx) => {
-					await dialect.createSandbox(tx, sandboxId);
-				});
-			} catch (e) {
-				const sqlErr = e as { code?: string };
-				if (sqlErr.code !== "23505") throw e;
-			}
-			const fs = new SqlFs({
-				dialect,
+			const { fs } = await createPostgresSandboxFs(
+				{ connectionString: databaseUrl, blobCache, pathSnapshot, redis: redis ?? undefined },
 				sandboxId,
-				redis: redis ?? undefined,
-				pathSnapshot,
-			});
-			await fs.ready();
+			);
 			return fs;
 		}
 		case "memory":
@@ -127,6 +192,9 @@ export function loadBackendConfig(): BackendConfig {
  * Destroys a sandbox and all its persistent data.
  * SQL backends: connects to DB, deletes sandbox in a transaction, disconnects.
  * Memory backend: no-op.
+ *
+ * Kept for backward compatibility. New multi-tenant code paths should use
+ * `destroyPostgresSandbox` with an explicit connection string.
  */
 export async function destroySandbox(backend: StorageBackend, sandboxId: string): Promise<void> {
 	switch (backend) {
@@ -135,15 +203,7 @@ export async function destroySandbox(backend: StorageBackend, sandboxId: string)
 			if (!databaseUrl) {
 				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
 			}
-			const dialect = new PostgresDialect(databaseUrl);
-			await dialect.connect();
-			try {
-				await dialect.transaction(async (tx) => {
-					await dialect.deleteSandbox(tx, sandboxId);
-				});
-			} finally {
-				await dialect.disconnect();
-			}
+			await destroyPostgresSandbox(databaseUrl, sandboxId);
 			return;
 		}
 		case "memory":

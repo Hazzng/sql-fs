@@ -26,8 +26,8 @@ describe.skipIf(SKIP)("SqlFs + RedisPathSnapshot (Phase E)", () => {
 	afterEach(async () => {
 		for (const id of createdSandboxes) {
 			await dialect.transaction(async (tx) => dialect.deleteSandbox(tx, id));
-			await redis.del(`vfs:ver:${id}`);
-			await redis.del(RedisPathSnapshot.key(id));
+			await redis.del(`vfs:default:ver:${id}`);
+			await redis.del(RedisPathSnapshot.key("default", id));
 		}
 		createdSandboxes.length = 0;
 	});
@@ -53,8 +53,8 @@ describe.skipIf(SKIP)("SqlFs + RedisPathSnapshot (Phase E)", () => {
 		await warm.ready();
 		await warm.writeFile("/seeded.txt", "hello");
 		// Simulate SessionManager.publishVersionIfDirty: INCR then snapshot write.
-		const newVersion = Number(await redis.incr(`vfs:ver:${sandboxId}`));
-		await snapshot.write(sandboxId, newVersion, warm._getPathCache());
+		const newVersion = Number(await redis.incr(`vfs:default:ver:${sandboxId}`));
+		await snapshot.write("default", sandboxId, newVersion, warm._getPathCache());
 
 		// Now simulate a cold replica — a fresh SqlFs on the same sandbox should
 		// hit the snapshot instead of querying loadAllPaths.
@@ -77,8 +77,8 @@ describe.skipIf(SKIP)("SqlFs + RedisPathSnapshot (Phase E)", () => {
 		const warm = new SqlFs({ dialect, sandboxId, redis, pathSnapshot: snapshot });
 		await warm.ready();
 		await warm.writeFile("/old.txt", "stale");
-		await snapshot.write(sandboxId, 1, warm._getPathCache());
-		await redis.set(`vfs:ver:${sandboxId}`, 5);
+		await snapshot.write("default", sandboxId, 1, warm._getPathCache());
+		await redis.set(`vfs:default:ver:${sandboxId}`, 5);
 		// Also add a newer file that only exists in the DB, not the snapshot.
 		await warm.writeFile("/fresh.txt", "fresh");
 

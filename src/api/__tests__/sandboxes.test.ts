@@ -22,7 +22,6 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
-		backend: "memory",
 		createFs: async () => fs,
 	});
 	return { sessionManager, fs };
@@ -138,10 +137,9 @@ describe("DELETE /v1/sandboxes/:id", () => {
 	it("delete returns 403 on a cold replica when another owner created the sandbox", async () => {
 		const meta = new Map<string, SandboxMeta>();
 		const ownerManager = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
-			persistSandboxMetaFn: async (sandboxId, sandboxMeta) => {
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
 				meta.set(sandboxId, sandboxMeta);
 			},
 		});
@@ -154,9 +152,8 @@ describe("DELETE /v1/sandboxes/:id", () => {
 		const { id } = (await createRes.json()) as { id: string };
 
 		const coldReplica = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
 		});
 		const app = makeTestApp(coldReplica);
 		const otherToken = await makeToken("owner-b");

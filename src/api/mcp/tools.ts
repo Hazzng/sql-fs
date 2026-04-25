@@ -29,7 +29,7 @@ function isValidRelativePath(p: string): boolean {
 	return true;
 }
 
-export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string): void {
+export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
 		"sandbox_create",
 		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands.",
@@ -43,9 +43,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
 			};
-			const session = await sessionManager.getOrCreate(id, runtimeOptions);
-			session.owner = owner;
-			await sessionManager.persistSandboxMeta(id, {
+			await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+			await sessionManager.persistSandboxMeta(tenant, id, {
 				owner,
 				python: runtimeOptions.python,
 				javascript: runtimeOptions.javascript,
@@ -63,8 +62,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 
 	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async () => undefined);
-			const existed = await sessionManager.destroy(args.id);
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async () => undefined);
+			const existed = await sessionManager.destroy(tenant, args.id);
 			if (!existed) {
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
@@ -124,7 +123,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const result = await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
+				const result = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 
@@ -207,7 +206,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
+				await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
 					for (const [relativePath, content] of Object.entries(args.files)) {
 						const absPath = `${basePath}/${relativePath}`;
 						const lastSlash = absPath.lastIndexOf("/");
@@ -251,35 +250,42 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 			try {
-				const { files, errors } = await withOwnedSessionOrRehydrate(sessionManager, args.id, owner, async (session) => {
-					const allPaths = session.fs.getAllPaths();
-					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
-					const result: Record<string, string> = Object.create(null);
-					const readErrors: string[] = [];
+				const { files, errors } = await withOwnedSessionOrRehydrate(
+					sessionManager,
+					tenant,
+					args.id,
+					owner,
+					async (session) => {
+						const allPaths = session.fs.getAllPaths();
+						const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
+						const result: Record<string, string> = Object.create(null);
+						const readErrors: string[] = [];
 
-					const candidates = allPaths.filter((p) => p.startsWith(prefix));
-					await Promise.all(
-						candidates.map(async (absPath) => {
-							try {
-								const buf = await session.fs.readFileBuffer(absPath);
-								const relativePath = absPath.slice(prefix.length);
+						const candidates = allPaths.filter((p) => p.startsWith(prefix));
+						await Promise.all(
+							candidates.map(async (absPath) => {
 								try {
-									result[relativePath] = utf8Decoder.decode(buf);
-								} catch {
-									result[relativePath] = `data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+									const buf = await session.fs.readFileBuffer(absPath);
+									const relativePath = absPath.slice(prefix.length);
+									try {
+										result[relativePath] = utf8Decoder.decode(buf);
+									} catch {
+										result[relativePath] =
+											`data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+									}
+								} catch (e) {
+									const code = (e as Error & { code?: string }).code;
+									// EISDIR is expected — directories cannot be read as files
+									if (code !== "EISDIR") {
+										readErrors.push(absPath);
+									}
 								}
-							} catch (e) {
-								const code = (e as Error & { code?: string }).code;
-								// EISDIR is expected — directories cannot be read as files
-								if (code !== "EISDIR") {
-									readErrors.push(absPath);
-								}
-							}
-						}),
-					);
+							}),
+						);
 
-					return { files: result, errors: readErrors };
-				});
+						return { files: result, errors: readErrors };
+					},
+				);
 
 				if (errors.length > 0) {
 					return {

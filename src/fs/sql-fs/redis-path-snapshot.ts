@@ -2,8 +2,8 @@
  * Redis path-snapshot cache (Phase E).
  *
  * Persists the full pathCache for a sandbox as a msgpack-encoded blob keyed
- * `vfs:snap:{sandboxId}`, with the sandbox version counter embedded so readers
- * can reject stale snapshots via strict-equality check against `vfs:ver:{X}`.
+ * `vfs:{tenantId}:snap:{sandboxId}`, with the sandbox version counter embedded so readers
+ * can reject stale snapshots via strict-equality check against `vfs:{tenantId}:ver:{sandboxId}`.
  *
  * All Redis failures fail open: `read` returns `null`, `write`/`delete` return
  * quietly. Callers fall back to `loadAllPaths`.
@@ -13,9 +13,9 @@ import { decode, encode } from "@msgpack/msgpack";
 import type { Redis } from "ioredis";
 import type { PathCacheEntry } from "./types.js";
 
-/** Redis key for the per-sandbox monotonic version counter. */
-export function versionKey(sandboxId: string): string {
-	return `vfs:ver:${sandboxId}`;
+/** Tenant-prefixed Redis key for the per-sandbox monotonic version counter. */
+export function versionKey(tenantId: string, sandboxId: string): string {
+	return `vfs:${tenantId}:ver:${sandboxId}`;
 }
 
 /**
@@ -67,11 +67,16 @@ export class RedisPathSnapshot {
 		this.#ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
 	}
 
-	static key(sandboxId: string): string {
-		return `vfs:snap:${sandboxId}`;
+	static key(tenantId: string, sandboxId: string): string {
+		return `vfs:${tenantId}:snap:${sandboxId}`;
 	}
 
-	async write(sandboxId: string, version: number, pathCache: Map<string, PathCacheEntry>): Promise<void> {
+	async write(
+		tenantId: string,
+		sandboxId: string,
+		version: number,
+		pathCache: Map<string, PathCacheEntry>,
+	): Promise<void> {
 		const entries: EncodedEntry[] = [];
 		for (const [path, e] of pathCache) {
 			entries.push({
@@ -88,15 +93,18 @@ export class RedisPathSnapshot {
 		const snap: Snapshot = { schemaVersion: SNAPSHOT_SCHEMA_VERSION, version, entries };
 		try {
 			const bytes = Buffer.from(encode(snap));
-			await this.#client.set(RedisPathSnapshot.key(sandboxId), bytes, "PX", this.#ttlMs);
+			await this.#client.set(RedisPathSnapshot.key(tenantId, sandboxId), bytes, "PX", this.#ttlMs);
 		} catch (err) {
 			console.error(JSON.stringify({ event: "snapshot_write_error", sandboxId, error: (err as Error).message }));
 		}
 	}
 
-	async read(sandboxId: string): Promise<{ version: number; entries: Map<string, PathCacheEntry> } | null> {
+	async read(
+		tenantId: string,
+		sandboxId: string,
+	): Promise<{ version: number; entries: Map<string, PathCacheEntry> } | null> {
 		try {
-			const buf = await this.#client.getBuffer(RedisPathSnapshot.key(sandboxId));
+			const buf = await this.#client.getBuffer(RedisPathSnapshot.key(tenantId, sandboxId));
 			if (!buf) return null;
 			const snap = decode(buf) as Snapshot;
 			if (!snap || snap.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) return null;
@@ -122,9 +130,9 @@ export class RedisPathSnapshot {
 		}
 	}
 
-	async delete(sandboxId: string): Promise<void> {
+	async delete(tenantId: string, sandboxId: string): Promise<void> {
 		try {
-			await this.#client.del(RedisPathSnapshot.key(sandboxId));
+			await this.#client.del(RedisPathSnapshot.key(tenantId, sandboxId));
 		} catch {
 			// best-effort; key ages out via TTL
 		}

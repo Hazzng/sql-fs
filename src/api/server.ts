@@ -9,14 +9,16 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
 import { translateSqlError } from "../fs/sql-fs/errors.js";
-import type { StorageBackend } from "../fs/sql-fs/index.js";
+import { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
+import type { SandboxMeta } from "../fs/sql-fs/types.js";
 import { getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
-import { type AuthVariables, authMiddleware } from "./auth.js";
+import { type AuthVariables, createAuthMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest } from "./mcp/server.js";
+import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
 import { adminRoutes } from "./routes/admin.js";
 import { execRoutes } from "./routes/exec.js";
@@ -24,10 +26,13 @@ import { fileRoutes } from "./routes/files.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
+import { loadTenantConfig } from "./tenants.js";
 
 export const app = new Hono<{ Variables: AuthVariables }>();
 
-// ── Session manager (lazy — no DB access until first request) ─────────────────
+// ── Tenant config + session manager ───────────────────────────────────────────
+
+const tenantConfig = loadTenantConfig();
 
 const redisClient = getRedisClient();
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
@@ -48,83 +53,95 @@ const pathSnapshot =
 			})
 		: undefined;
 
-const VALID_BACKENDS = ["postgres", "memory"] as const satisfies readonly StorageBackend[];
+const blobCacheEnabled = redisClient && process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const blobCacheOptions = blobCacheEnabled
+	? {
+			ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
+			maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
+		}
+	: undefined;
 
-function isStorageBackend(value: string): value is StorageBackend {
-	return (VALID_BACKENDS as readonly string[]).includes(value);
+// Per-tenant metadata dialects for session rehydration on cold replicas. Each
+// tenant gets a single long-lived dialect (connection-pooled internally).
+interface MetaBackend {
+	readonly dialect: PostgresDialect;
+	connected: boolean;
+	connectPromise?: Promise<void>;
+}
+const metaBackends: Map<string, MetaBackend> = new Map();
+
+function getOrInitMetaBackend(tenantId: string): MetaBackend {
+	const existing = metaBackends.get(tenantId);
+	if (existing !== undefined) return existing;
+	const url = tenantConfig.getConnectionString(tenantId);
+	const backend: MetaBackend = { dialect: new PostgresDialect(url), connected: false };
+	metaBackends.set(tenantId, backend);
+	return backend;
 }
 
-const fsBackend = process.env.FS_BACKEND;
-if (fsBackend !== undefined && !isStorageBackend(fsBackend)) {
-	throw Object.assign(
-		new Error(`FS_BACKEND '${fsBackend}' is not a valid backend. Valid values: ${VALID_BACKENDS.join(", ")}`),
-		{ code: "EINVAL" },
-	);
-}
-const backend: StorageBackend = fsBackend ?? "memory";
-
-// Postgres metadata functions for session rehydration on cold replicas.
-// Uses a single long-lived dialect (connection-pooled internally by the postgres driver).
-const { closeMetaFns, ...sessionMetaFns } = (() => {
-	if (backend !== "postgres" || !process.env.DATABASE_URL) {
-		return {
-			closeMetaFns: async (): Promise<void> => {},
-		};
+async function ensureMetaConnected(backend: MetaBackend): Promise<void> {
+	if (backend.connected) return;
+	if (backend.connectPromise !== undefined) {
+		await backend.connectPromise;
+		return;
 	}
-	const metaDialect = new PostgresDialect(process.env.DATABASE_URL);
-	let connected = false;
-	let connectPromise: Promise<void> | undefined;
-	const ensureConnected = async (): Promise<void> => {
-		if (connected) return;
-		if (connectPromise) {
-			await connectPromise;
-			return;
+	backend.connectPromise = (async () => {
+		await backend.dialect.connect();
+		backend.connected = true;
+	})();
+	try {
+		await backend.connectPromise;
+	} finally {
+		backend.connectPromise = undefined;
+	}
+}
+
+async function getSandboxMetaFn(tenantId: string, sandboxId: string): Promise<SandboxMeta | null> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	try {
+		return await backend.dialect.transaction((tx) => backend.dialect.getSandboxMeta(tx, sandboxId));
+	} catch (err) {
+		throw translateSqlError(err, sandboxId);
+	}
+}
+
+async function persistSandboxMetaFn(tenantId: string, sandboxId: string, meta: SandboxMeta): Promise<void> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	try {
+		await backend.dialect.transaction((tx) => backend.dialect.updateSandboxMeta(tx, sandboxId, meta));
+	} catch (err) {
+		throw translateSqlError(err, sandboxId);
+	}
+}
+
+async function closeMetaFns(): Promise<void> {
+	for (const backend of metaBackends.values()) {
+		if (backend.connected) {
+			backend.connected = false;
+			await backend.dialect.disconnect();
 		}
-		connectPromise = (async () => {
-			await metaDialect.connect();
-			connected = true;
-		})();
-		try {
-			await connectPromise;
-		} finally {
-			connectPromise = undefined;
-		}
-	};
-	return {
-		getSandboxMetaFn: async (sandboxId: string) => {
-			await ensureConnected();
-			try {
-				return await metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
-			} catch (err) {
-				throw translateSqlError(err, sandboxId);
-			}
-		},
-		persistSandboxMetaFn: async (sandboxId: string, meta: import("../fs/sql-fs/types.js").SandboxMeta) => {
-			await ensureConnected();
-			try {
-				await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
-			} catch (err) {
-				throw translateSqlError(err, sandboxId);
-			}
-		},
-		closeMetaFns: async (): Promise<void> => {
-			if (!connected) return;
-			connected = false;
-			await metaDialect.disconnect();
-		},
-	};
-})();
+	}
+	metaBackends.clear();
+}
 
 const sessionManager = new SessionManager({
-	backend,
+	tenantConfig,
 	redis: redisClient,
 	execLockOptions,
 	pathSnapshot,
-	...sessionMetaFns,
+	blobCacheFactory:
+		redisClient && blobCacheOptions
+			? (tenantId: string) => new RedisBlobCache(redisClient, tenantId, blobCacheOptions)
+			: undefined,
+	getSandboxMetaFn,
+	persistSandboxMetaFn,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
+const authMiddleware = createAuthMiddleware(tenantConfig);
 app.use("/v1/*", authMiddleware);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -147,7 +164,7 @@ app.use("/mcp", async (c, next) => {
 	}
 });
 app.use("/mcp", authMiddleware);
-app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner")));
+app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"), c.get("tenant")));
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
@@ -182,8 +199,6 @@ app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
 
-	// Sanitize error messages: only expose FS error codes/messages, not internal details
-	// FS errors have well-known codes; internal errors get a generic message
 	const knownFsCodes = [
 		"ENOENT",
 		"EEXIST",
@@ -208,23 +223,33 @@ app.onError((err, c) => {
 const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""));
 
 if (isMain) {
-	const port = Number(process.env.PORT ?? "8080");
-	const server = serve({ fetch: app.fetch, port }, () => {
-		console.log(JSON.stringify({ event: "server_start", port }));
-	});
-
-	let shuttingDown = false;
-	const shutdown = (): void => {
-		if (shuttingDown) return;
-		shuttingDown = true;
-		server.close(async () => {
-			try {
-				await closeMetaFns();
-			} finally {
-				process.exit(0);
+	void (async () => {
+		try {
+			if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
+				await runMigrations(tenantConfig);
 			}
+		} catch (err) {
+			console.error(JSON.stringify({ event: "startup_failed", error: (err as Error).message }));
+			process.exit(1);
+		}
+		const port = Number(process.env.PORT ?? "8080");
+		const server = serve({ fetch: app.fetch, port }, () => {
+			console.log(JSON.stringify({ event: "server_start", port, tenantCount: tenantConfig.tenantIds.length }));
 		});
-	};
-	process.once("SIGINT", shutdown);
-	process.once("SIGTERM", shutdown);
+
+		let shuttingDown = false;
+		const shutdown = (): void => {
+			if (shuttingDown) return;
+			shuttingDown = true;
+			server.close(async () => {
+				try {
+					await closeMetaFns();
+				} finally {
+					process.exit(0);
+				}
+			});
+		};
+		process.once("SIGINT", shutdown);
+		process.once("SIGTERM", shutdown);
+	})();
 }

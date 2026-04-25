@@ -111,7 +111,7 @@ class StubCoherentFs {
 	}
 }
 
-function makeFsFactory(instance: StubCoherentFs): (_backend: string, _sandboxId: string) => Promise<IFileSystem> {
+function makeFsFactory(instance: StubCoherentFs): (_tenantId: string, _sandboxId: string) => Promise<IFileSystem> {
 	return vi.fn(async () => instance as unknown as IFileSystem);
 }
 
@@ -119,21 +119,20 @@ describe("SessionManager version counter (Phase D)", () => {
 	it("stamps initial lastSeenVersion from Redis at session creation", async () => {
 		const redis = new FakeRedis();
 		// Seed a pre-existing version (e.g., another replica previously published v7)
-		redis.store.set("vfs:ver:sbx", { value: "7", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "7", expiresAt: Date.now() + 60_000 });
 
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			// Fresh session: lastSeenVersion matches Redis, so no reload needed.
 			expect(stub.reloadCount).toBe(0);
 		});
 
-		const session = sm.getSession("sbx");
+		const session = sm.getSession("default", "sbx");
 		expect(session?.lastSeenVersion).toBe(7);
 	});
 
@@ -141,100 +140,95 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			/* first exec, no writes */
 		});
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			/* second exec, no writes */
 		});
 
 		expect(stub.reloadCount).toBe(0);
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false); // no INCR because never dirty
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false); // no INCR because never dirty
 	});
 
 	it("reloads and updates lastSeenVersion when Redis version is ahead", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// First exec creates the session at version 0
-		await sm.withSession("sbx", async () => {});
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(0);
+		await sm.withSession("default", "sbx", async () => {});
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
 
 		// Simulate another replica bumping the version externally
-		redis.store.set("vfs:ver:sbx", { value: "5", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "5", expiresAt: Date.now() + 60_000 });
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			// During this turn, ensureFreshCache should have reloaded.
 			expect(stub.reloadCount).toBe(1);
 		});
 
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(5);
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(5);
 	});
 
 	it("bumps Redis version on dirty exit and updates lastSeenVersion", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true; // simulate a mutation
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
 	it("does not INCR when no mutation occurred", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			// Pure read turn
 		});
 
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("sequential dirty turns bump the counter each time", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("3");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(3);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("3");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(3);
 		// No spurious reloads since the same replica did all three.
 		expect(stub.reloadCount).toBe(0);
 	});
@@ -243,67 +237,63 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			destroySandboxFn: vi.fn().mockResolvedValue(undefined),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
-		expect(redis.store.has("vfs:ver:sbx")).toBe(true);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(true);
 
-		await sm.destroy("sbx");
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		await sm.destroy("default", "sbx");
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("destroy on an unknown sandbox still deletes stale version key", async () => {
 		const redis = new FakeRedis();
 		// Stale key left behind by a previous incarnation
-		redis.store.set("vfs:ver:sbx", { value: "42", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "42", expiresAt: Date.now() + 60_000 });
 
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(new StubCoherentFs()),
 			destroySandboxFn: vi.fn().mockResolvedValue(undefined),
 			redis: asRedis(redis),
 		});
 
-		await sm.destroy("sbx");
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		await sm.destroy("default", "sbx");
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("withExistingSession applies the same version check", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// Warm the session first
-		await sm.withSession("sbx", async () => {});
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(0);
+		await sm.withSession("default", "sbx", async () => {});
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
 
 		// External bump
-		redis.store.set("vfs:ver:sbx", { value: "9", expiresAt: Date.now() + 60_000 });
+		redis.store.set("vfs:default:ver:sbx", { value: "9", expiresAt: Date.now() + 60_000 });
 
-		await sm.withExistingSession("sbx", async () => {
+		await sm.withExistingSession("default", "sbx", async () => {
 			expect(stub.reloadCount).toBe(1);
 		});
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(9);
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(9);
 	});
 
 	it("skips version logic entirely when no Redis is configured", async () => {
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
 
@@ -315,19 +305,18 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// Warm the session (no INCR because not dirty).
-		await sm.withSession("sbx", async () => {});
+		await sm.withSession("default", "sbx", async () => {});
 
 		// Next turn: mutation happens, but INCR throws once.
 		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValueOnce(new Error("ECONNRESET"));
 
 		await expect(
-			sm.withSession("sbx", async () => {
+			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true;
 			}),
 		).resolves.toBeUndefined();
@@ -335,17 +324,17 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Dirty flag must survive — the publish failed and the next turn needs
 		// to retry the bump.
 		expect(stub.dirty).toBe(true);
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(0);
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 
 		// Next turn: INCR works, the pending bump flushes.
 		incrSpy.mockRestore();
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			// dirty still set from the prior failed turn — no new mutation needed.
 		});
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 		expect(stub.dirty).toBe(false);
 	});
 
@@ -353,13 +342,12 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// Warm the session.
-		await sm.withSession("sbx", async () => {});
+		await sm.withSession("default", "sbx", async () => {});
 
 		// First GET fails — ensureFreshCache falls back to reload from PG
 		// so we don't serve stale data. The subsequent INCR for the mutation
@@ -367,7 +355,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		const getSpy = vi.spyOn(redis, "get").mockRejectedValueOnce(new Error("ECONNRESET"));
 
 		await expect(
-			sm.withSession("sbx", async () => {
+			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true;
 			}),
 		).resolves.toBeUndefined();
@@ -377,7 +365,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Reload happened because version couldn't be checked.
 		expect(stub.reloadCount).toBe(1);
 		// INCR still ran at end-of-turn.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 	});
 
 	it("ensureFreshCache no longer strands the dirty flag on version match", async () => {
@@ -386,26 +374,25 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// Pre-seed a dirty flag as if a prior publish failed.
-		await sm.withSession("sbx", async () => {});
+		await sm.withSession("default", "sbx", async () => {});
 		stub.dirty = true;
-		const session = sm.getSession("sbx");
+		const session = sm.getSession("default", "sbx");
 		if (session === undefined) throw new Error("expected session");
 		session.lastSeenVersion = 0; // matches current redis value
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			/* no new mutation */
 		});
 
 		// The pending dirty bit must have triggered a real INCR, not been
 		// silently swallowed by ensureFreshCache.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
 	it("publishes version even when fn throws after a committed mutation", async () => {
@@ -416,13 +403,12 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		await expect(
-			sm.withSession("sbx", async () => {
+			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true; // simulate a successful mutation
 				throw Object.assign(new Error("ENOENT: later step failed"), { code: "ENOENT" });
 			}),
@@ -430,8 +416,8 @@ describe("SessionManager version counter (Phase D)", () => {
 
 		// The counter must have bumped despite the throw; other replicas will
 		// see v=1 and reload on their next turn.
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 		expect(stub.dirty).toBe(false);
 	});
 
@@ -439,23 +425,22 @@ describe("SessionManager version counter (Phase D)", () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: makeFsFactory(stub),
 			redis: asRedis(redis),
 		});
 
 		// Warm the session so withExistingSession finds it.
-		await sm.withSession("sbx", async () => {});
+		await sm.withSession("default", "sbx", async () => {});
 
 		await expect(
-			sm.withExistingSession("sbx", async () => {
+			sm.withExistingSession("default", "sbx", async () => {
 				stub.dirty = true;
 				throw new Error("boom");
 			}),
 		).rejects.toThrow("boom");
 
-		expect(redis.store.get("vfs:ver:sbx")?.value).toBe("1");
-		expect(sm.getSession("sbx")?.lastSeenVersion).toBe(1);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(1);
 	});
 
 	it("non-coherent fs (memory backend) skips reload/publish but exec still works", async () => {
@@ -465,17 +450,16 @@ describe("SessionManager version counter (Phase D)", () => {
 			getAllPaths: () => [],
 		};
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: vi.fn(async () => plainFs as IFileSystem),
 			redis: asRedis(redis),
 		});
 
-		await sm.withSession("sbx", async () => {
+		await sm.withSession("default", "sbx", async () => {
 			/* ok */
 		});
 
 		// No version key created because the fs is not coherence-aware.
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 
 	it("partial fs missing clearDirty is rejected by the guard (no runtime crash)", async () => {
@@ -489,18 +473,17 @@ describe("SessionManager version counter (Phase D)", () => {
 			// clearDirty intentionally omitted
 		};
 		const sm = new SessionManager({
-			backend: "memory",
 			createFs: vi.fn(async () => partial as IFileSystem),
 			redis: asRedis(redis),
 		});
 
 		await expect(
-			sm.withSession("sbx", async () => {
+			sm.withSession("default", "sbx", async () => {
 				/* nothing */
 			}),
 		).resolves.toBeUndefined();
 
 		// Treated as non-coherent: no INCR, no reload attempt.
-		expect(redis.store.has("vfs:ver:sbx")).toBe(false);
+		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 	});
 });

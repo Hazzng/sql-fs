@@ -25,10 +25,9 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFileSystem }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
-		backend: "memory",
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate(SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID);
 	return { sessionManager, fs };
 }
 
@@ -97,7 +96,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		const timeoutSandboxId = `${SANDBOX_ID}-timeout`;
 
 		// Pre-create the session so we can spy on bash.exec
-		const session = await sessionManager.getOrCreate(timeoutSandboxId);
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
 
 		// Mock bash.exec to hang, but respond to the abort signal
 		vi.spyOn(session.bash, "exec").mockImplementation(
@@ -192,7 +191,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		const timeoutSandboxId = `${SANDBOX_ID}-sse-timeout`;
 
 		// Pre-create session so we can spy on bash.exec
-		const session = await sessionManager.getOrCreate(timeoutSandboxId);
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
 
 		// Mock bash.exec to hang but respond to abort signal
 		vi.spyOn(session.bash, "exec").mockImplementation(
@@ -233,22 +232,24 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 	it("rejects unauthorized cold-replica SSE requests before opening the stream", async () => {
 		const meta = new Map<string, SandboxMeta>();
 		const ownerManager = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
-			persistSandboxMetaFn: async (sandboxId, sandboxMeta) => {
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
 				meta.set(sandboxId, sandboxMeta);
 			},
 		});
-		await ownerManager.withSession(SANDBOX_ID, async (session) => {
+		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
 			session.owner = "agent-1";
-			await ownerManager.persistSandboxMeta(SANDBOX_ID, { owner: "agent-1", python: false, javascript: false });
+			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				python: false,
+				javascript: false,
+			});
 		});
 
 		const coldReplica = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
 		});
 		const app = makeTestApp(coldReplica);
 		const token = await makeToken("agent-2");

@@ -44,8 +44,17 @@ function mkFile(path: string, id: bigint, opts: Partial<PathCacheEntry> = {}): [
 }
 
 describe("RedisPathSnapshot", () => {
-	it("key() namespaces under vfs:snap:", () => {
-		expect(RedisPathSnapshot.key("sb-123")).toBe("vfs:snap:sb-123");
+	it("key() namespaces under vfs:{tenantId}:snap:{sandboxId}", () => {
+		expect(RedisPathSnapshot.key("tenant-a", "sb-123")).toBe("vfs:tenant-a:snap:sb-123");
+		expect(RedisPathSnapshot.key("default", "sb-123")).toBe("vfs:default:snap:sb-123");
+	});
+
+	it("same sandboxId across tenants produces disjoint keys", () => {
+		const keyA = RedisPathSnapshot.key("tenant-a", "sb-1");
+		const keyB = RedisPathSnapshot.key("tenant-b", "sb-1");
+		expect(keyA).not.toBe(keyB);
+		expect(keyA).toBe("vfs:tenant-a:snap:sb-1");
+		expect(keyB).toBe("vfs:tenant-b:snap:sb-1");
 	});
 
 	it("round-trips files, directories, and symlinks", async () => {
@@ -79,8 +88,8 @@ describe("RedisPathSnapshot", () => {
 			],
 		]);
 
-		await snap.write("sb-1", 7, original);
-		const got = await snap.read("sb-1");
+		await snap.write("default", "sb-1", 7, original);
+		const got = await snap.read("default", "sb-1");
 
 		expect(got).not.toBeNull();
 		expect(got!.version).toBe(7);
@@ -102,13 +111,30 @@ describe("RedisPathSnapshot", () => {
 		}
 	});
 
+	it("tenant-a snapshot is not visible to tenant-b for the same sandboxId", async () => {
+		const store: FakeStore = { data: new Map() };
+		const snap = new RedisPathSnapshot(makeFakeRedis(store));
+		const m = new Map<string, PathCacheEntry>([mkFile("/secret.txt", 1n)]);
+
+		await snap.write("tenant-a", "sb-shared", 1, m);
+
+		// tenant-b should not see tenant-a's snapshot
+		const gotB = await snap.read("tenant-b", "sb-shared");
+		expect(gotB).toBeNull();
+
+		// tenant-a should still read its own snapshot
+		const gotA = await snap.read("tenant-a", "sb-shared");
+		expect(gotA).not.toBeNull();
+		expect(gotA!.entries.size).toBe(1);
+	});
+
 	it("preserves bigint inode IDs larger than Number.MAX_SAFE_INTEGER", async () => {
 		const store: FakeStore = { data: new Map() };
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
 		const bigId = (1n << 62n) + 123n; // safely > 2^53
 		const m = new Map<string, PathCacheEntry>([mkFile("/big", bigId)]);
-		await snap.write("sb-1", 1, m);
-		const got = await snap.read("sb-1");
+		await snap.write("default", "sb-1", 1, m);
+		const got = await snap.read("default", "sb-1");
 		expect(got!.entries.get("/big")!.inodeId).toBe(bigId);
 	});
 
@@ -117,38 +143,38 @@ describe("RedisPathSnapshot", () => {
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
 		const id = (1n << 63n) - 1n;
 		const m = new Map<string, PathCacheEntry>([mkFile("/max", id)]);
-		await snap.write("sb-1", 1, m);
-		const got = await snap.read("sb-1");
+		await snap.write("default", "sb-1", 1, m);
+		const got = await snap.read("default", "sb-1");
 		expect(got!.entries.get("/max")!.inodeId).toBe(id);
 	});
 
 	it("read() returns null for a missing key", async () => {
 		const store: FakeStore = { data: new Map() };
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
-		expect(await snap.read("nope")).toBeNull();
+		expect(await snap.read("default", "nope")).toBeNull();
 	});
 
 	it("read() returns null on decode failure", async () => {
 		const store: FakeStore = { data: new Map() };
-		store.data.set("vfs:snap:sb-x", Buffer.from([0xff, 0xff, 0xff, 0xff]));
+		store.data.set("vfs:default:snap:sb-x", Buffer.from([0xff, 0xff, 0xff, 0xff]));
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
-		expect(await snap.read("sb-x")).toBeNull();
+		expect(await snap.read("default", "sb-x")).toBeNull();
 	});
 
 	it("read() rejects snapshots from a different schema version", async () => {
 		const store: FakeStore = { data: new Map() };
 		// Hand-craft a valid msgpack blob with schemaVersion=999
 		const bogus = Buffer.from(encode({ schemaVersion: 999, version: 1, entries: [] }));
-		store.data.set("vfs:snap:sb-old", bogus);
+		store.data.set("vfs:default:snap:sb-old", bogus);
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
-		expect(await snap.read("sb-old")).toBeNull();
+		expect(await snap.read("default", "sb-old")).toBeNull();
 	});
 
 	it("embeds the current schemaVersion in write output", async () => {
 		const store: FakeStore = { data: new Map() };
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
-		await snap.write("sb-1", 0, new Map());
-		const raw = store.data.get("vfs:snap:sb-1");
+		await snap.write("default", "sb-1", 0, new Map());
+		const raw = store.data.get("vfs:default:snap:sb-1");
 		expect(raw).toBeDefined();
 		const decoded = decode(raw!) as { schemaVersion: number };
 		expect(decoded.schemaVersion).toBe(1);
@@ -156,10 +182,10 @@ describe("RedisPathSnapshot", () => {
 
 	it("delete() removes the key", async () => {
 		const store: FakeStore = { data: new Map() };
-		store.data.set("vfs:snap:sb-1", Buffer.from(encode({ schemaVersion: 1, version: 0, entries: [] })));
+		store.data.set("vfs:default:snap:sb-1", Buffer.from(encode({ schemaVersion: 1, version: 0, entries: [] })));
 		const snap = new RedisPathSnapshot(makeFakeRedis(store));
-		await snap.delete("sb-1");
-		expect(store.data.has("vfs:snap:sb-1")).toBe(false);
+		await snap.delete("default", "sb-1");
+		expect(store.data.has("vfs:default:snap:sb-1")).toBe(false);
 	});
 
 	it("write() swallows Redis errors (fail open)", async () => {
@@ -171,7 +197,7 @@ describe("RedisPathSnapshot", () => {
 			del: vi.fn(),
 		} as unknown as Redis;
 		const snap = new RedisPathSnapshot(brittle);
-		await expect(snap.write("sb-1", 1, new Map())).resolves.toBeUndefined();
+		await expect(snap.write("default", "sb-1", 1, new Map())).resolves.toBeUndefined();
 	});
 
 	it("read() swallows Redis errors and returns null", async () => {
@@ -183,7 +209,7 @@ describe("RedisPathSnapshot", () => {
 			del: vi.fn(),
 		} as unknown as Redis;
 		const snap = new RedisPathSnapshot(brittle);
-		expect(await snap.read("sb-1")).toBeNull();
+		expect(await snap.read("default", "sb-1")).toBeNull();
 	});
 
 	it("delete() swallows Redis errors", async () => {
@@ -195,6 +221,6 @@ describe("RedisPathSnapshot", () => {
 			}),
 		} as unknown as Redis;
 		const snap = new RedisPathSnapshot(brittle);
-		await expect(snap.delete("sb-1")).resolves.toBeUndefined();
+		await expect(snap.delete("default", "sb-1")).resolves.toBeUndefined();
 	});
 });

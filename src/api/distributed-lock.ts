@@ -152,6 +152,6 @@ export async function withDistributedLock<T>(
 	}
 }
 
-export function execLockKey(sandboxId: string): string {
-	return `vfs:lock:${sandboxId}`;
+export function execLockKey(tenantId: string, sandboxId: string): string {
+	return `vfs:${tenantId}:lock:${sandboxId}`;
 }

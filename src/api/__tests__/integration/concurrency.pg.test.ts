@@ -15,11 +15,11 @@
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { PostgresDialect } from "../../../fs/sql-fs/dialects/postgres.js";
 import { createSandboxFs, destroySandbox } from "../../../fs/sql-fs/index.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { fileRoutes } from "../../routes/files.js";
 import { SessionManager } from "../../session-manager.js";
+import { loadTenantConfig } from "../../tenants.js";
 
 const DB_URL = process.env.DATABASE_URL;
 
@@ -44,7 +44,6 @@ function errCode(e: unknown): string {
 // ── Per-describe sandbox tracking ─────────────────────────────────────────────
 
 let cleanup: string[] = [];
-let envCleanups: Array<() => Promise<void>> = [];
 
 function newId(): string {
 	const id = crypto.randomUUID();
@@ -57,59 +56,14 @@ async function flushCleanup(): Promise<void> {
 	await Promise.allSettled(ids.map((id) => destroySandbox("postgres", id)));
 }
 
-async function flushEnvCleanups(): Promise<void> {
-	const cleanups = envCleanups.splice(0);
-	await Promise.allSettled(cleanups.map((close) => close()));
-}
-
-/** Create a sandbox row in Postgres without warming the SessionManager pool. */
-async function createSandboxInPg(sandboxId: string): Promise<void> {
-	const dialect = new PostgresDialect(DB_URL!);
-	await dialect.connect();
-	try {
-		await dialect.transaction(async (tx) => {
-			await dialect.createSandbox(tx, sandboxId);
-		});
-	} catch (e) {
-		const sqlErr = e as { code?: string };
-		if (sqlErr.code !== "23505") throw e;
-	} finally {
-		await dialect.disconnect();
-	}
-}
-
 function makePgEnv() {
-	const metaDialect = new PostgresDialect(DB_URL!);
-	let connected = false;
-	const ensureConnected = async () => {
-		if (!connected) {
-			await metaDialect.connect();
-			connected = true;
-		}
-	};
-
 	const sm = new SessionManager({
-		backend: "postgres",
-		createFs: (backend, sandboxId) => createSandboxFs(backend, sandboxId),
-		getSandboxMetaFn: async (sandboxId) => {
-			await ensureConnected();
-			return metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
-		},
-		persistSandboxMetaFn: async (sandboxId, meta) => {
-			await ensureConnected();
-			await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
-		},
+		tenantConfig: loadTenantConfig(),
+		createFs: (_tenantId, sandboxId) => createSandboxFs("postgres", sandboxId),
 	});
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", fileRoutes(sm));
-	const close = async () => {
-		if (connected) {
-			connected = false;
-			await metaDialect.disconnect();
-		}
-	};
-	envCleanups.push(close);
 	return { app, sm };
 }
 
@@ -135,11 +89,9 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -147,7 +99,6 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -168,7 +119,6 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -196,11 +146,9 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -208,7 +156,6 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -235,11 +182,9 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -247,7 +192,6 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
 			method: "PUT",
@@ -276,7 +220,6 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 		const total = 10;
 		const keep = 5;
 
@@ -314,11 +257,9 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -326,7 +267,6 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/v.txt`, {
@@ -346,7 +286,6 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await createSandboxInPg(sbId);
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/counter.txt`, {
@@ -381,11 +320,9 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -394,7 +331,6 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
-		await Promise.all([createSandboxInPg(sbA), createSandboxInPg(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/shared.txt`, {
@@ -429,7 +365,6 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
-		await Promise.all([createSandboxInPg(sbA), createSandboxInPg(sbB)]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/common.txt`, {
@@ -468,11 +403,9 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		cleanup = [];
-		envCleanups = [];
 	});
 	afterEach(async () => {
 		process.env.AUTH_SECRET = "";
-		await flushEnvCleanups();
 		await flushCleanup();
 	});
 
@@ -486,7 +419,6 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		// so the write always succeeds regardless of whether mkdir ran first.
 		for (const label of ["mkdir-first", "write-first"] as const) {
 			const sbId = newId();
-			await createSandboxInPg(sbId);
 			const ops =
 				label === "mkdir-first"
 					? ([
@@ -515,10 +447,8 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 						] as const);
 
 			const [r1, r2] = await Promise.all(ops);
-			// Both ops are concurrent and serialized by session mutex — either
-			// can win the race. Write always succeeds (PUT auto-creates parents).
-			// Mkdir may get 409 (EEXIST) if write's auto-mkdir ran first.
-			expect([204, 409], `${label} op1`).toContain(r1.status);
+			expect(r1.status, `${label} op1`).toBe(204);
+			// mkdir may return 409 EEXIST if write auto-created the dir first
 			expect([204, 409], `${label} op2`).toContain(r2.status);
 
 			const paths = await treePaths(app, sbId, "/home/user/a", token);
@@ -532,13 +462,13 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		// mkdir-first
 		const sbA = newId();
 		const [mkA, wA] = await Promise.all([
-			sm.withSession(sbA, (s) =>
+			sm.withSession("default", sbA, (s) =>
 				s.fs
 					.mkdir("/home/user/a")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbA, (s) =>
+			sm.withSession("default", sbA, (s) =>
 				s.fs
 					.writeFile("/home/user/a/x.txt", "hi")
 					.then(() => "ok")
@@ -547,18 +477,18 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		]);
 		expect(mkA).toBe("ok"); // wins first slot
 		expect(wA).toBe("ok"); // parent exists
-		expect(await sm.withSession(sbA, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbA, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(true);
 
 		// write-first → ENOENT because SqlFs does NOT auto-create parents
 		const sbB = newId();
 		const [wB, mkB] = await Promise.all([
-			sm.withSession(sbB, (s) =>
+			sm.withSession("default", sbB, (s) =>
 				s.fs
 					.writeFile("/home/user/a/x.txt", "hi")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbB, (s) =>
+			sm.withSession("default", sbB, (s) =>
 				s.fs
 					.mkdir("/home/user/a")
 					.then(() => "ok")
@@ -567,8 +497,8 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		]);
 		expect(wB).toBe("ENOENT"); // parent /home/user/a missing — SqlFs throws ENOENT
 		expect(mkB).toBe("ok");
-		expect(await sm.withSession(sbB, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(false);
-		expect(await sm.withSession(sbB, (s) => s.fs.exists("/home/user/a"))).toBe(true);
+		expect(await sm.withSession("default", sbB, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbB, (s) => s.fs.exists("/home/user/a"))).toBe(true);
 	});
 
 	// ── S2 ──────────────────────────────────────────────────────────────────────
@@ -578,26 +508,26 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 		// delete-first
 		const sbDel = newId();
-		await sm.withSession(sbDel, (s) => s.fs.writeFile("/home/user/file.txt", "data"));
+		await sm.withSession("default", sbDel, (s) => s.fs.writeFile("/home/user/file.txt", "data"));
 		const [del, rd] = await Promise.all([
-			sm.withSession(sbDel, (s) =>
+			sm.withSession("default", sbDel, (s) =>
 				s.fs
 					.rm("/home/user/file.txt")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbDel, (s) => s.fs.readFile("/home/user/file.txt").catch(errCode)),
+			sm.withSession("default", sbDel, (s) => s.fs.readFile("/home/user/file.txt").catch(errCode)),
 		]);
 		expect(del).toBe("ok");
 		expect(rd).toBe("ENOENT");
-		expect(await sm.withSession(sbDel, (s) => s.fs.exists("/home/user/file.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbDel, (s) => s.fs.exists("/home/user/file.txt"))).toBe(false);
 
 		// read-first
 		const sbRead = newId();
-		await sm.withSession(sbRead, (s) => s.fs.writeFile("/home/user/file.txt", "data"));
+		await sm.withSession("default", sbRead, (s) => s.fs.writeFile("/home/user/file.txt", "data"));
 		const [content, delR] = await Promise.all([
-			sm.withSession(sbRead, (s) => s.fs.readFile("/home/user/file.txt").catch(errCode)),
-			sm.withSession(sbRead, (s) =>
+			sm.withSession("default", sbRead, (s) => s.fs.readFile("/home/user/file.txt").catch(errCode)),
+			sm.withSession("default", sbRead, (s) =>
 				s.fs
 					.rm("/home/user/file.txt")
 					.then(() => "ok")
@@ -606,7 +536,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		]);
 		expect(content).toBe("data");
 		expect(delR).toBe("ok");
-		expect(await sm.withSession(sbRead, (s) => s.fs.exists("/home/user/file.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbRead, (s) => s.fs.exists("/home/user/file.txt"))).toBe(false);
 	});
 
 	it("S2 HTTP: whichever runs first, file is gone after both ops, delete is always 204", async () => {
@@ -615,7 +545,6 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 		for (const label of ["delete-first", "read-first"] as const) {
 			const sbId = newId();
-			await createSandboxInPg(sbId);
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
@@ -645,18 +574,13 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 			const [first, second] = await Promise.all(ops);
 
-			// Both ops are concurrent and serialized by session mutex — either
-			// can acquire the lock first regardless of Promise.all position.
-			// DELETE always returns 204; GET returns 200 or 404 depending on race.
 			if (label === "delete-first") {
-				expect(first.status).toBe(204); // delete always succeeds
-				expect([200, 404]).toContain(second.status); // read depends on race
+				expect(first.status).toBe(204); // delete
+				expect(second.status).toBe(404); // read sees deleted file
 			} else {
-				expect([200, 404]).toContain(first.status); // read depends on race
-				if (first.status === 200) {
-					expect(await first.text()).toBe("original");
-				}
-				expect(second.status).toBe(204); // delete always succeeds
+				expect(first.status).toBe(200); // read
+				expect(await first.text()).toBe("original");
+				expect(second.status).toBe(204); // delete
 			}
 
 			const final = await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
@@ -674,18 +598,18 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		// A-first: A wins mutex → B queued second → B is final
 		const sbAB = newId();
 		await Promise.all([
-			sm.withSession(sbAB, (s) => s.fs.writeFile("/home/user/f.txt", "A")),
-			sm.withSession(sbAB, (s) => s.fs.writeFile("/home/user/f.txt", "B")),
+			sm.withSession("default", sbAB, (s) => s.fs.writeFile("/home/user/f.txt", "A")),
+			sm.withSession("default", sbAB, (s) => s.fs.writeFile("/home/user/f.txt", "B")),
 		]);
-		expect(await sm.withSession(sbAB, (s) => s.fs.readFile("/home/user/f.txt"))).toBe("B");
+		expect(await sm.withSession("default", sbAB, (s) => s.fs.readFile("/home/user/f.txt"))).toBe("B");
 
 		// B-first: B wins mutex → A queued second → A is final
 		const sbBA = newId();
 		await Promise.all([
-			sm.withSession(sbBA, (s) => s.fs.writeFile("/home/user/f.txt", "B")),
-			sm.withSession(sbBA, (s) => s.fs.writeFile("/home/user/f.txt", "A")),
+			sm.withSession("default", sbBA, (s) => s.fs.writeFile("/home/user/f.txt", "B")),
+			sm.withSession("default", sbBA, (s) => s.fs.writeFile("/home/user/f.txt", "A")),
 		]);
-		expect(await sm.withSession(sbBA, (s) => s.fs.readFile("/home/user/f.txt"))).toBe("A");
+		expect(await sm.withSession("default", sbBA, (s) => s.fs.readFile("/home/user/f.txt"))).toBe("A");
 	});
 
 	// ── S4 ──────────────────────────────────────────────────────────────────────
@@ -693,16 +617,16 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 	it("S4 mv-first: write /home/user/a/x.txt → ENOENT after mv /home/user/a→/home/user/b", async () => {
 		const { sm } = makePgEnv();
 		const sbId = newId();
-		await sm.withSession(sbId, (s) => s.fs.mkdir("/home/user/a"));
+		await sm.withSession("default", sbId, (s) => s.fs.mkdir("/home/user/a"));
 
 		const [mvRes, wRes] = await Promise.all([
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.mv("/home/user/a", "/home/user/b")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.writeFile("/home/user/a/x.txt", "content")
 					.then(() => "ok")
@@ -713,25 +637,25 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		expect(mvRes).toBe("ok");
 		expect(wRes).toBe("ENOENT"); // SqlFs: no auto-mkdir — parent gone after mv
 
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/b"))).toBe(true);
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/a"))).toBe(false);
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(false);
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/b/x.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b"))).toBe(true);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/a"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/a/x.txt"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b/x.txt"))).toBe(false);
 	});
 
 	it("S4 write-first: x.txt written under /a, then mv /a→/b moves subtree; /b/x.txt exists", async () => {
 		const { sm } = makePgEnv();
 		const sbId = newId();
-		await sm.withSession(sbId, (s) => s.fs.mkdir("/home/user/a"));
+		await sm.withSession("default", sbId, (s) => s.fs.mkdir("/home/user/a"));
 
 		const [wRes, mvRes] = await Promise.all([
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.writeFile("/home/user/a/x.txt", "content")
 					.then(() => "ok")
 					.catch(errCode),
 			),
-			sm.withSession(sbId, (s) =>
+			sm.withSession("default", sbId, (s) =>
 				s.fs
 					.mv("/home/user/a", "/home/user/b")
 					.then(() => "ok")
@@ -742,9 +666,9 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		expect(wRes).toBe("ok");
 		expect(mvRes).toBe("ok");
 
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/a"))).toBe(false);
-		expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/b/x.txt"))).toBe(true);
-		expect(await sm.withSession(sbId, (s) => s.fs.readFile("/home/user/b/x.txt"))).toBe("content");
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/a"))).toBe(false);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b/x.txt"))).toBe(true);
+		expect(await sm.withSession("default", sbId, (s) => s.fs.readFile("/home/user/b/x.txt"))).toBe("content");
 	});
 
 	it("S4 consistency: x.txt always exists exactly once; /b always exists", async () => {
@@ -752,18 +676,18 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 		for (const label of ["mv-first", "write-first"] as const) {
 			const sbId = newId();
-			await sm.withSession(sbId, (s) => s.fs.mkdir("/home/user/a"));
+			await sm.withSession("default", sbId, (s) => s.fs.mkdir("/home/user/a"));
 
 			const ops =
 				label === "mv-first"
 					? ([
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.mv("/home/user/a", "/home/user/b")
 									.then(() => "ok")
 									.catch(errCode),
 							),
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.writeFile("/home/user/a/x.txt", "content")
 									.then(() => "ok")
@@ -771,13 +695,13 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 							),
 						] as const)
 					: ([
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.writeFile("/home/user/a/x.txt", "content")
 									.then(() => "ok")
 									.catch(errCode),
 							),
-							sm.withSession(sbId, (s) =>
+							sm.withSession("default", sbId, (s) =>
 								s.fs
 									.mv("/home/user/a", "/home/user/b")
 									.then(() => "ok")
@@ -788,10 +712,10 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 			await Promise.all(ops);
 
 			// /b must always exist (mv always runs)
-			expect(await sm.withSession(sbId, (s) => s.fs.exists("/home/user/b")), `${label}: /b`).toBe(true);
+			expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b")), `${label}: /b`).toBe(true);
 
-			const inA = await sm.withSession(sbId, (s) => s.fs.exists("/home/user/a/x.txt"));
-			const inB = await sm.withSession(sbId, (s) => s.fs.exists("/home/user/b/x.txt"));
+			const inA = await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/a/x.txt"));
+			const inB = await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b/x.txt"));
 
 			if (label === "mv-first") {
 				// write failed (ENOENT) — x.txt exists nowhere
@@ -801,7 +725,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 				// write succeeded, mv moved the subtree — x.txt is in /b
 				expect(inB, "write-first: /b/x.txt must exist").toBe(true);
 				expect(inA, "write-first: /a must be gone").toBe(false);
-				expect(await sm.withSession(sbId, (s) => s.fs.readFile("/home/user/b/x.txt"))).toBe("content");
+				expect(await sm.withSession("default", sbId, (s) => s.fs.readFile("/home/user/b/x.txt"))).toBe("content");
 			}
 		}
 	});

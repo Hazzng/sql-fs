@@ -34,6 +34,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 	// POST /v1/sandboxes/:id/ingest — upload tar.gz and extract into sandbox
 	router.post("/:id/ingest", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const body = await c.req.parseBody();
 		const archiveField = body.archive;
 		const basePathField = body.basePath;
@@ -57,7 +58,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 				// Ensure /tmp exists before writing archive
 				try {
 					await session.fs.mkdir("/tmp", { recursive: true });
@@ -102,6 +103,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 	router.post("/:id/ingest-files", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		let raw: unknown;
 		try {
 			raw = await c.req.json();
@@ -148,7 +150,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const fileCount = Object.keys(files).length;
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 				for (const [relativePath, base64Content] of Object.entries(files)) {
 					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
 					const lastSlash = absPath.lastIndexOf("/");
@@ -184,6 +186,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 	// GET /v1/sandboxes/:id/export — download sandbox contents as tar.gz
 	router.get("/:id/export", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const basePath = c.req.query("basePath") ?? "/home/user";
 
 		if (!isValidBasePath(basePath)) {
@@ -195,40 +198,46 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		let archiveBytes: Uint8Array;
 		try {
-			archiveBytes = await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
-				// Check basePath exists
-				const exists = await session.fs.exists(basePath);
-				if (!exists) {
-					throw Object.assign(new Error(`ENOENT: basePath does not exist: ${basePath}`), { code: "ENOENT" });
-				}
+			archiveBytes = await withOwnedSessionOrRehydrate(
+				sessionManager,
+				tenant,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					// Check basePath exists
+					const exists = await session.fs.exists(basePath);
+					if (!exists) {
+						throw Object.assign(new Error(`ENOENT: basePath does not exist: ${basePath}`), { code: "ENOENT" });
+					}
 
-				// Ensure /tmp exists
-				try {
-					await session.fs.mkdir("/tmp", { recursive: true });
-				} catch (e) {
-					const code = (e as Error & { code?: string }).code;
-					if (code !== "EEXIST") throw e;
-				}
+					// Ensure /tmp exists
+					try {
+						await session.fs.mkdir("/tmp", { recursive: true });
+					} catch (e) {
+						const code = (e as Error & { code?: string }).code;
+						if (code !== "EEXIST") throw e;
+					}
 
-				// Create archive
-				const tarResult = await sessionManager.execWithRuntimeThrottle(
-					session,
-					`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`,
-				);
-				if (tarResult.exitCode !== 0) {
-					throw Object.assign(new Error(`tar creation failed: ${tarResult.stderr || "unknown error"}`), {
-						code: "EINVAL",
-					});
-				}
+					// Create archive
+					const tarResult = await sessionManager.execWithRuntimeThrottle(
+						session,
+						`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`,
+					);
+					if (tarResult.exitCode !== 0) {
+						throw Object.assign(new Error(`tar creation failed: ${tarResult.stderr || "unknown error"}`), {
+							code: "EINVAL",
+						});
+					}
 
-				// Read archive bytes
-				const bytes = await session.fs.readFileBuffer("/tmp/_export.tar.gz");
+					// Read archive bytes
+					const bytes = await session.fs.readFileBuffer("/tmp/_export.tar.gz");
 
-				// Delete temp file (best effort — don't fail if cleanup fails)
-				await sessionManager.execWithRuntimeThrottle(session, "rm /tmp/_export.tar.gz");
+					// Delete temp file (best effort — don't fail if cleanup fails)
+					await sessionManager.execWithRuntimeThrottle(session, "rm /tmp/_export.tar.gz");
 
-				return bytes;
-			});
+					return bytes;
+				},
+			);
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;
 			if (isForbiddenError(e)) {

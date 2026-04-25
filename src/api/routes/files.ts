@@ -84,6 +84,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
 	router.get("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
@@ -96,6 +97,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			result = await withOwnedSessionOrRehydrate<ReadResult>(
 				sessionManager,
+				tenant,
 				sandboxId,
 				c.get("owner"),
 				async (session) => {
@@ -155,6 +157,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// PUT /v1/sandboxes/:id/files/* — write raw file content
 	router.put("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
@@ -162,7 +165,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const content = new Uint8Array(buffer);
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 				const parent = parentDir(filePath);
 				if (parent !== "/") {
 					try {
@@ -185,6 +188,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
 	router.delete("/:id/files/:path{.*}", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 		const recursive = c.req.query("recursive") === "true";
@@ -195,6 +199,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			result = await withOwnedSessionOrRehydrate<DeleteResult>(
 				sessionManager,
+				tenant,
 				sandboxId,
 				c.get("owner"),
 				async (session) => {
@@ -231,6 +236,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/writeFiles", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof writeFilesBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -250,7 +256,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const { files } = body;
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, sandboxId, c.get("owner"), async (session) => {
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 				for (const [filePath, content] of Object.entries(files)) {
 					const parent = parentDir(filePath);
 					if (parent !== "/") {
@@ -280,6 +286,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.post("/:id/mkdir", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof mkdirBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -304,6 +311,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			result = await withOwnedSessionOrRehydrate<MkdirResult>(
 				sessionManager,
+				tenant,
 				sandboxId,
 				c.get("owner"),
 				async (session) => {
@@ -337,6 +345,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	router.get("/:id/tree", async (c) => {
 		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
 		const queryResult = treeQuerySchema.safeParse(c.req.query());
 		if (!queryResult.success) {
 			const details = queryResult.error.issues.map((i) => i.message);
@@ -353,6 +362,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			entries = await withOwnedSessionOrRehydrate<TreeEntry[]>(
 				sessionManager,
+				tenant,
 				sandboxId,
 				c.get("owner"),
 				async (session) => {

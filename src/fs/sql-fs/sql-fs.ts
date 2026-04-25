@@ -64,11 +64,17 @@ const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 interface SqlFsOptions<Tx> {
 	readonly dialect: SqlDialect<Tx>;
 	readonly sandboxId: string;
+	/** Tenant identifier — used to build tenant-prefixed Redis keys (Phase 3). */
+	readonly tenantId?: string;
 	/** Max total byte budget for the content cache. Default: 50 MB. */
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
-	/** Redis client for reading the version counter during snapshot-backed cold starts. */
+	/**
+	 * Optional Redis client used to read the per-sandbox version counter
+	 * (`vfs:{tenantId}:ver:{sandboxId}`) during cold-start / reload. Required
+	 * together with `pathSnapshot` for snapshot-backed cold starts (Phase E).
+	 */
 	readonly redis?: Redis;
 	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
 	readonly pathSnapshot?: RedisPathSnapshot;
@@ -93,6 +99,7 @@ export interface ICoherentFs extends IFileSystem {
 export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
+	readonly #tenantId: string;
 	readonly #pathCache: Map<string, PathCacheEntry>;
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
@@ -109,6 +116,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
+		this.#tenantId = opts.tenantId ?? "default";
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
 		this.#redis = opts.redis;
 		this.#pathSnapshot = opts.pathSnapshot;
@@ -254,17 +262,22 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	}
 
 	/**
-	 * Loads the full path tree without touching in-memory caches.
-	 * Tries Redis snapshot first (strict version equality); falls through
-	 * to `dialect.loadAllPaths` on miss, mismatch, or error.
+	 * Loads the full path tree from the DB without touching in-memory caches.
+	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
+	 * On error the caller's caches are left untouched.
+	 *
+	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
+	 * snapshot read first. The embedded `version` must equal the current
+	 * `vfs:{tenantId}:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
+	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
 	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
-				const raw = await this.#redis.get(versionKey(this.#sandboxId));
+				const raw = await this.#redis.get(versionKey(this.#tenantId, this.#sandboxId));
 				const currentVersion = raw === null ? 0 : Number(raw) || 0;
-				const snap = await this.#pathSnapshot.read(this.#sandboxId);
+				const snap = await this.#pathSnapshot.read(this.#tenantId, this.#sandboxId);
 				if (snap === null) {
 					missReason = "no_key";
 				} else if (snap.version !== currentVersion) {

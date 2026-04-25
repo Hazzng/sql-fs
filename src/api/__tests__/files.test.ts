@@ -28,10 +28,9 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFileSystem }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({
-		backend: "memory",
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate(SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID);
 	return { sessionManager, fs };
 }
 
@@ -179,22 +178,24 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 	it("returns 403 when a cold replica rehydrates a sandbox owned by another caller", async () => {
 		const meta = new Map<string, SandboxMeta>();
 		const ownerManager = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
-			persistSandboxMetaFn: async (sandboxId, sandboxMeta) => {
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
 				meta.set(sandboxId, sandboxMeta);
 			},
 		});
-		await ownerManager.withSession(SANDBOX_ID, async (session) => {
+		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
 			session.owner = "agent-1";
-			await ownerManager.persistSandboxMeta(SANDBOX_ID, { owner: "agent-1", python: false, javascript: false });
+			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				python: false,
+				javascript: false,
+			});
 		});
 
 		const coldReplica = new SessionManager({
-			backend: "memory",
 			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (sandboxId) => meta.get(sandboxId) ?? null,
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
 		});
 		const app = makeTestApp(coldReplica);
 		const token = await makeToken("agent-2");
