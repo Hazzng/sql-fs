@@ -1,6 +1,5 @@
 /**
  * Ingest/Export routes.
- * US-071: POST /v1/sandboxes/:id/ingest — tar.gz upload
  * US-072: POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
  * US-073: GET /v1/sandboxes/:id/export — tar.gz download
  */
@@ -8,6 +7,8 @@
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
+import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import type { AuthVariables } from "../auth.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
@@ -30,70 +31,6 @@ function isValidRelativePath(p: string): boolean {
 
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
-
-	// POST /v1/sandboxes/:id/ingest — upload tar.gz and extract into sandbox
-	router.post("/:id/ingest", async (c) => {
-		const sandboxId = c.req.param("id");
-		const tenant = c.get("tenant");
-		const body = await c.req.parseBody();
-		const archiveField = body.archive;
-		const basePathField = body.basePath;
-		const basePath =
-			typeof basePathField === "string" && basePathField.length > 0 ? basePathField : "/home/user/project";
-
-		if (!(archiveField instanceof File)) {
-			return c.json(
-				{ error: "validation_error", code: "INVALID_INPUT", details: ["archive field is required and must be a file"] },
-				400 as ContentfulStatusCode,
-			);
-		}
-
-		if (!isValidBasePath(basePath)) {
-			return c.json(
-				{ error: "validation_error", code: "INVALID_INPUT", details: ["basePath must be a safe absolute path"] },
-				400 as ContentfulStatusCode,
-			);
-		}
-
-		const archiveBuffer = new Uint8Array(await archiveField.arrayBuffer());
-
-		try {
-			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				// Ensure /tmp exists before writing archive
-				try {
-					await session.fs.mkdir("/tmp", { recursive: true });
-				} catch (e) {
-					const code = (e as Error & { code?: string }).code;
-					if (code !== "EEXIST") throw e;
-				}
-
-				// Write archive to sandbox FS at /tmp/_ingest.tar.gz
-				await session.fs.writeFile("/tmp/_ingest.tar.gz", archiveBuffer);
-
-				// Extract via bash (just-bash requires dash-prefixed flags: -xzf not xzf)
-				const extractResult = await sessionManager.execWithRuntimeThrottle(
-					session,
-					`mkdir -p '${basePath}' && cd '${basePath}' && tar -xzf /tmp/_ingest.tar.gz && rm /tmp/_ingest.tar.gz`,
-				);
-				if (extractResult.exitCode !== 0) {
-					throw Object.assign(new Error(`tar extraction failed: ${extractResult.stderr || "unknown error"}`), {
-						code: "EINVAL",
-					});
-				}
-			});
-		} catch (e) {
-			const code = (e as Error & { code?: string }).code;
-			if (isForbiddenError(e)) {
-				return forbiddenResponse();
-			}
-			if (code === "ENOENT") {
-				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
-			}
-			throw e;
-		}
-
-		return c.json({ status: "ok", basePath });
-	});
 
 	// POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
 	const ingestFilesBodySchema = z.object({
@@ -149,25 +86,19 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		const fileCount = Object.keys(files).length;
 
+		const bulkFiles: BulkIngestFile[] = Object.entries(files).map(([rel, b64]) => ({
+			path: `${basePath}/${rel}`.replace(/\/+/g, "/"),
+			content: new Uint8Array(Buffer.from(b64, "base64")),
+			mode: 0o644,
+		}));
+
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				for (const [relativePath, base64Content] of Object.entries(files)) {
-					const absPath = `${basePath}/${relativePath}`.replace(/\/+/g, "/");
-					const lastSlash = absPath.lastIndexOf("/");
-					const parentDir = lastSlash > 0 ? absPath.slice(0, lastSlash) : "/";
-
-					if (parentDir !== "/") {
-						try {
-							await session.fs.mkdir(parentDir, { recursive: true });
-						} catch (e) {
-							const code = (e as Error & { code?: string }).code;
-							if (code !== "EEXIST") throw e;
-						}
-					}
-
-					const decoded = Buffer.from(base64Content, "base64");
-					await session.fs.writeFile(absPath, new Uint8Array(decoded));
+				const fs = session.fs as ICoherentFs;
+				if (typeof fs.bulkIngest !== "function") {
+					throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
 				}
+				await fs.bulkIngest(bulkFiles);
 			});
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;

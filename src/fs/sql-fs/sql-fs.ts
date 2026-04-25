@@ -22,7 +22,7 @@ import {
 	createEperm,
 } from "./errors.js";
 import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
-import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
+import { type BulkIngestFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
  * Normalize a virtual filesystem path: resolve `.` and `..` components,
@@ -94,6 +94,12 @@ export interface ICoherentFs extends IFileSystem {
 	wasDirty(): boolean;
 	/** Resets the dirty flag — called after publishing a new version. */
 	clearDirty(): void;
+	/**
+	 * Bulk-inserts files into the sandbox in minimal DB round-trips, creating
+	 * any missing parent directories. After commit, repopulates the in-memory
+	 * pathCache via reload() and marks the FS dirty.
+	 */
+	bulkIngest(files: BulkIngestFile[]): Promise<void>;
 }
 
 export class SqlFs<Tx = unknown> implements ICoherentFs {
@@ -355,6 +361,25 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		})();
 		this.#pendingReload = p;
 		return p;
+	}
+
+	/**
+	 * Bulk-inserts files via the dialect's `bulkIngest` (multi-row INSERT for
+	 * blobs/inodes/dirents) inside one transaction. Cache coherence is restored
+	 * by `reload()`; contentCache fills lazily on first read.
+	 *
+	 * The dirty flag is set AFTER `reload()` because `reload()` resets it to
+	 * false on completion. Setting it last preserves the multi-replica version
+	 * bookkeeping contract (publishVersionIfDirty needs to see dirty=true at
+	 * session-finalize so other replicas pick up the new tree).
+	 */
+	async bulkIngest(files: BulkIngestFile[]): Promise<void> {
+		if (files.length === 0) return;
+		await this.#withTx(async (tx) => {
+			await this.#dialect.bulkIngest(tx, files);
+		});
+		await this.reload();
+		this.#dirty = true;
 	}
 
 	// ── IFileSystem: cache-served methods ────────────────────────────────────────
