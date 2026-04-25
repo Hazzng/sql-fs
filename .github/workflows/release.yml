@@ -45,8 +45,8 @@ jobs:
             exit 1
           fi
 
-          if ! [[ "$VERSION" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
-            echo "::error::CHANGELOG version '$VERSION' is not a valid Docker tag (no '+' build metadata, no leading '.' or '-')."
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::CHANGELOG version '$VERSION' is not valid SemVer. Expected MAJOR.MINOR.PATCH with optional -prerelease (e.g. 0.2.0, 1.0.0-rc.1). Build metadata (+...) is forbidden because Docker tags cannot contain '+'."
             exit 1
           fi
 
