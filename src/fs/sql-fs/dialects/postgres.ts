@@ -75,9 +75,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Stubs — implemented in subsequent user stories ────────────────────────────
 
 	// US-005
-	async createSandbox(tx: PgTx, sandboxId: string): Promise<{ rootInodeId: bigint }> {
+	async createSandbox(tx: PgTx, sandboxId: string, owner = ""): Promise<{ rootInodeId: bigint }> {
 		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK
-		await tx`INSERT INTO sandboxes (id, root_inode) VALUES (${sandboxId}, NULL)`;
+		await tx`INSERT INTO sandboxes (id, root_inode, owner) VALUES (${sandboxId}, NULL, ${owner})`;
 
 		// 2. Insert root directory inode (kind=2, mode=0o755)
 		const rootRows = await tx<{ id: string }[]>`
@@ -108,6 +108,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// (from other replicas or code paths that bypass withSession) serialize first.
 		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
+	}
+
+	async readSandboxOwner(sandboxId: string): Promise<string | null> {
+		const sql = this.pool;
+		if (sql === null) throw new Error("readSandboxOwner: dialect not connected");
+		const rows = await sql<{ owner: string | null }[]>`
+			SELECT owner FROM sandboxes WHERE id = ${sandboxId}
+		`;
+		return rows[0]?.owner ?? null;
 	}
 
 	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */

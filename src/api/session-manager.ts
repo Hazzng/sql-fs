@@ -255,9 +255,13 @@ export class SessionManager {
 	}
 
 	/** Construct the underlying filesystem for a new session. */
-	private async buildFs(tenantId: string, sandboxId: string): Promise<IFileSystem> {
+	private async buildFs(
+		tenantId: string,
+		sandboxId: string,
+		owner = "",
+	): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
 		if (this.createFsOverride !== undefined) {
-			return this.createFsOverride(tenantId, sandboxId);
+			return { fs: await this.createFsOverride(tenantId, sandboxId), resolvedOwner: "" };
 		}
 		const backend = this.getOrInitBackend(tenantId);
 		return createPostgresSandboxFs(
@@ -269,6 +273,7 @@ export class SessionManager {
 				pathSnapshot: this.pathSnapshot,
 			},
 			sandboxId,
+			owner,
 		);
 	}
 
@@ -294,7 +299,12 @@ export class SessionManager {
 	 * @param sandboxId - Sandbox id scoped within the tenant.
 	 * @param runtimeOptions - Optional runtime opt-ins; only honored on first creation.
 	 */
-	async getOrCreate(tenantId: string, sandboxId: string, runtimeOptions?: RuntimeOptions): Promise<Session> {
+	async getOrCreate(
+		tenantId: string,
+		sandboxId: string,
+		runtimeOptions?: RuntimeOptions,
+		owner = "",
+	): Promise<Session> {
 		const key = this.sessionKey(tenantId, sandboxId);
 		const existing = this.sessions.get(key);
 		if (existing !== undefined) {
@@ -312,7 +322,7 @@ export class SessionManager {
 
 		const creationPromise = (async (): Promise<Session> => {
 			try {
-				const fs = await this.buildFs(tenantId, sandboxId);
+				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
 				// just-bash treats `false` and `undefined` both as off, but the types distinguish them —
 				// `|| undefined` keeps types happy without changing behavior.
 				const bash = new Bash({
@@ -346,7 +356,7 @@ export class SessionManager {
 					inFlight: 0,
 					mutex: new Mutex(),
 					state: "active",
-					owner: "",
+					owner: resolvedOwner,
 					createdAt: new Date().toISOString(),
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
@@ -486,9 +496,10 @@ export class SessionManager {
 		sandboxId: string,
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
+		owner = "",
 	): Promise<T> {
 		return this.withExecLock(tenantId, sandboxId, async () => {
-			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions);
+			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner);
 
 			// Fast-fail: session is being destroyed — don't queue in the mutex
 			if (session.state === "closing") {

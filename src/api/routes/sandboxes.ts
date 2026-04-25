@@ -50,7 +50,9 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			tenant,
 			sandboxId,
 			async (session) => {
-				session.owner = owner;
+				// Ensure owner is set for in-memory/test backends that bypass DB persistence.
+				// For Postgres, getOrCreate already sets it from the DB row; this is a no-op.
+				if (!session.owner) session.owner = owner;
 				session.createdAt = createdAt;
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
@@ -59,6 +61,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				}
 			},
 			{ python, javascript },
+			owner,
 		);
 
 		return c.json({ id: sandboxId, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);

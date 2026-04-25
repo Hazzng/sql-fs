@@ -47,18 +47,24 @@ export interface PostgresBackendOptions {
  * @param opts.redis - Optional Redis client forwarded to SqlFs for coherence counters.
  * @param sandboxId - Sandbox identifier scoped within this tenant's database.
  */
-export async function createPostgresSandboxFs(opts: PostgresBackendOptions, sandboxId: string): Promise<IFileSystem> {
+export async function createPostgresSandboxFs(
+	opts: PostgresBackendOptions,
+	sandboxId: string,
+	owner = "",
+): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
 	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
 	await dialect.connect();
 	// Initialize the sandbox in the DB (creates root inode structure).
-	// Ignore unique violation (23505) — sandbox already exists on reconnect.
+	// On unique violation (23505) the sandbox already exists — read its owner back.
+	let resolvedOwner = owner;
 	try {
 		await dialect.transaction(async (tx) => {
-			await dialect.createSandbox(tx, sandboxId);
+			await dialect.createSandbox(tx, sandboxId, owner);
 		});
 	} catch (e) {
 		const sqlErr = e as { code?: string };
 		if (sqlErr.code !== "23505") throw e;
+		resolvedOwner = (await dialect.readSandboxOwner(sandboxId)) ?? "";
 	}
 	const fs = new SqlFs({
 		dialect,
@@ -68,7 +74,7 @@ export async function createPostgresSandboxFs(opts: PostgresBackendOptions, sand
 		pathSnapshot: opts.pathSnapshot,
 	});
 	await fs.ready();
-	return fs;
+	return { fs, resolvedOwner };
 }
 
 /**
@@ -117,10 +123,11 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 						ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
 					})
 				: undefined;
-			return createPostgresSandboxFs(
+			const { fs } = await createPostgresSandboxFs(
 				{ connectionString: databaseUrl, blobCache, pathSnapshot, redis: redis ?? undefined },
 				sandboxId,
 			);
+			return fs;
 		}
 		case "memory":
 			return new InMemoryFs();

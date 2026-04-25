@@ -138,7 +138,9 @@ export interface SqlDialect<Tx = unknown> {
 	 * (/home, /home/user, /tmp, /bin).
 	 * Returns the root inode ID.
 	 */
-	createSandbox(tx: Tx, sandboxId: string): Promise<{ rootInodeId: bigint }>;
+	createSandbox(tx: Tx, sandboxId: string, owner?: string): Promise<{ rootInodeId: bigint }>;
+	/** Reads the owner stored in the sandboxes row, or null if the row does not exist. */
+	readSandboxOwner(sandboxId: string): Promise<string | null>;
 
 	/**
 	 * Deletes a sandbox and all associated inodes, dirents, and blobs
