@@ -277,16 +277,20 @@ a `basePath`. Walks the manifest with the dialect's bulk multi-row INSERT, so th
 whole batch costs ~5 DB round-trips regardless of file count.
 
 ```bash
-# Build payload from local files (recursive)
+# Build payload from local files (recursive). Skips symlinks, uses a
+# null-prototype object so keys like "__proto__" survive, normalizes manifest
+# keys to POSIX separators so the payload works the same on Windows hosts.
 node -e "
 const fs = require('fs'), path = require('path');
 const root = process.argv[1], base = process.argv[2];
-const out = {};
+const out = Object.create(null);
 (function walk(d) {
   for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    if (e.isSymbolicLink()) continue;
     const p = path.join(d, e.name);
-    if (e.isDirectory()) walk(p);
-    else out[path.relative(root, p)] = fs.readFileSync(p).toString('base64');
+    if (e.isDirectory()) { walk(p); continue; }
+    const rel = path.relative(root, p).split(path.sep).join('/');
+    out[rel] = fs.readFileSync(p).toString('base64');
   }
 })(root);
 process.stdout.write(JSON.stringify({ basePath: base, files: out }));

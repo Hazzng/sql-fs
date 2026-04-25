@@ -366,10 +366,24 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// `#dirty = true` must be set AFTER `reload()` because `reload()` clears it,
 	// and `publishVersionIfDirty` at session-finalize needs to see dirty=true so
 	// other replicas pick up the new tree.
+	//
+	// Every input path is normalized via `validatePath` (rejects null bytes,
+	// resolves `.`/`..`) before reaching the dialect, matching the contract used
+	// by every other write method on this class. Two inputs that normalize to
+	// the same final path are rejected with EEXIST rather than silently
+	// shadowing each other — the dialect would commit only one and drop the rest.
 	async bulkIngest(files: BulkIngestFile[]): Promise<void> {
 		if (files.length === 0) return;
+		const normalized: BulkIngestFile[] = [];
+		const seen = new Set<string>();
+		for (const file of files) {
+			const path = validatePath(file.path);
+			if (seen.has(path)) throw createEexist(path);
+			seen.add(path);
+			normalized.push({ path, content: file.content, mode: file.mode });
+		}
 		await this.#withTx(async (tx) => {
-			await this.#dialect.bulkIngest(tx, files);
+			await this.#dialect.bulkIngest(tx, normalized);
 		});
 		await this.reload();
 		this.#dirty = true;

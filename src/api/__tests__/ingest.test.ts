@@ -33,8 +33,7 @@ async function makeToken(sub = "agent-1"): Promise<string> {
  * we make (file readable, fileCount returned).
  */
 function withBulkIngest(fs: IFileSystem): IFileSystem & Pick<ICoherentFs, "bulkIngest"> {
-	const wrapped = fs as IFileSystem & Pick<ICoherentFs, "bulkIngest">;
-	wrapped.bulkIngest = async (files: BulkIngestFile[]) => {
+	const bulkIngest = async (files: BulkIngestFile[]): Promise<void> => {
 		for (const f of files) {
 			const lastSlash = f.path.lastIndexOf("/");
 			const parentDir = lastSlash > 0 ? f.path.slice(0, lastSlash) : "/";
@@ -49,7 +48,7 @@ function withBulkIngest(fs: IFileSystem): IFileSystem & Pick<ICoherentFs, "bulkI
 			await fs.writeFile(f.path, f.content);
 		}
 	};
-	return wrapped;
+	return Object.assign(fs, { bulkIngest }) satisfies IFileSystem & Pick<ICoherentFs, "bulkIngest">;
 }
 
 function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
@@ -173,6 +172,33 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { code: string };
 		expect(body.code).toBe("INVALID_INPUT");
+	});
+
+	it("returns 400 listing offending keys when any file value is not valid base64", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: {
+					"good.txt": Buffer.from("hello").toString("base64"),
+					"bad.txt": "not*valid*base64!!!",
+					"truncated.txt": "abc", // length not divisible by 4
+				},
+			}),
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string; details: string[] };
+		expect(body.code).toBe("INVALID_INPUT");
+		expect(body.details.some((d) => d.includes("invalid base64"))).toBe(true);
+		expect(body.details.some((d) => d.includes("bad.txt"))).toBe(true);
+		expect(body.details.some((d) => d.includes("truncated.txt"))).toBe(true);
 	});
 
 	it("returns 404 for non-existent sandbox", async () => {

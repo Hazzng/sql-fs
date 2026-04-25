@@ -33,6 +33,11 @@ function makeDialect(): {
 	const bulkIngestMock = vi.fn();
 	const loadAllPathsMock = vi.fn(async () => [] as Array<{ path: string } & PathCacheEntry>);
 	const setSandboxContextWithLockMock = vi.fn();
+	// `as unknown as SqlDialect<unknown>` (not `satisfies`) is required here because
+	// `SqlDialect.transaction` is a generic method `<T>(fn) => Promise<T>`, and a
+	// `vi.fn(...)` mock collapses the type parameter so it cannot structurally
+	// match the variance. Same pattern used by the other dialect-mock tests in
+	// this directory (sql-fs.read.test.ts etc.).
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
@@ -112,7 +117,9 @@ describe("SqlFs.bulkIngest", () => {
 		await fs.bulkIngest(files);
 
 		expect(bulkIngestMock).toHaveBeenCalledOnce();
-		expect(bulkIngestMock.mock.calls[0]?.[1]).toBe(files);
+		// bulkIngest forwards a normalized copy (paths run through validatePath),
+		// not the caller's array — assert by value, not by reference.
+		expect(bulkIngestMock.mock.calls[0]?.[1]).toEqual(files);
 		// Advisory lock must be acquired (write path), not the read-only setSandboxContext.
 		expect(setSandboxContextWithLockMock.mock.calls.length).toBeGreaterThan(lockCallsBefore);
 		// reload() ran loadAllPaths exactly once more after the mutation.
@@ -148,5 +155,43 @@ describe("SqlFs.bulkIngest", () => {
 
 		await expect(fs.bulkIngest(files)).rejects.toMatchObject({ code: "EINVAL" });
 		expect(loadAllPathsMock.mock.calls.length).toBe(loadCallsBefore);
+	});
+
+	it("normalizes paths through validatePath before forwarding to the dialect", async () => {
+		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n)]);
+
+		await fs.bulkIngest([
+			{ path: "/home/user/./a.txt", content: new TextEncoder().encode("a"), mode: 0o644 },
+			{ path: "/home/user/sub/../b.txt", content: new TextEncoder().encode("b"), mode: 0o644 },
+		]);
+
+		expect(bulkIngestMock).toHaveBeenCalledOnce();
+		const forwarded = bulkIngestMock.mock.calls[0]?.[1] as BulkIngestFile[];
+		expect(forwarded.map((f) => f.path)).toEqual(["/home/user/a.txt", "/home/user/b.txt"]);
+	});
+
+	it("rejects EINVAL on null byte in path before opening a transaction", async () => {
+		const txCallsBefore = transactionMock.mock.calls.length;
+
+		await expect(
+			fs.bulkIngest([{ path: "/home/user/\0bad.txt", content: new Uint8Array(0), mode: 0o644 }]),
+		).rejects.toMatchObject({ code: "EINVAL" });
+
+		expect(bulkIngestMock).not.toHaveBeenCalled();
+		expect(transactionMock.mock.calls.length).toBe(txCallsBefore);
+	});
+
+	it("rejects EEXIST when two inputs normalize to the same path, before opening a transaction", async () => {
+		const txCallsBefore = transactionMock.mock.calls.length;
+
+		await expect(
+			fs.bulkIngest([
+				{ path: "/home/user/a.txt", content: new TextEncoder().encode("first"), mode: 0o644 },
+				{ path: "/home/user/./a.txt", content: new TextEncoder().encode("second"), mode: 0o644 },
+			]),
+		).rejects.toMatchObject({ code: "EEXIST" });
+
+		expect(bulkIngestMock).not.toHaveBeenCalled();
+		expect(transactionMock.mock.calls.length).toBe(txCallsBefore);
 	});
 });

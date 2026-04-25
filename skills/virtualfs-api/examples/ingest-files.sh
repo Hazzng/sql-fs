@@ -26,16 +26,21 @@ fi
 
 echo "Uploading $SRC_DIR → sandbox $SB at $BASE_PATH"
 
-# Build the JSON manifest with Node (recursive, base64, binary-safe)
+# Build the JSON manifest with Node (recursive, base64, binary-safe).
+# - skips symlinks so readFileSync cannot escape the selected tree
+# - uses Object.create(null) so filenames like "__proto__" are preserved
+# - normalizes keys to POSIX separators so the manifest is portable across OSes
 node -e '
   const fs = require("fs"), path = require("path");
   const dir = process.argv[1], base = process.argv[2];
-  const out = {};
+  const out = Object.create(null);
   (function walk(d) {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isSymbolicLink()) continue;
       const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else out[path.relative(dir, p)] = fs.readFileSync(p).toString("base64");
+      if (e.isDirectory()) { walk(p); continue; }
+      const rel = path.relative(dir, p).split(path.sep).join("/");
+      out[rel] = fs.readFileSync(p).toString("base64");
     }
   })(dir);
   process.stdout.write(JSON.stringify({ basePath: base, files: out }));

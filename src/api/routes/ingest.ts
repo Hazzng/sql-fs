@@ -29,6 +29,15 @@ function isValidRelativePath(p: string): boolean {
 	return true;
 }
 
+// Strict base64 (RFC 4648) — no whitespace, length divisible by 4 once padded.
+// Buffer.from(_, "base64") silently drops invalid chars and accepts ragged
+// lengths, so we screen here to reject corrupt manifests up front.
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+function isValidBase64(s: string): boolean {
+	if (s.length % 4 !== 0) return false;
+	return BASE64_RE.test(s);
+}
+
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
@@ -68,9 +77,14 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		const bulkFiles: BulkIngestFile[] = [];
 		const invalidPaths: string[] = [];
+		const invalidBase64: string[] = [];
 		for (const [rel, b64] of Object.entries(files)) {
 			if (!isValidRelativePath(rel)) {
 				invalidPaths.push(rel);
+				continue;
+			}
+			if (!isValidBase64(b64)) {
+				invalidBase64.push(rel);
 				continue;
 			}
 			bulkFiles.push({
@@ -79,15 +93,11 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 				mode: 0o644,
 			});
 		}
-		if (invalidPaths.length > 0) {
-			return c.json(
-				{
-					error: "validation_error",
-					code: "INVALID_INPUT",
-					details: [`invalid paths: ${invalidPaths.join(", ")}`],
-				},
-				400 as ContentfulStatusCode,
-			);
+		if (invalidPaths.length > 0 || invalidBase64.length > 0) {
+			const details: string[] = [];
+			if (invalidPaths.length > 0) details.push(`invalid paths: ${invalidPaths.join(", ")}`);
+			if (invalidBase64.length > 0) details.push(`invalid base64: ${invalidBase64.join(", ")}`);
+			return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
 		}
 
 		const fileCount = bulkFiles.length;
