@@ -363,16 +363,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		return p;
 	}
 
-	/**
-	 * Bulk-inserts files via the dialect's `bulkIngest` (multi-row INSERT for
-	 * blobs/inodes/dirents) inside one transaction. Cache coherence is restored
-	 * by `reload()`; contentCache fills lazily on first read.
-	 *
-	 * The dirty flag is set AFTER `reload()` because `reload()` resets it to
-	 * false on completion. Setting it last preserves the multi-replica version
-	 * bookkeeping contract (publishVersionIfDirty needs to see dirty=true at
-	 * session-finalize so other replicas pick up the new tree).
-	 */
+	// `#dirty = true` must be set AFTER `reload()` because `reload()` clears it,
+	// and `publishVersionIfDirty` at session-finalize needs to see dirty=true so
+	// other replicas pick up the new tree.
 	async bulkIngest(files: BulkIngestFile[]): Promise<void> {
 		if (files.length === 0) return;
 		await this.#withTx(async (tx) => {

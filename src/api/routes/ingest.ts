@@ -66,12 +66,18 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			);
 		}
 
-		// Validate all relative paths before writing any files
+		const bulkFiles: BulkIngestFile[] = [];
 		const invalidPaths: string[] = [];
-		for (const relativePath of Object.keys(files)) {
-			if (!isValidRelativePath(relativePath)) {
-				invalidPaths.push(relativePath);
+		for (const [rel, b64] of Object.entries(files)) {
+			if (!isValidRelativePath(rel)) {
+				invalidPaths.push(rel);
+				continue;
 			}
+			bulkFiles.push({
+				path: `${basePath}/${rel}`,
+				content: Buffer.from(b64, "base64"),
+				mode: 0o644,
+			});
 		}
 		if (invalidPaths.length > 0) {
 			return c.json(
@@ -84,13 +90,7 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			);
 		}
 
-		const fileCount = Object.keys(files).length;
-
-		const bulkFiles: BulkIngestFile[] = Object.entries(files).map(([rel, b64]) => ({
-			path: `${basePath}/${rel}`.replace(/\/+/g, "/"),
-			content: new Uint8Array(Buffer.from(b64, "base64")),
-			mode: 0o644,
-		}));
+		const fileCount = bulkFiles.length;
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
