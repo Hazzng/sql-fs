@@ -14,11 +14,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { Redis } from "ioredis";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RedisPathSnapshot } from "../../../fs/sql-fs/redis-path-snapshot.js";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
+import { mapFsErrorToStatus } from "../../errors.js";
 import { signToken } from "../../lib/jwt.js";
 import { runMigrations } from "../../migrations.js";
 import { execRoutes } from "../../routes/exec.js";
@@ -75,6 +77,13 @@ function makeApp(tenantConfig: TenantConfig, redis: Redis) {
 	app.route("/v1/sandboxes", fileRoutes(sessionManager));
 	app.route("/v1/sandboxes", execRoutes(sessionManager));
 	app.route("/v1/sandboxes", ingestRoutes(sessionManager));
+	// Mirror server.ts global error handler so FS error codes (ENOENT etc.) map
+	// to the correct HTTP status instead of bubbling up as 500.
+	app.onError((err, c) => {
+		const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
+		const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
+		return c.json({ error: err.message, code }, status);
+	});
 	return { app, sessionManager };
 }
 
