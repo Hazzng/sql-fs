@@ -13,6 +13,7 @@ Claude Code, curl, or Node.js.
 | **Error codes** | `ref/errors.md` | HTTP → FS code table + debugging patterns |
 | **Bash capabilities** | `ref/bash.md` | What just-bash supports / doesn't |
 | **Quickstart** | `examples/quickstart.sh` | Full lifecycle in one script |
+| **Folder upload** | `examples/ingest-files.sh` | Upload a local directory via the `ingest-files` JSON manifest |
 | **Codebase exploration** | `examples/ingest-explore.sh` | Load source files + grep/cat via bash |
 | **SSE streaming** | `examples/sse-stream.sh` | Real-time script output |
 
@@ -53,9 +54,11 @@ Sub-commands:
 
 ## Key facts to remember
 
-1. **`ingest-files` vs `ingest`**: use `ingest-files` (base64 JSON) for source files.
-   The tar.gz route runs `tar` inside just-bash — 3 Postgres round-trips per file,
-   sequentially. At ~300 ms/file on Neon (AUS-East), >20 files hits the ACA 240s timeout.
+1. **`ingest-files` is the only ingest route**. The tar.gz `/ingest` route was removed
+   (it shelled out to `tar -xzf` inside just-bash, costing 3 Postgres round-trips per
+   file and reliably tripping the ACA 240 s gateway timeout). `ingest-files` now uses
+   a single bulk multi-row INSERT — ~5 DB round-trips total regardless of file count,
+   so 100+ files typically complete in well under a second.
 
 2. **`writeFiles` vs `ingest-files`**:
    - `writeFiles` → plain text, **absolute** paths, no `basePath`

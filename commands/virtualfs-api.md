@@ -52,6 +52,7 @@ All reference material lives under `skills/virtualfs-api/` in this project:
 
 - **Working examples** → `skills/virtualfs-api/examples/`
   - `quickstart.sh` — create sandbox, write file, exec, delete
+  - `ingest-files.sh` — upload a local folder via the `ingest-files` JSON manifest
   - `ingest-explore.sh` — load a codebase and grep/cat via bash_exec
   - `sse-stream.sh` — SSE streaming execution
 
@@ -63,8 +64,10 @@ response shapes, and known gotchas from the live API.
 ## Core rules
 
 1. Always use parameterised shell variables (`$BASE_URL`, `$TOKEN`, `$SB`) in examples.
-2. Prefer `ingest-files` (base64 JSON) over `ingest` (tar.gz) for loading files — the tar
-   route extracts via bash and hits the ACA 240s gateway timeout for >20 files.
+2. Use `ingest-files` (base64 JSON) for loading a local folder. It is the only supported
+   ingest route — the tar.gz `/ingest` route was removed. Server-side it now uses a single
+   bulk multi-row INSERT (~5 round-trips total regardless of file count) so 100+ files
+   typically complete in <1s.
 3. Remind the user that `writeFiles` takes plain-text absolute paths; `ingest-files` takes
    base64 relative paths under a `basePath`.
 4. Sandbox filesystem survives session eviction (Postgres is durable). Shell state (env vars,

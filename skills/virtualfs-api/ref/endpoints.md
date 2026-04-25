@@ -270,25 +270,32 @@ Client disconnect cancels the script via `AbortController`.
 
 ## Ingest / Export
 
-### POST /v1/sandboxes/:id/ingest-files — JSON manifest upload (PREFERRED)
+### POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
 
-Takes **base64-encoded** content and **relative** paths under a `basePath`.
+The only ingest route. Takes **base64-encoded** content and **relative** paths under
+a `basePath`. Walks the manifest with the dialect's bulk multi-row INSERT, so the
+whole batch costs ~5 DB round-trips regardless of file count.
 
 ```bash
-# Build payload from local files
+# Build payload from local files (recursive)
 node -e "
 const fs = require('fs'), path = require('path');
-const srcDir = './src';
-const files = {};
-for (const f of fs.readdirSync(srcDir)) {
-  files[f] = fs.readFileSync(path.join(srcDir, f)).toString('base64');
-}
-process.stdout.write(JSON.stringify({ basePath: '/home/user/src', files }));
-" | curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/ingest-files" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  --data-binary @- | jq
-# → {"status":"ok","fileCount":12}
+const root = process.argv[1], base = process.argv[2];
+const out = {};
+(function walk(d) {
+  for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+    const p = path.join(d, e.name);
+    if (e.isDirectory()) walk(p);
+    else out[path.relative(root, p)] = fs.readFileSync(p).toString('base64');
+  }
+})(root);
+process.stdout.write(JSON.stringify({ basePath: base, files: out }));
+" ./src /home/user/src \
+| curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/ingest-files" \
+       -H "Authorization: Bearer $TOKEN" \
+       -H "Content-Type: application/json" \
+       --data-binary @- | jq
+# → {"status":"ok","fileCount":37}
 ```
 
 Request body:
@@ -303,23 +310,9 @@ Request body:
 }
 ```
 
-**Performance:** ~2 s/file (3 Postgres round-trips per file: blob upsert, inode upsert, dirent
-insert). Keep batches ≤ 25 files per request to stay under ACA's 240 s stream timeout.
-For larger codebases, split into multiple calls by directory.
-
-### POST /v1/sandboxes/:id/ingest — tar.gz upload
-
-```bash
-tar czf /tmp/project.tar.gz -C /path/to/project .
-curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/ingest" \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "archive=@/tmp/project.tar.gz" \
-  -F "basePath=/home/user/project" | jq
-# → {"status":"ok","basePath":"/home/user/project"}
-```
-
-**Warning:** extraction runs `tar -xzf` inside just-bash. Each file costs ~3 DB round-trips
-sequentially. For >20 files the ACA 240 s stream timeout will be hit. Use `ingest-files` instead.
+**Performance:** ~150 files / ~1 MB JSON typically completes in <100 ms server-side.
+The previous "≤25 files per batch" rule no longer applies — the dialect now uses a
+single bulk INSERT. Practical caps are HTTP body size and the 240 s ACA gateway window.
 
 ### GET /v1/sandboxes/:id/export — Download as tar.gz
 
