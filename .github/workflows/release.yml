@@ -2,7 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -10,30 +14,57 @@ permissions:
 
 jobs:
   release:
-    name: Build, push & GitHub Release
+    name: Build, push & maybe release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Get version from tag
-        id: version
+      - name: Detect topmost version in CHANGELOG
+        id: detect
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          if ! [[ "$VERSION" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Tag '$GITHUB_REF' produced invalid VERSION='$VERSION'. Docker tags must match [a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127} (no '+' build metadata, no leading '.' or '-')."
-            exit 1
-          fi
-          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Extract CHANGELOG section for version
-        id: changelog
-        run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-
           if [ ! -f CHANGELOG.md ]; then
             echo "::error::CHANGELOG.md not found"
             exit 1
           fi
+
+          VERSION=$(awk '
+            /^## \[Unreleased\]/ { next }
+            /^## \[[^]]+\]/ {
+              line = $0
+              sub(/^## \[/, "", line)
+              sub(/\].*/, "", line)
+              print line
+              exit
+            }
+          ' CHANGELOG.md)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No versioned section (## [x.y.z]) found in CHANGELOG.md"
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo "::error::CHANGELOG version '$VERSION' is not a valid Docker tag (no '+' build metadata, no leading '.' or '-')."
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "RELEASE=false" >> "$GITHUB_OUTPUT"
+            echo "Tag v$VERSION already exists — only publishing :latest + :sha-<short>"
+          else
+            echo "RELEASE=true" >> "$GITHUB_OUTPUT"
+            echo "Tag v$VERSION not found — will tag, push :v$VERSION, and create GitHub Release"
+          fi
+
+      - name: Extract CHANGELOG section
+        if: steps.detect.outputs.RELEASE == 'true'
+        id: changelog
+        run: |
+          VERSION="${{ steps.detect.outputs.VERSION }}"
 
           CONTENT=$(awk -v ver="$VERSION" '
             BEGIN { header = "## [" ver "]" }
@@ -44,13 +75,12 @@ jobs:
 
           if [ -z "$CONTENT" ] || [ "${CONTENT// /}" = "" ]; then
             echo "::error::No CHANGELOG entry found for version [$VERSION] in CHANGELOG.md"
-            echo "::error::Please add a changelog entry with format: ## [$VERSION]"
             exit 1
           fi
 
           BYTES=$(printf '%s' "$CONTENT" | wc -c)
           if [ "$BYTES" -gt 10000 ]; then
-            echo "::error::CHANGELOG entry for [$VERSION] is $BYTES bytes; max 10000. Shorten the entry or raise the limit intentionally."
+            echo "::error::CHANGELOG entry for [$VERSION] is $BYTES bytes; max 10000."
             exit 1
           fi
 
@@ -79,7 +109,9 @@ jobs:
         with:
           images: ${{ steps.image.outputs.NAME }}
           tags: |
-            type=raw,value=v${{ steps.version.outputs.VERSION }}
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+            type=raw,value=v${{ steps.detect.outputs.VERSION }},enable=${{ steps.detect.outputs.RELEASE == 'true' }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -90,18 +122,27 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Create and push git tag
+        if: steps.detect.outputs.RELEASE == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ steps.detect.outputs.VERSION }}"
+          git push origin "v${{ steps.detect.outputs.VERSION }}"
+
       - name: Create GitHub Release
+        if: steps.detect.outputs.RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Release v${{ steps.version.outputs.VERSION }}
+          tag_name: v${{ steps.detect.outputs.VERSION }}
+          name: Release v${{ steps.detect.outputs.VERSION }}
           body: |
-            ## Release v${{ steps.version.outputs.VERSION }}
+            ## Release v${{ steps.detect.outputs.VERSION }}
 
             ${{ steps.changelog.outputs.CONTENT }}
 
             ---
 
-            **Image:** `${{ steps.image.outputs.NAME }}:v${{ steps.version.outputs.VERSION }}`
+            **Image:** `${{ steps.image.outputs.NAME }}:v${{ steps.detect.outputs.VERSION }}`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
