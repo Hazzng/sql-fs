@@ -491,6 +491,80 @@ describe("MCP tool — fs_ingest", () => {
 
 		await client.close();
 	});
+
+	it("rejects malformed manifest entries before any DB work and reports both bad paths and bad base64", async () => {
+		const sessionManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/proj",
+				files: {
+					"": b64("empty key"),
+					"dir/": b64("trailing slash"),
+					"good.txt": "%%%not-base64%%%",
+				},
+			},
+		});
+
+		const content = res.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toMatch(/invalid paths/);
+		expect(parsed.error).toMatch(/invalid base64/);
+
+		await client.close();
+	});
+
+	it("returns a sanitized internal error (no backend wiring) when the FS lacks bulkIngest", async () => {
+		// Use a plain InMemoryFs WITHOUT the bulkIngest shim so the runtime guard
+		// fires and synthesizes an ENOTSUP error. The raw "bulkIngest not supported
+		// by this fs backend" message must NOT leak to the MCP client.
+		const sessionManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/proj",
+				files: { "a.txt": b64("hello") },
+			},
+		});
+
+		const content = res.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toBe("internal error");
+		expect(parsed.error).not.toContain("bulkIngest");
+		expect(parsed.error).not.toContain("backend");
+
+		await client.close();
+	});
 });
 
 describe("MCP tool — fs_export", () => {

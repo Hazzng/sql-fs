@@ -10,32 +10,13 @@ import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import type { AuthVariables } from "../auth.js";
+import { isValidBase64, isValidRelativePath } from "../ingest-validation.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 // Validates that a basePath is a safe absolute path (no shell metacharacters)
 function isValidBasePath(p: string): boolean {
 	return /^\/[a-zA-Z0-9_\-./]*$/.test(p) && !p.includes("..");
-}
-
-// Validates that a relative path is safe (no traversal, no absolute paths, no null bytes)
-function isValidRelativePath(p: string): boolean {
-	if (p.includes("\0")) return false;
-	if (p.startsWith("/")) return false;
-	const segments = p.split("/");
-	for (const seg of segments) {
-		if (seg === "..") return false;
-	}
-	return true;
-}
-
-// Strict base64 (RFC 4648) — no whitespace, length divisible by 4 once padded.
-// Buffer.from(_, "base64") silently drops invalid chars and accepts ragged
-// lengths, so we screen here to reject corrupt manifests up front.
-const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
-function isValidBase64(s: string): boolean {
-	if (s.length % 4 !== 0) return false;
-	return BASE64_RE.test(s);
 }
 
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {

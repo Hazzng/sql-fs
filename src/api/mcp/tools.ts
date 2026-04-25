@@ -12,24 +12,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
+import { isValidBase64, isValidRelativePath } from "../ingest-validation.js";
 import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
-
-/**
- * Validates that a relative path is safe (no traversal, no absolute paths, no null bytes).
- */
-function isValidRelativePath(p: string): boolean {
-	if (p.includes("\0")) return false;
-	if (p.startsWith("/")) return false;
-	const segments = p.split("/");
-	for (const seg of segments) {
-		if (seg === "..") return false;
-	}
-	return true;
-}
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
@@ -217,25 +205,35 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		async (args) => {
 			const basePath = args.basePath ?? "/home/user";
 
-			// Validate all relative paths before any DB work
-			for (const relativePath of Object.keys(args.files)) {
-				if (!isValidRelativePath(relativePath)) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({ ok: false, error: `invalid path: ${relativePath}` }),
-							},
-						],
-					};
+			// Validate paths and base64 in one pass before any DB work.
+			// `Buffer.from(_, "base64")` silently decodes garbage to corrupt bytes,
+			// so we reject malformed values up front rather than persist them.
+			const bulkFiles: BulkIngestFile[] = [];
+			const invalidPaths: string[] = [];
+			const invalidBase64: string[] = [];
+			for (const [rel, b64] of Object.entries(args.files)) {
+				if (!isValidRelativePath(rel)) {
+					invalidPaths.push(rel);
+					continue;
 				}
+				if (!isValidBase64(b64)) {
+					invalidBase64.push(rel);
+					continue;
+				}
+				bulkFiles.push({
+					path: `${basePath}/${rel}`,
+					content: new Uint8Array(Buffer.from(b64, "base64")),
+					mode: 0o644,
+				});
 			}
-
-			const bulkFiles: BulkIngestFile[] = Object.entries(args.files).map(([rel, b64]) => ({
-				path: `${basePath}/${rel}`.replace(/\/+/g, "/"),
-				content: new Uint8Array(Buffer.from(b64, "base64")),
-				mode: 0o644,
-			}));
+			if (invalidPaths.length > 0 || invalidBase64.length > 0) {
+				const parts: string[] = [];
+				if (invalidPaths.length > 0) parts.push(`invalid paths: ${invalidPaths.join(", ")}`);
+				if (invalidBase64.length > 0) parts.push(`invalid base64: ${invalidBase64.join(", ")}`);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: parts.join("; ") }) }],
+				};
+			}
 
 			try {
 				await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
@@ -247,9 +245,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				});
 
 				return {
-					content: [
-						{ type: "text" as const, text: JSON.stringify({ ok: true, count: Object.keys(args.files).length }) },
-					],
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: true, count: bulkFiles.length }) }],
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
@@ -258,7 +254,28 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
 					};
 				}
-				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
+				if (code === "ENOENT") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+					};
+				}
+				// `ENOTSUP` here means the FS backend has no `bulkIngest` — only reachable
+				// from a misconfigured replica. Don't echo the internal "bulkIngest not
+				// supported by this fs backend" message back to the MCP client; log and
+				// return a generic internal error, mirroring the HTTP route.
+				if (code === "ENOTSUP") {
+					console.error(
+						JSON.stringify({
+							event: "fs_ingest_backend_unsupported",
+							sandboxId: args.id,
+							tenant,
+						}),
+					);
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
+					};
+				}
+				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};
