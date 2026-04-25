@@ -522,9 +522,49 @@ describe("MCP tool — fs_ingest", () => {
 
 		const content = res.content as Array<{ type: string; text?: string }>;
 		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
-		expect(parsed.ok).toBe(false);
-		expect(parsed.error).toMatch(/invalid paths/);
-		expect(parsed.error).toMatch(/invalid base64/);
+		// Deterministic full payload: empty key + "dir/" → invalid paths,
+		// "good.txt"/"%%%not-base64%%%" → invalid base64. Asserting the entire
+		// shape catches accidental delimiter/format changes that substring
+		// matches would silently miss.
+		expect(parsed).toEqual({
+			ok: false,
+			error: "invalid paths: , dir/; invalid base64: good.txt",
+		});
+
+		await client.close();
+	});
+
+	it.each([
+		["tmp", "no leading slash"],
+		["./proj", "relative path"],
+		["/home/user/../etc", ".. segment escapes basePath"],
+		["/home/user;rm -rf /", "shell metachar"],
+	])("rejects unsafe basePath %p (%s) before any DB work", async (basePath) => {
+		// The HTTP route validates basePath via isValidBasePath; the MCP tool
+		// shares the same helper. Without this guard, /home/user/../etc would
+		// silently normalize to /home/etc inside SqlFs.bulkIngest — diverging
+		// the two ingest contracts. This test pins both surfaces to one rule.
+		const sessionManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const createContent = createResult.content as Array<{ type: string; text?: string }>;
+		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: { id: created.id, basePath, files: { "a.txt": b64("hello") } },
+		});
+		const content = res.content as Array<{ type: string; text?: string }>;
+		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
+		expect(parsed).toEqual({ ok: false, error: "basePath must be a safe absolute path" });
 
 		await client.close();
 	});

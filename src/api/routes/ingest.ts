@@ -10,14 +10,9 @@ import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import type { AuthVariables } from "../auth.js";
-import { isValidBase64, isValidRelativePath } from "../ingest-validation.js";
+import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
-
-// Validates that a basePath is a safe absolute path (no shell metacharacters)
-function isValidBasePath(p: string): boolean {
-	return /^\/[a-zA-Z0-9_\-./]*$/.test(p) && !p.includes("..");
-}
 
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();

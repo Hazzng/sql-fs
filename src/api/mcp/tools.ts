@@ -12,7 +12,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
-import { isValidBase64, isValidRelativePath } from "../ingest-validation.js";
+import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
 import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -204,6 +204,21 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		},
 		async (args) => {
 			const basePath = args.basePath ?? "/home/user";
+
+			// Reuse the same basePath guard the HTTP /ingest-files route uses
+			// so the two ingest surfaces share one contract. Inputs like
+			// "tmp", "./proj", "/home/user/../tmp" must not silently normalize
+			// to a different destination than the caller supplied.
+			if (!isValidBasePath(basePath)) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: "basePath must be a safe absolute path" }),
+						},
+					],
+				};
+			}
 
 			// Validate paths and base64 in one pass before any DB work.
 			// `Buffer.from(_, "base64")` silently decodes garbage to corrupt bytes,

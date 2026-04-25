@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { isValidBase64, isValidRelativePath } from "./ingest-validation.js";
+import { isValidBase64, isValidBasePath, isValidRelativePath } from "./ingest-validation.js";
 
 describe("isValidRelativePath", () => {
 	it.each([
@@ -49,7 +49,33 @@ describe("isValidBase64", () => {
 		["YWJj YWJj", "whitespace is not allowed in strict base64"],
 		["YWJj\n", "newline is not allowed"],
 		["===", "padding-only is malformed"],
+		["AZ==", "non-canonical: non-zero pad bits — decodes to 0x01 like AQ==, but doesn't round-trip"],
+		["ab==", "non-canonical: pad bits set — decodes to 0x69 but re-encodes to aQ=="],
+		["YQ", "missing required padding"],
+		["YQ=", "wrong padding length for 1-byte payload"],
 	])("rejects malformed base64 %p — %s", (s) => {
 		expect(isValidBase64(s)).toBe(false);
+	});
+});
+
+describe("isValidBasePath", () => {
+	it.each(["/home/user", "/home/user/proj", "/tmp/work", "/a", "/home/user-1/proj_v2/src.dir"])(
+		"accepts safe absolute path %p",
+		(p) => {
+			expect(isValidBasePath(p)).toBe(true);
+		},
+	);
+
+	it.each([
+		["", "empty string"],
+		["home/user", "missing leading slash"],
+		["./proj", "relative path"],
+		["/home/user/../etc", ".. segment escapes basePath"],
+		["/home/user;rm -rf", "shell metachar"],
+		["/home/user $HOME", "shell expansion / spaces"],
+		["/home/user\0", "null byte"],
+		["/home/user\nproj", "newline"],
+	])("rejects unsafe basePath %p — %s", (p) => {
+		expect(isValidBasePath(p)).toBe(false);
 	});
 });

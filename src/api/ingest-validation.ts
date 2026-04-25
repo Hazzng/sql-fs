@@ -32,13 +32,31 @@ export function isValidRelativePath(p: string): boolean {
 }
 
 /**
- * Strict RFC 4648 base64 check (no whitespace, length divisible by 4 once
- * padded). `Buffer.from(_, "base64")` silently drops invalid chars and
- * accepts ragged lengths, so we screen here to reject corrupt manifests
- * before bytes hit the database.
+ * Strict canonical RFC 4648 base64 check.
+ *
+ * Two-step:
+ *   1. Structural regex: 0+ groups of 4 alphabet chars, optionally followed
+ *      by a final group of either 2 chars + `==` or 3 chars + `=`. This
+ *      rejects whitespace, ragged lengths, and bare padding.
+ *   2. Canonical round-trip: `Buffer.from(s, "base64")` silently tolerates
+ *      non-zero pad bits (e.g. `AZ==` decodes to the same bytes as `AQ==`),
+ *      so reject any input that doesn't re-encode to itself. Without this
+ *      check a tampered manifest could pass validation while persisting
+ *      bytes whose checksum no longer matches the value the caller sent.
  */
-const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 export function isValidBase64(s: string): boolean {
-	if (s.length % 4 !== 0) return false;
-	return BASE64_RE.test(s);
+	if (!BASE64_RE.test(s)) return false;
+	return Buffer.from(s, "base64").toString("base64") === s;
+}
+
+/**
+ * Strict absolute-path check for the `basePath` parameter in both the HTTP
+ * `/ingest-files` route and the MCP `fs_ingest` tool. Rejects shell-unsafe
+ * characters and any `..` segment so the two surfaces share one contract.
+ */
+export function isValidBasePath(p: string): boolean {
+	if (!/^\/[a-zA-Z0-9_\-./]*$/.test(p)) return false;
+	if (p.includes("..")) return false;
+	return true;
 }
