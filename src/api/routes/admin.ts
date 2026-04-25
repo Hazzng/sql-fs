@@ -27,7 +27,6 @@ const tokenBodySchema = z.object({
 export const adminRoutes = new Hono<{ Variables: AuthVariables }>();
 
 adminRoutes.post("/tokens", validateBody(tokenBodySchema), async (c) => {
-	// Require ADMIN_SECRET header for token minting authorization
 	const adminSecret = process.env.ADMIN_SECRET;
 	if (!adminSecret) {
 		return c.json({ error: "admin_not_configured", code: "ADMIN_NOT_CONFIGURED" }, 500 as ContentfulStatusCode);
@@ -40,21 +39,13 @@ adminRoutes.post("/tokens", validateBody(tokenBodySchema), async (c) => {
 
 	const { sub, tenant, expiresIn = "30d" } = c.get("body");
 
-	// Reject unknown tenants up-front so we never mint a token that will fail
-	// auth later. Resolve the config lazily per-request — admin token minting
-	// is rare and this avoids a cold module-load order dependency.
-	if (tenant !== undefined) {
-		const tenantConfig = loadTenantConfig();
-		if (!tenantConfig.hasTenant(tenant)) {
-			return c.json({ error: "unknown_tenant", code: "INVALID_INPUT" }, 400 as ContentfulStatusCode);
-		}
+	if (tenant !== undefined && !loadTenantConfig().hasTenant(tenant)) {
+		return c.json({ error: "unknown_tenant", code: "INVALID_INPUT" }, 400 as ContentfulStatusCode);
 	}
 
 	const secret = process.env.AUTH_SECRET ?? "";
-
 	const token = await signToken({ sub, tenant, expiresIn, secret });
 
-	// Calculate expiresAt from expiresIn instead of re-verifying the just-signed token
 	let expiresAt: string | null = null;
 	if (expiresIn !== "never") {
 		const durations: Record<string, number> = { "24h": 86400, "30d": 2592000, "1y": 31536000 };
