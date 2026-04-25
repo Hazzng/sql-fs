@@ -46,14 +46,22 @@ curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
 
 ## Step 3 — Mint agent tokens via API (for CI / other services)
 
-Once you have an admin token you can mint scoped tokens via the API instead of the CLI:
+Once you have an admin token you can mint scoped tokens via the API instead of the CLI.
+
+`POST /v1/admin/tokens` requires **two** auth signals:
+1. `Authorization: Bearer <admin-token>` — same JWT auth as every `/v1/*` route
+2. `X-Admin-Secret: <ADMIN_SECRET>` — additional out-of-band secret matched against the
+   server's `ADMIN_SECRET` env var (separate from `AUTH_SECRET`)
 
 ```bash
-# Create a 7-day token for an agent
-AGENT_TOKEN=$(curl -s -X POST "$BASE_URL/v1/admin/tokens" \
+export ADMIN_SECRET="<YOUR_ADMIN_SECRET>"   # never commit; ask the deployer
+
+# Mint a 30-day token for an agent (valid expiresIn: "24h", "30d", "1y", "never")
+AGENT_TOKEN=$(curl -fsS -X POST "$BASE_URL/v1/admin/tokens" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-Secret: $ADMIN_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"sub": "agent-1", "expiresIn": "7d"}' | jq -r '.token')
+  -d '{"sub": "agent-1", "expiresIn": "30d"}' | jq -er '.token')
 echo "Agent token: $AGENT_TOKEN"
 ```
 
@@ -99,4 +107,5 @@ alias vfs-health='curl -fsS "$VIRTUALFS_BASE_URL/healthz"'
 | `{"error":"unauthorized","code":"AUTH_REQUIRED"}` | Missing or malformed `Authorization` header | Add `Authorization: Bearer $TOKEN` |
 | `{"error":"invalid_token","code":"AUTH_INVALID"}` | JWT expired or wrong `AUTH_SECRET` | Re-generate token with correct secret |
 | `{"error":"unknown_tenant","code":"AUTH_UNKNOWN_TENANT"}` | `tenant` claim in JWT not configured on server | Omit `tenant` claim or update server config |
-| `{"error":"forbidden","code":"FORBIDDEN"}` | Sandbox owned by a different `sub` | Use the token that created the sandbox |
+| `{"error":"forbidden","code":"FORBIDDEN"}` | Sandbox owned by a different `sub`, OR (on `/v1/admin/tokens`) `X-Admin-Secret` missing or wrong | Use the token that created the sandbox; for admin endpoints set `X-Admin-Secret: $ADMIN_SECRET` |
+| `{"error":"admin_not_configured","code":"ADMIN_NOT_CONFIGURED"}` | Server has no `ADMIN_SECRET` env var | Ask the deployer to set `ADMIN_SECRET` |

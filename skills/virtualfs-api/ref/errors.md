@@ -19,8 +19,9 @@ All error responses use this shape:
 | 401 | `AUTH_REQUIRED` | Missing or malformed `Authorization` | Add `Authorization: Bearer $TOKEN` |
 | 401 | `AUTH_INVALID` | JWT expired or bad signature | Regenerate token; check `AUTH_SECRET` |
 | 401 | `AUTH_UNKNOWN_TENANT` | `tenant` claim not configured | Omit the claim (single-tenant) or update server config |
-| 403 | `FORBIDDEN` | Sandbox owned by different caller | Use the token that created the sandbox |
+| 403 | `FORBIDDEN` | Sandbox owned by different caller, OR `X-Admin-Secret` missing/wrong on `/v1/admin/tokens` | Use the token that created the sandbox; for admin endpoints add `X-Admin-Secret: $ADMIN_SECRET` |
 | 404 | `ENOENT` | Sandbox or file not found | Sandbox deleted, or path doesn't exist |
+| 500 | `ADMIN_NOT_CONFIGURED` | Server has no `ADMIN_SECRET` env var | Operator must set `ADMIN_SECRET` on the deployment |
 | 408 | `EXEC_TIMEOUT` | Script exceeded `timeoutMs` | Increase `timeoutMs` (max 300 000) |
 | 409 | `EEXIST` | File or directory already exists | Path collision on create |
 | 409 | `ENOTEMPTY` | Directory not empty | Use `?recursive=true` on DELETE |

@@ -10,25 +10,36 @@ All routes require `Authorization: Bearer <JWT>` unless noted.
 
 ### POST /v1/admin/tokens — Create JWT
 
+Requires both `Authorization: Bearer <admin-token>` AND `X-Admin-Secret: <ADMIN_SECRET>`
+headers. The admin secret is a separate env-var from `AUTH_SECRET` and gates this
+endpoint independently of JWT auth.
+
 ```bash
-curl -s -X POST "$BASE_URL/v1/admin/tokens" \
+curl -fsS -X POST "$BASE_URL/v1/admin/tokens" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "X-Admin-Secret: $ADMIN_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"sub": "agent-1", "expiresIn": "7d"}' | jq
+  -d '{"sub": "agent-1", "expiresIn": "30d"}' | jq
 ```
 
 Request body:
 ```json
 {
-  "sub": "string (required) — token subject / owner identity",
-  "expiresIn": "24h | 7d | 30d | 1y | never  (default: 30d)"
+  "sub":       "string (required) — token subject / owner identity",
+  "tenant":    "string (optional) — tenant id; must match [A-Za-z0-9_.-]+",
+  "expiresIn": "24h | 30d | 1y | never  (default: 30d)"
 }
 ```
 
 Response `201`:
 ```json
-{ "token": "<jwt>", "sub": "agent-1", "expiresAt": "2026-05-02T..." }
+{ "token": "<jwt>", "sub": "agent-1", "tenant": null, "expiresAt": "2026-05-02T..." }
 ```
+
+Error responses:
+- `403 FORBIDDEN` — `X-Admin-Secret` missing or doesn't match server `ADMIN_SECRET`
+- `500 ADMIN_NOT_CONFIGURED` — server has no `ADMIN_SECRET` env var set
+- `400 INVALID_INPUT` — body validation failed (bad `sub`, unknown tenant, invalid `expiresIn`)
 
 ---
 
