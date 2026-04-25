@@ -12,12 +12,41 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryFs } from "just-bash";
+import type { IFileSystem } from "just-bash";
 import { describe, expect, it } from "vitest";
-import type { SandboxMeta } from "../../fs/sql-fs/types.js";
+import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { BulkIngestFile, SandboxMeta } from "../../fs/sql-fs/types.js";
 import { createMcpServer } from "../mcp/server.js";
 import { registerTools } from "../mcp/tools.js";
 import { SessionManager } from "../session-manager.js";
 import type { Session } from "../session-manager.js";
+
+/**
+ * Wraps `InMemoryFs` with a `bulkIngest` shim so MCP fs_ingest tests (which
+ * cast to ICoherentFs) work without standing up Postgres. Behaves like the
+ * real bulkIngest for the assertions we make: files become readable.
+ */
+function withBulkIngest(fs: IFileSystem): IFileSystem & Pick<ICoherentFs, "bulkIngest"> {
+	const wrapped = fs as IFileSystem & Pick<ICoherentFs, "bulkIngest">;
+	wrapped.bulkIngest = async (files: BulkIngestFile[]) => {
+		for (const f of files) {
+			const lastSlash = f.path.lastIndexOf("/");
+			const parentDir = lastSlash > 0 ? f.path.slice(0, lastSlash) : "/";
+			if (parentDir !== "/") {
+				try {
+					await fs.mkdir(parentDir, { recursive: true });
+				} catch (e) {
+					const code = (e as Error & { code?: string }).code;
+					if (code !== "EEXIST") throw e;
+				}
+			}
+			await fs.writeFile(f.path, f.content);
+		}
+	};
+	return wrapped;
+}
+
+const b64 = (s: string): string => Buffer.from(s, "utf-8").toString("base64");
 
 describe("MCP server", () => {
 	it("initializes without error", () => {
@@ -407,7 +436,7 @@ describe("MCP tool — bash_exec", () => {
 describe("MCP tool — fs_ingest", () => {
 	it("ingests 3 files and verifies they are readable via bash_exec cat", async () => {
 		const sessionManager = new SessionManager({
-			createFs: async () => new InMemoryFs(),
+			createFs: async () => withBulkIngest(new InMemoryFs()),
 		});
 
 		const server = createMcpServer();
@@ -424,16 +453,16 @@ describe("MCP tool — fs_ingest", () => {
 		const createContent = createResult.content as Array<{ type: string; text?: string }>;
 		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
 
-		// Ingest 3 files
+		// Ingest 3 files (values are base64-encoded — see fs_ingest tool description)
 		const ingestResult = await client.callTool({
 			name: "fs_ingest",
 			arguments: {
 				id: created.id,
 				basePath: "/home/user/project",
 				files: {
-					"a.txt": "hello from a",
-					"subdir/b.txt": "hello from b",
-					"subdir/c.txt": "hello from c",
+					"a.txt": b64("hello from a"),
+					"subdir/b.txt": b64("hello from b"),
+					"subdir/c.txt": b64("hello from c"),
 				},
 			},
 		});
@@ -467,7 +496,7 @@ describe("MCP tool — fs_ingest", () => {
 describe("MCP tool — fs_export", () => {
 	it("exports files written to sandbox as a JSON map", async () => {
 		const sessionManager = new SessionManager({
-			createFs: async () => new InMemoryFs(),
+			createFs: async () => withBulkIngest(new InMemoryFs()),
 		});
 
 		const server = createMcpServer();
@@ -479,7 +508,7 @@ describe("MCP tool — fs_export", () => {
 		await server.connect(serverTransport);
 		await client.connect(clientTransport);
 
-		// Create a sandbox and ingest files
+		// Create a sandbox and ingest files (base64 per fs_ingest contract)
 		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
 		const createContent = createResult.content as Array<{ type: string; text?: string }>;
 		const created = JSON.parse(createContent[0]?.text ?? "") as { id: string };
@@ -490,9 +519,9 @@ describe("MCP tool — fs_export", () => {
 				id: created.id,
 				basePath: "/home/user/proj",
 				files: {
-					"a.txt": "content of a",
-					"sub/b.txt": "content of b",
-					"sub/c.txt": "content of c",
+					"a.txt": b64("content of a"),
+					"sub/b.txt": b64("content of b"),
+					"sub/c.txt": b64("content of c"),
 				},
 			},
 		});
