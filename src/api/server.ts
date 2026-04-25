@@ -48,7 +48,20 @@ const pathSnapshot =
 			})
 		: undefined;
 
-const backend = (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memory";
+const VALID_BACKENDS = ["postgres", "memory"] as const satisfies readonly StorageBackend[];
+
+function isStorageBackend(value: string): value is StorageBackend {
+	return (VALID_BACKENDS as readonly string[]).includes(value);
+}
+
+const fsBackend = process.env.FS_BACKEND;
+if (fsBackend !== undefined && !isStorageBackend(fsBackend)) {
+	throw Object.assign(
+		new Error(`FS_BACKEND '${fsBackend}' is not a valid backend. Valid values: ${VALID_BACKENDS.join(", ")}`),
+		{ code: "EINVAL" },
+	);
+}
+const backend: StorageBackend = fsBackend ?? "memory";
 
 // Postgres metadata functions for session rehydration on cold replicas.
 // Uses a single long-lived dialect (connection-pooled internally by the postgres driver).
