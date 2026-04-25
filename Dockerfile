@@ -5,8 +5,7 @@ FROM node:22-bookworm AS builder
 WORKDIR /app
 RUN corepack enable
 COPY pnpm-lock.yaml package.json ./
-RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm build
 
