@@ -15,7 +15,7 @@ Run this from the **project root** (e.g. `<repo-root>/virtualFS`):
 ```bash
 # Pull AUTH_SECRET from your secret store / .env — never commit the real value
 export AUTH_SECRET="<YOUR_AUTH_SECRET>"
-export BASE_URL="https://virtualfs-api.redocean-7a422dd7.australiaeast.azurecontainerapps.io"
+export BASE_URL="<YOUR_VIRTUALFS_API_URL>"
 
 export TOKEN=$(AUTH_SECRET=$AUTH_SECRET pnpm token:create -- --sub admin --expires 30d 2>/dev/null | tail -1)
 echo "Token: $TOKEN"
