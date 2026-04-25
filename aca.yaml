@@ -1,5 +1,5 @@
 # Azure Container Apps deployment config
-# Deploy: az containerapp create --yaml aca.yaml
+# Deploy: az containerapp create --name virtualfs-api --resource-group <RG> --yaml aca.yaml
 properties:
   managedEnvironmentId: /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.App/managedEnvironments/<ENV>
   configuration:
@@ -8,8 +8,10 @@ properties:
       targetPort: 8080
       transport: http
       allowInsecure: false
-      stickySessions:
-        affinity: sticky
+    registries:
+      - server: ghcr.io
+        username: <GITHUB_USERNAME>
+        passwordSecretRef: ghcr-token
     secrets:
       - name: database-url
         value: "<POOLER_URL>"
@@ -17,10 +19,14 @@ properties:
         value: "<DIRECT_URL>"
       - name: auth-secret
         value: "<AUTH_SECRET>"
+      - name: redis-url
+        value: "<REDIS_URL>"
+      - name: ghcr-token
+        value: "<GITHUB_PAT>"
   template:
     containers:
       - name: api
-        image: <REGISTRY>/virtualfs-api:latest
+        image: ghcr.io/<GITHUB_USERNAME>/virtualfs-api:latest
         resources:
           cpu: 1.0
           memory: 2Gi
@@ -33,6 +39,8 @@ properties:
             secretRef: database-direct-url
           - name: AUTH_SECRET
             secretRef: auth-secret
+          - name: REDIS_URL
+            secretRef: redis-url
           - name: PORT
             value: "8080"
         probes:
@@ -52,11 +60,6 @@ properties:
               port: 8080
             failureThreshold: 30
             periodSeconds: 2
-    # Uncomment for Azure FileShare backend:
-    # volumes:
-    #   - name: sandbox-storage
-    #     storageName: my-fileshare
-    #     storageType: AzureFile
     scale:
       minReplicas: 1
       maxReplicas: 10
