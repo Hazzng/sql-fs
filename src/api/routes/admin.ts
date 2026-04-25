@@ -12,6 +12,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import { signToken } from "../lib/jwt.js";
+import { loadTenantConfig } from "../tenants.js";
 import { validateBody } from "../validation.js";
 
 const tokenBodySchema = z.object({
@@ -38,6 +39,17 @@ adminRoutes.post("/tokens", validateBody(tokenBodySchema), async (c) => {
 	}
 
 	const { sub, tenant, expiresIn = "30d" } = c.get("body");
+
+	// Reject unknown tenants up-front so we never mint a token that will fail
+	// auth later. Resolve the config lazily per-request — admin token minting
+	// is rare and this avoids a cold module-load order dependency.
+	if (tenant !== undefined) {
+		const tenantConfig = loadTenantConfig();
+		if (!tenantConfig.hasTenant(tenant)) {
+			return c.json({ error: "unknown_tenant", code: "INVALID_INPUT" }, 400 as ContentfulStatusCode);
+		}
+	}
+
 	const secret = process.env.AUTH_SECRET ?? "";
 
 	const token = await signToken({ sub, tenant, expiresIn, secret });

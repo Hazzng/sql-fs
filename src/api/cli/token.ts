@@ -25,15 +25,23 @@ function parseArgs(argv: string[]): CliArgs {
 	let tenant: string | undefined;
 	let expires: string | undefined;
 
+	const readValue = (flag: string, index: number): string => {
+		const next = argv[index + 1];
+		if (next === undefined || next.startsWith("--")) {
+			throw Object.assign(new Error(`Missing value for ${flag}`), { code: "EINVAL" });
+		}
+		return next;
+	};
+
 	for (let i = 0; i < argv.length; i++) {
-		if (argv[i] === "--sub" && i + 1 < argv.length) {
-			sub = argv[i + 1];
+		if (argv[i] === "--sub") {
+			sub = readValue("--sub", i);
 			i++;
-		} else if (argv[i] === "--tenant" && i + 1 < argv.length) {
-			tenant = argv[i + 1];
+		} else if (argv[i] === "--tenant") {
+			tenant = readValue("--tenant", i);
 			i++;
-		} else if (argv[i] === "--expires" && i + 1 < argv.length) {
-			expires = argv[i + 1];
+		} else if (argv[i] === "--expires") {
+			expires = readValue("--expires", i);
 			i++;
 		}
 	}

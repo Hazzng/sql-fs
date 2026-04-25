@@ -18,10 +18,18 @@ describe("POST /v1/admin/tokens", () => {
 	const originalAuthSecret = process.env.AUTH_SECRET;
 	const originalAdminSecret = process.env.ADMIN_SECRET;
 	const originalDatabaseUrl = process.env.DATABASE_URL;
+	const originalTenantDatabases = process.env.TENANT_DATABASES;
 
 	beforeEach(() => {
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		process.env.ADMIN_SECRET = ADMIN_SECRET;
+		// The admin route now validates tenant against the configured tenants;
+		// register both `default` and `tenant-a` so the existing test covering
+		// tenant claim forwarding can mint a token.
+		process.env.TENANT_DATABASES = JSON.stringify({
+			default: "postgres://test@localhost:5432/test_default",
+			"tenant-a": "postgres://test@localhost:5432/test_tenant_a",
+		});
 		// The server wires the legacy lazy authMiddleware, which resolves a
 		// TenantConfig from env on first request. DATABASE_URL makes that
 		// resolve to the single-tenant "default" fallback.
@@ -31,7 +39,16 @@ describe("POST /v1/admin/tokens", () => {
 	afterEach(() => {
 		process.env.AUTH_SECRET = originalAuthSecret ?? "";
 		process.env.ADMIN_SECRET = originalAdminSecret ?? "";
-		process.env.DATABASE_URL = originalDatabaseUrl ?? "";
+		if (originalDatabaseUrl === undefined) {
+			Reflect.deleteProperty(process.env, "DATABASE_URL");
+		} else {
+			process.env.DATABASE_URL = originalDatabaseUrl;
+		}
+		if (originalTenantDatabases === undefined) {
+			Reflect.deleteProperty(process.env, "TENANT_DATABASES");
+		} else {
+			process.env.TENANT_DATABASES = originalTenantDatabases;
+		}
 	});
 
 	it("creates token via endpoint, decode verifies sub matches", async () => {

@@ -111,12 +111,16 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async readSandboxOwner(sandboxId: string): Promise<string | null> {
-		const sql = this.pool;
-		if (sql === null) throw new Error("readSandboxOwner: dialect not connected");
-		const rows = await sql<{ owner: string | null }[]>`
-			SELECT owner FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		return rows[0]?.owner ?? null;
+		try {
+			return await this.transaction(async (tx) => {
+				const rows = await tx<{ owner: string | null }[]>`
+					SELECT owner FROM sandboxes WHERE id = ${sandboxId}
+				`;
+				return rows[0]?.owner ?? null;
+			});
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
 	}
 
 	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */

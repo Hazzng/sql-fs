@@ -111,7 +111,7 @@ class StubCoherentFs {
 	}
 }
 
-function makeFsFactory(instance: StubCoherentFs): (_backend: string, _sandboxId: string) => Promise<IFileSystem> {
+function makeFsFactory(instance: StubCoherentFs): (_tenantId: string, _sandboxId: string) => Promise<IFileSystem> {
 	return vi.fn(async () => instance as unknown as IFileSystem);
 }
 

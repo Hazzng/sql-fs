@@ -2,12 +2,14 @@
  * Session Manager — US-074
  * Maintains a pool of warm Bash sessions, keyed by (tenantId, sandboxId).
  *
- * Multi-tenant Phase 2: each tenant maps to its own Postgres database via
+ * Multi-tenant: each tenant maps to its own Postgres database via
  * `TenantConfig`. Postgres backends (connection string + optional blob cache)
  * are lazily constructed per tenant; the session map is keyed by
  * `${tenantId}:${sandboxId}` so two tenants with colliding sandbox ids stay
- * isolated. Redis keys are NOT yet tenant-prefixed in this phase — Phase 3
- * threads the tenant id through the four Redis keyspaces.
+ * isolated. Redis keys are tenant-prefixed (`vfs:${tenantId}:...`) — the
+ * tenantId is propagated into snapshot operations and every Redis key generator
+ * (locks, version counters, path snapshots, blob cache) so cross-tenant key
+ * collisions are impossible.
  */
 
 import { Mutex } from "async-mutex";
@@ -241,8 +243,11 @@ export class SessionManager {
 		const existing = this.backends.get(tenantId);
 		if (existing !== undefined) return existing;
 		if (this.tenantConfig === undefined) {
-			throw new Error(
-				`SessionManager: tenantConfig required to resolve tenant "${tenantId}" (no createFs override configured)`,
+			throw Object.assign(
+				new Error(
+					`SessionManager: tenantConfig required to resolve tenant "${tenantId}" (no createFs override configured)`,
+				),
+				{ code: "EINVAL" as const },
 			);
 		}
 		const connectionString = this.tenantConfig.getConnectionString(tenantId);
@@ -261,7 +266,9 @@ export class SessionManager {
 		owner = "",
 	): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
 		if (this.createFsOverride !== undefined) {
-			return { fs: await this.createFsOverride(tenantId, sandboxId), resolvedOwner: "" };
+			// Override path (tests / non-Postgres backends) does not persist owner,
+			// so the caller-supplied owner is the resolved owner for this session.
+			return { fs: await this.createFsOverride(tenantId, sandboxId), resolvedOwner: owner };
 		}
 		const backend = this.getOrInitBackend(tenantId);
 		return createPostgresSandboxFs(

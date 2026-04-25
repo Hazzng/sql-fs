@@ -16,7 +16,9 @@ export function stubTenantConfig(ids: readonly string[] = ["default"]): TenantCo
 		tenantIds: [...ids],
 		hasTenant: (id) => set.has(id),
 		getConnectionString: (id) => {
-			if (!set.has(id)) throw new Error(`Unknown tenant: ${id}`);
+			if (!set.has(id)) {
+				throw Object.assign(new Error(`Unknown tenant: ${id}`), { code: "ENOENT" });
+			}
 			return `postgres://stub/${id}`;
 		},
 	};

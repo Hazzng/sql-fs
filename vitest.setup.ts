@@ -11,7 +11,10 @@
 
 process.env.AUTH_SECRET ??= "vitest-default-auth-secret-at-least-32-bytes!";
 
-if (process.env.TENANT_DATABASES === undefined && process.env.DATABASE_URL === undefined) {
+const hasTenantDatabases = typeof process.env.TENANT_DATABASES === "string" && process.env.TENANT_DATABASES.length > 0;
+const hasDatabaseUrl = typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.length > 0;
+
+if (!hasTenantDatabases && !hasDatabaseUrl) {
 	process.env.TENANT_DATABASES = JSON.stringify({
 		default: "postgres://test@localhost:5432/test_default",
 	});

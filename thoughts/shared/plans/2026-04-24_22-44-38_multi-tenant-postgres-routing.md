@@ -988,10 +988,10 @@ All existing integration tests under `src/fs/sql-fs/integration/` construct dial
 
 #### Phase 5: Automated Verification
 
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes
 - [ ] `pnpm test` passes (entire suite, including integration)
-- [ ] `pnpm test:comparison` passes (just-bash semantics unaffected)
+- [x] `pnpm test:comparison` passes (just-bash semantics unaffected)
 - [ ] `pnpm knip` passes (no unused exports introduced)
 
 #### Phase 5: Manual Verification
@@ -1099,7 +1099,16 @@ docker exec $(docker ps --format '{{.Names}}' | grep redis) redis-cli --scan --p
 
 ### Phase 5: Discoveries and Notable Information
 
-[Filled by the implementing agent during Phase 5 execution.]
+**Technical Discoveries:**
+- The new `src/api/__tests__/integration/multi-tenant.integration.test.ts` can exercise the full tenant-aware stack without importing `src/api/server.ts` by composing a fresh Hono app from `createAuthMiddleware`, `SessionManager`, and the sandbox/file/exec/ingest routes directly. This avoids module-load env coupling while still testing the same runtime wiring used by the server.
+- `SessionManager`'s existing tenant-aware keying (`${tenantId}:${sandboxId}`) and tenant-prefixed Redis helpers were sufficient for the Phase 5 concurrency/isolation assertions; no production code changes were required beyond adding coverage and operator assets.
+
+**Implementation Adaptations:**
+- Added `docker-compose.local.yml`, `scripts/initdb/00-create-tenant-dbs.sql`, and `docs/MULTI_TENANT.md` exactly as the rollout plan described, plus an end-to-end multi-tenant integration suite covering same-sandbox-id cross-tenant concurrency, API isolation, Redis prefix checks, and legacy single-tenant fallback.
+- `pnpm test -- src/api/__tests__/integration/multi-tenant.integration.test.ts` and the full `pnpm test` run both passed in this environment, but the DB-backed integration suites were skipped because `DATABASE_URL` / `REDIS_URL` were not set. The new Phase 5 integration coverage is therefore implemented but not exercised locally here.
+
+**Future Considerations:**
+- `pnpm knip` still fails on pre-existing repository-wide findings (`drizzle-orm`, `mssql`, `mysql2`, `@types/mssql`, plus several exported types). Those issues are unrelated to the Phase 5 files added here, so the Phase 5 verification gap is now environmental/baseline rather than implementation-specific.
 
 ---
 

@@ -59,8 +59,10 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
 			};
-			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions);
-			session.owner = owner;
+			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+			// In-memory/test backends (createFs override) do not persist owner —
+			// stamp it here so subsequent ownership checks match the caller.
+			if (!session.owner) session.owner = owner;
 			return {
 				content: [
 					{
