@@ -5,3 +5,5 @@ dist/
 !.env.example
 *.tsbuildinfo
 scripts/ralph/archive/
+docs/
+docker-compose.local.yml
