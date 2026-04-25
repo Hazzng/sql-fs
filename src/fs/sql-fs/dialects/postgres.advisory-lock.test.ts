@@ -31,6 +31,11 @@ function makeFakeTx(): { tx: postgres.TransactionSql; calls: RecordedCall[] } {
 	return { tx: fn as unknown as postgres.TransactionSql, calls };
 }
 
+function makeRejectingTx(error: Error & { code?: string }): postgres.TransactionSql {
+	const fn = (): Promise<never> => Promise.reject(error);
+	return fn as unknown as postgres.TransactionSql;
+}
+
 describe("PostgresDialect.setSandboxContext — read-only, no advisory lock", () => {
 	it("issues only SET LOCAL app.sandbox_id and does NOT acquire the advisory lock", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
@@ -111,5 +116,43 @@ describe("PostgresDialect.deleteSandbox — advisory lock", () => {
 		const destroyLockSql = normalize(destroyPath.calls[0]!.sql);
 
 		expect(writeLockSql).toBe(destroyLockSql);
+	});
+});
+
+describe("PostgresDialect metadata helpers — SQL error translation", () => {
+	it("sandboxExists translates raw SQL errors", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const tx = makeRejectingTx(Object.assign(new Error("duplicate key"), { code: "23505" }));
+
+		await expect(dialect.sandboxExists(tx, "sandbox-meta")).rejects.toMatchObject({ code: "EEXIST" });
+	});
+
+	it("getSandboxMeta translates raw SQL errors", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const tx = makeRejectingTx(new Error("failed to connect: postgres://user:secret@db.example.com:5432/app"));
+
+		await expect(dialect.getSandboxMeta(tx, "sandbox-meta")).rejects.toMatchObject({
+			message: expect.stringContaining("[redacted]"),
+		});
+	});
+
+	it("updateSandboxMeta preserves ENOENT when no row was updated", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx } = makeFakeTx();
+
+		await expect(
+			dialect.updateSandboxMeta(tx, "sandbox-missing", { owner: null, python: false, javascript: false }),
+		).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("updateSandboxMeta translates raw SQL errors", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const tx = makeRejectingTx(new Error("permission denied on /var/lib/postgresql/data/base"));
+
+		await expect(
+			dialect.updateSandboxMeta(tx, "sandbox-meta", { owner: null, python: false, javascript: false }),
+		).rejects.toMatchObject({
+			message: expect.stringContaining("[redacted]"),
+		});
 	});
 });

@@ -13,6 +13,11 @@ import { decode, encode } from "@msgpack/msgpack";
 import type { Redis } from "ioredis";
 import type { PathCacheEntry } from "./types.js";
 
+/** Tenant-prefixed Redis key for the per-sandbox monotonic version counter. */
+export function versionKey(tenantId: string, sandboxId: string): string {
+	return `vfs:${tenantId}:ver:${sandboxId}`;
+}
+
 /**
  * Bump when the on-the-wire layout of `Snapshot` or `EncodedEntry` changes.
  * Old snapshots with a mismatched version are treated as a miss (Edge Case §8).

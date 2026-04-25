@@ -11,6 +11,7 @@
  * EISDIR         → 400  Bad Request
  * ENOTDIR        → 400  Bad Request
  * EPERM          → 403  Forbidden
+ * FORBIDDEN      → 403  Forbidden
  * ENOTEMPTY      → 409  Conflict
  * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
  * ELOOP          → 400  Bad Request (symlink loop)
@@ -31,6 +32,8 @@ export function mapFsErrorToStatus(err: Error): number {
 		case "ENOTDIR":
 			return 400;
 		case "EPERM":
+			return 403;
+		case "FORBIDDEN":
 			return 403;
 		case "ENOTEMPTY":
 			return 409;

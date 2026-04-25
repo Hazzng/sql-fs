@@ -338,7 +338,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(stub.dirty).toBe(false);
 	});
 
-	it("ensureFreshCache tolerates transient GET error without failing the turn", async () => {
+	it("ensureFreshCache reloads from PG on transient GET error without failing the turn", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
@@ -349,8 +349,8 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Warm the session.
 		await sm.withSession("default", "sbx", async () => {});
 
-		// First GET fails (stub; getOrCreate already succeeded, so no
-		// fallback-on-init interaction). The subsequent INCR for the mutation
+		// First GET fails — ensureFreshCache falls back to reload from PG
+		// so we don't serve stale data. The subsequent INCR for the mutation
 		// should still succeed and advance the counter.
 		const getSpy = vi.spyOn(redis, "get").mockRejectedValueOnce(new Error("ECONNRESET"));
 
@@ -362,8 +362,8 @@ describe("SessionManager version counter (Phase D)", () => {
 
 		getSpy.mockRestore();
 
-		// Reload was skipped (no throw, no reload count bump on best-effort GET failure).
-		expect(stub.reloadCount).toBe(0);
+		// Reload happened because version couldn't be checked.
+		expect(stub.reloadCount).toBe(1);
 		// INCR still ran at end-of-turn.
 		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 	});

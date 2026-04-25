@@ -14,10 +14,10 @@ import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type AuthVariables, createAuthMiddleware } from "../auth.js";
+import type { SandboxMeta } from "../../fs/sql-fs/types.js";
+import { type AuthVariables, authMiddleware } from "../auth.js";
 import { ingestRoutes } from "../routes/ingest.js";
 import { SessionManager } from "../session-manager.js";
-import { stubTenantConfig } from "./helpers/tenant.js";
 
 const AUTH_SECRET = "test-secret-for-ingest-tests-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -36,7 +36,7 @@ function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
 
 function makeTestApp(sessionManager: SessionManager) {
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
+	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", ingestRoutes(sessionManager));
 	return app;
 }
@@ -177,6 +177,45 @@ describe("POST /v1/sandboxes/:id/ingest", () => {
 		});
 
 		expect(res.status).toBe(404);
+	});
+
+	it("returns 403 when ingest-files hits a cold replica owned by another caller", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
+			session.owner = "agent-1";
+			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				python: false,
+				javascript: false,
+			});
+		});
+
+		const coldReplica = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const app = makeTestApp(coldReplica);
+		const token = await makeToken("agent-2");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: { "blocked.txt": Buffer.from("denied").toString("base64") },
+			}),
+		});
+
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "forbidden", code: "FORBIDDEN" });
 	});
 });
 

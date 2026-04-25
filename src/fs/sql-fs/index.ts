@@ -64,7 +64,8 @@ export async function createPostgresSandboxFs(
 	} catch (e) {
 		const sqlErr = e as { code?: string };
 		if (sqlErr.code !== "23505") throw e;
-		resolvedOwner = (await dialect.readSandboxOwner(sandboxId)) ?? "";
+		const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
+		resolvedOwner = meta?.owner ?? "";
 	}
 	const fs = new SqlFs({
 		dialect,

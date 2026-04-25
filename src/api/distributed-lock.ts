@@ -39,15 +39,7 @@ const DEFAULTS: DistributedLockOptions = {
 	acquireRetryMs: 50,
 };
 
-/**
- * Fails fast on configurations that would silently break the mutex invariants.
- *
- * `renewMs >= leaseMs` lets the Redis key expire before the first heartbeat
- * can extend it, so another replica can acquire the lock while this caller's
- * critical section is still running. Non-positive values either make Redis
- * reject the command (`SET PX 0`) or turn the heartbeat/retry timers into
- * tight spin loops.
- */
+/** Fails fast on configs that would break mutex invariants (e.g. renewMs >= leaseMs lets the lease expire before renewal). */
 function assertLockOptions(opts: DistributedLockOptions): void {
 	if (opts.leaseMs <= 0) {
 		throw new Error(`DistributedLockOptions.leaseMs must be > 0 (got ${opts.leaseMs})`);

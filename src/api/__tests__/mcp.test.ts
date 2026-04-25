@@ -13,6 +13,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
+import type { SandboxMeta } from "../../fs/sql-fs/types.js";
 import { createMcpServer } from "../mcp/server.js";
 import { registerTools } from "../mcp/tools.js";
 import { SessionManager } from "../session-manager.js";
@@ -39,6 +40,7 @@ describe("MCP tool — sandbox_create", () => {
 				return session;
 			},
 			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
+			persistSandboxMeta: async () => {},
 		};
 
 		const server = createMcpServer();
@@ -105,6 +107,18 @@ describe("MCP tool — sandbox_delete", () => {
 				return session;
 			},
 			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
+			withSessionOrRehydrate: async <T>(
+				_tenantId: string,
+				id: string,
+				fn: (session: Session) => Promise<T>,
+			): Promise<T> => {
+				const session = sessions.get(id);
+				if (session === undefined) {
+					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
+				}
+				return fn(session);
+			},
+			persistSandboxMeta: async () => {},
 			destroy: async (_tenantId: string, id: string): Promise<boolean> => {
 				if (!sessions.has(id)) {
 					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
@@ -146,6 +160,14 @@ describe("MCP tool — sandbox_delete", () => {
 		const mockSessionManager = {
 			getOrCreate: async (_tenantId: string, id: string): Promise<Session> => ({ id, owner: "" }) as unknown as Session,
 			getSession: (_tenantId: string, _id: string): Session | undefined => undefined,
+			withSessionOrRehydrate: async <T>(
+				_tenantId: string,
+				_id: string,
+				_fn: (session: Session) => Promise<T>,
+			): Promise<T> => {
+				throw Object.assign(new Error("ENOENT: sandbox not found"), { code: "ENOENT" });
+			},
+			persistSandboxMeta: async () => {},
 			destroy: async (_tenantId: string, _id: string): Promise<boolean> => {
 				throw Object.assign(new Error("ENOENT: sandbox not found"), { code: "ENOENT" });
 			},
@@ -168,6 +190,46 @@ describe("MCP tool — sandbox_delete", () => {
 		expect(typeof parsed.error).toBe("string");
 
 		await client.close();
+	});
+
+	it("rejects sandbox_delete on a cold replica when another owner created the sandbox", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		const serverA = createMcpServer();
+		registerTools(serverA, ownerManager, "user-a", "default");
+		const [clientTransportA, serverTransportA] = InMemoryTransport.createLinkedPair();
+		const clientA = new Client({ name: "test-a", version: "1.0.0" });
+		await serverA.connect(serverTransportA);
+		await clientA.connect(clientTransportA);
+		const createResult = await clientA.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+		await clientA.close();
+
+		const coldReplica = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const serverB = createMcpServer();
+		registerTools(serverB, coldReplica, "user-b", "default");
+		const [clientTransportB, serverTransportB] = InMemoryTransport.createLinkedPair();
+		const clientB = new Client({ name: "test-b", version: "1.0.0" });
+		await serverB.connect(serverTransportB);
+		await clientB.connect(clientTransportB);
+
+		const deleteResult = await clientB.callTool({ name: "sandbox_delete", arguments: { id: created.id } });
+		const parsed = JSON.parse((deleteResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+			ok: boolean;
+			error: string;
+		};
+		expect(parsed).toEqual({ ok: false, error: "forbidden" });
+
+		await clientB.close();
 	});
 });
 
@@ -265,6 +327,50 @@ describe("MCP tool — bash_exec", () => {
 		const parsed = JSON.parse(content[0]?.text ?? "") as { stdout: string; stderr: string; exitCode: number };
 		expect(parsed.stderr).toBe("forbidden");
 		expect(parsed.exitCode).toBe(1);
+
+		await clientB.close();
+	});
+
+	it("returns forbidden when a cold replica rehydrates a sandbox owned by another caller", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		const serverA = createMcpServer();
+		registerTools(serverA, ownerManager, "user-a", "default");
+		const [clientTransportA, serverTransportA] = InMemoryTransport.createLinkedPair();
+		const clientA = new Client({ name: "test-a", version: "1.0.0" });
+		await serverA.connect(serverTransportA);
+		await clientA.connect(clientTransportA);
+		const createResult = await clientA.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+		await clientA.close();
+
+		const coldReplica = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const serverB = createMcpServer();
+		registerTools(serverB, coldReplica, "user-b", "default");
+		const [clientTransportB, serverTransportB] = InMemoryTransport.createLinkedPair();
+		const clientB = new Client({ name: "test-b", version: "1.0.0" });
+		await serverB.connect(serverTransportB);
+		await clientB.connect(clientTransportB);
+
+		const execResult = await clientB.callTool({
+			name: "bash_exec",
+			arguments: { id: created.id, script: "echo hello" },
+		});
+		const parsed = JSON.parse((execResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+			stdout: string;
+			stderr: string;
+			exitCode: number;
+		};
+		expect(parsed).toEqual({ stdout: "", stderr: "forbidden", exitCode: 1 });
 
 		await clientB.close();
 	});

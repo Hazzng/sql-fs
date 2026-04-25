@@ -19,27 +19,16 @@ import type { ExecOptions, IFileSystem } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
-import type { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
+import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
-import type { PathCacheEntry } from "../fs/sql-fs/types.js";
+import type { PathCacheEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
-/**
- * Internal structural type: the subset of `SqlFs` the session manager touches
- * for Phase E snapshot writes. Declared here (rather than exported from sql-fs)
- * to keep the cross-module surface narrow.
- */
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
-/** Narrowing helper: returns the fs as a snapshot writer if the hook is present. */
 function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
 	return typeof (fs as Partial<SnapshotWriterFs>)._getPathCache === "function" ? (fs as SnapshotWriterFs) : undefined;
-}
-
-/** Redis key template for the per-sandbox monotonic version counter (Phase D). */
-function versionKey(tenantId: string, sandboxId: string): string {
-	return `vfs:${tenantId}:ver:${sandboxId}`;
 }
 
 /**
@@ -49,11 +38,6 @@ function versionKey(tenantId: string, sandboxId: string): string {
  */
 const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
 
-/**
- * Runtime guard + narrowing cast: returns the `IFileSystem` as an
- * `ICoherentFs` if it supports reload/wasDirty/clearDirty, otherwise
- * `undefined`. The memory backend does NOT implement the interface.
- */
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
 	if (
@@ -93,17 +77,9 @@ export interface Session {
 	state: "active" | "closing";
 	owner: string;
 	createdAt: string;
-	/** Estimated bytes consumed by pathCache: sum of (path.length + 100) per entry */
 	pathCacheBytes: number;
-	/** True when pathCacheBytes exceeds the configured budget — triggers eager eviction */
 	overBudget: boolean;
-	/** Set when destroy() is in progress — concurrent destroy calls await this for idempotency */
 	destroyPromise?: Promise<void>;
-	/**
-	 * Last-known sandbox version counter observed from Redis (Phase D).
-	 * 0 means "never synced" — treated as stale on first check so a fresh
-	 * replica reloads its cache before serving the first request.
-	 */
 	lastSeenVersion: number;
 }
 
@@ -116,44 +92,35 @@ interface PerTenantBackend {
 export interface SessionManagerOptions {
 	/**
 	 * Tenant configuration used to resolve a tenant id → Postgres connection
-	 * string. Required unless a `createFs` override is supplied (tests can
-	 * bypass the real backend by injecting their own filesystem factory).
+	 * string. Required unless a `createFs` override is supplied.
 	 */
 	readonly tenantConfig?: TenantConfig;
 	/** Override for createPostgresSandboxFs — used by tests and non-Postgres backends. */
 	readonly createFs?: (tenantId: string, sandboxId: string) => Promise<IFileSystem>;
 	/** Override for destroyPostgresSandbox — used for dependency injection in tests. */
 	readonly destroySandboxFn?: (tenantId: string, sandboxId: string) => Promise<void>;
-	/** Idle timeout in ms before a session is eligible for eviction (default: SESSION_IDLE_MS env var or 600000) */
 	readonly idleMs?: number;
-	/** Max pathCache bytes per session before it is marked over-budget (default: 50MB) */
 	readonly pathCacheMaxBytes?: number;
-	/** Max concurrent Python executions across all sessions (default: MAX_CONCURRENT_PYTHON env var or 5) */
 	readonly maxConcurrentPython?: number;
-	/** Max concurrent JavaScript (js-exec/node) executions across all sessions (default: MAX_CONCURRENT_JS env var or 5) */
 	readonly maxConcurrentJs?: number;
-	/**
-	 * Optional Redis client used to acquire a cross-replica distributed lock
-	 * around every exec/destroy. When undefined the manager runs in
-	 * single-replica mode (no distributed locking).
-	 */
 	readonly redis?: Redis;
-	/** Overrides for the distributed exec lock (lease/renew/acquire timeouts). */
 	readonly execLockOptions?: Partial<DistributedLockOptions>;
-	/**
-	 * Optional Redis path-snapshot cache (Phase E). When provided, the manager
-	 * writes a fresh snapshot after each version bump and deletes the snapshot
-	 * on sandbox destroy.
-	 */
 	readonly pathSnapshot?: RedisPathSnapshot;
-	/**
-	 * Factory constructing a per-tenant RedisBlobCache keyed by tenant id.
-	 * Called at most once per tenant on first access (lazy).
-	 */
+	/** Factory constructing a per-tenant RedisBlobCache. Called at most once per tenant on first access (lazy). */
 	readonly blobCacheFactory?: (tenantId: string) => RedisBlobCache | undefined;
+	/**
+	 * Reads sandbox metadata from the persistent store (Postgres) for the given
+	 * tenant. Returns null when the sandbox doesn't exist. Required for
+	 * withSessionOrRehydrate to restore owner + runtimeOptions on cold replicas.
+	 */
+	readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
+	/**
+	 * Persists sandbox metadata (owner, runtime flags) to the per-tenant store.
+	 * Called from `persistSandboxMeta` after sandbox creation.
+	 */
+	readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
 }
 
-/** Internal FIFO-semaphore state shared by the python and js throttles. */
 interface Semaphore {
 	readonly limit: number;
 	inFlight: number;
@@ -163,9 +130,7 @@ interface Semaphore {
 export class SessionManager {
 	/** Keyed by `${tenantId}:${sandboxId}` to isolate colliding sandbox ids across tenants. */
 	private readonly sessions: Map<string, Session> = new Map();
-	/** Single-flight map: tracks in-progress session creation, keyed by `${tenantId}:${sandboxId}`. */
 	private readonly pending: Map<string, Promise<Session>> = new Map();
-	/** Lazy per-tenant backend (connection string + blob cache). Keyed by tenantId. */
 	private readonly backends: Map<string, PerTenantBackend> = new Map();
 	private readonly tenantConfig: TenantConfig | undefined;
 	private readonly createFsOverride: ((tenantId: string, sandboxId: string) => Promise<IFileSystem>) | undefined;
@@ -177,15 +142,10 @@ export class SessionManager {
 	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
+	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
+	private readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
 
-	// --- Runtime throttle semaphores (US-080a) ---
-	/** Python runtime semaphore — caps CPython WASM workers (~80MB each). */
 	private readonly pythonSem: Semaphore;
-	/**
-	 * JS runtime semaphore — caps QuickJS executions. Note: just-bash currently
-	 * serializes `js-exec` internally via a single global worker, so this cap is
-	 * an upper bound that may not be a binding constraint at runtime.
-	 */
 	private readonly jsSem: Semaphore;
 
 	constructor({
@@ -200,14 +160,14 @@ export class SessionManager {
 		execLockOptions,
 		pathSnapshot,
 		blobCacheFactory,
+		getSandboxMetaFn,
+		persistSandboxMetaFn,
 	}: SessionManagerOptions) {
 		this.tenantConfig = tenantConfig;
 		this.createFsOverride = createFs;
 		this.destroySandboxFn =
 			destroySandboxFn ??
 			((tenantId, sandboxId) => {
-				// No tenantConfig means tests supplied a createFs override without a real
-				// Postgres backend — destroy is a no-op at the storage layer in that case.
 				if (this.tenantConfig === undefined) return Promise.resolve();
 				const backend = this.getOrInitBackend(tenantId);
 				return destroyPostgresSandbox(backend.connectionString, sandboxId);
@@ -218,6 +178,8 @@ export class SessionManager {
 		this.execLockOptions = execLockOptions;
 		this.pathSnapshot = pathSnapshot;
 		this.blobCacheFactory = blobCacheFactory;
+		this.getSandboxMetaFn = getSandboxMetaFn;
+		this.persistSandboxMetaFn = persistSandboxMetaFn;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -230,15 +192,10 @@ export class SessionManager {
 		};
 	}
 
-	/** Compose the internal session map key. */
 	private sessionKey(tenantId: string, sandboxId: string): string {
 		return `${tenantId}:${sandboxId}`;
 	}
 
-	/**
-	 * Lazily materialize the per-tenant backend on first use. Throws if the
-	 * tenant is unknown to the configured `TenantConfig`.
-	 */
 	private getOrInitBackend(tenantId: string): PerTenantBackend {
 		const existing = this.backends.get(tenantId);
 		if (existing !== undefined) return existing;
@@ -259,15 +216,12 @@ export class SessionManager {
 		return backend;
 	}
 
-	/** Construct the underlying filesystem for a new session. */
 	private async buildFs(
 		tenantId: string,
 		sandboxId: string,
 		owner = "",
 	): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
 		if (this.createFsOverride !== undefined) {
-			// Override path (tests / non-Postgres backends) does not persist owner,
-			// so the caller-supplied owner is the resolved owner for this session.
 			return { fs: await this.createFsOverride(tenantId, sandboxId), resolvedOwner: owner };
 		}
 		const backend = this.getOrInitBackend(tenantId);
@@ -284,7 +238,6 @@ export class SessionManager {
 		);
 	}
 
-	/** Estimate bytes used by the pathCache: path.length + 100 overhead per entry */
 	private estimatePathCacheBytes(fs: IFileSystem): number {
 		const paths = fs.getAllPaths();
 		let total = 0;
@@ -294,18 +247,6 @@ export class SessionManager {
 		return total;
 	}
 
-	/**
-	 * Returns an existing session or creates a new one.
-	 * Concurrent calls for the same (tenantId, sandboxId) pair are coalesced into a single
-	 * creation (single-flight).
-	 *
-	 * `runtimeOptions` are applied only on **cache miss** — the first caller "wins" the runtime flags.
-	 * Subsequent callers receive the warm session regardless of the flags they pass.
-	 *
-	 * @param tenantId - Tenant identifier from the JWT claim / config.
-	 * @param sandboxId - Sandbox id scoped within the tenant.
-	 * @param runtimeOptions - Optional runtime opt-ins; only honored on first creation.
-	 */
 	async getOrCreate(
 		tenantId: string,
 		sandboxId: string,
@@ -319,7 +260,6 @@ export class SessionManager {
 			return existing;
 		}
 
-		// If another getOrCreate is already creating this session, reuse its promise
 		const inProgress = this.pending.get(key);
 		if (inProgress !== undefined) {
 			return inProgress;
@@ -330,8 +270,6 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			try {
 				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
-				// just-bash treats `false` and `undefined` both as off, but the types distinguish them —
-				// `|| undefined` keeps types happy without changing behavior.
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
@@ -339,17 +277,12 @@ export class SessionManager {
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 
-				// Stamp the session's initial version from Redis so the first exec
-				// after `getOrCreate` does not trigger a spurious reload (the freshly
-				// loaded pathCache already reflects DB state at this moment).
 				let initialVersion = 0;
 				if (this.redis !== undefined) {
 					try {
 						const raw = await this.redis.get(versionKey(tenantId, sandboxId));
 						initialVersion = raw === null ? 0 : Number(raw) || 0;
 					} catch {
-						// Redis unavailable at bootstrap: treat as version 0. Subsequent
-						// ensureFreshCache will retry and reload if necessary.
 						initialVersion = 0;
 					}
 				}
@@ -380,32 +313,59 @@ export class SessionManager {
 		return creationPromise;
 	}
 
-	/**
-	 * Returns the session for the given (tenantId, sandboxId), or undefined if not found.
-	 */
 	getSession(tenantId: string, sandboxId: string): Session | undefined {
 		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
 	}
 
-	/**
-	 * Runs `fn` while holding the cross-replica distributed lock for `(tenantId, sandboxId)`.
-	 * No-op passthrough when no Redis client is configured (single-replica mode).
-	 */
 	private async withExecLock<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
 		if (this.redis === undefined) return fn();
 		return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
 	}
 
-	/**
-	 * Cross-replica cache coherence (Phase D):
-	 * Compares the session's `lastSeenVersion` against the shared Redis counter
-	 * and reloads the filesystem cache if another replica has mutated state
-	 * since this replica last ran. Also clears any stale dirty flag so
-	 * publishVersionIfDirty only fires on writes from the current turn.
-	 *
-	 * No-op when Redis is unset or when the underlying filesystem is not
-	 * coherence-aware (memory backend).
-	 */
+	/** Shared entry logic for all session wrappers. Must be called inside the distributed exec lock. */
+	private async withSessionEntry<T>(
+		tenantId: string,
+		sandboxId: string,
+		session: Session,
+		fn: (session: Session) => Promise<T>,
+	): Promise<T> {
+		if (session.state === "closing") {
+			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+		}
+
+		await this.ensureFreshCache(tenantId, sandboxId, session);
+
+		return session.mutex.runExclusive(async () => {
+			if (session.state === "closing") {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+			}
+			session.inFlight++;
+			session.lastUsed = Date.now();
+			try {
+				return await fn(session);
+			} finally {
+				const coherent = asCoherentFs(session.fs);
+				const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
+				try {
+					await this.publishVersionIfDirty(tenantId, sandboxId, session);
+				} catch (err) {
+					console.error(
+						JSON.stringify({
+							event: "publish_version_finally_error",
+							sandboxId,
+							error: (err as Error).message,
+						}),
+					);
+				}
+				session.inFlight--;
+				if (shouldRefreshPathBudget) {
+					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				}
+			}
+		});
+	}
+
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
@@ -416,35 +376,21 @@ export class SessionManager {
 			const raw = await this.redis.get(versionKey(tenantId, sandboxId));
 			current = raw === null ? 0 : Number(raw) || 0;
 		} catch (err) {
-			// Redis transiently unavailable — freshness check is a best-effort
-			// optimization. Skip the reload and let publishVersionIfDirty retry
-			// the INCR at end-of-turn. Preserve any outstanding dirty bit so a
-			// prior failed publish retries instead of being masked.
+			// Redis unavailable — can't determine whether the cache is fresh.
+			// Reload from Postgres so we don't serve stale data.
 			console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
+			await coherent.reload();
 			return;
 		}
 
 		if (session.lastSeenVersion !== current) {
 			await coherent.reload();
 			session.lastSeenVersion = current;
-			// reload() already resets the dirty flag internally, but calling it
-			// here too keeps the contract explicit and survives future edits
-			// to reload().
 			coherent.clearDirty();
 			return;
 		}
-		// Versions match — do NOT clear the dirty flag here. If a previous
-		// publishVersionIfDirty failed mid-turn (e.g., transient Redis error on
-		// INCR), the flag must survive into end-of-turn publish so the pending
-		// version bump retries rather than being silently dropped.
 	}
 
-	/**
-	 * If the fs recorded a mutation during this turn, bumps the Redis
-	 * version counter and updates `lastSeenVersion` so this replica does not
-	 * reload on its own INCR. Also (re)applies the TTL so stale sandboxes
-	 * age out of Redis after rollback.
-	 */
 	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
@@ -456,25 +402,14 @@ export class SessionManager {
 		try {
 			newVersion = Number(await this.redis.incr(key));
 		} catch (err) {
-			// Mutation is already committed to Postgres. A transient Redis INCR
-			// failure must NOT propagate up to the caller — the write succeeded.
-			// Leave the dirty bit set so the next turn's publish retries the
-			// bump. Other replicas will see stale caches until a subsequent
-			// successful INCR (acceptable degradation under Redis outage).
 			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
 			return;
 		}
-		// EXPIRE is best-effort; ignore failures (the counter is correct
-		// regardless and a stale key without TTL only wastes a few bytes).
 		try {
 			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);
 		} catch {
 			// swallow
 		}
-		// Phase E: persist the pathCache snapshot tagged with the new version so
-		// other replicas can cold-start without hitting the DB. Non-atomic with
-		// INCR — strict version-equality in the reader catches the window.
-		// `write` swallows Redis errors internally (fail open).
 		if (this.pathSnapshot !== undefined) {
 			const writer = asSnapshotWriter(coherent);
 			if (writer !== undefined) {
@@ -485,19 +420,6 @@ export class SessionManager {
 		coherent.clearDirty();
 	}
 
-	/**
-	 * Acquires the per-sandbox mutex, tracks inFlight, then calls fn(session).
-	 * Same-sandbox operations are serialized — later requests wait for earlier ones.
-	 *
-	 * When a Redis client is configured, a cross-replica distributed lock wraps
-	 * the local mutex so concurrent execs from different replicas also serialize.
-	 *
-	 * `runtimeOptions` are forwarded to `getOrCreate` — applied only on cache miss.
-	 * A warm session ignores subsequent runtimeOptions; the first caller's flags stick.
-	 *
-	 * @param tenantId - Tenant identifier.
-	 * @param sandboxId - Sandbox id scoped within the tenant.
-	 */
 	async withSession<T>(
 		tenantId: string,
 		sandboxId: string,
@@ -507,120 +429,79 @@ export class SessionManager {
 	): Promise<T> {
 		return this.withExecLock(tenantId, sandboxId, async () => {
 			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner);
-
-			// Fast-fail: session is being destroyed — don't queue in the mutex
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-
-			// Cross-replica cache check — done inside the exec lock but outside
-			// the session mutex so a reload cannot race with another turn on
-			// this replica; we already hold the distributed lock which serializes
-			// turns across replicas.
-			await this.ensureFreshCache(tenantId, sandboxId, session);
-
-			return session.mutex.runExclusive(async () => {
-				// Re-check inside mutex in case destroy was called between the check above and acquiring the lock
-				if (session.state === "closing") {
-					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-				}
-				session.inFlight++;
-				try {
-					return await fn(session);
-				} finally {
-					// Publish even when fn threw: each SqlFs mutation is already
-					// committed to Postgres before its dirty bit flips, so a
-					// partially-completed exec can leave the DB ahead of every
-					// peer's cache. Skipping the bump here would leave other
-					// replicas serving stale reads until this replica happens to
-					// run another successful turn.
-					try {
-						await this.publishVersionIfDirty(tenantId, sandboxId, session);
-					} catch (err) {
-						// Defensive: publishVersionIfDirty already swallows INCR
-						// errors internally, but never let a finally-block hide
-						// the primary error from fn.
-						console.error(
-							JSON.stringify({
-								event: "publish_version_finally_error",
-								sandboxId,
-								error: (err as Error).message,
-							}),
-						);
-					}
-					session.inFlight--;
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
-			});
+			return this.withSessionEntry(tenantId, sandboxId, session, fn);
 		});
 	}
 
-	/**
-	 * Like withSession, but throws ENOENT if the sandbox is not already in the pool.
-	 * Use this for operation routes that should NOT auto-create sandboxes.
-	 *
-	 * The cross-replica distributed lock is acquired before the pool check so a
-	 * sandbox that exists only on another replica can't slip past serialization.
-	 */
 	async withExistingSession<T>(tenantId: string, sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
 		return this.withExecLock(tenantId, sandboxId, async () => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
-
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-
-			await this.ensureFreshCache(tenantId, sandboxId, session);
-
-			return session.mutex.runExclusive(async () => {
-				if (session.state === "closing") {
-					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-				}
-				session.inFlight++;
-				session.lastUsed = Date.now();
-				try {
-					return await fn(session);
-				} finally {
-					// Publish even when fn threw — see comment in withSession.
-					try {
-						await this.publishVersionIfDirty(tenantId, sandboxId, session);
-					} catch (err) {
-						console.error(
-							JSON.stringify({
-								event: "publish_version_finally_error",
-								sandboxId,
-								error: (err as Error).message,
-							}),
-						);
-					}
-					session.inFlight--;
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
-			});
+			return this.withSessionEntry(tenantId, sandboxId, session, fn);
 		});
 	}
 
 	/**
-	 * Marks the session as closing, waits for any in-flight work to finish, then removes it
-	 * from the pool and destroys backend data. Concurrent calls are idempotent — destroySandbox
-	 * is called exactly once. Returns true if the session was in the pool, false otherwise.
-	 * Even when the session is not in the pool, destroySandbox is still called for DB cleanup.
-	 *
-	 * The cross-replica distributed lock is held for the full destroy flow so a
-	 * concurrent exec on another replica cannot interleave with the teardown.
+	 * Like withExistingSession, but falls back to Postgres to check if the sandbox
+	 * exists before throwing ENOENT. If the sandbox is in Postgres but not in the
+	 * pool (evicted by reaper, or created on another replica), rehydrates it via
+	 * getOrCreate. Falls back to withExistingSession behavior when getSandboxMetaFn
+	 * is undefined.
 	 */
+	async withSessionOrRehydrate<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		return this.withExecLock(tenantId, sandboxId, async () => {
+			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
+			if (session !== undefined && session.state !== "closing") {
+				return this.withSessionEntry(tenantId, sandboxId, session, fn);
+			}
+			return this.rehydrateAndExec(tenantId, sandboxId, fn, runtimeOptions);
+		});
+	}
+
+	private async rehydrateAndExec<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		let meta: SandboxMeta | null | undefined;
+		if (this.getSandboxMetaFn !== undefined) {
+			meta = await this.getSandboxMetaFn(tenantId, sandboxId);
+			if (meta === null) {
+				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			}
+		} else {
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+		}
+		const resolvedRuntime: RuntimeOptions = meta
+			? { python: meta.python, javascript: meta.javascript }
+			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
+		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
+		if (meta?.owner) {
+			session.owner = meta.owner;
+		}
+		return this.withSessionEntry(tenantId, sandboxId, session, fn);
+	}
+
+	async persistSandboxMeta(tenantId: string, sandboxId: string, meta: SandboxMeta): Promise<void> {
+		if (this.persistSandboxMetaFn !== undefined) {
+			await this.persistSandboxMetaFn(tenantId, sandboxId, meta);
+		}
+	}
+
 	async destroy(tenantId: string, sandboxId: string): Promise<boolean> {
 		return this.withExecLock(tenantId, sandboxId, async () => {
 			const key = this.sessionKey(tenantId, sandboxId);
 			const session = this.sessions.get(key);
 
 			if (session === undefined) {
-				// Session not in pool — still clean up backend data
 				await this.destroySandboxFn(tenantId, sandboxId);
 				await this.deleteVersionKey(tenantId, sandboxId);
 				if (this.pathSnapshot !== undefined) {
@@ -629,16 +510,13 @@ export class SessionManager {
 				return false;
 			}
 
-			// Idempotent: concurrent destroy calls share the same promise
 			if (session.destroyPromise !== undefined) {
 				await session.destroyPromise;
 				return true;
 			}
 
-			// Mark closing immediately — new withSession calls fail fast without queuing
 			session.state = "closing";
 
-			// Queue cleanup after any currently-running mutex holder finishes
 			const p = session.mutex.runExclusive(async () => {
 				this.sessions.delete(key);
 				await this.destroySandboxFn(tenantId, sandboxId);
@@ -654,12 +532,6 @@ export class SessionManager {
 		});
 	}
 
-	/**
-	 * Deletes the Redis version counter for a sandbox. Called after successful
-	 * destroy so a re-created sandbox with the same id starts at version 0.
-	 * Best-effort: Redis errors are swallowed (the key will eventually age out
-	 * via its TTL).
-	 */
 	private async deleteVersionKey(tenantId: string, sandboxId: string): Promise<void> {
 		if (this.redis === undefined) return;
 		try {
@@ -669,19 +541,11 @@ export class SessionManager {
 		}
 	}
 
-	/**
-	 * Starts the background idle-eviction reaper.
-	 * Checks all sessions every intervalMs and evicts those idle longer than idleMs.
-	 * Eviction drops in-memory state only — does NOT call destroySandbox.
-	 */
 	startReaper(intervalMs = 60_000): void {
 		if (this.reaperTimer !== undefined) return;
 		this.reaperTimer = setInterval(() => this.runReaper(), intervalMs);
 	}
 
-	/**
-	 * Stops the background reaper.
-	 */
 	stopReaper(): void {
 		if (this.reaperTimer !== undefined) {
 			clearInterval(this.reaperTimer);
@@ -694,17 +558,12 @@ export class SessionManager {
 		for (const [key, session] of this.sessions) {
 			if (session.state === "closing") continue;
 			if (session.inFlight !== 0) continue;
-			// Over-budget sessions are evicted immediately when idle (no idle timeout)
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
 				this.sessions.delete(key);
 			}
 		}
 	}
 
-	/**
-	 * Acquires a semaphore slot, waiting if the concurrency cap is reached.
-	 * Paired with release() in a try/finally.
-	 */
 	private acquireSlot(sem: Semaphore): Promise<void> {
 		if (sem.inFlight < sem.limit) {
 			sem.inFlight++;
@@ -715,11 +574,6 @@ export class SessionManager {
 		});
 	}
 
-	/**
-	 * Releases a semaphore slot. If a waiter is queued, the slot is transferred directly
-	 * (no decrement-then-increment) to avoid a counter race between a releaser and a
-	 * concurrent acquirer running in the same microtask turn.
-	 */
 	private releaseSlot(sem: Semaphore): void {
 		const next = sem.waiters.shift();
 		if (next !== undefined) {
@@ -729,14 +583,6 @@ export class SessionManager {
 		sem.inFlight--;
 	}
 
-	/**
-	 * Executes a script through the session's Bash. When the script looks like it invokes
-	 * Python or JS and the session opted into the corresponding runtime, routes through
-	 * the matching global semaphore(s) to cap concurrent WASM workers.
-	 *
-	 * When a script uses both runtimes, semaphores are acquired in a fixed order (python
-	 * first, then js) to avoid deadlock across concurrent callers needing both slots.
-	 */
 	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
 		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
@@ -745,13 +591,11 @@ export class SessionManager {
 			return session.bash.exec(script, opts);
 		}
 
-		// Acquire in a fixed order: python → js. Release in reverse.
 		if (usesPython) await this.acquireSlot(this.pythonSem);
 		if (usesJs) {
 			try {
 				await this.acquireSlot(this.jsSem);
 			} catch (e) {
-				// acquireSlot never rejects today, but if it ever does we still need to release python
 				if (usesPython) this.releaseSlot(this.pythonSem);
 				throw e;
 			}

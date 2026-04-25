@@ -15,6 +15,7 @@ import type {
 	InodeKind,
 	InodeRow,
 	PathCacheEntry,
+	SandboxMeta,
 	SqlDialect,
 	UpdateInodeOpts,
 } from "../types.js";
@@ -110,16 +111,44 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
 	}
 
-	async readSandboxOwner(sandboxId: string): Promise<string | null> {
+	async sandboxExists(tx: PgTx, sandboxId: string): Promise<boolean> {
 		try {
-			return await this.transaction(async (tx) => {
-				const rows = await tx<{ owner: string | null }[]>`
-					SELECT owner FROM sandboxes WHERE id = ${sandboxId}
-				`;
-				return rows[0]?.owner ?? null;
-			});
+			const rows = await tx<{ exists: boolean }[]>`
+				SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
+			`;
+			return rows[0]?.exists ?? false;
 		} catch (err) {
 			throw translateSqlError(err, sandboxId);
+		}
+	}
+
+	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
+		try {
+			const rows = await tx<{ owner: string | null; python: boolean; javascript: boolean }[]>`
+				SELECT owner, python, javascript FROM sandboxes WHERE id = ${sandboxId}
+			`;
+			if (rows.length === 0) return null;
+			const r = rows[0]!;
+			return { owner: r.owner, python: r.python, javascript: r.javascript };
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
+	}
+
+	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
+		let rows: Array<{ id: string }>;
+		try {
+			rows = await tx<{ id: string }[]>`
+				UPDATE sandboxes
+				SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
+				WHERE id = ${sandboxId}
+				RETURNING id
+			`;
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
+		if (rows.length === 0) {
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 	}
 

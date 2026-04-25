@@ -10,10 +10,10 @@ import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type AuthVariables, createAuthMiddleware } from "../auth.js";
+import type { SandboxMeta } from "../../fs/sql-fs/types.js";
+import { type AuthVariables, authMiddleware } from "../auth.js";
 import { execRoutes } from "../routes/exec.js";
 import { SessionManager } from "../session-manager.js";
-import { stubTenantConfig } from "./helpers/tenant.js";
 
 const AUTH_SECRET = "test-secret-for-exec-tests-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -33,7 +33,7 @@ async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFil
 
 function makeTestApp(sessionManager: SessionManager) {
 	const app = new Hono<{ Variables: AuthVariables }>();
-	app.use("/v1/*", createAuthMiddleware(stubTenantConfig()));
+	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", execRoutes(sessionManager));
 	return app;
 }
@@ -227,5 +227,45 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
 
 		vi.restoreAllMocks();
+	});
+
+	it("rejects unauthorized cold-replica SSE requests before opening the stream", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
+			session.owner = "agent-1";
+			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				python: false,
+				javascript: false,
+			});
+		});
+
+		const coldReplica = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const app = makeTestApp(coldReplica);
+		const token = await makeToken("agent-2");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ script: "echo hello" }),
+		});
+
+		expect(res.status).toBe(403);
+		expect(res.headers.get("content-type")).not.toContain("text/event-stream");
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "forbidden", code: "FORBIDDEN" });
 	});
 });

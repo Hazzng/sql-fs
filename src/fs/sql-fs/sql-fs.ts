@@ -21,7 +21,7 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
-import type { RedisPathSnapshot } from "./redis-path-snapshot.js";
+import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
 import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
@@ -76,12 +76,7 @@ interface SqlFsOptions<Tx> {
 	 * together with `pathSnapshot` for snapshot-backed cold starts (Phase E).
 	 */
 	readonly redis?: Redis;
-	/**
-	 * Optional Redis path snapshot. When both `redis` and `pathSnapshot` are
-	 * provided, `#loadFreshPathCache` attempts a snapshot read before falling
-	 * back to `dialect.loadAllPaths`. Strict version equality against the
-	 * counter is required (Edge Case §3).
-	 */
+	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
 	readonly pathSnapshot?: RedisPathSnapshot;
 }
 
@@ -280,7 +275,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
-				const raw = await this.#redis.get(`vfs:${this.#tenantId}:ver:${this.#sandboxId}`);
+				const raw = await this.#redis.get(versionKey(this.#tenantId, this.#sandboxId));
 				const currentVersion = raw === null ? 0 : Number(raw) || 0;
 				const snap = await this.#pathSnapshot.read(this.#tenantId, this.#sandboxId);
 				if (snap === null) {

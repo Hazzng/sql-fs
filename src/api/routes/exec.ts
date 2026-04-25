@@ -9,6 +9,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -21,30 +22,13 @@ const execBodySchema = z.object({
 	timeoutMs: z.number().int().positive().optional(),
 });
 
-/** Returns 403 response if caller does not own the sandbox, undefined otherwise */
-function checkOwnership(
-	sessionManager: SessionManager,
-	tenantId: string,
-	sandboxId: string,
-	caller: string,
-): Response | undefined {
-	const session = sessionManager.getSession(tenantId, sandboxId);
-	if (session?.owner && session.owner !== caller) {
-		return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
-	}
-	return undefined;
-}
-
 export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// POST /v1/sandboxes/:id/exec-sync — buffered (non-streaming) bash execution
 	router.post("/:id/exec-sync", async (c) => {
-		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof execBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -68,41 +52,53 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		type ExecSyncResult = { kind: "ok"; stdout: string; stderr: string; exitCode: number } | { kind: "timeout" };
 
-		const execResult = await sessionManager.withExistingSession<ExecSyncResult>(tenant, sandboxId, async (session) => {
-			const controller = new AbortController();
-			let timedOut = false;
+		let execResult: ExecSyncResult;
+		try {
+			execResult = await withOwnedSessionOrRehydrate<ExecSyncResult>(
+				sessionManager,
+				tenant,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					const controller = new AbortController();
+					let timedOut = false;
 
-			const timer = setTimeout(() => {
-				timedOut = true;
-				controller.abort();
-			}, timeoutMs);
+					const timer = setTimeout(() => {
+						timedOut = true;
+						controller.abort();
+					}, timeoutMs);
 
-			try {
-				const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
-					signal: controller.signal,
-					cwd: body.cwd,
-					env,
-				});
-				clearTimeout(timer);
+					try {
+						const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
+							signal: controller.signal,
+							cwd: body.cwd,
+							env,
+						});
+						clearTimeout(timer);
 
-				if (timedOut) {
-					return { kind: "timeout" };
-				}
+						if (timedOut) {
+							return { kind: "timeout" };
+						}
 
-				return {
-					kind: "ok",
-					stdout: result.stdout,
-					stderr: result.stderr,
-					exitCode: result.exitCode,
-				};
-			} catch (e) {
-				clearTimeout(timer);
-				if (timedOut) {
-					return { kind: "timeout" };
-				}
-				throw e;
-			}
-		});
+						return {
+							kind: "ok",
+							stdout: result.stdout,
+							stderr: result.stderr,
+							exitCode: result.exitCode,
+						};
+					} catch (e) {
+						clearTimeout(timer);
+						if (timedOut) {
+							return { kind: "timeout" };
+						}
+						throw e;
+					}
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		if (execResult.kind === "timeout") {
 			return c.json({ error: "timeout", code: "EXEC_TIMEOUT" }, 408 as ContentfulStatusCode);
@@ -113,11 +109,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
 	router.post("/:id/exec", async (c) => {
-		const tenant = c.get("tenant");
 		const sandboxId = c.req.param("id");
-		const ownershipErr = checkOwnership(sessionManager, tenant, sandboxId, c.get("owner"));
-		if (ownershipErr) return ownershipErr;
-
+		const tenant = c.get("tenant");
 		let body: z.infer<typeof execBodySchema>;
 		try {
 			const raw = await c.req.json();
@@ -136,6 +129,12 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
+		try {
+			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
 
 		return streamSSE(c, async (stream) => {
 			const controller = new AbortController();

@@ -1,18 +1,17 @@
 /**
  * Hono HTTP server entry point.
  * US-056: Hono server bootstrap
- *
- * Multi-tenant Phase 2: the server loads `TenantConfig` at startup and passes
- * it both to the tenant-aware auth middleware and the `SessionManager` so every
- * request routes to the correct tenant's Postgres database.
  */
 
 import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
+import { translateSqlError } from "../fs/sql-fs/errors.js";
 import { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
+import type { SandboxMeta } from "../fs/sql-fs/types.js";
 import { getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
 import { type AuthVariables, createAuthMiddleware } from "./auth.js";
@@ -62,6 +61,71 @@ const blobCacheOptions = blobCacheEnabled
 		}
 	: undefined;
 
+// Per-tenant metadata dialects for session rehydration on cold replicas. Each
+// tenant gets a single long-lived dialect (connection-pooled internally).
+interface MetaBackend {
+	readonly dialect: PostgresDialect;
+	connected: boolean;
+	connectPromise?: Promise<void>;
+}
+const metaBackends: Map<string, MetaBackend> = new Map();
+
+function getOrInitMetaBackend(tenantId: string): MetaBackend {
+	const existing = metaBackends.get(tenantId);
+	if (existing !== undefined) return existing;
+	const url = tenantConfig.getConnectionString(tenantId);
+	const backend: MetaBackend = { dialect: new PostgresDialect(url), connected: false };
+	metaBackends.set(tenantId, backend);
+	return backend;
+}
+
+async function ensureMetaConnected(backend: MetaBackend): Promise<void> {
+	if (backend.connected) return;
+	if (backend.connectPromise !== undefined) {
+		await backend.connectPromise;
+		return;
+	}
+	backend.connectPromise = (async () => {
+		await backend.dialect.connect();
+		backend.connected = true;
+	})();
+	try {
+		await backend.connectPromise;
+	} finally {
+		backend.connectPromise = undefined;
+	}
+}
+
+async function getSandboxMetaFn(tenantId: string, sandboxId: string): Promise<SandboxMeta | null> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	try {
+		return await backend.dialect.transaction((tx) => backend.dialect.getSandboxMeta(tx, sandboxId));
+	} catch (err) {
+		throw translateSqlError(err, sandboxId);
+	}
+}
+
+async function persistSandboxMetaFn(tenantId: string, sandboxId: string, meta: SandboxMeta): Promise<void> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	try {
+		await backend.dialect.transaction((tx) => backend.dialect.updateSandboxMeta(tx, sandboxId, meta));
+	} catch (err) {
+		throw translateSqlError(err, sandboxId);
+	}
+}
+
+async function closeMetaFns(): Promise<void> {
+	for (const backend of metaBackends.values()) {
+		if (backend.connected) {
+			backend.connected = false;
+			await backend.dialect.disconnect();
+		}
+	}
+	metaBackends.clear();
+}
+
 const sessionManager = new SessionManager({
 	tenantConfig,
 	redis: redisClient,
@@ -71,6 +135,8 @@ const sessionManager = new SessionManager({
 		redisClient && blobCacheOptions
 			? (tenantId: string) => new RedisBlobCache(redisClient, tenantId, blobCacheOptions)
 			: undefined,
+	getSandboxMetaFn,
+	persistSandboxMetaFn,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
@@ -133,14 +199,13 @@ app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
 
-	// Sanitize error messages: only expose FS error codes/messages, not internal details
-	// FS errors have well-known codes; internal errors get a generic message
 	const knownFsCodes = [
 		"ENOENT",
 		"EEXIST",
 		"EISDIR",
 		"ENOTDIR",
 		"EPERM",
+		"FORBIDDEN",
 		"ENOTEMPTY",
 		"ESESSIONCLOSING",
 		"ELOOP",
@@ -163,13 +228,28 @@ if (isMain) {
 			if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
 				await runMigrations(tenantConfig);
 			}
-			const port = Number(process.env.PORT ?? "8080");
-			serve({ fetch: app.fetch, port }, () => {
-				console.log(JSON.stringify({ event: "server_start", port, tenantCount: tenantConfig.tenantIds.length }));
-			});
 		} catch (err) {
-			console.error(err);
+			console.error(JSON.stringify({ event: "startup_failed", error: (err as Error).message }));
 			process.exit(1);
 		}
+		const port = Number(process.env.PORT ?? "8080");
+		const server = serve({ fetch: app.fetch, port }, () => {
+			console.log(JSON.stringify({ event: "server_start", port, tenantCount: tenantConfig.tenantIds.length }));
+		});
+
+		let shuttingDown = false;
+		const shutdown = (): void => {
+			if (shuttingDown) return;
+			shuttingDown = true;
+			server.close(async () => {
+				try {
+					await closeMetaFns();
+				} finally {
+					process.exit(0);
+				}
+			});
+		};
+		process.once("SIGINT", shutdown);
+		process.once("SIGTERM", shutdown);
 	})();
 }
