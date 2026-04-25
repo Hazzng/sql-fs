@@ -60,10 +60,21 @@ const { closeMetaFns, ...sessionMetaFns } = (() => {
 	}
 	const metaDialect = new PostgresDialect(process.env.DATABASE_URL);
 	let connected = false;
+	let connectPromise: Promise<void> | undefined;
 	const ensureConnected = async (): Promise<void> => {
-		if (!connected) {
+		if (connected) return;
+		if (connectPromise) {
+			await connectPromise;
+			return;
+		}
+		connectPromise = (async () => {
 			await metaDialect.connect();
 			connected = true;
+		})();
+		try {
+			await connectPromise;
+		} finally {
+			connectPromise = undefined;
 		}
 	};
 	return {
