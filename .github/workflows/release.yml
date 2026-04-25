@@ -33,11 +33,17 @@ jobs:
             $0 ~ "^## \\["ver"\\]" { found=1; next }
             found && /^## \[/ { exit }
             found { print }
-          ' CHANGELOG.md | sed '/^$/d' | head -c 10000)
+          ' CHANGELOG.md | sed '/^$/d')
 
           if [ -z "$CONTENT" ] || [ "${CONTENT// /}" = "" ]; then
             echo "::error::No CHANGELOG entry found for version [$VERSION] in CHANGELOG.md"
             echo "::error::Please add a changelog entry with format: ## [$VERSION]"
+            exit 1
+          fi
+
+          BYTES=$(printf '%s' "$CONTENT" | wc -c)
+          if [ "$BYTES" -gt 10000 ]; then
+            echo "::error::CHANGELOG entry for [$VERSION] is $BYTES bytes; max 10000. Shorten the entry or raise the limit intentionally."
             exit 1
           fi
 
@@ -61,7 +67,6 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=v${{ steps.version.outputs.VERSION }}
-            type=raw,value=latest
 
       - uses: docker/build-push-action@v6
         with:

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-04-26
 
 ### Added
+
 - Initial release of `virtualfs-api`: persistent filesystem backend + HTTP/MCP API for `just-bash` sandboxes.
 - SQL-backed `IFileSystem` implementation (`SqlFs`) with Postgres, MySQL, and Azure SQL dialects.
 - Adjacency-list directory model with content-addressable blob storage and global dedup.
