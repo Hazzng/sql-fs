@@ -8,6 +8,7 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
+import { translateSqlError } from "../fs/sql-fs/errors.js";
 import type { StorageBackend } from "../fs/sql-fs/index.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import { getRedisClient } from "../redis/client.js";
@@ -51,8 +52,12 @@ const backend = (process.env.FS_BACKEND as StorageBackend | undefined) ?? "memor
 
 // Postgres metadata functions for session rehydration on cold replicas.
 // Uses a single long-lived dialect (connection-pooled internally by the postgres driver).
-const metaFns = (() => {
-	if (backend !== "postgres" || !process.env.DATABASE_URL) return {};
+const { closeMetaFns, ...sessionMetaFns } = (() => {
+	if (backend !== "postgres" || !process.env.DATABASE_URL) {
+		return {
+			closeMetaFns: async (): Promise<void> => {},
+		};
+	}
 	const metaDialect = new PostgresDialect(process.env.DATABASE_URL);
 	let connected = false;
 	const ensureConnected = async (): Promise<void> => {
@@ -64,11 +69,24 @@ const metaFns = (() => {
 	return {
 		getSandboxMetaFn: async (sandboxId: string) => {
 			await ensureConnected();
-			return metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
+			try {
+				return await metaDialect.transaction((tx) => metaDialect.getSandboxMeta(tx, sandboxId));
+			} catch (err) {
+				throw translateSqlError(err, sandboxId);
+			}
 		},
 		persistSandboxMetaFn: async (sandboxId: string, meta: import("../fs/sql-fs/types.js").SandboxMeta) => {
 			await ensureConnected();
-			await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
+			try {
+				await metaDialect.transaction((tx) => metaDialect.updateSandboxMeta(tx, sandboxId, meta));
+			} catch (err) {
+				throw translateSqlError(err, sandboxId);
+			}
+		},
+		closeMetaFns: async (): Promise<void> => {
+			if (!connected) return;
+			connected = false;
+			await metaDialect.disconnect();
 		},
 	};
 })();
@@ -78,7 +96,7 @@ const sessionManager = new SessionManager({
 	redis: redisClient,
 	execLockOptions,
 	pathSnapshot,
-	...metaFns,
+	...sessionMetaFns,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
@@ -167,7 +185,22 @@ const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process
 
 if (isMain) {
 	const port = Number(process.env.PORT ?? "8080");
-	serve({ fetch: app.fetch, port }, () => {
+	const server = serve({ fetch: app.fetch, port }, () => {
 		console.log(JSON.stringify({ event: "server_start", port }));
 	});
+
+	let shuttingDown = false;
+	const shutdown = (): void => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		server.close(async () => {
+			try {
+				await closeMetaFns();
+			} finally {
+				process.exit(0);
+			}
+		});
+	};
+	process.once("SIGINT", shutdown);
+	process.once("SIGTERM", shutdown);
 }

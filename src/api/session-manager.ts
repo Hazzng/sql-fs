@@ -316,7 +316,8 @@ export class SessionManager {
 			try {
 				return await fn(session);
 			} finally {
-				const wasDirty = asCoherentFs(session.fs)?.wasDirty() ?? false;
+				const coherent = asCoherentFs(session.fs);
+				const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
 				try {
 					await this.publishVersionIfDirty(sandboxId, session);
 				} catch (err) {
@@ -329,7 +330,7 @@ export class SessionManager {
 					);
 				}
 				session.inFlight--;
-				if (wasDirty) {
+				if (shouldRefreshPathBudget) {
 					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
 				}

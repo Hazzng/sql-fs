@@ -112,28 +112,41 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async sandboxExists(tx: PgTx, sandboxId: string): Promise<boolean> {
-		const rows = await tx<{ exists: boolean }[]>`
-			SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
-		`;
-		return rows[0]?.exists ?? false;
+		try {
+			const rows = await tx<{ exists: boolean }[]>`
+				SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
+			`;
+			return rows[0]?.exists ?? false;
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
 	}
 
 	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
-		const rows = await tx<{ owner: string | null; python: boolean; javascript: boolean }[]>`
-			SELECT owner, python, javascript FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		if (rows.length === 0) return null;
-		const r = rows[0]!;
-		return { owner: r.owner, python: r.python, javascript: r.javascript };
+		try {
+			const rows = await tx<{ owner: string | null; python: boolean; javascript: boolean }[]>`
+				SELECT owner, python, javascript FROM sandboxes WHERE id = ${sandboxId}
+			`;
+			if (rows.length === 0) return null;
+			const r = rows[0]!;
+			return { owner: r.owner, python: r.python, javascript: r.javascript };
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
 	}
 
 	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
-		const rows = await tx<{ id: string }[]>`
-			UPDATE sandboxes
-			SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
-			WHERE id = ${sandboxId}
-			RETURNING id
-		`;
+		let rows: Array<{ id: string }>;
+		try {
+			rows = await tx<{ id: string }[]>`
+				UPDATE sandboxes
+				SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
+				WHERE id = ${sandboxId}
+				RETURNING id
+			`;
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
 		if (rows.length === 0) {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
