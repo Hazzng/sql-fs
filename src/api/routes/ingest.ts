@@ -118,6 +118,21 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 			if (code === "ENOENT") {
 				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
 			}
+			// Defensive: in production every replica wires SqlFs (which has bulkIngest),
+			// so this branch is only reachable from a misconfigured backend. Translate
+			// to a sanitized 500 here rather than letting the raw ENOTSUP code leak
+			// through the global handler — `ENOTSUP` isn't part of the public error
+			// vocabulary and would surprise clients.
+			if (code === "ENOTSUP") {
+				console.error(
+					JSON.stringify({
+						event: "ingest_files_backend_unsupported",
+						sandboxId,
+						tenant,
+					}),
+				);
+				return c.json({ error: "Internal server error", code: "INTERNAL_ERROR" }, 500 as ContentfulStatusCode);
+			}
 			throw e;
 		}
 

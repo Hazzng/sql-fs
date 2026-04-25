@@ -229,6 +229,37 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(res.status).toBe(401);
 	});
 
+	it("returns sanitized 500 when fs backend lacks bulkIngest (no raw ENOTSUP leak)", async () => {
+		// Bare InMemoryFs — no bulkIngest shim attached. Simulates a misconfigured
+		// backend where the route's defensive guard fires.
+		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
+
+		// Suppress the expected structured error log so the test output stays clean.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: { "a.txt": Buffer.from("hello").toString("base64") },
+			}),
+		});
+
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "Internal server error", code: "INTERNAL_ERROR" });
+		// Verify we logged the diagnostic so this can be detected in production.
+		expect(errorSpy).toHaveBeenCalled();
+		const logged = errorSpy.mock.calls[0]?.[0];
+		expect(typeof logged).toBe("string");
+		expect(logged as string).toContain("ingest_files_backend_unsupported");
+		errorSpy.mockRestore();
+	});
+
 	it("returns 403 when ingest-files hits a cold replica owned by another caller", async () => {
 		const meta = new Map<string, SandboxMeta>();
 		const ownerManager = new SessionManager({
