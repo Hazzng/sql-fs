@@ -58,11 +58,13 @@ falls back to a full Postgres reload. In practice this is transparent — just r
 
 ### 504 / "stream timeout" on ingest
 
-The ACA gateway has a 240 s stream timeout. You hit this when:
-- Using `POST /ingest` (tar.gz) with >20 files
+The ACA gateway has a 240 s stream timeout. With the bulk-INSERT `/ingest-files`
+path this is rare — the dialect commits the whole batch in ~5 round-trips. You can
+still hit it when:
+- The HTTP request body itself is huge and slow to upload
 - Network to Neon (Postgres) is degraded
 
-Fix: switch to `POST /ingest-files` with batches of ≤25 files.
+Fix: split very large uploads into a couple of calls by directory; check Neon health.
 
 ### Token looks right but gets AUTH_INVALID
 

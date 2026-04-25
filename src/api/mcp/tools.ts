@@ -10,24 +10,14 @@
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
+import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
 import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
-
-/**
- * Validates that a relative path is safe (no traversal, no absolute paths, no null bytes).
- */
-function isValidRelativePath(p: string): boolean {
-	if (p.includes("\0")) return false;
-	if (p.startsWith("/")) return false;
-	const segments = p.split("/");
-	for (const seg of segments) {
-		if (seg === "..") return false;
-	}
-	return true;
-}
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
@@ -182,46 +172,95 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 
 	server.tool(
 		"fs_ingest",
-		"Upload files into sandbox (use before bash_exec to seed project files)",
+		[
+			"Upload one or more files into a sandbox in a single bulk database insert.",
+			"Use this before `bash_exec` to seed project files. This is the only ingest path",
+			"(the previous tar.gz route was removed). Internally the server commits the entire",
+			"batch with one multi-row INSERT — uploading 100+ files typically completes in",
+			"under a second.",
+			"",
+			"INPUT PREPARATION (important):",
+			"• Each value in `files` MUST be the file's bytes encoded as base64 — not raw text.",
+			'  For text files: `Buffer.from(textContent, "utf-8").toString("base64")`.',
+			"  For binary files: read the bytes and base64-encode them.",
+			"• Each key in `files` MUST be a relative path — no leading `/`, no `..` segments,",
+			"  no null bytes. The server joins it onto `basePath` to form the absolute path.",
+			"• `basePath` is the absolute root inside the sandbox (default `/home/user`).",
+			"  Missing parent directories under `basePath` are created automatically.",
+			"",
+			"Returns `{ ok: true, count: N }` on success. On failure returns `{ ok: false, error }`.",
+		].join("\n"),
 		{
-			id: z.string(),
-			basePath: z.string().optional(),
-			files: z.record(z.string(), z.string()),
+			id: z.string().describe("Sandbox id returned by sandbox_create."),
+			basePath: z
+				.string()
+				.optional()
+				.describe("Absolute root path inside the sandbox to anchor relative file keys. Default: /home/user"),
+			files: z
+				.record(z.string(), z.string())
+				.describe(
+					"Map of relativePath → base64-encoded file bytes. Keys are relative paths under basePath; values must be base64 (use Buffer.from(content).toString('base64')).",
+				),
 		},
 		async (args) => {
 			const basePath = args.basePath ?? "/home/user";
 
-			// Validate all relative paths before writing any files
-			for (const relativePath of Object.keys(args.files)) {
-				if (!isValidRelativePath(relativePath)) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({ ok: false, error: `invalid path: ${relativePath}` }),
-							},
-						],
-					};
+			// Reuse the same basePath guard the HTTP /ingest-files route uses
+			// so the two ingest surfaces share one contract. Inputs like
+			// "tmp", "./proj", "/home/user/../tmp" must not silently normalize
+			// to a different destination than the caller supplied.
+			if (!isValidBasePath(basePath)) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: "basePath must be a safe absolute path" }),
+						},
+					],
+				};
+			}
+
+			// Validate paths and base64 in one pass before any DB work.
+			// `Buffer.from(_, "base64")` silently decodes garbage to corrupt bytes,
+			// so we reject malformed values up front rather than persist them.
+			const bulkFiles: BulkIngestFile[] = [];
+			const invalidPaths: string[] = [];
+			const invalidBase64: string[] = [];
+			for (const [rel, b64] of Object.entries(args.files)) {
+				if (!isValidRelativePath(rel)) {
+					invalidPaths.push(rel);
+					continue;
 				}
+				if (!isValidBase64(b64)) {
+					invalidBase64.push(rel);
+					continue;
+				}
+				bulkFiles.push({
+					path: `${basePath}/${rel}`,
+					content: new Uint8Array(Buffer.from(b64, "base64")),
+					mode: 0o644,
+				});
+			}
+			if (invalidPaths.length > 0 || invalidBase64.length > 0) {
+				const parts: string[] = [];
+				if (invalidPaths.length > 0) parts.push(`invalid paths: ${invalidPaths.join(", ")}`);
+				if (invalidBase64.length > 0) parts.push(`invalid base64: ${invalidBase64.join(", ")}`);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: parts.join("; ") }) }],
+				};
 			}
 
 			try {
 				await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
-					for (const [relativePath, content] of Object.entries(args.files)) {
-						const absPath = `${basePath}/${relativePath}`;
-						const lastSlash = absPath.lastIndexOf("/");
-						const parentDir = absPath.slice(0, lastSlash);
-						if (parentDir) {
-							await session.fs.mkdir(parentDir, { recursive: true });
-						}
-						await session.fs.writeFile(absPath, content);
+					const fs = session.fs as ICoherentFs;
+					if (typeof fs.bulkIngest !== "function") {
+						throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
 					}
+					await fs.bulkIngest(bulkFiles);
 				});
 
 				return {
-					content: [
-						{ type: "text" as const, text: JSON.stringify({ ok: true, count: Object.keys(args.files).length }) },
-					],
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: true, count: bulkFiles.length }) }],
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
@@ -230,7 +269,28 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
 					};
 				}
-				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
+				if (code === "ENOENT") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+					};
+				}
+				// `ENOTSUP` here means the FS backend has no `bulkIngest` — only reachable
+				// from a misconfigured replica. Don't echo the internal "bulkIngest not
+				// supported by this fs backend" message back to the MCP client; log and
+				// return a generic internal error, mirroring the HTTP route.
+				if (code === "ENOTSUP") {
+					console.error(
+						JSON.stringify({
+							event: "fs_ingest_backend_unsupported",
+							sandboxId: args.id,
+							tenant,
+						}),
+					);
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
+					};
+				}
+				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};

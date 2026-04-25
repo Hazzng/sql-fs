@@ -1,20 +1,20 @@
 /**
  * Unit tests for ingest routes.
- * US-071: POST /v1/sandboxes/:id/ingest — tar.gz upload
  * US-072: POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
  * US-073: GET /v1/sandboxes/:id/export — tar.gz download
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { SandboxMeta } from "../../fs/sql-fs/types.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { BulkIngestFile, SandboxMeta } from "../../fs/sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../auth.js";
 import { ingestRoutes } from "../routes/ingest.js";
 import { SessionManager } from "../session-manager.js";
@@ -26,8 +26,33 @@ async function makeToken(sub = "agent-1"): Promise<string> {
 	return new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).sign(secretBytes);
 }
 
+/**
+ * Wraps `InMemoryFs` with a `bulkIngest` shim that the route layer expects on
+ * an `ICoherentFs`. The implementation just walks the file list with mkdir+writeFile
+ * — fast enough for unit tests, and behaviourally equivalent for the assertions
+ * we make (file readable, fileCount returned).
+ */
+function withBulkIngest(fs: IFileSystem): IFileSystem & Pick<ICoherentFs, "bulkIngest"> {
+	const bulkIngest = async (files: BulkIngestFile[]): Promise<void> => {
+		for (const f of files) {
+			const lastSlash = f.path.lastIndexOf("/");
+			const parentDir = lastSlash > 0 ? f.path.slice(0, lastSlash) : "/";
+			if (parentDir !== "/") {
+				try {
+					await fs.mkdir(parentDir, { recursive: true });
+				} catch (e) {
+					const code = (e as Error & { code?: string }).code;
+					if (code !== "EEXIST") throw e;
+				}
+			}
+			await fs.writeFile(f.path, f.content);
+		}
+	};
+	return Object.assign(fs, { bulkIngest }) satisfies IFileSystem & Pick<ICoherentFs, "bulkIngest">;
+}
+
 function makeTestEnv(): { sessionManager: SessionManager; fs: IFileSystem } {
-	const fs = new InMemoryFs();
+	const fs = withBulkIngest(new InMemoryFs());
 	const sessionManager = new SessionManager({
 		createFs: async () => fs,
 	});
@@ -41,183 +66,7 @@ function makeTestApp(sessionManager: SessionManager) {
 	return app;
 }
 
-/**
- * Creates a tar.gz archive on the host filesystem containing the given files,
- * and returns its contents as a Uint8Array.
- */
-function createTarGz(files: Record<string, string>): Uint8Array {
-	const tmpDir = path.join(os.tmpdir(), `ingest-test-${Date.now()}`);
-	mkdirSync(tmpDir, { recursive: true });
-	try {
-		for (const [name, content] of Object.entries(files)) {
-			writeFileSync(path.join(tmpDir, name), content, "utf-8");
-		}
-		const archivePath = path.join(tmpDir, "_archive.tar.gz");
-		const fileNames = Object.keys(files).join(" ");
-		execSync(`tar czf '${archivePath}' -C '${tmpDir}' ${fileNames}`);
-		const buf = readFileSync(archivePath);
-		return new Uint8Array(buf);
-	} finally {
-		rmSync(tmpDir, { recursive: true, force: true });
-	}
-}
-
 const SANDBOX_ID = "test-sandbox-ingest-abc";
-
-describe("POST /v1/sandboxes/:id/ingest", () => {
-	beforeEach(() => {
-		process.env.AUTH_SECRET = AUTH_SECRET;
-	});
-
-	afterEach(() => {
-		process.env.AUTH_SECRET = "";
-	});
-
-	it("ingest tar.gz of 3 files — files are readable in sandbox at basePath", async () => {
-		const { sessionManager } = makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
-
-		const files = {
-			"hello.txt": "hello world",
-			"foo.js": "console.log('foo');",
-			"bar.md": "# Bar\nSome content",
-		};
-		const archiveBytes = createTarGz(files);
-
-		const formData = new FormData();
-		formData.append("archive", new File([archiveBytes], "archive.tar.gz", { type: "application/gzip" }));
-		formData.append("basePath", "/home/user/project");
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}` },
-			body: formData,
-		});
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { status: string; basePath: string };
-		expect(body.status).toBe("ok");
-		expect(body.basePath).toBe("/home/user/project");
-
-		// Verify files are readable in the sandbox
-		const session = await sessionManager.getOrCreate("default", SANDBOX_ID);
-		for (const [name, expectedContent] of Object.entries(files)) {
-			const content = await session.fs.readFile(`/home/user/project/${name}`);
-			expect(content).toBe(expectedContent);
-		}
-	});
-
-	it("uses default basePath /home/user/project when not specified", async () => {
-		const { sessionManager } = makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
-
-		const archiveBytes = createTarGz({ "readme.txt": "hello" });
-		const formData = new FormData();
-		formData.append("archive", new File([archiveBytes], "archive.tar.gz", { type: "application/gzip" }));
-		// No basePath field
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}` },
-			body: formData,
-		});
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { status: string; basePath: string };
-		expect(body.basePath).toBe("/home/user/project");
-	});
-
-	it("missing archive field returns 400", async () => {
-		const { sessionManager } = makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-
-		const formData = new FormData();
-		formData.append("basePath", "/home/user/project");
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}` },
-			body: formData,
-		});
-
-		expect(res.status).toBe(400);
-		const body = (await res.json()) as { code: string };
-		expect(body.code).toBe("INVALID_INPUT");
-	});
-
-	it("unauthenticated request returns 401", async () => {
-		const { sessionManager } = makeTestEnv();
-		const app = makeTestApp(sessionManager);
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest`, {
-			method: "POST",
-		});
-
-		expect(res.status).toBe(401);
-	});
-
-	it("returns 404 for non-existent sandbox", async () => {
-		const { sessionManager } = makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-
-		const archiveBytes = createTarGz({ "a.txt": "hello" });
-		const formData = new FormData();
-		formData.append("archive", new File([archiveBytes], "archive.tar.gz", { type: "application/gzip" }));
-
-		const res = await app.request("/v1/sandboxes/00000000-0000-0000-0000-000000000000/ingest", {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}` },
-			body: formData,
-		});
-
-		expect(res.status).toBe(404);
-	});
-
-	it("returns 403 when ingest-files hits a cold replica owned by another caller", async () => {
-		const meta = new Map<string, SandboxMeta>();
-		const ownerManager = new SessionManager({
-			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
-			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
-				meta.set(sandboxId, sandboxMeta);
-			},
-		});
-		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
-			session.owner = "agent-1";
-			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
-				owner: "agent-1",
-				python: false,
-				javascript: false,
-			});
-		});
-
-		const coldReplica = new SessionManager({
-			createFs: async () => new InMemoryFs(),
-			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
-		});
-		const app = makeTestApp(coldReplica);
-		const token = await makeToken("agent-2");
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-			body: JSON.stringify({
-				basePath: "/home/user/project",
-				files: { "blocked.txt": Buffer.from("denied").toString("base64") },
-			}),
-		});
-
-		expect(res.status).toBe(403);
-		const body = (await res.json()) as { error: string; code: string };
-		expect(body).toEqual({ error: "forbidden", code: "FORBIDDEN" });
-	});
-});
 
 describe("POST /v1/sandboxes/:id/ingest-files", () => {
 	beforeEach(() => {
@@ -257,6 +106,42 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(await session.fs.readFile("/home/user/project/sub/bar.md")).toBe("# Bar\nSome content");
 	});
 
+	it("invokes bulkIngest exactly once with decoded BulkIngestFile[] (no per-file loop regression)", async () => {
+		const fs = withBulkIngest(new InMemoryFs());
+		const spy = vi.spyOn(fs, "bulkIngest");
+		const sessionManager = new SessionManager({ createFs: async () => fs });
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
+
+		const files: Record<string, string> = {
+			"a.txt": Buffer.from("alpha").toString("base64"),
+			"sub/b.txt": Buffer.from("bravo").toString("base64"),
+		};
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ basePath: "/home/user/project", files }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(spy).toHaveBeenCalledOnce();
+
+		const arg = spy.mock.calls[0]?.[0] as BulkIngestFile[];
+		expect(arg).toHaveLength(2);
+
+		const a = arg.find((f) => f.path === "/home/user/project/a.txt");
+		expect(a).toBeDefined();
+		expect(new TextDecoder().decode(a!.content)).toBe("alpha");
+		expect(a!.mode).toBe(0o644);
+
+		const b = arg.find((f) => f.path === "/home/user/project/sub/b.txt");
+		expect(b).toBeDefined();
+		expect(new TextDecoder().decode(b!.content)).toBe("bravo");
+		expect(b!.mode).toBe(0o644);
+	});
+
 	it("missing basePath returns 400 validation error", async () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
@@ -289,6 +174,33 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(body.code).toBe("INVALID_INPUT");
 	});
 
+	it("returns 400 listing offending keys when any file value is not valid base64", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: {
+					"good.txt": Buffer.from("hello").toString("base64"),
+					"bad.txt": "not*valid*base64!!!",
+					"truncated.txt": "abc", // length not divisible by 4
+				},
+			}),
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string; details: string[] };
+		expect(body.code).toBe("INVALID_INPUT");
+		expect(body.details.some((d) => d.includes("invalid base64"))).toBe(true);
+		expect(body.details.some((d) => d.includes("bad.txt"))).toBe(true);
+		expect(body.details.some((d) => d.includes("truncated.txt"))).toBe(true);
+	});
+
 	it("returns 404 for non-existent sandbox", async () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
@@ -304,6 +216,87 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		});
 
 		expect(res.status).toBe(404);
+	});
+
+	it("unauthenticated request returns 401", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+		});
+
+		expect(res.status).toBe(401);
+	});
+
+	it("returns sanitized 500 when fs backend lacks bulkIngest (no raw ENOTSUP leak)", async () => {
+		// Bare InMemoryFs — no bulkIngest shim attached. Simulates a misconfigured
+		// backend where the route's defensive guard fires.
+		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		await sessionManager.getOrCreate("default", SANDBOX_ID);
+
+		// Suppress the expected structured error log so the test output stays clean.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: { "a.txt": Buffer.from("hello").toString("base64") },
+			}),
+		});
+
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "Internal server error", code: "INTERNAL_ERROR" });
+		// Verify we logged the diagnostic so this can be detected in production.
+		expect(errorSpy).toHaveBeenCalled();
+		const logged = errorSpy.mock.calls[0]?.[0];
+		expect(typeof logged).toBe("string");
+		expect(logged as string).toContain("ingest_files_backend_unsupported");
+		errorSpy.mockRestore();
+	});
+
+	it("returns 403 when ingest-files hits a cold replica owned by another caller", async () => {
+		const meta = new Map<string, SandboxMeta>();
+		const ownerManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+			persistSandboxMetaFn: async (_tenantId, sandboxId, sandboxMeta) => {
+				meta.set(sandboxId, sandboxMeta);
+			},
+		});
+		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
+			session.owner = "agent-1";
+			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				python: false,
+				javascript: false,
+			});
+		});
+
+		const coldReplica = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+			getSandboxMetaFn: async (_tenantId, sandboxId) => meta.get(sandboxId) ?? null,
+		});
+		const app = makeTestApp(coldReplica);
+		const token = await makeToken("agent-2");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({
+				basePath: "/home/user/project",
+				files: { "blocked.txt": Buffer.from("denied").toString("base64") },
+			}),
+		});
+
+		expect(res.status).toBe(403);
+		const body = (await res.json()) as { error: string; code: string };
+		expect(body).toEqual({ error: "forbidden", code: "FORBIDDEN" });
 	});
 });
 

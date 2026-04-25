@@ -14,7 +14,7 @@ set -euo pipefail
 BASE_URL="${BASE_URL:?BASE_URL env var required (e.g. https://your-app.azurecontainerapps.io)}"
 TOKEN="${TOKEN:?TOKEN env var required}"
 SRC_DIR="${SRC_DIR:?SRC_DIR env var required — path to local source directory}"
-MAX_FILES="${MAX_FILES:-25}"    # keep under ACA 240s timeout (~2s/file on Neon)
+MAX_FILES="${MAX_FILES:-200}"   # bulkIngest commits in ~5 round-trips regardless of count; cap is just to keep the demo bounded
 SANDBOX_BASE_PATH="/home/user/src"
 
 SB=""
@@ -83,7 +83,7 @@ echo "Payload size: $(echo -n "$PAYLOAD" | wc -c | tr -d ' ') bytes"
 echo ""
 
 # ── 3. Ingest ─────────────────────────────────────────────────────────────────
-echo "--- Ingesting files (this takes ~2s/file on Neon) ---"
+echo "--- Ingesting files (bulk multi-row INSERT — typically <1s) ---"
 INGEST_RESULT=$(echo "$PAYLOAD" | curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/ingest-files" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
