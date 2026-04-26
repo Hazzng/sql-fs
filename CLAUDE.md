@@ -247,6 +247,15 @@ tasks/
   IMPLEMENT.md                   ← 6-phase implementation plan
 ```
 
+## Changelog Requirement
+
+**Always update `CHANGELOG.md` before pushing any branch.** Rules:
+
+- **Never use `[Unreleased]`** — always use a concrete version number.
+- **Always auto-increment** from the current topmost version: patch bump (`0.1.0` → `0.1.1`) for fixes/chores/docs; minor bump (`0.1.x` → `0.2.0`) for new features; major bump for breaking changes.
+- Add a dated section header: `## [x.y.z] - YYYY-MM-DD` and one or more bullets under `Added` / `Changed` / `Fixed` / `Removed`.
+- The release pipeline reads the topmost versioned section to determine whether to cut a new GitHub Release — if the tag already exists it skips; a new version triggers a release automatically on merge to `main`.
+
 ## Implementation Guidance
 
 - Read `tasks/IMPLEMENT.md` for the phased implementation plan with verification steps.
