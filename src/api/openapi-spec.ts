@@ -54,6 +54,10 @@ const execBodySchema = {
 		cwd: { type: "string", example: "/home/user" },
 		env: { type: "object", additionalProperties: { type: "string" }, example: { MY_VAR: "value" } },
 		timeoutMs: { type: "integer", example: 30000, minimum: 1, maximum: 300000 },
+		debug: {
+			type: "boolean",
+			description: "When true, prepends 'set -x' for command-level tracing in stderr.",
+		},
 	},
 	required: ["script"],
 } as const;
@@ -504,8 +508,11 @@ export const openapiSpec = {
 										stdout: { type: "string" },
 										stderr: { type: "string" },
 										exitCode: { type: "integer" },
+										exitSignal: { type: "string", nullable: true },
+										timedOut: { type: "boolean" },
+										durationMs: { type: "integer" },
 									},
-									required: ["stdout", "stderr", "exitCode"],
+									required: ["stdout", "stderr", "exitCode", "exitSignal", "timedOut", "durationMs"],
 								},
 							},
 						},
@@ -524,7 +531,20 @@ export const openapiSpec = {
 					},
 					"408": {
 						description: "Execution timed out",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										error: { type: "string" },
+										code: { type: "string" },
+										timedOut: { type: "boolean" },
+										durationMs: { type: "integer" },
+									},
+									required: ["error", "code", "timedOut", "durationMs"],
+								},
+							},
+						},
 					},
 				},
 			},
