@@ -20,7 +20,12 @@ const execBodySchema = z.object({
 	cwd: z.string().optional(),
 	env: z.record(z.string(), z.string()).optional(),
 	timeoutMs: z.number().int().positive().optional(),
+	debug: z.boolean().optional(),
 });
+
+function wrapDebugScript(script: string): string {
+	return `set -x\n${script}`;
+}
 
 export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -46,11 +51,14 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const scriptToRun = body.debug ? wrapDebugScript(body.script) : body.script;
 
 		// Convert user-controlled env keys to null-prototype object to prevent prototype pollution
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
 
-		type ExecSyncResult = { kind: "ok"; stdout: string; stderr: string; exitCode: number } | { kind: "timeout" };
+		type ExecSyncResult =
+			| { kind: "ok"; stdout: string; stderr: string; exitCode: number; durationMs: number }
+			| { kind: "timeout"; durationMs: number };
 
 		let execResult: ExecSyncResult;
 		try {
@@ -62,6 +70,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
+					const startMs = Date.now();
 
 					const timer = setTimeout(() => {
 						timedOut = true;
@@ -69,7 +78,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					}, timeoutMs);
 
 					try {
-						const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
+						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 							signal: controller.signal,
 							cwd: body.cwd,
 							env,
@@ -77,7 +86,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 						clearTimeout(timer);
 
 						if (timedOut) {
-							return { kind: "timeout" };
+							return { kind: "timeout", durationMs: Date.now() - startMs };
 						}
 
 						return {
@@ -85,11 +94,12 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 							stdout: result.stdout,
 							stderr: result.stderr,
 							exitCode: result.exitCode,
+							durationMs: Date.now() - startMs,
 						};
 					} catch (e) {
 						clearTimeout(timer);
 						if (timedOut) {
-							return { kind: "timeout" };
+							return { kind: "timeout", durationMs: Date.now() - startMs };
 						}
 						throw e;
 					}
@@ -101,10 +111,25 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		if (execResult.kind === "timeout") {
-			return c.json({ error: "timeout", code: "EXEC_TIMEOUT" }, 408 as ContentfulStatusCode);
+			return c.json(
+				{
+					error: "timeout",
+					code: "EXEC_TIMEOUT",
+					timedOut: true,
+					durationMs: execResult.durationMs,
+				},
+				408 as ContentfulStatusCode,
+			);
 		}
 
-		return c.json({ stdout: execResult.stdout, stderr: execResult.stderr, exitCode: execResult.exitCode });
+		return c.json({
+			stdout: execResult.stdout,
+			stderr: execResult.stderr,
+			exitCode: execResult.exitCode,
+			exitSignal: null,
+			timedOut: false,
+			durationMs: execResult.durationMs,
+		});
 	});
 
 	// POST /v1/sandboxes/:id/exec — SSE streaming bash execution
@@ -128,6 +153,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const scriptToRun = body.debug ? wrapDebugScript(body.script) : body.script;
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
@@ -153,7 +179,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
 				try {
-					const result = await sessionManager.execWithRuntimeThrottle(session, body.script, {
+					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 						signal: controller.signal,
 						cwd: body.cwd,
 						env,
