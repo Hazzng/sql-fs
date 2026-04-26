@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-26
+
+### Fixed
+
+- `timeoutMs` query parameter now rejects values exceeding 300000 with a 400 error instead of silently capping.
+
+### Added
+
+- SSE streaming tests for `text/plain` content type and `timeoutMs` query parameter timeout enforcement.
+
 ## [0.2.0] - 2026-04-26
 
 ### Added

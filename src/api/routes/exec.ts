@@ -56,11 +56,15 @@ async function parseExecBody(c: Context): Promise<ParseResult> {
 		let timeoutMs: number | undefined;
 		if (rawTimeout !== undefined) {
 			const n = Number(rawTimeout);
-			if (!Number.isInteger(n) || n <= 0) {
+			if (!Number.isInteger(n) || n <= 0 || n > MAX_TIMEOUT_MS) {
 				return {
 					ok: false,
 					response: c.json(
-						{ error: "validation_error", code: "INVALID_INPUT", details: ["timeoutMs must be a positive integer"] },
+						{
+							error: "validation_error",
+							code: "INVALID_INPUT",
+							details: [`timeoutMs must be a positive integer <= ${MAX_TIMEOUT_MS}`],
+						},
 						400 as ContentfulStatusCode,
 					),
 				};

@@ -186,6 +186,26 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		expect(body.code).toBe("INVALID_INPUT");
 	});
 
+	it("rejects timeoutMs exceeding maximum with plaintext body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync?timeoutMs=999999`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string; details: string[] };
+		expect(body.code).toBe("INVALID_INPUT");
+		expect(body.details[0]).toContain("300000");
+	});
+
 	it("rejects empty plaintext body", async () => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
@@ -366,6 +386,76 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
 		expect(exitEvent).toBeDefined();
 		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+	});
+
+	it("accepts text/plain content type for SSE streaming", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/plain",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+		const bodyText = await res.text();
+		const events = parseSseEvents(bodyText);
+
+		const stdoutEvent = events.find((e) => e.event === "stdout");
+		const exitEvent = events.find((e) => e.event === "exit");
+
+		expect(stdoutEvent).toBeDefined();
+		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
+		expect(exitEvent).toBeDefined();
+		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+	});
+
+	it("SSE streaming respects timeoutMs query param with plaintext body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const timeoutSandboxId = `${SANDBOX_ID}-sse-plaintext-timeout`;
+
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
+
+		vi.spyOn(session.bash, "exec").mockImplementation(
+			(_script, opts) =>
+				new Promise((_resolve, reject) => {
+					const handle = setTimeout(() => {}, 60_000);
+					opts?.signal?.addEventListener("abort", () => {
+						clearTimeout(handle);
+						reject(new DOMException("The operation was aborted", "AbortError"));
+					});
+				}),
+		);
+
+		const res = await app.request(`/v1/sandboxes/${timeoutSandboxId}/exec?timeoutMs=50`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "sleep 1000",
+		});
+
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+		const bodyText = await res.text();
+		const events = parseSseEvents(bodyText);
+
+		const exitEvent = events.find((e) => e.event === "exit");
+		expect(exitEvent).toBeDefined();
+		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
+		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
+
+		vi.restoreAllMocks();
 	});
 
 	it("timeout sends exit event with exitCode -1 and error='timeout'", async () => {
