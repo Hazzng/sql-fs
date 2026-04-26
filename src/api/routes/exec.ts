@@ -235,6 +235,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const totalTimeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
+		const disconnectController = new AbortController();
+		c.req.raw.signal.addEventListener("abort", () => disconnectController.abort(), { once: true });
+
 		let results: BatchScriptResult[];
 		try {
 			results = await withOwnedSessionOrRehydrate<BatchScriptResult[]>(
@@ -242,7 +245,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				tenant,
 				sandboxId,
 				c.get("owner"),
-				async (session) => executeBatch(sessionManager, session, body.scripts, totalTimeoutMs),
+				async (session) =>
+					executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();

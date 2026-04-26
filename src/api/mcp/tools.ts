@@ -177,7 +177,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			"Execute multiple bash scripts in a sandbox sequentially within a single request.",
 			"Collapses N round-trips into 1 — ideal for exploration (find, grep, cat).",
 			"Scripts share shell state and run in order. Each result includes stdout, stderr, exitCode.",
-			"A single timeoutMs budget covers all scripts; remaining scripts get error: 'timeout' if exceeded.",
+			"A single timeout (ms) budget covers all scripts; set `timeout` to override the default. Remaining scripts get error: 'timeout' if the budget is exceeded.",
 			"Max 50 scripts per batch.",
 		].join("\n"),
 		{
@@ -211,9 +211,16 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
 					};
 				}
-				const message = err instanceof Error ? err.message : String(err);
+				console.error(
+					JSON.stringify({
+						event: "bash_exec_batch_failed",
+						sandboxId: args.id,
+						tenant,
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
 				};
 			}
 		},

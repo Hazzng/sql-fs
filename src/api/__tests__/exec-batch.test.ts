@@ -55,6 +55,7 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 
 	afterEach(() => {
 		process.env.AUTH_SECRET = "";
+		vi.restoreAllMocks();
 	});
 
 	it("executes multiple scripts and returns results for each", async () => {
@@ -166,8 +167,6 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 		expect(body.results[0]!.exitCode).toBe(-1);
 		expect(body.results[1]!.error).toBe("timeout");
 		expect(body.results[1]!.exitCode).toBe(-1);
-
-		vi.restoreAllMocks();
 	});
 
 	it("rejects empty scripts array", async () => {

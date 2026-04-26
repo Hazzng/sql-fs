@@ -19,11 +19,14 @@ export async function executeBatch(
 	session: Session,
 	scripts: readonly BatchScriptEntry[],
 	totalTimeoutMs: number,
+	outerSignal?: AbortSignal,
 ): Promise<BatchScriptResult[]> {
 	const results: BatchScriptResult[] = [];
 	const batchStart = Date.now();
 
 	for (const entry of scripts) {
+		if (outerSignal?.aborted) break;
+
 		const remaining = totalTimeoutMs - (Date.now() - batchStart);
 
 		if (remaining <= 0) {
@@ -38,11 +41,15 @@ export async function executeBatch(
 			controller.abort();
 		}, remaining);
 
+		const abortFromOuter = () => controller.abort();
+		outerSignal?.addEventListener("abort", abortFromOuter, { once: true });
+
 		try {
 			const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
 				signal: controller.signal,
 			});
 			clearTimeout(timer);
+			outerSignal?.removeEventListener("abort", abortFromOuter);
 
 			if (timedOut) {
 				results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
@@ -56,6 +63,7 @@ export async function executeBatch(
 			}
 		} catch {
 			clearTimeout(timer);
+			outerSignal?.removeEventListener("abort", abortFromOuter);
 			if (timedOut) {
 				results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
 			} else {
