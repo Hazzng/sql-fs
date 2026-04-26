@@ -1,14 +1,14 @@
 {
-  "name": "insightfactory-ai-plugins",
-  "owner": {
-    "name": "Harry Nguyen",
-    "email": "Harry.Nguyen@insightfactory.ai"
-  },
-  "plugins": [
-    {
-      "name": "virtualfs-api",
-      "source": "./plugins/virtualfs",
-      "description": "Operator skill for the VirtualFS API — persistent bash sandbox service with SQL-backed filesystem"
-    }
-  ]
+	"name": "insightfactory-ai-plugins",
+	"owner": {
+		"name": "Harry Nguyen",
+		"email": "Harry.Nguyen@insightfactory.ai"
+	},
+	"plugins": [
+		{
+			"name": "virtualfs-api",
+			"source": "./plugins/virtualfs",
+			"description": "Operator skill for the VirtualFS API — persistent bash sandbox service with SQL-backed filesystem"
+		}
+	]
 }
