@@ -88,6 +88,163 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		expect(body.exitCode).toBe(1);
 	});
 
+	it("accepts text/x-shellscript content type with raw script body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number };
+		expect(body.stdout).toBe("hello\n");
+		expect(body.exitCode).toBe(0);
+	});
+
+	it("accepts text/plain content type with raw script body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/plain",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number };
+		expect(body.stdout).toBe("hello\n");
+		expect(body.exitCode).toBe(0);
+	});
+
+	it("accepts text/plain with charset parameter", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/plain; charset=utf-8",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; exitCode: number };
+		expect(body.stdout).toBe("hello\n");
+		expect(body.exitCode).toBe(0);
+	});
+
+	it("supports timeoutMs query param with plaintext body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync?timeoutMs=60000`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; exitCode: number };
+		expect(body.stdout).toBe("hello\n");
+	});
+
+	it("rejects invalid timeoutMs query param with plaintext body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync?timeoutMs=abc`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "echo hello",
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("INVALID_INPUT");
+	});
+
+	it("rejects empty plaintext body", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "",
+		});
+
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { code: string; details: string[] };
+		expect(body.code).toBe("INVALID_INPUT");
+		expect(body.details).toContain("Empty script body");
+	});
+
+	it("returns 415 for unsupported content type", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/xml",
+			},
+			body: "<script>echo hello</script>",
+		});
+
+		expect(res.status).toBe(415);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+	});
+
+	it("handles scripts with quotes and special characters via plaintext", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const script = `echo "hello 'world'" && echo $'line1\\nline2'`;
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: script,
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; exitCode: number };
+		expect(body.exitCode).toBe(0);
+	});
+
 	it("timeout returns 408", async () => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
@@ -167,6 +324,34 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify({ script: "echo hello" }),
+		});
+
+		expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+		const bodyText = await res.text();
+		const events = parseSseEvents(bodyText);
+
+		const stdoutEvent = events.find((e) => e.event === "stdout");
+		const exitEvent = events.find((e) => e.event === "exit");
+
+		expect(stdoutEvent).toBeDefined();
+		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
+		expect(exitEvent).toBeDefined();
+		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+	});
+
+	it("accepts text/x-shellscript content type for SSE streaming", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "text/x-shellscript",
+			},
+			body: "echo hello",
 		});
 
 		expect(res.headers.get("content-type")).toContain("text/event-stream");
