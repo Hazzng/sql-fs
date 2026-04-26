@@ -491,11 +491,29 @@ export const openapiSpec = {
 			post: {
 				tags: ["Exec"],
 				summary: "Execute script (buffered)",
-				description: "Run a bash script and return stdout/stderr/exitCode once complete.",
-				parameters: [sandboxIdParam],
+				description:
+					"Run a bash script and return stdout/stderr/exitCode once complete. Accepts JSON (`application/json`) with `{ script, cwd?, env?, timeoutMs? }`, or a raw script body with `text/plain` or `text/x-shellscript` (no JSON encoding needed). When using plaintext, `timeoutMs` can be set via query parameter.",
+				parameters: [
+					sandboxIdParam,
+					{
+						name: "timeoutMs",
+						in: "query",
+						required: false,
+						description: "Execution timeout in ms (only used with text/plain or text/x-shellscript content types)",
+						schema: { type: "integer", minimum: 1, maximum: 300000 },
+					},
+				],
 				requestBody: {
 					required: true,
-					content: { "application/json": { schema: execBodySchema } },
+					content: {
+						"application/json": { schema: execBodySchema },
+						"text/x-shellscript": {
+							schema: { type: "string", example: "find /home/user -type f | sort" },
+						},
+						"text/plain": {
+							schema: { type: "string", example: "echo hello" },
+						},
+					},
 				},
 				responses: {
 					"200": {
@@ -555,11 +573,28 @@ export const openapiSpec = {
 				tags: ["Exec"],
 				summary: "Execute script (streaming SSE)",
 				description:
-					"Run a bash script and stream output as Server-Sent Events. Events: `stdout` `{ t, data }`, `stderr` `{ t, data }`, `exit` `{ t, exitCode, durationMs, error? }`.",
-				parameters: [sandboxIdParam],
+					"Run a bash script and stream output as Server-Sent Events. Events: `stdout` `{ t, data }`, `stderr` `{ t, data }`, `exit` `{ t, exitCode, durationMs, error? }`. Accepts JSON (`application/json`) or raw script body (`text/plain`, `text/x-shellscript`).",
+				parameters: [
+					sandboxIdParam,
+					{
+						name: "timeoutMs",
+						in: "query",
+						required: false,
+						description: "Execution timeout in ms (only used with text/plain or text/x-shellscript content types)",
+						schema: { type: "integer", minimum: 1, maximum: 300000 },
+					},
+				],
 				requestBody: {
 					required: true,
-					content: { "application/json": { schema: execBodySchema } },
+					content: {
+						"application/json": { schema: execBodySchema },
+						"text/x-shellscript": {
+							schema: { type: "string", example: "find /home/user -type f | sort" },
+						},
+						"text/plain": {
+							schema: { type: "string", example: "echo hello" },
+						},
+					},
 				},
 				responses: {
 					"200": {
