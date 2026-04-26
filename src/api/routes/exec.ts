@@ -22,15 +22,10 @@ const execBodySchema = z.object({
 	script: z.string(),
 	cwd: z.string().optional(),
 	env: z.record(z.string(), z.string()).optional(),
-	timeoutMs: z.number().int().positive().optional(),
+	timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 });
 
-interface ExecBody {
-	script: string;
-	cwd?: string;
-	env?: Record<string, string>;
-	timeoutMs?: number;
-}
+type ExecBody = z.infer<typeof execBodySchema>;
 
 type ParseResult = { ok: true; body: ExecBody } | { ok: false; response: Response };
 
@@ -121,9 +116,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		if (!parsed.ok) return parsed.response;
 		const body = parsed.body;
 
-		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const timeoutMs = body.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-		// Convert user-controlled env keys to null-prototype object to prevent prototype pollution
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
 
 		type ExecSyncResult = { kind: "ok"; stdout: string; stderr: string; exitCode: number } | { kind: "timeout" };
@@ -191,7 +185,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		if (!parsed.ok) return parsed.response;
 		const body = parsed.body;
 
-		const timeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const timeoutMs = body.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);

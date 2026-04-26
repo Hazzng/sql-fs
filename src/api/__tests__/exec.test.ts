@@ -88,7 +88,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		expect(body.exitCode).toBe(1);
 	});
 
-	it("accepts text/x-shellscript content type with raw script body", async () => {
+	it.each(["text/x-shellscript", "text/plain"])("accepts %s content type with raw script body", async (ct) => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
@@ -97,27 +97,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${token}`,
-				"Content-Type": "text/x-shellscript",
-			},
-			body: "echo hello",
-		});
-
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number };
-		expect(body.stdout).toBe("hello\n");
-		expect(body.exitCode).toBe(0);
-	});
-
-	it("accepts text/plain content type with raw script body", async () => {
-		const { sessionManager } = await makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${token}`,
-				"Content-Type": "text/plain",
+				"Content-Type": ct,
 			},
 			body: "echo hello",
 		});
@@ -360,7 +340,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
 	});
 
-	it("accepts text/x-shellscript content type for SSE streaming", async () => {
+	it.each(["text/x-shellscript", "text/plain"])("accepts %s content type for SSE streaming", async (ct) => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
@@ -369,35 +349,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${token}`,
-				"Content-Type": "text/x-shellscript",
-			},
-			body: "echo hello",
-		});
-
-		expect(res.headers.get("content-type")).toContain("text/event-stream");
-
-		const bodyText = await res.text();
-		const events = parseSseEvents(bodyText);
-
-		const stdoutEvent = events.find((e) => e.event === "stdout");
-		const exitEvent = events.find((e) => e.event === "exit");
-
-		expect(stdoutEvent).toBeDefined();
-		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
-		expect(exitEvent).toBeDefined();
-		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
-	});
-
-	it("accepts text/plain content type for SSE streaming", async () => {
-		const { sessionManager } = await makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
-
-		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec`, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${token}`,
-				"Content-Type": "text/plain",
+				"Content-Type": ct,
 			},
 			body: "echo hello",
 		});
