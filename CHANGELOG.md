@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Migrated Claude Code skills from `commands/virtualfs-api.md` + `skills/virtualfs-api/` into the plugin layout under `.claude-plugin/` and `plugins/virtualfs/`.
+
 ## [0.1.0] - 2026-04-26
 
 ### Added

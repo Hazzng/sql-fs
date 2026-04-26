@@ -247,6 +247,10 @@ tasks/
   IMPLEMENT.md                   ← 6-phase implementation plan
 ```
 
+## Changelog Requirement
+
+**Always update `CHANGELOG.md` before pushing any branch.** Add a bullet under `## [Unreleased]` describing the change (Added / Changed / Fixed / Removed). The release pipeline reads CHANGELOG to determine whether to cut a new GitHub Release — omitting an entry means the change ships silently with no release notes.
+
 ## Implementation Guidance
 
 - Read `tasks/IMPLEMENT.md` for the phased implementation plan with verification steps.
