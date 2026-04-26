@@ -64,9 +64,19 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		});
 
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number };
+		const body = (await res.json()) as {
+			stdout: string;
+			stderr: string;
+			exitCode: number;
+			exitSignal: string | null;
+			timedOut: boolean;
+			durationMs: number;
+		};
 		expect(body.stdout).toBe("hello\n");
 		expect(body.exitCode).toBe(0);
+		expect(body.exitSignal).toBeNull();
+		expect(body.timedOut).toBe(false);
+		expect(body.durationMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it("false command returns exitCode 1", async () => {
@@ -84,8 +94,16 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		});
 
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number };
+		const body = (await res.json()) as {
+			exitCode: number;
+			exitSignal: string | null;
+			timedOut: boolean;
+			durationMs: number;
+		};
 		expect(body.exitCode).toBe(1);
+		expect(body.exitSignal).toBeNull();
+		expect(body.timedOut).toBe(false);
+		expect(body.durationMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it.each(["text/x-shellscript", "text/plain"])("accepts %s content type with raw script body", async (ct) => {
@@ -245,7 +263,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		expect(body.exitCode).toBe(0);
 	});
 
-	it("timeout returns 408", async () => {
+	it("timeout returns 408 with timedOut and durationMs", async () => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
@@ -279,10 +297,34 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		});
 
 		expect(res.status).toBe(408);
-		const body = (await res.json()) as { error: string; code: string };
+		const body = (await res.json()) as { error: string; code: string; timedOut: boolean; durationMs: number };
 		expect(body.code).toBe("EXEC_TIMEOUT");
+		expect(body.timedOut).toBe(true);
+		expect(body.durationMs).toBeGreaterThanOrEqual(0);
 
 		vi.restoreAllMocks();
+	});
+
+	it("debug mode prepends set -x and produces trace output in stderr", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ script: "echo hello", debug: true }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; stderr: string; exitCode: number; timedOut: boolean };
+		expect(body.stdout).toBe("hello\n");
+		expect(body.exitCode).toBe(0);
+		expect(body.timedOut).toBe(false);
+		expect(body.stderr).toContain("+ echo hello");
 	});
 });
 
