@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
+import { executeBatch } from "../lib/batch-exec.js";
 import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -191,59 +192,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
 			try {
-				const results = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
-					const batchResults: Array<{
-						id: string;
-						stdout: string;
-						stderr: string;
-						exitCode: number;
-						error?: string;
-					}> = [];
-					const batchStart = Date.now();
-
-					for (const entry of args.scripts) {
-						const elapsed = Date.now() - batchStart;
-						const remaining = totalTimeoutMs - elapsed;
-
-						if (remaining <= 0) {
-							batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							continue;
-						}
-
-						const controller = new AbortController();
-						let timedOut = false;
-						const timer = setTimeout(() => {
-							timedOut = true;
-							controller.abort();
-						}, remaining);
-
-						try {
-							const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
-								signal: controller.signal,
-							});
-							clearTimeout(timer);
-							if (timedOut) {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							} else {
-								batchResults.push({
-									id: entry.id,
-									stdout: execResult.stdout,
-									stderr: execResult.stderr,
-									exitCode: execResult.exitCode,
-								});
-							}
-						} catch {
-							clearTimeout(timer);
-							if (timedOut) {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							} else {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
-							}
-						}
-					}
-
-					return batchResults;
-				});
+				const results = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) =>
+					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs),
+				);
 
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ results }) }],

@@ -9,6 +9,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { type BatchScriptResult, executeBatch } from "../lib/batch-exec.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -35,14 +36,6 @@ const batchExecBodySchema = z.object({
 		.max(MAX_BATCH_SCRIPTS),
 	timeoutMs: z.number().int().positive().optional(),
 });
-
-interface BatchScriptResult {
-	readonly id: string;
-	readonly stdout: string;
-	readonly stderr: string;
-	readonly exitCode: number;
-	readonly error?: string;
-}
 
 export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -221,7 +214,6 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		});
 	});
 
-	// POST /v1/sandboxes/:id/exec-sync-batch — sequential batch execution in a single round-trip
 	router.post("/:id/exec-sync-batch", async (c) => {
 		const sandboxId = c.req.param("id");
 		const tenant = c.get("tenant");
@@ -250,54 +242,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				tenant,
 				sandboxId,
 				c.get("owner"),
-				async (session) => {
-					const batchResults: BatchScriptResult[] = [];
-					const batchStart = Date.now();
-
-					for (const entry of body.scripts) {
-						const elapsed = Date.now() - batchStart;
-						const remaining = totalTimeoutMs - elapsed;
-
-						if (remaining <= 0) {
-							batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							continue;
-						}
-
-						const controller = new AbortController();
-						let timedOut = false;
-						const timer = setTimeout(() => {
-							timedOut = true;
-							controller.abort();
-						}, remaining);
-
-						try {
-							const result = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
-								signal: controller.signal,
-							});
-							clearTimeout(timer);
-
-							if (timedOut) {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							} else {
-								batchResults.push({
-									id: entry.id,
-									stdout: result.stdout,
-									stderr: result.stderr,
-									exitCode: result.exitCode,
-								});
-							}
-						} catch {
-							clearTimeout(timer);
-							if (timedOut) {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
-							} else {
-								batchResults.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
-							}
-						}
-					}
-
-					return batchResults;
-				},
+				async (session) => executeBatch(sessionManager, session, body.scripts, totalTimeoutMs),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
