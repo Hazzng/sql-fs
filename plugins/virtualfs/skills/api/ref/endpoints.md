@@ -4,6 +4,50 @@ Live spec: `$BASE_URL/openapi.json` · Swagger UI: `$BASE_URL/docs`
 
 All routes require `Authorization: Bearer <JWT>` unless noted.
 
+> ## ⛔ Agent endpoint policy
+> Agents must interact with sandboxes **exclusively via the Exec endpoints**
+> (`POST /exec-sync` and `POST /exec`). Every route under "File Operations" below is
+> **banned** for agent use. Use exec equivalents (`cat`, `echo`, `mkdir -p`, `rm -rf`,
+> `find`, `tar`) instead. See `SKILL.md` for the translation table.
+>
+> Allowed non-exec routes: sandbox lifecycle (`POST/GET/DELETE /v1/sandboxes`),
+> `POST /ingest-files` (bulk bootstrap only), `POST /v1/auth/bootstrap`, `POST /v1/admin/*`.
+
+---
+
+## Auth
+
+### POST /v1/auth/bootstrap — Mint JWT from AUTH_SECRET (no Bearer required)
+
+Unauthenticated endpoint. Exchanges `AUTH_SECRET` (sent in `X-Auth-Secret`) for a signed JWT.
+Use this when a client only has `AUTH_SECRET` and no pre-existing token.
+
+```bash
+export TOKEN=$(curl -fsS -X POST "$BASE_URL/v1/auth/bootstrap" \
+  -H "X-Auth-Secret: $AUTH_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"sub":"admin","expiresIn":"30d"}' | jq -er '.token')
+```
+
+Request body:
+```json
+{
+  "sub":       "string (required) — token subject / owner identity",
+  "tenant":    "string (optional) — tenant id; must match [A-Za-z0-9_.-]+",
+  "expiresIn": "24h | 30d | 1y | never  (default: 30d)"
+}
+```
+
+Response `201`:
+```json
+{ "token": "<jwt>", "sub": "admin", "tenant": null, "expiresAt": "2026-05-26T..." }
+```
+
+Error responses:
+- `403 FORBIDDEN` — `X-Auth-Secret` missing or doesn't match server `AUTH_SECRET`
+- `500 AUTH_NOT_CONFIGURED` — server has no `AUTH_SECRET` env var set
+- `400 INVALID_INPUT` — body validation failed (missing `sub`, unknown tenant, invalid `expiresIn`)
+
 ---
 
 ## Admin
@@ -107,6 +151,10 @@ Permanently deletes the sandbox row, all inodes, dirents, and orphaned blobs.
 ---
 
 ## File Operations
+
+> ⛔ **Banned for agent use.** Documented for reference only. Agents must use
+> `exec-sync`/`exec` equivalents (see SKILL.md translation table). The routes below
+> remain on the server for non-agent operators (CI tooling, admin scripts).
 
 > **Path encoding note:** omit the leading `/` after `/files/` in the URL.
 > `/v1/sandboxes/$SB/files/home/user/hello.txt` — not `/home/user/hello.txt`.
@@ -319,6 +367,17 @@ The previous "≤25 files per batch" rule no longer applies — the dialect now 
 single bulk INSERT. Practical caps are HTTP body size and the 240 s ACA gateway window.
 
 ### GET /v1/sandboxes/:id/export — Download as tar.gz
+
+> ⛔ **Banned for agent use.** Use the exec equivalent: stream a tar archive via stdout
+> and decode it client-side.
+>
+> ```bash
+> curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+>   -H "Authorization: Bearer $TOKEN" \
+>   -H "Content-Type: application/json" \
+>   -d '{"script": "tar -czf - /home/user/project | base64"}' \
+>   | jq -r '.stdout' | base64 -d > export.tar.gz
+> ```
 
 ```bash
 curl -s "$BASE_URL/v1/sandboxes/$SB/export?basePath=/home/user/project" \
