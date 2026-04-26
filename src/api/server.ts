@@ -20,7 +20,7 @@ import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
-import { adminRoutes } from "./routes/admin.js";
+import { authRoutes } from "./routes/auth.js";
 import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
 import { ingestRoutes } from "./routes/ingest.js";
@@ -146,7 +146,7 @@ app.use("/v1/*", authMiddleware);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.route("/v1/admin", adminRoutes);
+app.route("/v1/auth", authRoutes());
 app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 app.route("/v1/sandboxes", fileRoutes(sessionManager));
 app.route("/v1/sandboxes", execRoutes(sessionManager));

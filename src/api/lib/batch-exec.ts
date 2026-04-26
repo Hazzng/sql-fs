@@ -66,6 +66,8 @@ export async function executeBatch(
 			outerSignal?.removeEventListener("abort", abortFromOuter);
 			if (timedOut) {
 				results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+			} else if (outerSignal?.aborted) {
+				break;
 			} else {
 				results.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
 			}

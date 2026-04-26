@@ -109,14 +109,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			id: z.string(),
 			script: z.string(),
 			timeout: z.number().int().positive().optional(),
+			debug: z.boolean().optional().describe("When true, prepends 'set -x' for command-level tracing in stderr"),
 		},
 		async (args) => {
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+			const scriptToRun = args.debug ? `set -x\n${args.script}` : args.script;
 
 			try {
 				const result = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
+					const startMs = Date.now();
 
 					const timer = setTimeout(() => {
 						timedOut = true;
@@ -124,18 +127,39 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					}, timeoutMs);
 
 					try {
-						const execResult = await sessionManager.execWithRuntimeThrottle(session, args.script, {
+						const execResult = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 							signal: controller.signal,
 						});
 						clearTimeout(timer);
 						if (timedOut) {
-							return { stdout: "", stderr: "timeout", exitCode: -1 };
+							return {
+								stdout: "",
+								stderr: "timeout",
+								exitCode: -1,
+								exitSignal: null as string | null,
+								timedOut: true,
+								durationMs: Date.now() - startMs,
+							};
 						}
-						return { stdout: execResult.stdout, stderr: execResult.stderr, exitCode: execResult.exitCode };
+						return {
+							stdout: execResult.stdout,
+							stderr: execResult.stderr,
+							exitCode: execResult.exitCode,
+							exitSignal: null as string | null,
+							timedOut: false,
+							durationMs: Date.now() - startMs,
+						};
 					} catch (e) {
 						clearTimeout(timer);
 						if (timedOut) {
-							return { stdout: "", stderr: "timeout", exitCode: -1 };
+							return {
+								stdout: "",
+								stderr: "timeout",
+								exitCode: -1,
+								exitSignal: null as string | null,
+								timedOut: true,
+								durationMs: Date.now() - startMs,
+							};
 						}
 						throw e;
 					}

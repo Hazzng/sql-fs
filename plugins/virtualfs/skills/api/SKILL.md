@@ -37,6 +37,7 @@ The user supplies `$BASE_URL` and `$TOKEN` via environment variables. Never embe
 real URLs or secrets in generated commands — always reference the env vars.
 
 Auth: every `/v1/*` request needs `Authorization: Bearer <JWT>`.
+Exception: `POST /v1/auth/bootstrap` is unauthenticated — it is how you obtain the first token by sending `X-Auth-Secret: $AUTH_SECRET`.
 
 ---
 
@@ -70,13 +71,49 @@ response shapes, and known gotchas from the live API.
 ## Core rules
 
 1. Always use parameterised shell variables (`$BASE_URL`, `$TOKEN`, `$SB`) in examples.
-2. Use `ingest-files` (base64 JSON) for loading a local folder. It is the only supported
-   ingest route — the tar.gz `/ingest` route was removed. Server-side it now uses a single
-   bulk multi-row INSERT (~5 round-trips total regardless of file count) so 100+ files
-   typically complete in <1s.
-3. Remind the user that `writeFiles` takes plain-text absolute paths; `ingest-files` takes
-   base64 relative paths under a `basePath`.
-4. Sandbox filesystem survives session eviction (Postgres is durable). Shell state (env vars,
+2. Sandbox filesystem survives session eviction (Postgres is durable). Shell state (env vars,
    cwd, functions) resets after 10 min of idle.
-5. Never produce `curl` commands that omit `-s` — noisy progress meters obscure the output.
-6. For any task that touches files: read `plugins/virtualfs/skills/api/ref/endpoints.md` first.
+3. Never produce `curl` commands that omit `-s` — noisy progress meters obscure the output.
+4. For any task that touches files: read `plugins/virtualfs/skills/api/ref/endpoints.md` first.
+
+---
+
+## ⛔ Endpoint policy — exec-only sandbox interaction
+
+**All read/write/list interaction with a live sandbox MUST go through the Exec endpoints
+(`/exec-sync` or `/exec`).** The Files endpoints are banned for agent use.
+
+| Allowed | Banned |
+|---|---|
+| `POST /v1/sandboxes` (incl. `files` seed at creation) | `GET /v1/sandboxes/:id/files/*path` (read) |
+| `GET /v1/sandboxes/:id` | `PUT /v1/sandboxes/:id/files/*path` (write) |
+| `DELETE /v1/sandboxes/:id` | `DELETE /v1/sandboxes/:id/files/*path` |
+| `POST /v1/sandboxes/:id/exec-sync` | `POST /v1/sandboxes/:id/mkdir` |
+| `POST /v1/sandboxes/:id/exec` (SSE) | `POST /v1/sandboxes/:id/writeFiles` |
+| `POST /v1/sandboxes/:id/ingest-files` (bulk bootstrap only — see note) | `GET /v1/sandboxes/:id/tree` |
+| `POST /v1/auth/bootstrap` (get first token — no Bearer needed) | `GET /v1/sandboxes/:id/export` |
+| `POST /v1/auth/admin`, `POST /v1/admin/gc (not yet implemented)` | |
+
+**Translate Files-endpoint patterns to exec scripts:**
+
+| Need | Don't use | Use instead |
+|---|---|---|
+| Read a file | `GET /files/*path` | `exec-sync` with `cat <path>` |
+| Read binary safely | `GET /files/*path` | `exec-sync` with `base64 <path>` and decode client-side |
+| Write a small text file | `PUT /files/*path` | `exec-sync` with `cat > path <<'EOF' ... EOF` (single-quoted heredoc avoids expansion) |
+| Write binary | `PUT /files/*path` | base64-encode locally, pass via `script` body, decode in sandbox: `echo "<b64>" \| base64 -d > path` |
+| Bulk write text | `POST /writeFiles` | One `exec-sync` with multiple heredocs |
+| Make a directory | `POST /mkdir` | `exec-sync` with `mkdir -p <path>` |
+| Delete a file/dir | `DELETE /files/*path` | `exec-sync` with `rm -f` or `rm -rf` |
+| List the tree | `GET /tree` | `exec-sync` with `find <root> -printf '%y %s %p\n'` (or `ls -laR`, `stat`) |
+| Download as archive | `GET /export` | `exec-sync` with `tar -czf - <root> \| base64` and decode client-side |
+
+**Ingest exception:** `POST /ingest-files` is allowed for one-time bulk bootstrapping a
+local folder into a fresh sandbox (~5 DB round-trips regardless of file count, no practical
+exec equivalent for binary-safe multi-file upload). After ingest, all further interaction
+must be via exec.
+
+When a user asks for a Files-endpoint curl, **decline politely and produce the exec
+equivalent instead**, citing this policy. If the workflow truly cannot be expressed via
+exec (e.g. streaming a 100 MB binary download), surface that as a question rather than
+silently using a banned route.

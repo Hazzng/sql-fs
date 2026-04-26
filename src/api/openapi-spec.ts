@@ -54,6 +54,10 @@ const execBodySchema = {
 		cwd: { type: "string", example: "/home/user" },
 		env: { type: "object", additionalProperties: { type: "string" }, example: { MY_VAR: "value" } },
 		timeoutMs: { type: "integer", example: 30000, minimum: 1, maximum: 300000 },
+		debug: {
+			type: "boolean",
+			description: "When true, prepends 'set -x' for command-level tracing in stderr.",
+		},
 	},
 	required: ["script"],
 } as const;
@@ -72,7 +76,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.1.0",
+		version: "0.2.3",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},
@@ -84,7 +88,7 @@ export const openapiSpec = {
 				type: "http",
 				scheme: "bearer",
 				bearerFormat: "JWT",
-				description: "JWT issued via POST /v1/admin/tokens",
+				description: "JWT issued via POST /v1/auth/bootstrap or POST /v1/auth/admin",
 			},
 		},
 		schemas: {
@@ -95,11 +99,86 @@ export const openapiSpec = {
 		},
 	},
 	paths: {
-		// ── Admin ─────────────────────────────────────────────────────────────────
-		"/admin/tokens": {
+		// ── Auth (bootstrap, unauthenticated) ─────────────────────────────────────
+		"/auth/bootstrap": {
 			post: {
-				tags: ["Admin"],
-				summary: "Create JWT",
+				tags: ["Auth"],
+				summary: "Bootstrap JWT from AUTH_SECRET",
+				description:
+					"Exchange the server's `AUTH_SECRET` (sent in `X-Auth-Secret`) for a signed JWT. Unauthenticated — no Bearer token required. Use this when an external client only has `AUTH_SECRET` and cannot reach the CLI (`pnpm token:create`) or the admin endpoint (which itself requires a JWT).",
+				security: [],
+				parameters: [
+					{
+						name: "X-Auth-Secret",
+						in: "header",
+						required: true,
+						schema: { type: "string" },
+						description: "Must match the server-side AUTH_SECRET env var (constant-time compared).",
+					},
+				],
+				requestBody: {
+					required: true,
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								properties: {
+									sub: { type: "string", example: "agent-001", description: "Token subject (owner identity)" },
+									tenant: {
+										type: "string",
+										description: "Optional tenant id; omitted = default tenant",
+									},
+									expiresIn: {
+										type: "string",
+										enum: ["24h", "30d", "1y", "never"],
+										default: "30d",
+										description: "Token lifetime",
+									},
+								},
+								required: ["sub"],
+							},
+						},
+					},
+				},
+				responses: {
+					"201": {
+						description: "Token created",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										token: { type: "string" },
+										sub: { type: "string" },
+										tenant: { type: "string", nullable: true },
+										expiresAt: { type: "string", format: "date-time", nullable: true },
+									},
+									required: ["token", "sub"],
+								},
+							},
+						},
+					},
+					"400": {
+						description: "Invalid body or unknown tenant",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Wrong or missing X-Auth-Secret",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"500": {
+						description: "AUTH_SECRET not configured on the server",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+				},
+			},
+		},
+
+		// ── Admin ─────────────────────────────────────────────────────────────────
+		"/auth/admin": {
+			post: {
+				tags: ["Auth"],
+				summary: "Create JWT (admin)",
 				description: "Mint a signed JWT for a given subject. Requires `X-Admin-Secret` header.",
 				security: [bearerAuth],
 				requestBody: {
@@ -487,11 +566,29 @@ export const openapiSpec = {
 			post: {
 				tags: ["Exec"],
 				summary: "Execute script (buffered)",
-				description: "Run a bash script and return stdout/stderr/exitCode once complete.",
-				parameters: [sandboxIdParam],
+				description:
+					"Run a bash script and return stdout/stderr/exitCode once complete. Accepts JSON (`application/json`) with `{ script, cwd?, env?, timeoutMs? }`, or a raw script body with `text/plain` or `text/x-shellscript` (no JSON encoding needed). When using plaintext, `timeoutMs` can be set via query parameter.",
+				parameters: [
+					sandboxIdParam,
+					{
+						name: "timeoutMs",
+						in: "query",
+						required: false,
+						description: "Execution timeout in ms (only used with text/plain or text/x-shellscript content types)",
+						schema: { type: "integer", minimum: 1, maximum: 300000 },
+					},
+				],
 				requestBody: {
 					required: true,
-					content: { "application/json": { schema: execBodySchema } },
+					content: {
+						"application/json": { schema: execBodySchema },
+						"text/x-shellscript": {
+							schema: { type: "string", example: "find /home/user -type f | sort" },
+						},
+						"text/plain": {
+							schema: { type: "string", example: "echo hello" },
+						},
+					},
 				},
 				responses: {
 					"200": {
@@ -504,8 +601,11 @@ export const openapiSpec = {
 										stdout: { type: "string" },
 										stderr: { type: "string" },
 										exitCode: { type: "integer" },
+										exitSignal: { type: "string", nullable: true },
+										timedOut: { type: "boolean" },
+										durationMs: { type: "integer" },
 									},
-									required: ["stdout", "stderr", "exitCode"],
+									required: ["stdout", "stderr", "exitCode", "exitSignal", "timedOut", "durationMs"],
 								},
 							},
 						},
@@ -524,7 +624,20 @@ export const openapiSpec = {
 					},
 					"408": {
 						description: "Execution timed out",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										error: { type: "string" },
+										code: { type: "string" },
+										timedOut: { type: "boolean" },
+										durationMs: { type: "integer" },
+									},
+									required: ["error", "code", "timedOut", "durationMs"],
+								},
+							},
+						},
 					},
 				},
 			},
@@ -613,11 +726,28 @@ export const openapiSpec = {
 				tags: ["Exec"],
 				summary: "Execute script (streaming SSE)",
 				description:
-					"Run a bash script and stream output as Server-Sent Events. Events: `stdout` `{ t, data }`, `stderr` `{ t, data }`, `exit` `{ t, exitCode, durationMs, error? }`.",
-				parameters: [sandboxIdParam],
+					"Run a bash script and stream output as Server-Sent Events. Events: `stdout` `{ t, data }`, `stderr` `{ t, data }`, `exit` `{ t, exitCode, durationMs, error? }`. Accepts JSON (`application/json`) or raw script body (`text/plain`, `text/x-shellscript`).",
+				parameters: [
+					sandboxIdParam,
+					{
+						name: "timeoutMs",
+						in: "query",
+						required: false,
+						description: "Execution timeout in ms (only used with text/plain or text/x-shellscript content types)",
+						schema: { type: "integer", minimum: 1, maximum: 300000 },
+					},
+				],
 				requestBody: {
 					required: true,
-					content: { "application/json": { schema: execBodySchema } },
+					content: {
+						"application/json": { schema: execBodySchema },
+						"text/x-shellscript": {
+							schema: { type: "string", example: "find /home/user -type f | sort" },
+						},
+						"text/plain": {
+							schema: { type: "string", example: "echo hello" },
+						},
+					},
 				},
 				responses: {
 					"200": {

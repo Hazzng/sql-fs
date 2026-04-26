@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# VirtualFS API — Quickstart
-# Complete lifecycle: create → write → exec → read → delete
+# VirtualFS API — Quickstart (exec-only)
+#
+# Demonstrates the agent endpoint policy: all sandbox interaction goes through
+# /exec-sync. The Files endpoints (PUT/GET /files, /writeFiles, /mkdir, /tree,
+# /export) are banned — every read/write/list below uses bash via exec-sync.
+#
 # Usage: BASE_URL=... TOKEN=... bash quickstart.sh
 
 set -euo pipefail
@@ -18,7 +22,15 @@ cleanup_sandbox() {
 }
 trap cleanup_sandbox EXIT
 
-echo "=== VirtualFS Quickstart ==="
+exec_sync() {
+  local script="$1"
+  curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg s "$script" '{script: $s}')"
+}
+
+echo "=== VirtualFS Quickstart (exec-only) ==="
 echo "Base URL: $BASE_URL"
 echo ""
 
@@ -27,78 +39,60 @@ echo "--- Health check ---"
 curl -fsS "$BASE_URL/healthz" | jq
 echo ""
 
-# 2. Create sandbox
-echo "--- Creating sandbox ---"
+# 2. Create sandbox — seed the initial file via the `files` field at creation
+#    time. After creation, all further file ops go through exec.
+echo "--- Creating sandbox (with seeded /home/user/hello.txt) ---"
 SB=$(curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{}' | jq -er '.id')
+  -d '{
+    "files": { "/home/user/hello.txt": "Hello from VirtualFS!" }
+  }' | jq -er '.id')
 echo "Sandbox ID: $SB"
 echo ""
 
-# 3. Write a file
-echo "--- Writing /home/user/hello.txt ---"
-curl -fsS -X PUT "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
-  -H "Authorization: Bearer $TOKEN" \
-  --data-binary "Hello from VirtualFS!"
-echo "(204 = success)"
+# 3. Read the seeded file via exec (replaces GET /files/*path)
+echo "--- Reading /home/user/hello.txt via exec ---"
+exec_sync 'cat /home/user/hello.txt' | jq -r '.stdout'
 echo ""
 
-# 4. Execute bash
-echo "--- Executing bash ---"
-curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"script": "echo Hello && cat /home/user/hello.txt && echo && uname -a"}' | jq
+# 4. Write multiple files via a single exec heredoc batch
+#    (replaces POST /writeFiles and PUT /files/*path)
+echo "--- Bulk-writing files via exec heredocs ---"
+exec_sync '
+mkdir -p /home/user/sub
+cat > /home/user/a.txt <<'\''EOF'\''
+file A content
+EOF
+cat > /home/user/b.txt <<'\''EOF'\''
+file B content
+EOF
+cat > /home/user/sub/c.txt <<'\''EOF'\''
+nested file C
+EOF
+echo "wrote 3 files"
+' | jq -r '.stdout'
 echo ""
 
-# 5. Bulk write multiple files
-echo "--- Bulk writing files ---"
-curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/writeFiles" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "files": {
-      "/home/user/a.txt": "file A content",
-      "/home/user/b.txt": "file B content",
-      "/home/user/sub/c.txt": "nested file C"
-    }
-  }'
-echo "(204 = success)"
+# 5. List the file tree via exec (replaces GET /tree)
+echo "--- File tree via exec (find) ---"
+exec_sync "find /home/user -mindepth 1 -printf '%y %s %p\n' | sort" | jq -r '.stdout'
 echo ""
 
-# 6. List file tree
-echo "--- File tree ---"
-curl -fsS "$BASE_URL/v1/sandboxes/$SB/tree?prefix=/home/user" \
-  -H "Authorization: Bearer $TOKEN" | jq '[.[] | {path, kind, size}]'
-echo ""
-
-# 7. Run grep across files
+# 6. Search across files (this was always exec-native)
 echo "--- Search across files ---"
-curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"script": "grep -r \"file\" /home/user/ 2>/dev/null"}' | jq -er '.stdout'
+exec_sync 'grep -rn "file" /home/user/ 2>/dev/null' | jq -r '.stdout'
 echo ""
 
-# 8. Shell state persists
+# 7. Shell state persists across exec-sync calls on the same warm session
 echo "--- Shell state persistence ---"
-curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"script": "export MY_STATE=hello"}' > /dev/null
-
-curl -fsS -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"script": "echo MY_STATE=$MY_STATE"}' | jq -er '.stdout'
+exec_sync 'export MY_STATE=hello' >/dev/null
+exec_sync 'echo MY_STATE=$MY_STATE' | jq -r '.stdout'
 echo ""
 
-# 9. Read a file back
-echo "--- Reading file back ---"
-curl -fsS "$BASE_URL/v1/sandboxes/$SB/files/home/user/hello.txt" \
-  -H "Authorization: Bearer $TOKEN"
-echo ""
+# 8. Delete a file via exec (replaces DELETE /files/*path)
+echo "--- Deleting /home/user/sub via exec (rm -rf) ---"
+exec_sync 'rm -rf /home/user/sub && echo deleted' | jq -r '.stdout'
 echo ""
 
 # Cleanup runs via EXIT trap

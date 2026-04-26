@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.4] - 2026-04-26
+## [0.2.5] - 2026-04-26
 
 ### Fixed
 
@@ -14,13 +14,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sanitize unexpected `bash_exec_batch` MCP errors: log server-side and return `"internal error"` instead of exposing `err.message`.
 - Propagate client disconnect into batch cancellation via `c.req.raw.signal`, releasing the session lock early instead of running to timeout.
 
-## [0.2.3] - 2026-04-26
+## [0.2.4] - 2026-04-26
 
 ### Added
 
 - Batch execution endpoint `POST /v1/sandboxes/:id/exec-sync-batch` that collapses N sequential exec round-trips into a single HTTP request, eliminating transport overhead for exploration workflows.
 - `bash_exec_batch` MCP tool providing the same capability to MCP clients.
 - OpenAPI spec for the new batch endpoint.
+
+## [0.2.3] - 2026-04-26
+
+### Added
+
+- `POST /v1/auth/bootstrap` — unauthenticated token bootstrap endpoint that exchanges `AUTH_SECRET` (passed in `X-Auth-Secret`) for a signed JWT, breaking the chicken-and-egg dependency on `POST /v1/admin/tokens` for external clients (issue #27). Uses constant-time secret comparison, hard-fails when `AUTH_SECRET` is unset, validates tenants against the configured set, and emits `auth_bootstrap_issued` / `auth_bootstrap_denied` audit events.
+
+## [0.2.2] - 2026-04-26
+
+### Fixed
+
+- Updated OpenAPI spec to document new `debug` request parameter and `exitSignal`, `timedOut`, `durationMs` response fields on exec-sync 200/408 responses.
+
+## [0.2.1] - 2026-04-26
+
+### Fixed
+
+- `timeoutMs` query parameter now rejects values exceeding 300000 with a 400 error instead of silently capping.
+
+### Added
+
+- SSE streaming tests for `text/plain` content type and `timeoutMs` query parameter timeout enforcement.
+
+## [0.2.0] - 2026-04-26
+
+### Added
+
+- Accept `text/x-shellscript` and `text/plain` content types on `exec-sync` and `exec` (SSE) endpoints — the raw request body is used as the script verbatim, removing the need for JSON encoding. Optional `?timeoutMs=` query parameter available in plaintext mode. Returns 415 for unsupported content types.
+- Enriched exec-sync response with `exitSignal`, `timedOut`, and `durationMs` fields for better error disambiguation.
+- Enriched 408 timeout response with `timedOut` and `durationMs` fields.
+- `debug` request flag on exec-sync, exec (SSE), and MCP `bash_exec` that prepends `set -x` for command-level tracing without modifying the submitted script.
 
 ## [0.1.1] - 2026-04-26
 
