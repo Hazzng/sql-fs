@@ -14,6 +14,7 @@ import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
+const MAX_BATCH_SCRIPTS = 50;
 
 const execBodySchema = z.object({
 	script: z.string(),
@@ -21,6 +22,27 @@ const execBodySchema = z.object({
 	env: z.record(z.string(), z.string()).optional(),
 	timeoutMs: z.number().int().positive().optional(),
 });
+
+const batchExecBodySchema = z.object({
+	scripts: z
+		.array(
+			z.object({
+				id: z.string(),
+				script: z.string(),
+			}),
+		)
+		.min(1)
+		.max(MAX_BATCH_SCRIPTS),
+	timeoutMs: z.number().int().positive().optional(),
+});
+
+interface BatchScriptResult {
+	readonly id: string;
+	readonly stdout: string;
+	readonly stderr: string;
+	readonly exitCode: number;
+	readonly error?: string;
+}
 
 export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -197,6 +219,92 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				}
 			});
 		});
+	});
+
+	// POST /v1/sandboxes/:id/exec-sync-batch — sequential batch execution in a single round-trip
+	router.post("/:id/exec-sync-batch", async (c) => {
+		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
+		let body: z.infer<typeof batchExecBodySchema>;
+		try {
+			const raw = await c.req.json();
+			const result = batchExecBodySchema.safeParse(raw);
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const totalTimeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+
+		let results: BatchScriptResult[];
+		try {
+			results = await withOwnedSessionOrRehydrate<BatchScriptResult[]>(
+				sessionManager,
+				tenant,
+				sandboxId,
+				c.get("owner"),
+				async (session) => {
+					const batchResults: BatchScriptResult[] = [];
+					const batchStart = Date.now();
+
+					for (const entry of body.scripts) {
+						const elapsed = Date.now() - batchStart;
+						const remaining = totalTimeoutMs - elapsed;
+
+						if (remaining <= 0) {
+							batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							continue;
+						}
+
+						const controller = new AbortController();
+						let timedOut = false;
+						const timer = setTimeout(() => {
+							timedOut = true;
+							controller.abort();
+						}, remaining);
+
+						try {
+							const result = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
+								signal: controller.signal,
+							});
+							clearTimeout(timer);
+
+							if (timedOut) {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							} else {
+								batchResults.push({
+									id: entry.id,
+									stdout: result.stdout,
+									stderr: result.stderr,
+									exitCode: result.exitCode,
+								});
+							}
+						} catch {
+							clearTimeout(timer);
+							if (timedOut) {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							} else {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
+							}
+						}
+					}
+
+					return batchResults;
+				},
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
+
+		return c.json({ results });
 	});
 
 	return router;

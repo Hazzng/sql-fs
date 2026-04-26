@@ -171,6 +171,104 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 	);
 
 	server.tool(
+		"bash_exec_batch",
+		[
+			"Execute multiple bash scripts in a sandbox sequentially within a single request.",
+			"Collapses N round-trips into 1 — ideal for exploration (find, grep, cat).",
+			"Scripts share shell state and run in order. Each result includes stdout, stderr, exitCode.",
+			"A single timeoutMs budget covers all scripts; remaining scripts get error: 'timeout' if exceeded.",
+			"Max 50 scripts per batch.",
+		].join("\n"),
+		{
+			id: z.string(),
+			scripts: z
+				.array(z.object({ id: z.string(), script: z.string() }))
+				.min(1)
+				.max(50),
+			timeout: z.number().int().positive().optional(),
+		},
+		async (args) => {
+			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+
+			try {
+				const results = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+					const batchResults: Array<{
+						id: string;
+						stdout: string;
+						stderr: string;
+						exitCode: number;
+						error?: string;
+					}> = [];
+					const batchStart = Date.now();
+
+					for (const entry of args.scripts) {
+						const elapsed = Date.now() - batchStart;
+						const remaining = totalTimeoutMs - elapsed;
+
+						if (remaining <= 0) {
+							batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							continue;
+						}
+
+						const controller = new AbortController();
+						let timedOut = false;
+						const timer = setTimeout(() => {
+							timedOut = true;
+							controller.abort();
+						}, remaining);
+
+						try {
+							const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
+								signal: controller.signal,
+							});
+							clearTimeout(timer);
+							if (timedOut) {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							} else {
+								batchResults.push({
+									id: entry.id,
+									stdout: execResult.stdout,
+									stderr: execResult.stderr,
+									exitCode: execResult.exitCode,
+								});
+							}
+						} catch {
+							clearTimeout(timer);
+							if (timedOut) {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+							} else {
+								batchResults.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
+							}
+						}
+					}
+
+					return batchResults;
+				});
+
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
+				};
+			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+					};
+				}
+				if (code === "ENOENT") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+					};
+				}
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+				};
+			}
+		},
+	);
+
+	server.tool(
 		"fs_ingest",
 		[
 			"Upload one or more files into a sandbox in a single bulk database insert.",
