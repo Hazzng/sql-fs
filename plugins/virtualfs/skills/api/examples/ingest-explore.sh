@@ -5,6 +5,11 @@
 # sandbox, then runs a series of bash_exec calls to explore the codebase
 # just like a coding agent would.
 #
+# Endpoint policy: ingest-files is allowed for one-time bulk bootstrap of a
+# local folder. Everything that follows (find/grep/wc/etc) goes through
+# /exec-sync — the Files endpoints (GET /files, /tree, /export, ...) are
+# banned for agent use.
+#
 # Usage:
 #   BASE_URL=... TOKEN=... SRC_DIR=./src bash ingest-explore.sh
 #   BASE_URL=... TOKEN=... SRC_DIR=./src MAX_FILES=20 bash ingest-explore.sh

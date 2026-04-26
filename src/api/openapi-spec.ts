@@ -76,7 +76,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.1.0",
+		version: "0.2.3",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},
@@ -88,7 +88,7 @@ export const openapiSpec = {
 				type: "http",
 				scheme: "bearer",
 				bearerFormat: "JWT",
-				description: "JWT issued via POST /v1/admin/tokens",
+				description: "JWT issued via POST /v1/auth/bootstrap or POST /v1/auth/admin",
 			},
 		},
 		schemas: {
@@ -99,11 +99,86 @@ export const openapiSpec = {
 		},
 	},
 	paths: {
-		// ── Admin ─────────────────────────────────────────────────────────────────
-		"/admin/tokens": {
+		// ── Auth (bootstrap, unauthenticated) ─────────────────────────────────────
+		"/auth/bootstrap": {
 			post: {
-				tags: ["Admin"],
-				summary: "Create JWT",
+				tags: ["Auth"],
+				summary: "Bootstrap JWT from AUTH_SECRET",
+				description:
+					"Exchange the server's `AUTH_SECRET` (sent in `X-Auth-Secret`) for a signed JWT. Unauthenticated — no Bearer token required. Use this when an external client only has `AUTH_SECRET` and cannot reach the CLI (`pnpm token:create`) or the admin endpoint (which itself requires a JWT).",
+				security: [],
+				parameters: [
+					{
+						name: "X-Auth-Secret",
+						in: "header",
+						required: true,
+						schema: { type: "string" },
+						description: "Must match the server-side AUTH_SECRET env var (constant-time compared).",
+					},
+				],
+				requestBody: {
+					required: true,
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								properties: {
+									sub: { type: "string", example: "agent-001", description: "Token subject (owner identity)" },
+									tenant: {
+										type: "string",
+										description: "Optional tenant id; omitted = default tenant",
+									},
+									expiresIn: {
+										type: "string",
+										enum: ["24h", "30d", "1y", "never"],
+										default: "30d",
+										description: "Token lifetime",
+									},
+								},
+								required: ["sub"],
+							},
+						},
+					},
+				},
+				responses: {
+					"201": {
+						description: "Token created",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										token: { type: "string" },
+										sub: { type: "string" },
+										tenant: { type: "string", nullable: true },
+										expiresAt: { type: "string", format: "date-time", nullable: true },
+									},
+									required: ["token", "sub"],
+								},
+							},
+						},
+					},
+					"400": {
+						description: "Invalid body or unknown tenant",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Wrong or missing X-Auth-Secret",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"500": {
+						description: "AUTH_SECRET not configured on the server",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+				},
+			},
+		},
+
+		// ── Admin ─────────────────────────────────────────────────────────────────
+		"/auth/admin": {
+			post: {
+				tags: ["Auth"],
+				summary: "Create JWT (admin)",
 				description: "Mint a signed JWT for a given subject. Requires `X-Admin-Secret` header.",
 				security: [bearerAuth],
 				requestBody: {

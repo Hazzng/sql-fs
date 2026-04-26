@@ -35,8 +35,22 @@ const UNAUTHORIZED = 401 as ContentfulStatusCode;
  *
  * @param tenantConfig - The active tenant configuration.
  */
+/**
+ * Paths under /v1/* that are intentionally exempt from Bearer auth because they
+ * are themselves credential-bootstrap endpoints (chicken-and-egg). Keep this
+ * list tiny — every entry is an explicit decision to expose the route to
+ * unauthenticated callers (the route handler is responsible for its own
+ * authorization, e.g. AUTH_SECRET via timing-safe compare).
+ */
+const UNAUTHENTICATED_PATHS = new Set<string>(["POST /v1/auth/bootstrap"]);
+
 export function createAuthMiddleware(tenantConfig: TenantConfig) {
 	return createMiddleware<{ Variables: AuthVariables }>(async (c, next) => {
+		const requestKey = `${c.req.method.toUpperCase()} ${c.req.path}`;
+		if (UNAUTHENTICATED_PATHS.has(requestKey)) {
+			return next();
+		}
+
 		const authHeader = c.req.header("Authorization");
 
 		if (!authHeader?.startsWith("Bearer ")) {
