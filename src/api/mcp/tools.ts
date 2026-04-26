@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
+import { executeBatch } from "../lib/batch-exec.js";
 import { withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -189,6 +190,61 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: message, exitCode: 1 }) }],
+				};
+			}
+		},
+	);
+
+	server.tool(
+		"bash_exec_batch",
+		[
+			"Execute multiple bash scripts in a sandbox sequentially within a single request.",
+			"Collapses N round-trips into 1 — ideal for exploration (find, grep, cat).",
+			"Scripts share shell state and run in order. Each result includes stdout, stderr, exitCode.",
+			"A single timeout (ms) budget covers all scripts; set `timeout` to override the default. Remaining scripts get error: 'timeout' if the budget is exceeded.",
+			"Max 50 scripts per batch.",
+		].join("\n"),
+		{
+			id: z.string(),
+			scripts: z
+				.array(z.object({ id: z.string(), script: z.string() }))
+				.min(1)
+				.max(50),
+			timeout: z.number().int().positive().optional(),
+		},
+		async (args) => {
+			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+
+			try {
+				const results = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) =>
+					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs),
+				);
+
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
+				};
+			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+					};
+				}
+				if (code === "ENOENT") {
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+					};
+				}
+				console.error(
+					JSON.stringify({
+						event: "bash_exec_batch_failed",
+						sandboxId: args.id,
+						tenant,
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
 				};
 			}
 		},

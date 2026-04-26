@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-04-26
+
+### Fixed
+
+- Move `vi.restoreAllMocks()` into `afterEach` in exec-batch tests so spy cleanup is guaranteed even when a test throws.
+- Align `bash_exec_batch` MCP tool description to reference the `timeout` field (not `timeoutMs`) so clients send the correct key.
+- Sanitize unexpected `bash_exec_batch` MCP errors: log server-side and return `"internal error"` instead of exposing `err.message`.
+- Propagate client disconnect into batch cancellation via `c.req.raw.signal`, releasing the session lock early instead of running to timeout.
+
+## [0.2.4] - 2026-04-26
+
+### Added
+
+- Batch execution endpoint `POST /v1/sandboxes/:id/exec-sync-batch` that collapses N sequential exec round-trips into a single HTTP request, eliminating transport overhead for exploration workflows.
+- `bash_exec_batch` MCP tool providing the same capability to MCP clients.
+- OpenAPI spec for the new batch endpoint.
+
 ## [0.2.3] - 2026-04-26
 
 ### Added

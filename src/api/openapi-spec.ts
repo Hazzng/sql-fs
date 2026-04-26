@@ -643,6 +643,84 @@ export const openapiSpec = {
 			},
 		},
 
+		"/sandboxes/{id}/exec-sync-batch": {
+			post: {
+				tags: ["Exec"],
+				summary: "Execute scripts in batch (sequential)",
+				description:
+					"Run multiple bash scripts sequentially in a single HTTP round-trip. Eliminates N-1 round-trips for independent exploration work (find, grep, cat). A single timeoutMs budget covers all scripts; if exhausted, remaining scripts receive exitCode -1 with error 'timeout'. Max 50 scripts per batch.",
+				parameters: [sandboxIdParam],
+				requestBody: {
+					required: true,
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								properties: {
+									scripts: {
+										type: "array",
+										items: {
+											type: "object",
+											properties: {
+												id: { type: "string", example: "tree" },
+												script: { type: "string", example: "find /home/user -type f | sort" },
+											},
+											required: ["id", "script"],
+										},
+										minItems: 1,
+										maxItems: 50,
+									},
+									timeoutMs: { type: "integer", example: 30000, minimum: 1, maximum: 300000 },
+								},
+								required: ["scripts"],
+							},
+						},
+					},
+				},
+				responses: {
+					"200": {
+						description: "Batch execution results",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										results: {
+											type: "array",
+											items: {
+												type: "object",
+												properties: {
+													id: { type: "string" },
+													stdout: { type: "string" },
+													stderr: { type: "string" },
+													exitCode: { type: "integer" },
+													error: { type: "string" },
+												},
+												required: ["id", "stdout", "stderr", "exitCode"],
+											},
+										},
+									},
+									required: ["results"],
+								},
+							},
+						},
+					},
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+				},
+			},
+		},
+
 		"/sandboxes/{id}/exec": {
 			post: {
 				tags: ["Exec"],

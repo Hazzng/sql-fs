@@ -10,11 +10,13 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { type BatchScriptResult, executeBatch } from "../lib/batch-exec.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
+const MAX_BATCH_SCRIPTS = 50;
 
 const PLAINTEXT_TYPES = ["text/x-shellscript", "text/plain"];
 
@@ -24,6 +26,19 @@ const execBodySchema = z.object({
 	env: z.record(z.string(), z.string()).optional(),
 	timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 	debug: z.boolean().optional(),
+});
+
+const batchExecBodySchema = z.object({
+	scripts: z
+		.array(
+			z.object({
+				id: z.string(),
+				script: z.string(),
+			}),
+		)
+		.min(1)
+		.max(MAX_BATCH_SCRIPTS),
+	timeoutMs: z.number().int().positive().optional(),
 });
 
 type ExecBody = z.infer<typeof execBodySchema>;
@@ -281,6 +296,52 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				}
 			});
 		});
+	});
+
+	router.post("/:id/exec-sync-batch", async (c) => {
+		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
+		let body: z.infer<typeof batchExecBodySchema>;
+		try {
+			const raw = await c.req.json();
+			const result = batchExecBodySchema.safeParse(raw);
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const totalTimeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+
+		const disconnectController = new AbortController();
+		if (c.req.raw.signal.aborted) {
+			disconnectController.abort();
+		} else {
+			c.req.raw.signal.addEventListener("abort", () => disconnectController.abort(), { once: true });
+		}
+
+		let results: BatchScriptResult[];
+		try {
+			results = await withOwnedSessionOrRehydrate<BatchScriptResult[]>(
+				sessionManager,
+				tenant,
+				sandboxId,
+				c.get("owner"),
+				async (session) =>
+					executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal),
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
+
+		return c.json({ results });
 	});
 
 	return router;
