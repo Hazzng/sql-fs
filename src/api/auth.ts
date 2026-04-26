@@ -42,11 +42,12 @@ const UNAUTHORIZED = 401 as ContentfulStatusCode;
  * unauthenticated callers (the route handler is responsible for its own
  * authorization, e.g. AUTH_SECRET via timing-safe compare).
  */
-const UNAUTHENTICATED_PATHS = new Set<string>(["/v1/auth/bootstrap"]);
+const UNAUTHENTICATED_PATHS = new Set<string>(["POST /v1/auth/bootstrap"]);
 
 export function createAuthMiddleware(tenantConfig: TenantConfig) {
 	return createMiddleware<{ Variables: AuthVariables }>(async (c, next) => {
-		if (UNAUTHENTICATED_PATHS.has(c.req.path)) {
+		const requestKey = `${c.req.method.toUpperCase()} ${c.req.path}`;
+		if (UNAUTHENTICATED_PATHS.has(requestKey)) {
 			return next();
 		}
 

@@ -23,7 +23,11 @@ describe("POST /v1/auth/bootstrap", () => {
 	});
 
 	afterEach(() => {
-		process.env.AUTH_SECRET = originalAuthSecret ?? "";
+		if (originalAuthSecret === undefined) {
+			Reflect.deleteProperty(process.env, "AUTH_SECRET");
+		} else {
+			process.env.AUTH_SECRET = originalAuthSecret;
+		}
 		if (originalDatabaseUrl === undefined) {
 			Reflect.deleteProperty(process.env, "DATABASE_URL");
 		} else {
@@ -128,7 +132,7 @@ describe("POST /v1/auth/bootstrap", () => {
 			},
 			body: JSON.stringify({ sub: "agent-001" }),
 		});
-		expect(res.status).not.toBe(401);
+		expect(res.status).toBe(201);
 	});
 
 	it("returns 400 INVALID_INPUT for missing sub (after secret check passes)", async () => {

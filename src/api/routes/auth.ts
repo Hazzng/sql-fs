@@ -77,7 +77,11 @@ export function authRoutes(): Hono {
 		async (c) => {
 			const ip = c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? "unknown";
 			const ua = c.req.header("user-agent") ?? "";
-			const authSecret = process.env.AUTH_SECRET as string; // already validated above
+			const authSecret = process.env.AUTH_SECRET;
+			if (!authSecret) {
+				logAudit("auth_bootstrap_misconfigured", { ip, ua });
+				return c.json({ error: "auth_not_configured", code: "AUTH_NOT_CONFIGURED" }, 500 as ContentfulStatusCode);
+			}
 
 			const {
 				sub,
