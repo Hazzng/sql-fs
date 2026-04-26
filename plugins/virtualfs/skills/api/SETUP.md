@@ -7,13 +7,13 @@ VirtualFS uses **two separate secrets**. Mixing them up is the #1 source of auth
 | Secret | Purpose | Where it's used |
 |---|---|---|
 | `AUTH_SECRET` | HMAC key that **signs** every JWT. The server verifies incoming `Authorization: Bearer <jwt>` against this. | Server-side verification on every `/v1/*` request. Also used by `POST /v1/auth/bootstrap` (send as `X-Auth-Secret`) to mint the first token over HTTP. |
-| `ADMIN_SECRET` | Out-of-band gate on the `POST /v1/admin/tokens` minting endpoint. Sent as `X-Admin-Secret` header. | Only on `/v1/admin/tokens` requests. Independent of JWT auth. |
+| `ADMIN_SECRET` | Out-of-band gate on the `POST /v1/auth/admin` minting endpoint. Sent as `X-Admin-Secret` header. | Only on `/v1/auth/admin` requests. Independent of JWT auth. |
 
 **Three ways to mint your first token** (pick one):
 
 1. **HTTP bootstrap** — `POST /v1/auth/bootstrap` with `X-Auth-Secret: $AUTH_SECRET` ← recommended, no CLI needed
 2. **CLI** — `pnpm token:create` on a host that has the project root and `AUTH_SECRET` available
-3. **Admin endpoint** — `POST /v1/admin/tokens` (requires a Bearer JWT _and_ `ADMIN_SECRET`, so only useful for day-2 token rotation, not first-time setup)
+3. **Admin endpoint** — `POST /v1/auth/admin` (requires a Bearer JWT _and_ `ADMIN_SECRET`, so only useful for day-2 token rotation, not first-time setup)
 
 ## Prerequisites
 
@@ -67,7 +67,7 @@ curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
 
 Once you have an admin token you can mint scoped tokens via the API instead of bootstrap.
 
-`POST /v1/admin/tokens` requires **two** auth signals:
+`POST /v1/auth/admin` requires **two** auth signals:
 1. `Authorization: Bearer <admin-token>` — same JWT auth as every `/v1/*` route
 2. `X-Admin-Secret: <ADMIN_SECRET>` — additional out-of-band secret matched against the
    server's `ADMIN_SECRET` env var (separate from `AUTH_SECRET`)
@@ -76,7 +76,7 @@ Once you have an admin token you can mint scoped tokens via the API instead of b
 export ADMIN_SECRET="<YOUR_ADMIN_SECRET>"   # never commit; ask the deployer
 
 # Mint a 30-day token for an agent (valid expiresIn: "24h", "30d", "1y", "never")
-AGENT_TOKEN=$(curl -fsS -X POST "$BASE_URL/v1/admin/tokens" \
+AGENT_TOKEN=$(curl -fsS -X POST "$BASE_URL/v1/auth/admin" \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Admin-Secret: $ADMIN_SECRET" \
   -H "Content-Type: application/json" \

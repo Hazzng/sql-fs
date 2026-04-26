@@ -76,7 +76,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.3.0",
+		version: "0.2.3",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},
@@ -88,7 +88,7 @@ export const openapiSpec = {
 				type: "http",
 				scheme: "bearer",
 				bearerFormat: "JWT",
-				description: "JWT issued via POST /v1/admin/tokens",
+				description: "JWT issued via POST /v1/auth/bootstrap or POST /v1/auth/admin",
 			},
 		},
 		schemas: {
@@ -175,10 +175,10 @@ export const openapiSpec = {
 		},
 
 		// ── Admin ─────────────────────────────────────────────────────────────────
-		"/admin/tokens": {
+		"/auth/admin": {
 			post: {
-				tags: ["Admin"],
-				summary: "Create JWT",
+				tags: ["Auth"],
+				summary: "Create JWT (admin)",
 				description: "Mint a signed JWT for a given subject. Requires `X-Admin-Secret` header.",
 				security: [bearerAuth],
 				requestBody: {

@@ -92,7 +92,7 @@ response shapes, and known gotchas from the live API.
 | `POST /v1/sandboxes/:id/exec` (SSE) | `POST /v1/sandboxes/:id/writeFiles` |
 | `POST /v1/sandboxes/:id/ingest-files` (bulk bootstrap only — see note) | `GET /v1/sandboxes/:id/tree` |
 | `POST /v1/auth/bootstrap` (get first token — no Bearer needed) | `GET /v1/sandboxes/:id/export` |
-| `POST /v1/admin/tokens`, `POST /v1/admin/gc` | |
+| `POST /v1/auth/admin`, `POST /v1/admin/gc (not yet implemented)` | |
 
 **Translate Files-endpoint patterns to exec scripts:**
 

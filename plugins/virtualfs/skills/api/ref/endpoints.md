@@ -11,7 +11,7 @@ All routes require `Authorization: Bearer <JWT>` unless noted.
 > `find`, `tar`) instead. See `SKILL.md` for the translation table.
 >
 > Allowed non-exec routes: sandbox lifecycle (`POST/GET/DELETE /v1/sandboxes`),
-> `POST /ingest-files` (bulk bootstrap only), `POST /v1/auth/bootstrap`, `POST /v1/admin/*`.
+> `POST /ingest-files` (bulk bootstrap only), `POST /v1/auth/bootstrap`, `POST /v1/auth/bootstrap, POST /v1/auth/admin`.
 
 ---
 
@@ -52,14 +52,14 @@ Error responses:
 
 ## Admin
 
-### POST /v1/admin/tokens — Create JWT
+### POST /v1/auth/admin — Create JWT
 
 Requires both `Authorization: Bearer <admin-token>` AND `X-Admin-Secret: <ADMIN_SECRET>`
 headers. The admin secret is a separate env-var from `AUTH_SECRET` and gates this
 endpoint independently of JWT auth.
 
 ```bash
-curl -fsS -X POST "$BASE_URL/v1/admin/tokens" \
+curl -fsS -X POST "$BASE_URL/v1/auth/admin" \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Admin-Secret: $ADMIN_SECRET" \
   -H "Content-Type: application/json" \

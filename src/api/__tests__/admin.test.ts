@@ -1,5 +1,5 @@
 /**
- * Unit tests for POST /v1/admin/tokens (US-057c)
+ * Unit tests for POST /v1/auth/admin (US-057c)
  */
 
 import { SignJWT, jwtVerify } from "jose";
@@ -14,7 +14,7 @@ async function makeCallerToken(sub: string): Promise<string> {
 	return new SignJWT({ sub }).setProtectedHeader({ alg: "HS256" }).setIssuedAt().sign(key);
 }
 
-describe("POST /v1/admin/tokens", () => {
+describe("POST /v1/auth/admin", () => {
 	const originalAuthSecret = process.env.AUTH_SECRET;
 	const originalAdminSecret = process.env.ADMIN_SECRET;
 	const originalDatabaseUrl = process.env.DATABASE_URL;
@@ -53,7 +53,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("creates token via endpoint, decode verifies sub matches", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -77,7 +77,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("forwards tenant claim into issued token and echoes it in the response", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -104,7 +104,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("rejects tenant with invalid characters with 400 INVALID_INPUT", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -121,7 +121,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("never expiresIn returns expiresAt null", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -138,7 +138,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("missing sub returns 400 INVALID_INPUT", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -154,7 +154,7 @@ describe("POST /v1/admin/tokens", () => {
 	});
 
 	it("unauthenticated request returns 401 AUTH_REQUIRED", async () => {
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -170,7 +170,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("missing X-Admin-Secret returns 403 FORBIDDEN", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
@@ -186,7 +186,7 @@ describe("POST /v1/admin/tokens", () => {
 
 	it("invalid X-Admin-Secret returns 403 FORBIDDEN", async () => {
 		const callerToken = await makeCallerToken("admin");
-		const res = await app.request("/v1/admin/tokens", {
+		const res = await app.request("/v1/auth/admin", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${callerToken}`,
