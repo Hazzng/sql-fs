@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-04-28
+
+### Added
+
+- `jti` claim on tokens minted by `POST /v1/auth/admin`, generated via `randomUUID()` and recorded in the `admin_token_issued` audit log so a leaked-token incident can be correlated back to the issuing log line.
+- `admin_token_issued`, `admin_token_denied`, and `admin_token_misconfigured` audit log events on `POST /v1/auth/admin` (matching issue #23 names; bootstrap retains the existing `auth_bootstrap_*` events).
+- `auth_rate_limited` audit log event emitted when a rate-limited request is rejected.
+- `src/api/rate-limit.ts` — in-memory rate-limit primitive with injectable store and clock. Mounted on `/v1/auth/admin` (keyed by IP and Bearer sub) and `/v1/auth/bootstrap` (keyed by IP).
+- Env vars: `ADMIN_RATE_LIMIT_WINDOW_MS` (default `60000`), `ADMIN_RATE_LIMIT_MAX` (default `5`), `BOOTSTRAP_RATE_LIMIT_WINDOW_MS` (default `60000`), `BOOTSTRAP_RATE_LIMIT_MAX` (default `5`), `TRUST_PROXY_HEADERS` (default `false`).
+- `InMemoryRateLimitStore` now caps live keys (default `10000`) with FIFO eviction so attacker-controlled key cardinality (e.g. spoofed `X-Forwarded-For` against unauthenticated bootstrap) cannot grow the store unbounded within a window.
+- HTTP `429 RATE_LIMITED` response (with `Retry-After` header) on both auth endpoints when the limit is tripped.
+
+### Changed
+
+- `constantTimeEqual()` in `src/api/routes/auth.ts` now compares SHA-256 digests of the inputs, removing the early-return length oracle. Used by both `POST /v1/auth/bootstrap` and `POST /v1/auth/admin`.
+- `POST /v1/auth/admin` is now structured as pre-middleware → `validateBody` → handler so the `X-Admin-Secret` check runs before body parsing. Wrong/missing secrets now return 403 even for malformed bodies (previously returned 400 from Zod). The handler also hard-fails with 500 `AUTH_NOT_CONFIGURED` when `AUTH_SECRET` is unset.
+- Rate-limit `clientIp()` no longer reads `X-Forwarded-For` / `X-Real-IP` by default — those headers are spoofable. Operators behind a trusted ingress that strips inbound forwarding headers must opt in via `TRUST_PROXY_HEADERS=true`. Otherwise the connecting socket's `remoteAddress` is used. See `plugins/virtualfs/skills/api/SETUP.md` for the full trust-proxy note.
+
 ## [0.2.7] - 2026-04-28
 
 ### Changed
