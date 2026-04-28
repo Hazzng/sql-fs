@@ -6,18 +6,19 @@
 
 import { createHash } from "node:crypto";
 import postgres from "postgres";
-import { createEnoent, translateSqlError } from "../errors.js";
+import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
-import type {
-	BulkIngestFile,
-	CreateInodeOpts,
-	DirentRow,
-	InodeKind,
-	InodeRow,
-	PathCacheEntry,
-	SandboxMeta,
-	SqlDialect,
-	UpdateInodeOpts,
+import {
+	type BulkIngestFile,
+	type CreateInodeOpts,
+	type DirentRow,
+	INODE_KIND,
+	type InodeKind,
+	type InodeRow,
+	type PathCacheEntry,
+	type SandboxMeta,
+	type SqlDialect,
+	type UpdateInodeOpts,
 } from "../types.js";
 
 /** Transaction handle type used throughout this dialect. */
@@ -453,10 +454,10 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-017
-	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<void> {
-		if (files.length === 0) return;
+	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>> {
+		const result = new Map<string, PathCacheEntry>();
+		if (files.length === 0) return result;
 
-		// Get sandbox_id and root_inode via current session context
 		const ctxRows = await tx<{ id: string; root_inode: string }[]>`
 			SELECT id, root_inode FROM sandboxes WHERE id = current_setting('app.sandbox_id')
 		`;
@@ -465,69 +466,145 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		const sandboxId = ctxRow.id;
 		const rootInodeId = BigInt(ctxRow.root_inode);
 
-		// Build path → inodeId map starting from the root
+		// ── Phase A: resolve/create ancestor directories by depth level ──────────
+
 		const dirMap = new Map<string, bigint>();
 		dirMap.set("/", rootInodeId);
 
-		// Collect all unique ancestor directory paths, sorted shallow-first
-		const dirPaths = new Set<string>();
+		const dirsByDepth = new Map<number, Set<string>>();
 		for (const f of files) {
 			const parts = f.path.split("/").filter(Boolean);
 			for (let i = 1; i < parts.length; i++) {
-				dirPaths.add(`/${parts.slice(0, i).join("/")}`);
+				const dirPath = `/${parts.slice(0, i).join("/")}`;
+				const depth = i;
+				let set = dirsByDepth.get(depth);
+				if (!set) {
+					set = new Set();
+					dirsByDepth.set(depth, set);
+				}
+				set.add(dirPath);
 			}
 		}
-		const sortedDirPaths = [...dirPaths].sort((a, b) => {
-			const da = a.split("/").filter(Boolean).length;
-			const db = b.split("/").filter(Boolean).length;
-			return da - db;
-		});
+		const sortedDepths = [...dirsByDepth.keys()].sort((a, b) => a - b);
 
-		// Ensure each directory exists, creating it if missing
-		for (const dirPath of sortedDirPaths) {
-			if (dirMap.has(dirPath)) continue;
-			const parts = dirPath.split("/").filter(Boolean);
+		for (const depth of sortedDepths) {
+			const dirsAtDepth = dirsByDepth.get(depth)!;
+
+			const candidates: Array<{ dirPath: string; name: string; parentInodeId: bigint }> = [];
+			for (const dirPath of dirsAtDepth) {
+				if (dirMap.has(dirPath)) continue;
+				const parts = dirPath.split("/").filter(Boolean);
+				const name = parts[parts.length - 1]!;
+				const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+				const parentInodeId = dirMap.get(parentPath);
+				if (!parentInodeId) throw new Error(`bulkIngest: parent dir ${parentPath} not found`);
+				candidates.push({ dirPath, name, parentInodeId });
+			}
+
+			if (candidates.length === 0) continue;
+
+			const checkValues = candidates.map((c) => [String(c.parentInodeId), c.name]);
+			const existingRows = await tx<{ parent_inode_id: string; name: string; inode_id: string; kind: number }[]>`
+				SELECT d.parent_inode_id, d.name, d.inode_id, i.kind
+				FROM dirents d
+				JOIN inodes i ON i.id = d.inode_id
+				JOIN (VALUES ${tx(checkValues)}) AS v(pid, nm)
+					ON d.parent_inode_id = v.pid::bigint AND d.name = v.nm
+			`;
+
+			const candidateByKey = new Map<string, (typeof candidates)[0]>();
+			for (const c of candidates) candidateByKey.set(`${String(c.parentInodeId)}:${c.name}`, c);
+
+			for (const row of existingRows) {
+				const match = candidateByKey.get(`${row.parent_inode_id}:${row.name}`);
+				if (row.kind !== INODE_KIND.DIRECTORY) {
+					throw createEnotdir(match?.dirPath ?? row.name);
+				}
+				if (match) dirMap.set(match.dirPath, BigInt(row.inode_id));
+			}
+
+			const toCreate = candidates.filter((c) => !dirMap.has(c.dirPath));
+			if (toCreate.length === 0) continue;
+
+			const dirInodeInserts = toCreate.map((_c) => ({
+				sandbox_id: sandboxId,
+				kind: INODE_KIND.DIRECTORY,
+				mode: 0o755,
+				size: 0,
+			}));
+			const createdDirInodes = await tx<{ id: string; mtime: string }[]>`
+				INSERT INTO inodes ${tx(dirInodeInserts)} RETURNING id, mtime
+			`;
+
+			const dirDirentInserts = toCreate.map((c, i) => ({
+				parent_inode_id: String(c.parentInodeId),
+				name: c.name,
+				inode_id: createdDirInodes[i]!.id,
+				sandbox_id: sandboxId,
+			}));
+			await tx`INSERT INTO dirents ${tx(dirDirentInserts)}`;
+
+			for (let i = 0; i < toCreate.length; i++) {
+				const c = toCreate[i]!;
+				const row = createdDirInodes[i]!;
+				const inodeId = BigInt(row.id);
+				dirMap.set(c.dirPath, inodeId);
+				result.set(c.dirPath, {
+					inodeId,
+					kind: INODE_KIND.DIRECTORY,
+					mode: 0o755,
+					size: 0,
+					mtime: new Date(row.mtime),
+					contentSha256: null,
+					symlinkTarget: null,
+				});
+			}
+		}
+
+		// ── Phase B: detect existing file dirents for overwrite handling ──────────
+
+		const filesWithHash = files.map((f) => {
+			const parts = f.path.split("/").filter(Boolean);
 			const name = parts[parts.length - 1]!;
 			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-			const parentInodeId = dirMap.get(parentPath);
-			if (!parentInodeId) throw new Error(`bulkIngest: parent dir ${parentPath} not found`);
+			return {
+				path: f.path,
+				content: f.content,
+				mode: f.mode,
+				sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
+				name,
+				parentPath,
+				parentInodeId: dirMap.get(parentPath)!,
+			};
+		});
 
-			// Check if dir already exists in DB
-			const existing = await tx<{ inode_id: string }[]>`
-				SELECT inode_id FROM dirents
-				WHERE parent_inode_id = ${String(parentInodeId)} AND name = ${name}
-			`;
-			if (existing[0]) {
-				dirMap.set(dirPath, BigInt(existing[0].inode_id));
-				continue;
+		const fileCheckValues = filesWithHash.map((f) => [String(f.parentInodeId), f.name]);
+		const existingFileDirents = await tx<
+			{
+				parent_inode_id: string;
+				name: string;
+				inode_id: string;
+				kind: number;
+			}[]
+		>`
+			SELECT d.parent_inode_id, d.name, d.inode_id, i.kind
+			FROM dirents d
+			JOIN inodes i ON i.id = d.inode_id
+			JOIN (VALUES ${tx(fileCheckValues)}) AS v(pid, nm)
+				ON d.parent_inode_id = v.pid::bigint AND d.name = v.nm
+		`;
+
+		const existingFileMap = new Map<string, bigint>();
+		for (const row of existingFileDirents) {
+			if (row.kind === INODE_KIND.DIRECTORY) {
+				const match = filesWithHash.find((f) => String(f.parentInodeId) === row.parent_inode_id && f.name === row.name);
+				throw createEisdir(match?.path ?? row.name);
 			}
-
-			// Create dir inode + dirent
-			const dirInodeRows = await tx<{ id: string }[]>`
-				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				VALUES (${sandboxId}, 2, ${0o755}, 0)
-				RETURNING id
-			`;
-			const dirInodeRow = dirInodeRows[0];
-			if (!dirInodeRow) throw new Error(`bulkIngest: failed to create dir inode for ${dirPath}`);
-			const dirInodeId = BigInt(dirInodeRow.id);
-
-			await tx`
-				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-				VALUES (${String(parentInodeId)}, ${name}, ${String(dirInodeId)}, ${sandboxId})
-			`;
-			dirMap.set(dirPath, dirInodeId);
+			existingFileMap.set(`${row.parent_inode_id}:${row.name}`, BigInt(row.inode_id));
 		}
 
-		// Compute sha256 for every file
-		const filesWithHash = files.map((f) => ({
-			path: f.path,
-			content: f.content,
-			mode: f.mode,
-			sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
-		}));
+		// ── Phase C: bulk insert blobs ────────────────────────────────────────────
 
-		// Multi-row INSERT unique blobs, dedup via ON CONFLICT DO NOTHING
 		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
 		for (const f of filesWithHash) {
 			const key = f.sha256.toString("hex");
@@ -540,32 +617,89 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING`;
 		}
 
-		// Multi-row INSERT file inodes, RETURNING ids in insertion order
+		// ── Phase D: bulk insert file inodes ─────────────────────────────────────
+
 		const inodeInserts = filesWithHash.map((f) => ({
 			sandbox_id: sandboxId,
-			kind: 1,
+			kind: INODE_KIND.FILE,
 			mode: f.mode,
 			size: f.content.length,
 			content_sha256: f.sha256,
 		}));
-		const insertedInodes = await tx<{ id: string }[]>`INSERT INTO inodes ${tx(inodeInserts)} RETURNING id`;
+		const insertedInodes = await tx<{ id: string; mtime: string }[]>`
+			INSERT INTO inodes ${tx(inodeInserts)} RETURNING id, mtime
+		`;
 
-		// Multi-row INSERT dirents linking each file inode to its parent dir
-		const direntInserts = filesWithHash.map((f, i) => {
-			const parts = f.path.split("/").filter(Boolean);
-			const name = parts[parts.length - 1]!;
-			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-			const parentInodeId = dirMap.get(parentPath);
-			if (!parentInodeId) throw new Error(`bulkIngest: parent dir not found for ${f.path}`);
-			const inodeId = insertedInodes[i]!.id;
-			return {
-				parent_inode_id: String(parentInodeId),
-				name,
-				inode_id: inodeId,
-				sandbox_id: sandboxId,
-			};
-		});
-		await tx`INSERT INTO dirents ${tx(direntInserts)} ON CONFLICT DO NOTHING`;
+		// ── Phase E: link dirents — upsert for overwrites, clean up old inodes ───
+
+		const toUpdate: Array<[string, string, string]> = [];
+		const oldInodeIds: bigint[] = [];
+		const toInsert: Array<{ parent_inode_id: string; name: string; inode_id: string; sandbox_id: string }> = [];
+
+		for (let i = 0; i < filesWithHash.length; i++) {
+			const f = filesWithHash[i]!;
+			const newInodeId = insertedInodes[i]!.id;
+			const key = `${String(f.parentInodeId)}:${f.name}`;
+			const oldInodeId = existingFileMap.get(key);
+
+			if (oldInodeId !== undefined) {
+				toUpdate.push([String(f.parentInodeId), f.name, newInodeId]);
+				oldInodeIds.push(oldInodeId);
+			} else {
+				toInsert.push({
+					parent_inode_id: String(f.parentInodeId),
+					name: f.name,
+					inode_id: newInodeId,
+					sandbox_id: sandboxId,
+				});
+			}
+		}
+
+		if (toUpdate.length > 0) {
+			await tx`
+				UPDATE dirents d
+				SET inode_id = v.new_id::bigint
+				FROM (VALUES ${tx(toUpdate)}) AS v(pid, nm, new_id)
+				WHERE d.parent_inode_id = v.pid::bigint AND d.name = v.nm
+			`;
+			// Count occurrences of each old inode — hardlinks may cause duplicates
+			const nlinkDecrements = new Map<string, number>();
+			for (const id of oldInodeIds) {
+				const key = String(id);
+				nlinkDecrements.set(key, (nlinkDecrements.get(key) ?? 0) + 1);
+			}
+			const decrementValues = [...nlinkDecrements.entries()].map(([id, cnt]) => [id, String(cnt)]);
+			await tx`
+				UPDATE inodes i
+				SET nlink = i.nlink - v.cnt::int
+				FROM (VALUES ${tx(decrementValues)}) AS v(inode_id, cnt)
+				WHERE i.id = v.inode_id::bigint
+			`;
+			const oldIdStrings = [...nlinkDecrements.keys()];
+			await tx`DELETE FROM inodes WHERE id IN ${tx(oldIdStrings)} AND nlink <= 0`;
+		}
+
+		if (toInsert.length > 0) {
+			await tx`INSERT INTO dirents ${tx(toInsert)}`;
+		}
+
+		// ── Phase F: build result cache entries from INSERT RETURNING data ────────
+
+		for (let i = 0; i < filesWithHash.length; i++) {
+			const f = filesWithHash[i]!;
+			const row = insertedInodes[i]!;
+			result.set(f.path, {
+				inodeId: BigInt(row.id),
+				kind: INODE_KIND.FILE,
+				mode: f.mode,
+				size: f.content.length,
+				mtime: new Date(row.mtime),
+				contentSha256: f.sha256,
+				symlinkTarget: null,
+			});
+		}
+
+		return result;
 	}
 
 	// US-018

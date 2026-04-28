@@ -282,7 +282,7 @@ export interface SqlDialect<Tx = unknown> {
 	 * creating all missing parent directories automatically.
 	 * Prefers multi-row INSERT statements for blobs and inodes.
 	 */
-	bulkIngest(tx: Tx, files: BulkIngestFile[]): Promise<void>;
+	bulkIngest(tx: Tx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>>;
 
 	// ── Path resolution ───────────────────────────────────────────────────────────
 
