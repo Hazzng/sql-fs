@@ -11,7 +11,7 @@ import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
 import { translateSqlError } from "../fs/sql-fs/errors.js";
 import { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
-import type { SandboxMeta } from "../fs/sql-fs/types.js";
+import type { SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
 import { type AuthVariables, createAuthMiddleware } from "./auth.js";
@@ -116,6 +116,16 @@ async function persistSandboxMetaFn(tenantId: string, sandboxId: string, meta: S
 	}
 }
 
+async function listSandboxesFn(tenantId: string, owner?: string): Promise<SandboxListEntry[]> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	try {
+		return await backend.dialect.transaction((tx) => backend.dialect.listSandboxes(tx, owner));
+	} catch (err) {
+		throw translateSqlError(err, "listSandboxes");
+	}
+}
+
 async function closeMetaFns(): Promise<void> {
 	for (const backend of metaBackends.values()) {
 		if (backend.connected) {
@@ -137,6 +147,7 @@ const sessionManager = new SessionManager({
 			: undefined,
 	getSandboxMetaFn,
 	persistSandboxMetaFn,
+	listSandboxesFn,
 });
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────

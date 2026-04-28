@@ -23,7 +23,7 @@ import { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
-export type { InodeKind, StorageBackend } from "./types.js";
+export type { InodeKind, SandboxListEntry, StorageBackend } from "./types.js";
 
 /**
  * Options passed to the tenant-aware Postgres factory.

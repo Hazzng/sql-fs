@@ -273,6 +273,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 			session.owner = "agent-1";
 			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
 				owner: "agent-1",
+				name: null,
 				python: false,
 				javascript: false,
 			});

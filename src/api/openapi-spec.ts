@@ -17,23 +17,25 @@ const sandboxSchema = {
 	type: "object",
 	properties: {
 		id: { type: "string", format: "uuid", example: "550e8400-e29b-41d4-a716-446655440000" },
+		name: { type: "string", nullable: true, example: "my-project-sandbox" },
 		owner: { type: "string", example: "alice" },
 		createdAt: { type: "string", format: "date-time" },
 		python: { type: "boolean", example: false },
 		javascript: { type: "boolean", example: false },
 	},
-	required: ["id", "owner", "createdAt", "python", "javascript"],
+	required: ["id", "name", "owner", "createdAt", "python", "javascript"],
 } as const;
 
 const sandboxInfoSchema = {
 	type: "object",
 	properties: {
 		id: { type: "string", format: "uuid" },
+		name: { type: "string", nullable: true },
 		owner: { type: "string" },
 		createdAt: { type: "string", format: "date-time" },
 		lastUsedAt: { type: "string", format: "date-time" },
 	},
-	required: ["id", "owner", "createdAt", "lastUsedAt"],
+	required: ["id", "name", "owner", "createdAt", "lastUsedAt"],
 } as const;
 
 const treeEntrySchema = {
@@ -76,7 +78,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.2.3",
+		version: "0.2.6",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},
@@ -241,6 +243,30 @@ export const openapiSpec = {
 
 		// ── Sandboxes ─────────────────────────────────────────────────────────────
 		"/sandboxes": {
+			get: {
+				tags: ["Sandboxes"],
+				summary: "List sandboxes",
+				description: "List all sandboxes owned by the authenticated user.",
+				responses: {
+					"200": {
+						description: "Sandbox list",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										sandboxes: {
+											type: "array",
+											items: { $ref: "#/components/schemas/Sandbox" },
+										},
+									},
+									required: ["sandboxes"],
+								},
+							},
+						},
+					},
+				},
+			},
 			post: {
 				tags: ["Sandboxes"],
 				summary: "Create sandbox",
@@ -252,6 +278,11 @@ export const openapiSpec = {
 							schema: {
 								type: "object",
 								properties: {
+									name: {
+										type: "string",
+										maxLength: 255,
+										description: "Human-readable name for the sandbox",
+									},
 									env: {
 										type: "object",
 										additionalProperties: { type: "string" },
