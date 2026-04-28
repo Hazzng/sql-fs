@@ -1,10 +1,10 @@
 /**
  * Unit tests for the SqlFs.bulkIngest cache-coherence wrapper.
  *
- * The wrapper is what differentiates the public API method from the dialect
- * primitive: it must run inside `#withTx` (acquires advisory lock + RLS),
- * mark the FS dirty so multi-replica version bookkeeping fires, and refresh
- * `pathCache` via `reload()` so subsequent reads see the new entries.
+ * The wrapper validates/normalizes input paths, delegates to `dialect.bulkIngest`
+ * inside a write transaction (advisory lock + RLS), merges the returned
+ * PathCacheEntry map into `#pathCache` (evicting overwritten inodes from
+ * contentCache), and marks the FS dirty.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,9 +17,13 @@ function dirEntry(path: string, inodeId: bigint): { path: string } & PathCacheEn
 	return { path, inodeId, kind: 2, mode: 0o755, size: 0, mtime: now, contentSha256: null, symlinkTarget: null };
 }
 
-function fileEntry(path: string, inodeId: bigint, size: number): { path: string } & PathCacheEntry {
+function cacheEntry(inodeId: bigint, size: number): PathCacheEntry {
 	const sha = new Uint8Array(32).fill(0xcd);
-	return { path, inodeId, kind: 1, mode: 0o644, size, mtime: now, contentSha256: sha, symlinkTarget: null };
+	return { inodeId, kind: 1, mode: 0o644, size, mtime: now, contentSha256: sha, symlinkTarget: null };
+}
+
+function dirCacheEntry(inodeId: bigint): PathCacheEntry {
+	return { inodeId, kind: 2, mode: 0o755, size: 0, mtime: now, contentSha256: null, symlinkTarget: null };
 }
 
 function makeDialect(): {
@@ -30,14 +34,9 @@ function makeDialect(): {
 	setSandboxContextWithLockMock: ReturnType<typeof vi.fn>;
 } {
 	const transactionMock = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({}));
-	const bulkIngestMock = vi.fn();
+	const bulkIngestMock = vi.fn(async () => new Map<string, PathCacheEntry>());
 	const loadAllPathsMock = vi.fn(async () => [] as Array<{ path: string } & PathCacheEntry>);
 	const setSandboxContextWithLockMock = vi.fn();
-	// `as unknown as SqlDialect<unknown>` (not `satisfies`) is required here because
-	// `SqlDialect.transaction` is a generic method `<T>(fn) => Promise<T>`, and a
-	// `vi.fn(...)` mock collapses the type parameter so it cannot structurally
-	// match the variance. Same pattern used by the other dialect-mock tests in
-	// this directory (sql-fs.read.test.ts etc.).
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
@@ -72,7 +71,6 @@ function makeDialect(): {
 }
 
 describe("SqlFs.bulkIngest", () => {
-	let dialect: SqlDialect<unknown>;
 	let bulkIngestMock: ReturnType<typeof vi.fn>;
 	let loadAllPathsMock: ReturnType<typeof vi.fn>;
 	let transactionMock: ReturnType<typeof vi.fn>;
@@ -81,64 +79,54 @@ describe("SqlFs.bulkIngest", () => {
 
 	beforeEach(async () => {
 		const m = makeDialect();
-		dialect = m.dialect;
 		bulkIngestMock = m.bulkIngestMock;
 		loadAllPathsMock = m.loadAllPathsMock;
 		transactionMock = m.transactionMock;
 		setSandboxContextWithLockMock = m.setSandboxContextWithLockMock;
 
-		// Initial pathCache: just /
 		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n)]);
-		fs = new SqlFs({ dialect, sandboxId: "s1" });
+		fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
 		await fs.ready();
 	});
 
-	it("is a no-op for an empty file list — no transaction, no reload, no dirty flip", async () => {
+	it("is a no-op for an empty file list — no transaction, no dirty flip", async () => {
 		const txCallsBefore = transactionMock.mock.calls.length;
-		const loadCallsBefore = loadAllPathsMock.mock.calls.length;
 
 		await fs.bulkIngest([]);
 
 		expect(bulkIngestMock).not.toHaveBeenCalled();
 		expect(transactionMock.mock.calls.length).toBe(txCallsBefore);
-		expect(loadAllPathsMock.mock.calls.length).toBe(loadCallsBefore);
 		expect(fs.wasDirty()).toBe(false);
 	});
 
-	it("opens one write tx (with advisory lock), invokes dialect.bulkIngest, sets dirty, then reloads", async () => {
+	it("opens one write tx (with advisory lock), invokes dialect.bulkIngest, merges cache, sets dirty", async () => {
 		const lockCallsBefore = setSandboxContextWithLockMock.mock.calls.length;
 		const loadCallsBefore = loadAllPathsMock.mock.calls.length;
 
 		const files: BulkIngestFile[] = [{ path: "/a.txt", content: new TextEncoder().encode("a"), mode: 0o644 }];
 
-		// Reload after bulkIngest will call loadAllPaths once more.
-		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n), fileEntry("/a.txt", 2n, 1)]);
+		bulkIngestMock.mockResolvedValueOnce(new Map([["/a.txt", cacheEntry(2n, 1)]]));
 
 		await fs.bulkIngest(files);
 
 		expect(bulkIngestMock).toHaveBeenCalledOnce();
-		// bulkIngest forwards a normalized copy (paths run through validatePath),
-		// not the caller's array — assert by value, not by reference.
 		expect(bulkIngestMock.mock.calls[0]?.[1]).toEqual(files);
-		// Advisory lock must be acquired (write path), not the read-only setSandboxContext.
 		expect(setSandboxContextWithLockMock.mock.calls.length).toBeGreaterThan(lockCallsBefore);
-		// reload() ran loadAllPaths exactly once more after the mutation.
-		expect(loadAllPathsMock.mock.calls.length).toBe(loadCallsBefore + 1);
-		// dirty must be set AFTER reload() so publishVersionIfDirty sees the
-		// mutation and bumps the cross-replica version counter.
+		// No reload() — loadAllPaths should NOT be called after the mutation
+		expect(loadAllPathsMock.mock.calls.length).toBe(loadCallsBefore);
 		expect(fs.wasDirty()).toBe(true);
 	});
 
-	it("after bulkIngest + reload, stat() returns the new entry from the refreshed pathCache", async () => {
+	it("after bulkIngest, stat() returns entries from the merged cache (no reload needed)", async () => {
 		const files: BulkIngestFile[] = [{ path: "/home/user/x.txt", content: new TextEncoder().encode("x"), mode: 0o644 }];
 
-		// Stub loadAllPaths to return the post-ingest tree on reload.
-		loadAllPathsMock.mockResolvedValueOnce([
-			dirEntry("/", 1n),
-			dirEntry("/home", 10n),
-			dirEntry("/home/user", 11n),
-			fileEntry("/home/user/x.txt", 20n, 1),
-		]);
+		bulkIngestMock.mockResolvedValueOnce(
+			new Map<string, PathCacheEntry>([
+				["/home", dirCacheEntry(10n)],
+				["/home/user", dirCacheEntry(11n)],
+				["/home/user/x.txt", cacheEntry(20n, 1)],
+			]),
+		);
 
 		await fs.bulkIngest(files);
 
@@ -147,7 +135,7 @@ describe("SqlFs.bulkIngest", () => {
 		expect(stat.size).toBe(1);
 	});
 
-	it("propagates dialect.bulkIngest errors and does NOT call reload()", async () => {
+	it("propagates dialect.bulkIngest errors without modifying cache", async () => {
 		const loadCallsBefore = loadAllPathsMock.mock.calls.length;
 		bulkIngestMock.mockRejectedValueOnce(Object.assign(new Error("boom"), { code: "EINVAL" }));
 
@@ -155,10 +143,11 @@ describe("SqlFs.bulkIngest", () => {
 
 		await expect(fs.bulkIngest(files)).rejects.toMatchObject({ code: "EINVAL" });
 		expect(loadAllPathsMock.mock.calls.length).toBe(loadCallsBefore);
+		expect(fs.wasDirty()).toBe(false);
 	});
 
 	it("normalizes paths through validatePath before forwarding to the dialect", async () => {
-		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n)]);
+		bulkIngestMock.mockResolvedValueOnce(new Map<string, PathCacheEntry>());
 
 		await fs.bulkIngest([
 			{ path: "/home/user/./a.txt", content: new TextEncoder().encode("a"), mode: 0o644 },
@@ -193,5 +182,22 @@ describe("SqlFs.bulkIngest", () => {
 
 		expect(bulkIngestMock).not.toHaveBeenCalled();
 		expect(transactionMock.mock.calls.length).toBe(txCallsBefore);
+	});
+
+	it("evicts overwritten file from contentCache when inode ID changes", async () => {
+		// Seed pathCache with an existing file at /a.txt with inodeId 5n
+		bulkIngestMock.mockResolvedValueOnce(new Map([["/a.txt", cacheEntry(5n, 3)]]));
+		await fs.bulkIngest([{ path: "/a.txt", content: new TextEncoder().encode("old"), mode: 0o644 }]);
+
+		// Populate contentCache for the old inode
+		fs._contentCacheSet(5n, new TextEncoder().encode("old"));
+		expect(fs._contentCacheHas(5n)).toBe(true);
+
+		// Now overwrite /a.txt with a new inode (6n)
+		bulkIngestMock.mockResolvedValueOnce(new Map([["/a.txt", cacheEntry(6n, 3)]]));
+		await fs.bulkIngest([{ path: "/a.txt", content: new TextEncoder().encode("new"), mode: 0o644 }]);
+
+		// Old inode's content should be evicted
+		expect(fs._contentCacheHas(5n)).toBe(false);
 	});
 });

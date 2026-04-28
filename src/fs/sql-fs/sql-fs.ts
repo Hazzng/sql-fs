@@ -382,10 +382,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			seen.add(path);
 			normalized.push({ path, content: file.content, mode: file.mode });
 		}
-		await this.#withTx(async (tx) => {
-			await this.#dialect.bulkIngest(tx, normalized);
-		});
-		await this.reload();
+		const newEntries = await this.#withTx((tx) => this.#dialect.bulkIngest(tx, normalized));
+		// Evict overwritten inodes from contentCache so stale content is never served.
+		for (const [path, entry] of newEntries) {
+			const old = this.#pathCache.get(path);
+			if (old !== undefined && old.inodeId !== entry.inodeId) {
+				this.#contentCache.delete(old.inodeId);
+			}
+			this.#pathCache.set(path, entry);
+		}
 		this.#dirty = true;
 	}
 
