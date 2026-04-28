@@ -152,7 +152,11 @@ export function rateLimit(opts: RateLimitOptions): MiddlewareHandler {
 
 		for (const key of keys) {
 			const decision = store.hit(key, opts.windowMs, opts.max, t);
-			if (!decision.allowed && trippedKey === undefined) {
+			// Track the *latest* resetAt across all denied keys so Retry-After
+			// reflects the longest remaining wait — not the first bucket tripped.
+			// Otherwise a client could wake up while a slower-resetting bucket
+			// is still in violation and immediately receive another 429.
+			if (!decision.allowed && decision.resetAt >= trippedResetAt) {
 				trippedKey = key;
 				trippedResetAt = decision.resetAt;
 			}
