@@ -11,6 +11,8 @@ export interface SignTokenOptions {
 	tenant?: string;
 	expiresIn?: string; // e.g. "30d", "1y", "24h", "never" or undefined = no expiry
 	secret: string;
+	/** Optional JWT id claim. When set, allows correlating an issued token with audit logs. */
+	jti?: string;
 }
 
 export interface VerifyTokenOptions {
@@ -35,7 +37,7 @@ export interface TokenPayload {
  * @param opts.secret - HS256 signing secret.
  * @returns The signed token string.
  */
-export async function signToken({ sub, tenant, expiresIn, secret }: SignTokenOptions): Promise<string> {
+export async function signToken({ sub, tenant, expiresIn, secret, jti }: SignTokenOptions): Promise<string> {
 	const key = new TextEncoder().encode(secret);
 	const body: Record<string, unknown> = { sub };
 	if (tenant !== undefined) {
@@ -45,6 +47,10 @@ export async function signToken({ sub, tenant, expiresIn, secret }: SignTokenOpt
 
 	if (expiresIn && expiresIn !== "never") {
 		jwt.setExpirationTime(expiresIn);
+	}
+
+	if (jti !== undefined) {
+		jwt.setJti(jti);
 	}
 
 	return jwt.sign(key);
