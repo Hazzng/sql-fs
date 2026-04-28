@@ -33,7 +33,7 @@ function makeSessionManager(): SessionManager {
 	});
 }
 
-const DEFAULT_META: SandboxMeta = { owner: null, python: false, javascript: false };
+const DEFAULT_META: SandboxMeta = { owner: null, name: null, python: false, javascript: false };
 
 describe("SessionManager.withSessionOrRehydrate()", () => {
 	let sm: SessionManager;
@@ -102,7 +102,7 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("restores owner from PG metadata on rehydration", async () => {
-		pgSandboxes.set("sb-owned", { owner: "user-a", python: false, javascript: false });
+		pgSandboxes.set("sb-owned", { owner: "user-a", name: null, python: false, javascript: false });
 
 		let capturedOwner = "";
 		await sm.withSessionOrRehydrate("default", "sb-owned", async (session) => {
@@ -112,7 +112,7 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("restores runtime options from PG metadata on rehydration", async () => {
-		pgSandboxes.set("sb-py", { owner: null, python: true, javascript: false });
+		pgSandboxes.set("sb-py", { owner: null, name: null, python: true, javascript: false });
 
 		let capturedRuntime = { python: false, javascript: false };
 		await sm.withSessionOrRehydrate("default", "sb-py", async (session) => {
@@ -124,7 +124,12 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
 		await sm.withSession("default", "sb-meta", async (session) => {
 			session.owner = "creator";
-			await sm.persistSandboxMeta("default", "sb-meta", { owner: "creator", python: true, javascript: false });
+			await sm.persistSandboxMeta("default", "sb-meta", {
+				owner: "creator",
+				name: null,
+				python: true,
+				javascript: false,
+			});
 		});
 
 		// Simulate pool eviction by creating a new manager with same store

@@ -212,7 +212,12 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 		});
 		await mgr.withSession("default", SANDBOX_ID, async (session) => {
 			session.owner = "agent-1";
-			await mgr.persistSandboxMeta("default", SANDBOX_ID, { owner: "agent-1", python: false, javascript: false });
+			await mgr.persistSandboxMeta("default", SANDBOX_ID, {
+				owner: "agent-1",
+				name: null,
+				python: false,
+				javascript: false,
+			});
 		});
 
 		const app = makeTestApp(mgr);

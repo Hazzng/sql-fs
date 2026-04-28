@@ -15,6 +15,7 @@ import type {
 	InodeKind,
 	InodeRow,
 	PathCacheEntry,
+	SandboxListEntry,
 	SandboxMeta,
 	SqlDialect,
 	UpdateInodeOpts,
@@ -124,12 +125,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
 		try {
-			const rows = await tx<{ owner: string | null; python: boolean; javascript: boolean }[]>`
-				SELECT owner, python, javascript FROM sandboxes WHERE id = ${sandboxId}
+			const rows = await tx<{ owner: string | null; name: string | null; python: boolean; javascript: boolean }[]>`
+				SELECT owner, name, python, javascript FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
-			return { owner: r.owner, python: r.python, javascript: r.javascript };
+			return { owner: r.owner, name: r.name, python: r.python, javascript: r.javascript };
 		} catch (err) {
 			throw translateSqlError(err, sandboxId);
 		}
@@ -140,7 +141,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		try {
 			rows = await tx<{ id: string }[]>`
 				UPDATE sandboxes
-				SET owner = ${meta.owner}, python = ${meta.python}, javascript = ${meta.javascript}
+				SET owner = ${meta.owner}, name = ${meta.name}, python = ${meta.python}, javascript = ${meta.javascript}
 				WHERE id = ${sandboxId}
 				RETURNING id
 			`;
@@ -149,6 +150,43 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 		if (rows.length === 0) {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+		}
+	}
+
+	async listSandboxes(tx: PgTx, owner?: string): Promise<SandboxListEntry[]> {
+		try {
+			const rows =
+				owner !== undefined
+					? await tx<
+							{
+								id: string;
+								name: string | null;
+								owner: string | null;
+								created_at: Date;
+								python: boolean;
+								javascript: boolean;
+							}[]
+						>`SELECT id, name, owner, created_at, python, javascript FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
+					: await tx<
+							{
+								id: string;
+								name: string | null;
+								owner: string | null;
+								created_at: Date;
+								python: boolean;
+								javascript: boolean;
+							}[]
+						>`SELECT id, name, owner, created_at, python, javascript FROM sandboxes ORDER BY created_at DESC`;
+			return rows.map((r) => ({
+				id: r.id,
+				name: r.name,
+				owner: r.owner,
+				createdAt: r.created_at,
+				python: r.python,
+				javascript: r.javascript,
+			}));
+		} catch (err) {
+			throw translateSqlError(err, "listSandboxes");
 		}
 	}
 

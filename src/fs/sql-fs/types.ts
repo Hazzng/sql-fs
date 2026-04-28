@@ -60,6 +60,17 @@ export interface PathCacheEntry {
 /** Persisted sandbox metadata needed for session rehydration on cold replicas. */
 export interface SandboxMeta {
 	readonly owner: string | null;
+	readonly name: string | null;
+	readonly python: boolean;
+	readonly javascript: boolean;
+}
+
+/** A single entry returned by the list-sandboxes query. */
+export interface SandboxListEntry {
+	readonly id: string;
+	readonly name: string | null;
+	readonly owner: string | null;
+	readonly createdAt: Date;
 	readonly python: boolean;
 	readonly javascript: boolean;
 }
@@ -164,6 +175,9 @@ export interface SqlDialect<Tx = unknown> {
 
 	/** Writes owner and runtime-option metadata to the sandbox row. */
 	updateSandboxMeta(tx: Tx, sandboxId: string, meta: SandboxMeta): Promise<void>;
+
+	/** Lists all sandboxes, optionally filtered by owner. */
+	listSandboxes(tx: Tx, owner?: string): Promise<SandboxListEntry[]>;
 
 	// ── Inode CRUD ────────────────────────────────────────────────────────────────
 

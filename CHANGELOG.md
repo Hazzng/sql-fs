@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-04-28
+
+### Added
+
+- `GET /v1/sandboxes` — list all sandboxes owned by the authenticated user, queried directly from Postgres for accuracy across replicas.
+- `sandbox_list` MCP tool providing the same listing capability to MCP clients.
+- `name` field on sandboxes: optional human-readable name (`TEXT`, max 255 chars) set at creation time via `POST /v1/sandboxes` body or `sandbox_create` MCP tool. Returned in create, get, and list responses.
+- Postgres migration `0003_add_sandbox_name.sql` adding the `name` column.
+- `listSandboxes` method on `SqlDialect` interface and Postgres dialect implementation.
+- OpenAPI spec updated with the new list endpoint and `name` field on all sandbox schemas.
+
 ## [0.2.5] - 2026-04-26
 
 ### Fixed

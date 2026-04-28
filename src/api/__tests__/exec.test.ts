@@ -511,6 +511,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 			session.owner = "agent-1";
 			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
 				owner: "agent-1",
+				name: null,
 				python: false,
 				javascript: false,
 			});
