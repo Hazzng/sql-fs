@@ -64,12 +64,21 @@ export class InMemoryRateLimitStore implements RateLimitStore {
 		const existing = this.entries.get(key);
 		if (existing === undefined || existing.resetAt <= now) {
 			// New (or rolled-over) bucket. Cap live keys: when we'd exceed the
-			// max, evict the oldest insertion-order entry. Map preserves insertion
-			// order, which approximates oldest-resetAt in steady state and bounds
-			// memory under attacker-controlled key cardinality.
+			// max, first purge expired entries so we don't evict a still-live
+			// tracker while dead space is sitting in the map (the every-1024-hits
+			// lazy GC may not have run yet under bursty traffic). If the store
+			// is still full after that, fall back to FIFO eviction.
 			if (existing === undefined && this.entries.size >= this.maxEntries) {
-				const oldest = this.entries.keys().next().value;
-				if (oldest !== undefined) this.entries.delete(oldest);
+				for (const [k, v] of this.entries) {
+					if (v.resetAt <= now) {
+						this.entries.delete(k);
+						if (this.entries.size < this.maxEntries) break;
+					}
+				}
+				if (this.entries.size >= this.maxEntries) {
+					const oldest = this.entries.keys().next().value;
+					if (oldest !== undefined) this.entries.delete(oldest);
+				}
 			}
 			const resetAt = now + windowMs;
 			// Re-insert (delete + set) so the entry moves to the tail of the
