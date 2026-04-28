@@ -23,20 +23,24 @@ const MAX_TIMEOUT_MS = 300_000;
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
 		"sandbox_create",
-		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands.",
+		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands. Optional name for human-readable identification.",
 		{
+			name: z.string().max(255).optional().describe("Human-readable name for the sandbox"),
 			python: z.boolean().optional(),
 			javascript: z.boolean().optional(),
 		},
 		async (args) => {
 			const id = randomUUID();
+			const name = args.name ?? null;
 			const runtimeOptions = {
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
 			};
-			await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+			session.name = name;
 			await sessionManager.persistSandboxMeta(tenant, id, {
 				owner,
+				name,
 				python: runtimeOptions.python,
 				javascript: runtimeOptions.javascript,
 			});
@@ -44,10 +48,43 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				content: [
 					{
 						type: "text" as const,
-						text: JSON.stringify({ id, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
+						text: JSON.stringify({ id, name, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
 					},
 				],
 			};
+		},
+	);
+
+	server.tool(
+		"sandbox_list",
+		"List all sandboxes owned by the current user. Returns id, name, owner, createdAt, and runtime flags for each sandbox.",
+		{},
+		async () => {
+			try {
+				const sandboxes = await sessionManager.listSandboxes(tenant, owner);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({
+								sandboxes: sandboxes.map((s) => ({
+									id: s.id,
+									name: s.name,
+									owner: s.owner,
+									createdAt: s.createdAt.toISOString(),
+									python: s.python,
+									javascript: s.javascript,
+								})),
+							}),
+						},
+					],
+				};
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+				};
+			}
 		},
 	);
 

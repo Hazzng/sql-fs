@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-04-28
+
+### Changed
+
+- **perf(ingest):** Batch directory existence checks per depth level in `bulkIngest`, reducing ~40 sequential DB round-trips to ~4 (one per depth level).
+- **perf(ingest):** Replace post-write `reload()` (full recursive CTE re-read) with in-memory `pathCache` merge from `INSERT RETURNING` data — zero DB calls after commit.
+- `SqlDialect.bulkIngest` return type changed from `Promise<void>` to `Promise<Map<string, PathCacheEntry>>` to support cache merge.
+
+### Fixed
+
+- **bulkIngest EISDIR:** Ingesting a file at a path that is currently a directory now throws `EISDIR` instead of silently overwriting the directory and orphaning its children.
+- **bulkIngest ENOTDIR:** Ancestor directory check now JOINs `inodes` to verify `kind=DIRECTORY`, throwing `ENOTDIR` if an ancestor is a file or symlink.
+- **bulkIngest nlink:** Overwriting two hardlinks to the same inode now decrements `nlink` by the correct count (was only decrementing once due to `IN`-clause deduplication).
+- **bulkIngest contentCache:** Overwritten file inodes are evicted from `contentCache` during the cache merge, preventing stale content reads.
+
+## [0.2.6] - 2026-04-28
+
+### Added
+
+- `GET /v1/sandboxes` — list all sandboxes owned by the authenticated user, queried directly from Postgres for accuracy across replicas.
+- `sandbox_list` MCP tool providing the same listing capability to MCP clients.
+- `name` field on sandboxes: optional human-readable name (`TEXT`, max 255 chars) set at creation time via `POST /v1/sandboxes` body or `sandbox_create` MCP tool. Returned in create, get, and list responses.
+- Postgres migration `0003_add_sandbox_name.sql` adding the `name` column.
+- `listSandboxes` method on `SqlDialect` interface and Postgres dialect implementation.
+- OpenAPI spec updated with the new list endpoint and `name` field on all sandbox schemas.
+
 ## [0.2.5] - 2026-04-26
 
 ### Fixed

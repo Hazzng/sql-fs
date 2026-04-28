@@ -21,7 +21,7 @@ import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/in
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
-import type { PathCacheEntry, SandboxMeta } from "../fs/sql-fs/types.js";
+import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
@@ -76,6 +76,7 @@ export interface Session {
 	readonly mutex: Mutex;
 	state: "active" | "closing";
 	owner: string;
+	name: string | null;
 	createdAt: string;
 	pathCacheBytes: number;
 	overBudget: boolean;
@@ -119,6 +120,11 @@ export interface SessionManagerOptions {
 	 * Called from `persistSandboxMeta` after sandbox creation.
 	 */
 	readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	/**
+	 * Lists all sandboxes from the persistent store for the given tenant,
+	 * optionally filtered by owner.
+	 */
+	readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
 }
 
 interface Semaphore {
@@ -144,6 +150,7 @@ export class SessionManager {
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
 	private readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	private readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
 
 	private readonly pythonSem: Semaphore;
 	private readonly jsSem: Semaphore;
@@ -162,6 +169,7 @@ export class SessionManager {
 		blobCacheFactory,
 		getSandboxMetaFn,
 		persistSandboxMetaFn,
+		listSandboxesFn,
 	}: SessionManagerOptions) {
 		this.tenantConfig = tenantConfig;
 		this.createFsOverride = createFs;
@@ -180,6 +188,7 @@ export class SessionManager {
 		this.blobCacheFactory = blobCacheFactory;
 		this.getSandboxMetaFn = getSandboxMetaFn;
 		this.persistSandboxMetaFn = persistSandboxMetaFn;
+		this.listSandboxesFn = listSandboxesFn;
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
 			inFlight: 0,
@@ -297,6 +306,7 @@ export class SessionManager {
 					mutex: new Mutex(),
 					state: "active",
 					owner: resolvedOwner,
+					name: null,
 					createdAt: new Date().toISOString(),
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
@@ -487,6 +497,9 @@ export class SessionManager {
 		if (meta?.owner) {
 			session.owner = meta.owner;
 		}
+		if (meta?.name !== undefined) {
+			session.name = meta.name;
+		}
 		return this.withSessionEntry(tenantId, sandboxId, session, fn);
 	}
 
@@ -494,6 +507,13 @@ export class SessionManager {
 		if (this.persistSandboxMetaFn !== undefined) {
 			await this.persistSandboxMetaFn(tenantId, sandboxId, meta);
 		}
+	}
+
+	async listSandboxes(tenantId: string, owner?: string): Promise<SandboxListEntry[]> {
+		if (this.listSandboxesFn === undefined) {
+			throw Object.assign(new Error("listSandboxes not configured"), { code: "ENOTSUP" });
+		}
+		return this.listSandboxesFn(tenantId, owner);
 	}
 
 	async destroy(tenantId: string, sandboxId: string): Promise<boolean> {

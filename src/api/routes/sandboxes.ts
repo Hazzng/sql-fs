@@ -13,6 +13,7 @@ import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from
 import type { SessionManager } from "../session-manager.js";
 
 const createBodySchema = z.object({
+	name: z.string().max(255).optional(),
 	env: z.record(z.string()).optional(),
 	files: z.record(z.string()).optional(),
 	python: z.boolean().optional(),
@@ -23,6 +24,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	router.post("/", async (c) => {
+		let name: string | null = null;
 		let files: Record<string, string> | undefined;
 		let python = false;
 		let javascript = false;
@@ -35,6 +37,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				const details = result.error.issues.map((i) => i.message);
 				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
 			}
+			name = result.data.name ?? null;
 			files = result.data.files;
 			python = result.data.python ?? false;
 			javascript = result.data.javascript ?? false;
@@ -52,8 +55,9 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			sandboxId,
 			async (session) => {
 				if (!session.owner) session.owner = owner;
+				session.name = name;
 				session.createdAt = createdAt;
-				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, python, javascript });
+				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, name, python, javascript });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);
@@ -64,7 +68,31 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			owner,
 		);
 
-		return c.json({ id: sandboxId, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);
+		return c.json({ id: sandboxId, name, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);
+	});
+
+	router.get("/", async (c) => {
+		const tenant = c.get("tenant");
+		const caller = c.get("owner");
+		try {
+			const sandboxes = await sessionManager.listSandboxes(tenant, caller);
+			return c.json({
+				sandboxes: sandboxes.map((s) => ({
+					id: s.id,
+					name: s.name,
+					owner: s.owner,
+					createdAt: s.createdAt.toISOString(),
+					python: s.python,
+					javascript: s.javascript,
+				})),
+			});
+		} catch (err) {
+			const code = (err as Error & { code?: string }).code;
+			if (code === "ENOTSUP") {
+				return c.json({ error: "listing not supported", code: "ENOTSUP" }, 501 as ContentfulStatusCode);
+			}
+			throw err;
+		}
 	});
 
 	router.get("/:id", (c) => {
@@ -80,6 +108,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		}
 		return c.json({
 			id,
+			name: session.name,
 			owner: session.owner,
 			createdAt: session.createdAt,
 			lastUsedAt: new Date(session.lastUsed).toISOString(),
