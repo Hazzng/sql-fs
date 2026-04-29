@@ -47,6 +47,12 @@ Error responses:
 - `403 FORBIDDEN` — `X-Auth-Secret` missing or doesn't match server `AUTH_SECRET`
 - `500 AUTH_NOT_CONFIGURED` — server has no `AUTH_SECRET` env var set
 - `400 INVALID_INPUT` — body validation failed (missing `sub`, unknown tenant, invalid `expiresIn`)
+- `429 RATE_LIMITED` — too many requests from this IP (default 5 / 60s, configurable via `BOOTSTRAP_RATE_LIMIT_*`). Response includes a `Retry-After` header (seconds).
+
+Audit log shape (`auth_bootstrap_issued`):
+```json
+{"event":"auth_bootstrap_issued","ip":"1.2.3.4","ua":"curl/...","sub":"admin","tenant":null,"expiresIn":"30d","expiresAt":"2026-05-26T..."}
+```
 
 ---
 
@@ -80,10 +86,24 @@ Response `201`:
 { "token": "<jwt>", "sub": "agent-1", "tenant": null, "expiresAt": "2026-05-02T..." }
 ```
 
+Issued tokens carry a `jti` (JWT ID) claim — a server-generated UUID that is also written
+to the `admin_token_issued` audit log so a leaked token can be correlated back to its
+issuance. The token string itself is **never** logged.
+
 Error responses:
 - `403 FORBIDDEN` — `X-Admin-Secret` missing or doesn't match server `ADMIN_SECRET`
 - `500 ADMIN_NOT_CONFIGURED` — server has no `ADMIN_SECRET` env var set
-- `400 INVALID_INPUT` — body validation failed (bad `sub`, unknown tenant, invalid `expiresIn`)
+- `500 AUTH_NOT_CONFIGURED` — server has no `AUTH_SECRET` env var set (cannot sign tokens)
+- `400 INVALID_INPUT` — body validation failed (bad `sub`, unknown tenant, invalid `expiresIn`). Only checked **after** `X-Admin-Secret` validates; wrong secret returns 403, never 400.
+- `429 RATE_LIMITED` — too many requests (default 5 / 60s per IP and per Bearer `sub`; either key tripping returns 429). Configurable via `ADMIN_RATE_LIMIT_*`. Response includes a `Retry-After` header (seconds).
+
+Audit log shapes:
+```json
+{"event":"admin_token_issued","ts":"2026-04-28T...","caller":"admin","callerTenant":"default","sub":"agent-1","tenant":null,"expiresIn":"30d","expiresAt":"2026-05-28T...","jti":"<uuid>","ip":"1.2.3.4","ua":"curl/..."}
+{"event":"admin_token_denied","ts":"...","caller":"admin","ip":"1.2.3.4","ua":"...","reason":"mismatch"}
+{"event":"admin_token_misconfigured","ts":"...","caller":"admin","ip":"1.2.3.4","ua":"...","reason":"auth_secret_unset"}
+{"event":"auth_rate_limited","ts":"...","scope":"admin","keys":["admin:ip:1.2.3.4","admin:sub:admin"],"trippedKey":"admin:ip:1.2.3.4","ip":"1.2.3.4","sub":"admin","path":"/v1/auth/admin"}
+```
 
 ---
 

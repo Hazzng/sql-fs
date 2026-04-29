@@ -4,6 +4,7 @@
 
 import { jwtVerify } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { defaultRateLimitStore } from "../rate-limit.js";
 import { app } from "../server.js";
 
 const AUTH_SECRET = "test-bootstrap-secret-exactly-32-bytes";
@@ -14,6 +15,7 @@ describe("POST /v1/auth/bootstrap", () => {
 	const originalTenantDatabases = process.env.TENANT_DATABASES;
 
 	beforeEach(() => {
+		defaultRateLimitStore.reset();
 		process.env.AUTH_SECRET = AUTH_SECRET;
 		process.env.TENANT_DATABASES = JSON.stringify({
 			default: "postgres://test@localhost:5432/test_default",

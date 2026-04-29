@@ -19,7 +19,7 @@ All `/v1/*` endpoints require `Authorization: Bearer <JWT>`. Three ways to mint 
 
 2. **CLI** (when you have the repo cloned): `AUTH_SECRET=... pnpm token:create -- --sub agent-1 --expires 30d`.
 
-3. **Admin endpoint** (`POST /v1/admin/tokens`) — requires both an existing Bearer JWT *and* `X-Admin-Secret`. Use this once you already have a token and want to mint others without exposing `AUTH_SECRET`.
+3. **Admin endpoint** (`POST /v1/auth/admin`) — requires both an existing Bearer JWT *and* `X-Admin-Secret`. Use this once you already have a token and want to mint others without exposing `AUTH_SECRET`.
 
 ## License
 

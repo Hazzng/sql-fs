@@ -47,4 +47,22 @@ describe("signToken / verifyToken", () => {
 		expect(payloadNone.exp).toBeUndefined();
 		expect(payloadNever.exp).toBeUndefined();
 	});
+
+	it("includes jti claim when provided", async () => {
+		const token = await signToken({ sub: "agent-1", jti: "abc-123", secret: SECRET });
+		const body = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(body.jti).toBe("abc-123");
+	});
+
+	it("omits jti claim when not provided", async () => {
+		const token = await signToken({ sub: "agent-1", secret: SECRET });
+		const body = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect("jti" in body).toBe(false);
+	});
 });

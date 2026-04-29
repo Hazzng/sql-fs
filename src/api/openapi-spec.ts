@@ -78,7 +78,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.2.7",
+		version: "0.2.8",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},
@@ -168,6 +168,14 @@ export const openapiSpec = {
 						description: "Wrong or missing X-Auth-Secret",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
+					"429": {
+						description:
+							"Rate limited. The bootstrap endpoint is per-IP rate limited (defaults: 5 requests / 60s). The `Retry-After` response header gives seconds until the next request is allowed.",
+						headers: {
+							"Retry-After": { schema: { type: "integer" }, description: "Seconds until the next request is allowed" },
+						},
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 					"500": {
 						description: "AUTH_SECRET not configured on the server",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
@@ -230,11 +238,19 @@ export const openapiSpec = {
 						},
 					},
 					"403": {
-						description: "Wrong X-Admin-Secret",
+						description: "Wrong or missing X-Admin-Secret",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"429": {
+						description:
+							"Rate limited. The admin endpoint is per-IP and per-Bearer-`sub` rate limited (defaults: 5 requests / 60s). Either key tripping returns 429; the `Retry-After` response header gives seconds until the next request is allowed.",
+						headers: {
+							"Retry-After": { schema: { type: "integer" }, description: "Seconds until the next request is allowed" },
+						},
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
 					"500": {
-						description: "ADMIN_SECRET not configured",
+						description: "ADMIN_SECRET or AUTH_SECRET not configured",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
 				},

@@ -139,6 +139,7 @@ alias vfs-bootstrap='curl -fsS -X POST "$VIRTUALFS_BASE_URL/v1/auth/bootstrap" -
 | `{"error":"forbidden","code":"FORBIDDEN"}` | Sandbox owned by a different `sub`, OR wrong/missing `X-Auth-Secret` on bootstrap | Use the token that created the sandbox; double-check `AUTH_SECRET` |
 | `{"error":"auth_not_configured","code":"AUTH_NOT_CONFIGURED"}` | Server has no `AUTH_SECRET` env var | Ask the deployer to set `AUTH_SECRET` |
 | `{"error":"admin_not_configured","code":"ADMIN_NOT_CONFIGURED"}` | Server has no `ADMIN_SECRET` env var | Ask the deployer to set `ADMIN_SECRET` |
+| `{"error":"rate_limited","code":"RATE_LIMITED"}` | Too many requests to `/v1/auth/bootstrap` or `/v1/auth/admin` (default 5 / 60s). Response includes `Retry-After` header. | Wait `Retry-After` seconds, or raise `*_RATE_LIMIT_*` env vars. |
 
 ---
 
@@ -147,9 +148,69 @@ alias vfs-bootstrap='curl -fsS -X POST "$VIRTUALFS_BASE_URL/v1/auth/bootstrap" -
 `POST /v1/auth/bootstrap` is unauthenticated by design — it is itself the credential-bootstrap
 endpoint. Its hardening:
 
-- **Constant-time comparison** of `X-Auth-Secret` against `AUTH_SECRET` (`crypto.timingSafeEqual`) — no timing oracle
+- **Constant-time comparison** of `X-Auth-Secret` against `AUTH_SECRET` using a SHA-256-digest `crypto.timingSafeEqual` — no length oracle and no early-return timing leak
 - **Hard-fail when `AUTH_SECRET` is unset** — returns `500 AUTH_NOT_CONFIGURED`, never signs with an empty string
 - **Secret check before body parsing** — callers without the correct secret cannot probe the request schema with cheap 400s
 - **Tenant validation** — rejects unknown `tenant` values before signing
 - **Audit log** — emits `auth_bootstrap_issued` / `auth_bootstrap_denied` (with `reason`: `mismatch`, `missing_header`, `unknown_tenant`) on every call
 - **Method-scoped exemption** — only `POST /v1/auth/bootstrap` bypasses Bearer auth; `GET` (or any other method) on the same path is still gated
+- **Per-IP rate limit** — defaults to 5 requests / 60s (configurable via `BOOTSTRAP_RATE_LIMIT_WINDOW_MS` / `BOOTSTRAP_RATE_LIMIT_MAX`). 429 responses include a `Retry-After` header.
+
+---
+
+## POST /v1/auth/admin — security notes
+
+`POST /v1/auth/admin` lives behind the standard Bearer middleware *and* requires
+`X-Admin-Secret`. Its hardening:
+
+- **SHA-256-digest timing-safe compare** of `X-Admin-Secret` against `ADMIN_SECRET` — same helper as bootstrap, no length leak
+- **Secret check before body parsing** — wrong/missing `X-Admin-Secret` returns 403 even for malformed bodies (no schema-probing via 400s)
+- **Hard-fail on missing `AUTH_SECRET`** — returns `500 AUTH_NOT_CONFIGURED` instead of signing with an empty key
+- **`jti` claim on every issued token** — UUID generated server-side, included in the JWT, and recorded in the `admin_token_issued` audit log so a leaked token can be correlated to its issuance
+- **Audit log** — emits `admin_token_issued` (with `caller`, `callerTenant`, `sub`, `tenant`, `expiresIn`, `jti`, `ip`, `ua`), `admin_token_denied` (with `reason`: `mismatch` / `missing_header` / `unknown_tenant`), and `admin_token_misconfigured` (when `ADMIN_SECRET` or `AUTH_SECRET` is unset). Issued tokens are **never** logged.
+- **Per-IP and per-Bearer-`sub` rate limit** — defaults to 5 requests / 60s. Either key tripping returns 429. Configure via `ADMIN_RATE_LIMIT_WINDOW_MS` / `ADMIN_RATE_LIMIT_MAX`.
+
+### Rate limit env vars
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_RATE_LIMIT_WINDOW_MS` | `60000` | Window length for the admin endpoint, in milliseconds. |
+| `ADMIN_RATE_LIMIT_MAX` | `5` | Max requests per `(ip)` and per `(sub)` in one window. |
+| `BOOTSTRAP_RATE_LIMIT_WINDOW_MS` | `60000` | Window length for the bootstrap endpoint. |
+| `BOOTSTRAP_RATE_LIMIT_MAX` | `5` | Max requests per `(ip)` in one window. |
+| `TRUST_PROXY_HEADERS` | `false` | Honour `X-Forwarded-For` / `X-Real-IP` for rate-limit keying. **See trust-proxy note below.** |
+
+> **Trust-proxy note (security-critical for `/v1/auth/bootstrap`).** `/v1/auth/bootstrap`
+> is unauthenticated, so its rate limit is the only barrier against `AUTH_SECRET`
+> brute-forcing. The IP used for keying must come from a source the caller cannot
+> spoof:
+>
+> - **Default (`TRUST_PROXY_HEADERS=false`)** — the connecting socket's
+>   `remoteAddress` is the key. Inbound `X-Forwarded-For` / `X-Real-IP` headers
+>   are ignored. Safe behind any deployment, but if the API sits behind a cloud
+>   load balancer that terminates TCP, every request appears to come from the
+>   load balancer's IP and the bucket is *shared by all callers* — usually too
+>   tight for production.
+> - **`TRUST_PROXY_HEADERS=true`** — the leftmost `X-Forwarded-For` value is
+>   used. **Only safe if the ingress strips inbound forwarding headers** (so
+>   the leftmost value is one the proxy itself stamped). If the ingress merely
+>   *appends* to the chain (Azure Container Apps, many K8s ingresses), an
+>   attacker can prepend an arbitrary value and bypass per-IP rate limiting on
+>   `/v1/auth/bootstrap`. Verify by sending a request with a synthetic
+>   `X-Forwarded-For: 9.9.9.9` header from outside and inspecting the audit
+>   log: if the recorded `ip` is `9.9.9.9`, the proxy is *not* sanitising and
+>   you must not enable this flag.
+
+### Audit log events
+
+All audit events are emitted as single JSON lines on stdout for log-aggregator ingestion.
+
+| Event | Emitted by | Notable fields |
+|---|---|---|
+| `auth_bootstrap_issued` | `POST /v1/auth/bootstrap` (success) | `ip`, `ua`, `sub`, `tenant`, `expiresIn`, `expiresAt` |
+| `auth_bootstrap_denied` | `POST /v1/auth/bootstrap` (403/400) | `ip`, `ua`, `reason` |
+| `auth_bootstrap_misconfigured` | `POST /v1/auth/bootstrap` (500) | `ip`, `ua` |
+| `admin_token_issued` | `POST /v1/auth/admin` (success) | `caller`, `callerTenant`, `sub`, `tenant`, `expiresIn`, `expiresAt`, `jti`, `ip`, `ua` |
+| `admin_token_denied` | `POST /v1/auth/admin` (403/400) | `caller`, `ip`, `ua`, `reason` |
+| `admin_token_misconfigured` | `POST /v1/auth/admin` (500) | `caller`, `ip`, `ua`, `reason` (e.g. `auth_secret_unset`) |
+| `auth_rate_limited` | rate-limit middleware (429) | `scope` (`admin`/`bootstrap`), `keys`, `trippedKey`, `ip`, `sub`, `path` |
