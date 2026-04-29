@@ -1,0 +1,343 @@
+"""`Sandbox` handle — bound to a specific sandbox id, exposes the full API.
+
+Get one via:
+
+    client = Client(...)
+    sb = client.sandboxes.create(name="my-project")
+    # or:
+    sb = client.sandboxes.attach("550e8400-...")
+
+Then call:
+
+    sb.exec("echo hi")              # → ExecResult
+    sb.exec_batch([...])            # → list[BatchExecResult]
+    for ev in sb.exec_stream(...):  # SSE
+        ...
+
+    sb.fs.read("/home/user/x.py")   # → ReadResult (.content / .text())
+    sb.fs.write("/home/user/x", "hi")
+    sb.fs.write_files({...})
+    sb.fs.delete(...)
+    sb.fs.mkdir(...)
+    sb.fs.tree(prefix=..., depth=...)
+
+    sb.ingest_archive(open("p.tar.gz", "rb"), base_path="/home/user/p")
+    sb.ingest_files({"a.txt": b"..."}, base_path="/home/user/p")
+    bytes_ = sb.export(base_path="/home/user")
+    sb.delete()
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from collections.abc import Iterator, Mapping
+from typing import Any, BinaryIO, Dict, List, Optional, Union
+
+from ._http import Transport, encode_path, iter_sse_events
+from .models import (
+    BatchExecResult,
+    ExecResult,
+    FileStat,
+    ReadResult,
+    SandboxRecord,
+    StreamEvent,
+    TreeEntry,
+)
+
+
+class FilesAPI:
+    """`sandbox.fs.*` — file operations on a single sandbox."""
+
+    def __init__(self, transport: Transport, sandbox_id: str) -> None:
+        self._t = transport
+        self._id = sandbox_id
+
+    def read(self, path: str) -> ReadResult:
+        """`GET /files/{path}` — read raw bytes + parsed `X-FS-Stat` header."""
+        resp = self._t.request(
+            "GET",
+            f"/sandboxes/{self._id}/files/{encode_path(path)}",
+            expect_json=False,
+        )
+        stat: Optional[FileStat] = None
+        raw = resp.headers.get("X-FS-Stat")
+        if raw:
+            try:
+                stat = FileStat.from_api(json.loads(raw))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                stat = None
+        return ReadResult(content=resp.content, stat=stat)
+
+    def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        """Convenience: read + decode as text."""
+        return self.read(path).text(encoding)
+
+    def write(self, path: str, content: Union[str, bytes]) -> None:
+        """`PUT /files/{path}` — write raw bytes; parents auto-created."""
+        body = content.encode("utf-8") if isinstance(content, str) else content
+        self._t.request(
+            "PUT",
+            f"/sandboxes/{self._id}/files/{encode_path(path)}",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+            expect_json=False,
+        )
+
+    def write_files(self, files: Mapping[str, str]) -> None:
+        """`POST /writeFiles` — write multiple files in one round-trip.
+
+        Keys are absolute paths inside the sandbox, values are file contents
+        (text). For binary content, prefer `ingest_files()` (base64).
+        """
+        self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/writeFiles",
+            json_body={"files": dict(files)},
+            expect_json=False,
+        )
+
+    def delete(self, path: str, *, recursive: bool = False) -> None:
+        """`DELETE /files/{path}` — delete file or directory.
+
+        For directories, set `recursive=True` to delete contents too.
+        """
+        params = {"recursive": "true"} if recursive else None
+        self._t.request(
+            "DELETE",
+            f"/sandboxes/{self._id}/files/{encode_path(path)}",
+            params=params,
+            expect_json=False,
+        )
+
+    def mkdir(self, path: str, *, recursive: bool = False) -> None:
+        """`POST /mkdir` — create a directory (optionally `mkdir -p`)."""
+        self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/mkdir",
+            json_body={"path": path, "recursive": recursive},
+            expect_json=False,
+        )
+
+    def tree(
+        self,
+        *,
+        prefix: Optional[str] = None,
+        depth: Optional[int] = None,
+    ) -> List[TreeEntry]:
+        """`GET /tree` — list entries under `prefix`, up to `depth` deep."""
+        params: Dict[str, Any] = {}
+        if prefix is not None:
+            params["prefix"] = prefix
+        if depth is not None:
+            params["depth"] = depth
+        resp = self._t.request("GET", f"/sandboxes/{self._id}/tree", params=params)
+        body = resp.json()
+        if not isinstance(body, list):
+            return []
+        return [TreeEntry.from_api(item) for item in body]
+
+
+class Sandbox:
+    """A sandbox handle. Use `Client.sandboxes.create()` or `.attach()`."""
+
+    def __init__(
+        self,
+        transport: Transport,
+        sandbox_id: str,
+        *,
+        record: Optional[SandboxRecord] = None,
+    ) -> None:
+        self._t = transport
+        self._id = sandbox_id
+        self._record = record
+        self.fs = FilesAPI(transport, sandbox_id)
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @property
+    def record(self) -> Optional[SandboxRecord]:
+        """The full record returned at creation. None for attached sandboxes."""
+        return self._record
+
+    def __repr__(self) -> str:
+        return f"Sandbox(id={self._id!r})"
+
+    # ── exec ────────────────────────────────────────────────────────────────
+    def exec(
+        self,
+        script: str,
+        *,
+        cwd: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+        timeout_ms: int = 30_000,
+        debug: bool = False,
+    ) -> ExecResult:
+        """`POST /exec-sync` — run a bash script and return the buffered result."""
+        body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
+        if cwd is not None:
+            body["cwd"] = cwd
+        if env is not None:
+            body["env"] = dict(env)
+        if debug:
+            body["debug"] = True
+
+        # Wall-clock httpx timeout slightly above server-side budget so a
+        # legitimate timeout surfaces as 408 rather than a transport error.
+        client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
+        resp = self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/exec-sync",
+            json_body=body,
+            timeout=client_timeout,
+        )
+        return ExecResult.from_api(resp.json())
+
+    def exec_batch(
+        self,
+        scripts: List[Mapping[str, str]],
+        *,
+        timeout_ms: int = 30_000,
+    ) -> List[BatchExecResult]:
+        """`POST /exec-sync-batch` — run up to 50 scripts sequentially.
+
+        `scripts` is a list of `{"id": "...", "script": "..."}` dicts. The
+        single `timeout_ms` budget covers all scripts; if it is exhausted,
+        the remaining results carry `exit_code=-1` and `error="timeout"`.
+        """
+        body = {"scripts": [dict(s) for s in scripts], "timeoutMs": timeout_ms}
+        client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
+        resp = self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/exec-sync-batch",
+            json_body=body,
+            timeout=client_timeout,
+        )
+        payload = resp.json()
+        items = payload.get("results", []) if isinstance(payload, dict) else []
+        return [BatchExecResult.from_api(item) for item in items]
+
+    def exec_stream(
+        self,
+        script: str,
+        *,
+        cwd: Optional[str] = None,
+        env: Optional[Mapping[str, str]] = None,
+        timeout_ms: int = 30_000,
+        debug: bool = False,
+    ) -> Iterator[StreamEvent]:
+        """`POST /exec` — stream stdout/stderr/exit events as `StreamEvent`s.
+
+        Yields events until the server emits an `exit` event. The connection is
+        closed on iterator exhaustion or generator close().
+        """
+        body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
+        if cwd is not None:
+            body["cwd"] = cwd
+        if env is not None:
+            body["env"] = dict(env)
+        if debug:
+            body["debug"] = True
+
+        client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
+        resp = self._t.stream(
+            "POST",
+            f"/sandboxes/{self._id}/exec",
+            json_body=body,
+            headers={"Accept": "text/event-stream"},
+            timeout=client_timeout,
+        )
+        try:
+            for event_name, payload in iter_sse_events(resp):
+                if event_name not in ("stdout", "stderr", "exit"):
+                    continue
+                yield StreamEvent.from_sse(event_name, payload)
+                if event_name == "exit":
+                    return
+        finally:
+            resp.close()
+
+    # ── ingest / export ─────────────────────────────────────────────────────
+    def ingest_archive(
+        self,
+        archive: Union[bytes, BinaryIO],
+        *,
+        base_path: str = "/home/user/project",
+    ) -> Dict[str, Any]:
+        """`POST /ingest` — extract a `.tar.gz` archive into the sandbox."""
+        files: Dict[str, Any] = {
+            "archive": ("archive.tar.gz", archive, "application/gzip"),
+            "basePath": (None, base_path),
+        }
+        resp = self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/ingest",
+            files=files,
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    def ingest_files(
+        self,
+        files: Mapping[str, Union[str, bytes]],
+        *,
+        base_path: str = "/home/user/project",
+    ) -> Dict[str, Any]:
+        """`POST /ingest-files` — write a JSON manifest of files (auto base64).
+
+        Keys are paths relative to `base_path`. Values may be `str` (encoded
+        utf-8) or `bytes` (encoded as-is); the SDK base64-encodes them.
+        """
+        encoded: Dict[str, str] = {}
+        for path, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            encoded[path] = base64.b64encode(data).decode("ascii")
+        resp = self._t.request(
+            "POST",
+            f"/sandboxes/{self._id}/ingest-files",
+            json_body={"basePath": base_path, "files": encoded},
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
+    def export(self, *, base_path: str = "/home/user") -> bytes:
+        """`GET /export` — download `base_path` as a `.tar.gz` blob.
+
+        For very large exports, use `export_stream()` to avoid buffering the
+        whole archive in memory.
+        """
+        resp = self._t.request(
+            "GET",
+            f"/sandboxes/{self._id}/export",
+            params={"basePath": base_path},
+            expect_json=False,
+        )
+        return resp.content
+
+    def export_stream(
+        self,
+        *,
+        base_path: str = "/home/user",
+        chunk_size: int = 64 * 1024,
+    ) -> Iterator[bytes]:
+        """Streaming variant of `export()` — yields chunks of the tar.gz body."""
+        resp = self._t.stream(
+            "GET",
+            f"/sandboxes/{self._id}/export",
+            params={"basePath": base_path},
+        )
+        try:
+            yield from resp.iter_bytes(chunk_size)
+        finally:
+            resp.close()
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+    def delete(self) -> None:
+        """`DELETE /sandboxes/{id}` — destroy this sandbox."""
+        self._t.request(
+            "DELETE",
+            f"/sandboxes/{self._id}",
+            expect_json=False,
+        )
