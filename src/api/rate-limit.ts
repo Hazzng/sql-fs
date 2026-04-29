@@ -49,6 +49,12 @@ export class InMemoryRateLimitStore implements RateLimitStore {
 	private hits = 0;
 
 	constructor(opts: InMemoryRateLimitStoreOptions = {}) {
+		if (opts.maxEntries !== undefined && (!Number.isInteger(opts.maxEntries) || opts.maxEntries <= 0)) {
+			throw Object.assign(
+				new Error(`opts.maxEntries must be a positive integer, got ${opts.maxEntries}`),
+				{ code: "ERR_INVALID_RATE_LIMIT" },
+			);
+		}
 		this.maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES;
 	}
 
@@ -149,6 +155,18 @@ export function clientIp(c: Context): string {
 }
 
 export function rateLimit(opts: RateLimitOptions): MiddlewareHandler {
+	if (!Number.isInteger(opts.windowMs) || opts.windowMs <= 0) {
+		throw Object.assign(
+			new Error(`opts.windowMs must be a positive integer, got ${opts.windowMs}`),
+			{ code: "ERR_INVALID_RATE_LIMIT" },
+		);
+	}
+	if (!Number.isInteger(opts.max) || opts.max <= 0) {
+		throw Object.assign(
+			new Error(`opts.max must be a positive integer, got ${opts.max}`),
+			{ code: "ERR_INVALID_RATE_LIMIT" },
+		);
+	}
 	const store = opts.store ?? defaultRateLimitStore;
 	const now = opts.now ?? (() => Date.now());
 
