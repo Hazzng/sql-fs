@@ -9,7 +9,7 @@
 
 import type postgres from "postgres";
 import { describe, expect, it, vi } from "vitest";
-import { RedisBlobCache } from "../redis-blob-cache.js";
+import type { RedisBlobCache } from "../redis-blob-cache.js";
 import { PostgresDialect } from "./postgres.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
