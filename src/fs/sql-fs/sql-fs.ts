@@ -376,20 +376,27 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		if (files.length === 0) return;
 		const normalized: BulkIngestFile[] = [];
 		const seen = new Set<string>();
+		const bytesByPath = new Map<string, Uint8Array>();
 		for (const file of files) {
 			const path = validatePath(file.path);
 			if (seen.has(path)) throw createEexist(path);
 			seen.add(path);
 			normalized.push({ path, content: file.content, mode: file.mode });
+			bytesByPath.set(path, file.content);
 		}
 		const newEntries = await this.#withTx((tx) => this.#dialect.bulkIngest(tx, normalized));
 		// Evict overwritten inodes from contentCache so stale content is never served.
+		// Populate #contentCache with the bytes already in memory — next readFile is a Map lookup.
 		for (const [path, entry] of newEntries) {
 			const old = this.#pathCache.get(path);
 			if (old !== undefined && old.inodeId !== entry.inodeId) {
 				this.#contentCache.delete(old.inodeId);
 			}
 			this.#pathCache.set(path, entry);
+			const bytes = bytesByPath.get(path);
+			if (bytes !== undefined && bytes.byteLength > 0) {
+				this.#contentCache.set(entry.inodeId, bytes);
+			}
 		}
 		this.#dirty = true;
 	}
