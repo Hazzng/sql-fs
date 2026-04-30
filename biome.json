@@ -22,6 +22,6 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"ignore": ["node_modules", "dist", "*.sql", "scripts"]
+		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python/.venv"]
 	}
 }
