@@ -25,8 +25,8 @@ jobs:
     # PyPI trusted-publisher config must use the same name in the Environment field.
     environment: release
     permissions:
-      # Scoped to this job only — minimises OIDC token exposure.
-      id-token: write
+      contents: write   # git push tag + GitHub Release creation
+      id-token: write   # OIDC token for PyPI trusted publisher
     steps:
       - uses: actions/checkout@v4
         with:
