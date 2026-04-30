@@ -5,6 +5,10 @@ FROM node:22-bookworm AS builder
 WORKDIR /app
 RUN corepack enable
 COPY pnpm-lock.yaml package.json ./
+# Remove the `prepare` lifecycle hook before install. lefthook install panics
+# in Docker Desktop's Linux VM (Go taggedPointerPack runtime bug). Git hooks
+# are not needed in the build image; this edit is layer-local only.
+RUN node -e "const fs=require('fs'),p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.scripts.prepare;fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
 RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm build
