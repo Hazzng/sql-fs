@@ -1,5 +1,5 @@
 [project]
-name = "virtualfs"
+name = "virtualfs-sdk"
 version = "0.1.0"
 description = "Python SDK for the VirtualFS API — persistent bash sandboxes for AI agents"
 readme = "README.md"

@@ -412,7 +412,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
-    print(f"virtualfs-python {__version__}  →  {base_url}")
+    print(f"virtualfs-sdk {__version__}  →  {base_url}")
     print(f"skip={sorted(skip) or 'none'}")
 
     if args.folder:

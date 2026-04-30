@@ -88,7 +88,7 @@ class Transport:
         self._max_retries = max_retries
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout)
-        self._user_agent = user_agent or f"virtualfs-python/{__version__}"
+        self._user_agent = user_agent or f"virtualfs-sdk/{__version__}"
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def close(self) -> None:
