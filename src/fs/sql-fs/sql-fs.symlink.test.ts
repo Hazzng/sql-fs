@@ -39,6 +39,7 @@ function makeDialect(overrides: Partial<SqlDialect<unknown>> = {}): SqlDialect<u
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

@@ -47,6 +47,25 @@ export class RedisBlobCache {
 		}
 	}
 
+	/**
+	 * Bulk variant of `get`. Returns one entry per input sha256 in the same
+	 * order; `null` for a miss. Fail-open: any Redis error returns all-null.
+	 */
+	async mget(sha256s: ReadonlyArray<Uint8Array>): Promise<Array<Uint8Array | null>> {
+		if (!this.#enabled || sha256s.length === 0) return sha256s.map(() => null);
+		try {
+			const keys = sha256s.map((s) => this.#key(s));
+			// ioredis exposes mgetBuffer for binary-safe pipelined gets.
+			const bufs = await (
+				this.#client as unknown as { mgetBuffer(...keys: string[]): Promise<Array<Buffer | null>> }
+			).mgetBuffer(...keys);
+			return bufs.map((b) => (b ? new Uint8Array(b) : null));
+		} catch (err) {
+			console.error(JSON.stringify({ event: "redis_blob_mget_error", error: (err as Error).message }));
+			return sha256s.map(() => null); // fail open
+		}
+	}
+
 	async set(sha256: Uint8Array, data: Uint8Array): Promise<void> {
 		if (!this.#enabled) return;
 		if (data.byteLength > this.#maxBytes) return;

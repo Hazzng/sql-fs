@@ -283,6 +283,20 @@ export interface SqlDialect<Tx = unknown> {
 	getBlobNoTx(sha256: Uint8Array): Promise<Uint8Array | null>;
 
 	/**
+	 * Bulk-fetches blob contents for file inodes in the sandbox, ordered
+	 * smallest-first under a `maxBytes` running-total cap. Used to prewarm the
+	 * in-memory content cache in one round-trip.
+	 *
+	 * Smallest-first matters: a 50 MB cap consumed by one 50 MB file gives
+	 * agents no coverage; the same cap consumed by 5000 small files makes most
+	 * greps free.
+	 *
+	 * Returns one entry per qualifying inode (two inodes sharing a blob both
+	 * appear). Implementations should prefer Redis L2 over Postgres for misses.
+	 */
+	getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>>;
+
+	/**
 	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.
 	 * Returns the count of blobs deleted.
 	 */

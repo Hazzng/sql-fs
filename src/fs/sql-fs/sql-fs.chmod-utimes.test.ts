@@ -47,6 +47,7 @@ function makeFs() {
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(async () => []),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

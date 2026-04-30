@@ -76,6 +76,7 @@ function makeDialect(): {
 		upsertBlob: upsertBlobMock,
 		getBlob: getBlobMock,
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n]),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

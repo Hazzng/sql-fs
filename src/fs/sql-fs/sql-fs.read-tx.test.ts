@@ -51,6 +51,7 @@ function makeDialect(getBlobNoTxImpl: () => Promise<Uint8Array | null>): {
 		getBlob: getBlobSpy,
 		getBlobNoTx: getBlobNoTxSpy,
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

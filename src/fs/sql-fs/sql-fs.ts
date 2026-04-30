@@ -118,6 +118,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * against the DB simultaneously.
 	 */
 	#pendingReload: Promise<void> | undefined;
+	/**
+	 * In-flight prewarm task. Read by `readFile`/`readFileBuffer` cache-miss
+	 * paths to coalesce reads onto the batched fetch instead of racing it with
+	 * per-file SELECTs.
+	 */
+	#prewarmInFlight: Promise<void> | undefined;
+	/**
+	 * One-shot follow-up requested while a prewarm is already running.
+	 * Used when reload() clears contentCache during an in-flight prewarm.
+	 */
+	#prewarmQueued = false;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -322,11 +333,47 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		return fresh;
 	}
 
+	#startPrewarm(queueIfRunning = false): void {
+		if (this.#prewarmInFlight !== undefined) {
+			if (queueIfRunning) this.#prewarmQueued = true;
+			return;
+		}
+		const cap = this.#contentCache.maxSize;
+		const task = (async (): Promise<void> => {
+			try {
+				const blobs = await this.#dialect.getBlobsForSandbox(this.#sandboxId, cap);
+				for (const { inodeId, data } of blobs) {
+					if (data.byteLength > 0) this.#contentCache.set(inodeId, data);
+				}
+				console.log(JSON.stringify({ event: "content_prewarm_ok", sandboxId: this.#sandboxId, entries: blobs.length }));
+			} catch (err) {
+				// Non-fatal: lazy fetch via getBlobNoTx still works.
+				console.error(
+					JSON.stringify({
+						event: "content_prewarm_error",
+						sandboxId: this.#sandboxId,
+						error: (err as Error).message,
+					}),
+				);
+			} finally {
+				this.#prewarmInFlight = undefined;
+				if (this.#prewarmQueued) {
+					this.#prewarmQueued = false;
+					this.#startPrewarm();
+				}
+			}
+		})();
+		this.#prewarmInFlight = task;
+	}
+
 	/**
 	 * Initialises the in-memory pathCache by loading all paths from the DB
 	 * via a single recursive CTE query.  Must be called once before any FS op.
 	 */
 	async ready(): Promise<void> {
+		// Background; ready() must not block on prewarm.
+		this.#startPrewarm();
+
 		const fresh = await this.#loadFreshPathCache();
 		this.#pathCache.clear();
 		for (const [p, e] of fresh) this.#pathCache.set(p, e);
@@ -355,6 +402,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
+				this.#startPrewarm(true);
 			} finally {
 				this.#pendingReload = undefined;
 			}
@@ -671,40 +719,35 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
 
-	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+	async #readBytes(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		// Cache hit: return decoded bytes without any DB call
-		const cached = this.#contentCache.get(entry.inodeId);
-		if (cached !== undefined) return new TextDecoder().decode(cached);
-
-		// Cache miss: fetch blob directly from pool — no transaction needed because
-		// the blobs table is global (no sandbox_id, no RLS).
-		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
-		const bytes = data ?? new Uint8Array(0);
-		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
-		return new TextDecoder().decode(bytes);
-	}
-
-	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
-		const path = validatePath(inputPath);
-		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
-		const entry = await this.#resolveReadEntry(path);
-		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
-
-		// Cache hit: return raw bytes without any DB call
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob directly from pool — no transaction needed because
-		// the blobs table is global (no sandbox_id, no RLS).
+		// Coalesce onto an in-flight prewarm fetch instead of racing it.
+		if (this.#prewarmInFlight !== undefined) {
+			await this.#prewarmInFlight;
+			const afterPrewarm = this.#contentCache.get(entry.inodeId);
+			if (afterPrewarm !== undefined) return afterPrewarm;
+		}
+
+		// `blobs` is global (no RLS), so a transaction wrapper is unnecessary.
 		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
+	}
+
+	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+		return new TextDecoder().decode(await this.#readBytes(inputPath));
+	}
+
+	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
+		return this.#readBytes(inputPath);
 	}
 
 	async exists(inputPath: string): Promise<boolean> {

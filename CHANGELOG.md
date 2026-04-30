@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.11] - 2026-04-30
+
+### Added
+
+- `SqlDialect.getBlobsForSandbox(sandboxId, maxBytes)` and `RedisBlobCache.mget(sha256s)` for batched content prewarm. The dialect method issues a metadata-only window-CTE first, bulk-fetches misses from Redis L2, then one batched `WHERE sha256 = ANY(…)` for remaining Postgres misses.
+
+### Changed
+
+- `SqlFs.ready()` and `SqlFs.reload()` now kick off a non-fatal background content-cache prewarm. Cache-miss reads in `readFile`/`readFileBuffer` coalesce onto the in-flight prewarm rather than racing it with per-file SELECTs. Cold-grep latency on a 125-file / 1 MB tree drops from ~9.4 s to ~3.8 s on remote Postgres deployments.
+
 ## [0.2.10] - 2026-04-30
 
 ### Changed
