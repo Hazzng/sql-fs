@@ -1,0 +1,186 @@
+name: Python SDK Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clients/python/**"
+
+concurrency:
+  group: python-sdk-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: clients/python
+
+jobs:
+  release:
+    name: Build & maybe publish
+    runs-on: ubuntu-latest
+    # 'release' maps to a GitHub Actions environment (Settings → Environments).
+    # PyPI trusted-publisher config must use the same name in the Environment field.
+    environment: release
+    permissions:
+      contents: write   # git push tag + GitHub Release creation
+      id-token: write   # OIDC token for PyPI trusted publisher
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 1. Detect version from clients/python/CHANGELOG.md ───────────────
+      - name: Detect version from CHANGELOG
+        id: detect
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::clients/python/CHANGELOG.md not found"
+            exit 1
+          fi
+
+          VERSION=$(awk '
+            /^## \[Unreleased\]/ { next }
+            /^## \[[^]]+\]/ {
+              line = $0
+              sub(/^## \[/, "", line)
+              sub(/\].*/, "", line)
+              print line
+              exit
+            }
+          ' CHANGELOG.md)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No versioned section (## [x.y.z]) found in clients/python/CHANGELOG.md"
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::CHANGELOG version '$VERSION' is not valid SemVer (expected MAJOR.MINOR.PATCH with optional -prerelease)"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+          TAG="python-sdk-v$VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "RELEASE=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists — skipping PyPI publish"
+          else
+            echo "RELEASE=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG not found — will build, publish to PyPI, and create GitHub Release"
+          fi
+
+      # ── 2. Verify pyproject.toml and _version.py match CHANGELOG ─────────
+      - name: Verify version consistency
+        if: steps.detect.outputs.RELEASE == 'true'
+        run: |
+          CHANGELOG_VER="${{ steps.detect.outputs.VERSION }}"
+
+          PYPROJECT_VER=$(awk -F'"' '/^version =/{print $2; exit}' pyproject.toml)
+          if [ "$CHANGELOG_VER" != "$PYPROJECT_VER" ]; then
+            echo "::error::Version mismatch: CHANGELOG=$CHANGELOG_VER, pyproject.toml=$PYPROJECT_VER"
+            exit 1
+          fi
+
+          VERSION_PY_VER=$(awk -F'"' '/^__version__/{print $2; exit}' src/virtualfs/_version.py)
+          if [ "$CHANGELOG_VER" != "$VERSION_PY_VER" ]; then
+            echo "::error::Version mismatch: CHANGELOG=$CHANGELOG_VER, _version.py=$VERSION_PY_VER"
+            exit 1
+          fi
+
+          echo "All three version files agree on $CHANGELOG_VER"
+
+      # ── 3. Extract CHANGELOG section for the release body ─────────────────
+      - name: Extract CHANGELOG section
+        if: steps.detect.outputs.RELEASE == 'true'
+        id: changelog
+        run: |
+          VERSION="${{ steps.detect.outputs.VERSION }}"
+
+          CONTENT=$(awk -v ver="$VERSION" '
+            BEGIN { header = "## [" ver "]" }
+            index($0, header) == 1 { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/^[[:space:]]*$/d')
+
+          if [ -z "$CONTENT" ]; then
+            echo "::error::No CHANGELOG entry found for version [$VERSION]"
+            exit 1
+          fi
+
+          BYTES=$(printf '%s' "$CONTENT" | wc -c)
+          if [ "$BYTES" -gt 10000 ]; then
+            echo "::error::CHANGELOG entry for [$VERSION] is $BYTES bytes; max 10000"
+            exit 1
+          fi
+
+          {
+            echo "CONTENT<<EOF"
+            echo "$CONTENT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 4. Build sdist + wheel ─────────────────────────────────────────────
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.RELEASE == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Build package
+        if: steps.detect.outputs.RELEASE == 'true'
+        run: |
+          pip install --quiet build
+          python -m build
+
+      - name: Upload build artifacts
+        if: steps.detect.outputs.RELEASE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdk-dist-${{ steps.detect.outputs.VERSION }}
+          path: clients/python/dist/
+          retention-days: 30
+
+      # ── 5. Publish to PyPI via OIDC trusted publisher ─────────────────────
+      # Set up trusted publisher on PyPI first:
+      #   Owner: <github-org>, Repo: virtualFS, Workflow: python-sdk-release.yml
+      # To use an API token instead, remove id-token permission above and add:
+      #   password: ${{ secrets.PYPI_TOKEN }}
+      - name: Publish to PyPI
+        if: steps.detect.outputs.RELEASE == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/python/dist/
+
+      # ── 6. Tag and GitHub Release ──────────────────────────────────────────
+      - name: Create and push git tag
+        if: steps.detect.outputs.RELEASE == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "python-sdk-v${{ steps.detect.outputs.VERSION }}"
+          git push origin "python-sdk-v${{ steps.detect.outputs.VERSION }}"
+
+      - name: Create GitHub Release
+        if: steps.detect.outputs.RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: python-sdk-v${{ steps.detect.outputs.VERSION }}
+          name: Python SDK v${{ steps.detect.outputs.VERSION }}
+          files: clients/python/dist/*
+          body: |
+            ## Python SDK v${{ steps.detect.outputs.VERSION }}
+
+            ${{ steps.changelog.outputs.CONTENT }}
+
+            ---
+
+            Install via pip:
+            ```
+            pip install virtualfs-sdk==${{ steps.detect.outputs.VERSION }}
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
