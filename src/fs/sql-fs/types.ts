@@ -268,6 +268,21 @@ export interface SqlDialect<Tx = unknown> {
 	getBlob(tx: Tx, sha256: Uint8Array): Promise<Uint8Array | null>;
 
 	/**
+	 * Like `getBlob` but issues a single pool-level SELECT with no surrounding
+	 * transaction. Safe because the `blobs` table is global (no `sandbox_id`,
+	 * no RLS policy — see migrations/postgres/0000_create_tables.sql:40-44),
+	 * so the `app.sandbox_id` setting is meaningless on this read.
+	 *
+	 * Use from read paths (`readFile` / `readFileBuffer`) where eliminating the
+	 * BEGIN/SET LOCAL/COMMIT envelope removes 3 of 4 RTTs per cache miss.
+	 * Writers must keep using the in-transaction `getBlob` so the bytes they
+	 * fetch are consistent with the inode mutations they're about to make.
+	 *
+	 * Returns null if no blob with the given hash exists.
+	 */
+	getBlobNoTx(sha256: Uint8Array): Promise<Uint8Array | null>;
+
+	/**
 	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.
 	 * Returns the count of blobs deleted.
 	 */

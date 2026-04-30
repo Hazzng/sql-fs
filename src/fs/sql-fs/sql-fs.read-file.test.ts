@@ -25,9 +25,9 @@ function makeFs(
 	blobData: Uint8Array,
 ): {
 	fs: SqlFs;
-	getBlobMock: ReturnType<typeof vi.fn>;
+	getBlobNoTxMock: ReturnType<typeof vi.fn>;
 } {
-	const getBlobMock = vi.fn(async () => blobData);
+	const getBlobNoTxMock = vi.fn(async () => blobData);
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
@@ -49,7 +49,8 @@ function makeFs(
 		listDirents: vi.fn(),
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
-		getBlob: getBlobMock,
+		getBlob: vi.fn(),
+		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
@@ -57,7 +58,7 @@ function makeFs(
 	} as unknown as SqlDialect<unknown>;
 
 	const fs = new SqlFs({ dialect, sandboxId: "s1" });
-	return { fs, getBlobMock };
+	return { fs, getBlobNoTxMock };
 }
 
 // ── readFile tests ─────────────────────────────────────────────────────────────
@@ -98,18 +99,18 @@ describe("SqlFs.readFileBuffer", () => {
 	const inodeId = 10n;
 
 	let fs: SqlFs;
-	let getBlobMock: ReturnType<typeof vi.fn>;
+	let getBlobNoTxMock: ReturnType<typeof vi.fn>;
 
 	beforeEach(async () => {
 		const result = makeFs([fileEntry(filePath, inodeId), dirEntry(dirPath, 11n)], fileContent);
 		fs = result.fs;
-		getBlobMock = result.getBlobMock;
+		getBlobNoTxMock = result.getBlobNoTxMock;
 		await fs.ready();
 	});
 
 	it("returns raw Uint8Array from DB on cache miss", async () => {
 		const data = await fs.readFileBuffer(filePath);
-		expect(getBlobMock).toHaveBeenCalledOnce();
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 		expect(data).toEqual(fileContent);
 		expect(data).toBeInstanceOf(Uint8Array);
 	});
@@ -121,12 +122,12 @@ describe("SqlFs.readFileBuffer", () => {
 		expect(fs._contentCacheGet(inodeId)).toEqual(fileContent);
 	});
 
-	it("returns cached Uint8Array on cache hit without calling getBlob", async () => {
+	it("returns cached Uint8Array on cache hit without calling getBlobNoTx", async () => {
 		await fs.readFileBuffer(filePath); // prime cache
-		getBlobMock.mockClear();
+		getBlobNoTxMock.mockClear();
 
 		const data = await fs.readFileBuffer(filePath);
-		expect(getBlobMock).not.toHaveBeenCalled();
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 		expect(data).toEqual(fileContent);
 	});
 

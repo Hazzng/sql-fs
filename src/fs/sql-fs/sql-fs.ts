@@ -674,9 +674,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return new TextDecoder().decode(cached);
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
-		// Read-only: skip the advisory lock.
-		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob directly from pool — no transaction needed because
+		// the blobs table is global (no sandbox_id, no RLS).
+		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return new TextDecoder().decode(bytes);
@@ -692,9 +692,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob from DB, populate cache keyed by resolved inodeId.
-		// Read-only: skip the advisory lock.
-		const data = await this.#withReadTx((tx) => this.#dialect.getBlob(tx, entry.contentSha256!));
+		// Cache miss: fetch blob directly from pool — no transaction needed because
+		// the blobs table is global (no sandbox_id, no RLS).
+		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;

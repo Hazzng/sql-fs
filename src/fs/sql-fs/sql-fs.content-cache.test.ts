@@ -32,6 +32,7 @@ function makeDialect(): SqlDialect<unknown> {
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
+		getBlobNoTx: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
