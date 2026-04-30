@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-04-30
+
+### Changed
+
+- Removed the per-blob read transaction wrapper from `readFile`/`readFileBuffer`. Cache-miss reads now issue a single pool-level SELECT instead of `BEGIN`/`SET LOCAL`/`COMMIT`/`SELECT`/`COMMIT`. ~70 % reduction in cold-grep latency on remote Postgres deployments. Internal change; no API surface impact.
+
 ## [0.2.8] - 2026-04-28
 
 ### Added
