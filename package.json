@@ -24,7 +24,8 @@
 		"db:generate": "drizzle-kit generate",
 		"db:migrate": "drizzle-kit migrate",
 		"db:gc": "tsx src/api/cli/gc.ts",
-		"token:create": "tsx src/api/cli/token.ts"
+		"token:create": "tsx src/api/cli/token.ts",
+		"prepare": "lefthook install"
 	},
 	"dependencies": {
 		"@hono/node-server": "^1.14.0",
@@ -49,6 +50,7 @@
 		"@types/node": "^22.0.0",
 		"drizzle-kit": "^0.30.0",
 		"knip": "^6.4.1",
+		"lefthook": "^1.11.0",
 		"tsx": "^4.19.0",
 		"typescript": "^5.7.0",
 		"vitest": "^3.1.0"

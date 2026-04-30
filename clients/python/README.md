@@ -7,7 +7,7 @@ Handles JWT minting, JSON serialization, retries, and streaming so callers don't
 ## Install
 
 ```bash
-pip install virtualfs
+pip install virtualfs-sdk
 ```
 
 Local (from this repo):

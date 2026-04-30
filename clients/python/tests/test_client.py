@@ -125,9 +125,7 @@ def test_get_sandbox_404_raises_notfound():
 
 @respx.mock
 def test_delete_sandbox():
-    route = respx.delete(f"{BASE_URL}/v1/sandboxes/sb-9").mock(
-        return_value=httpx.Response(204)
-    )
+    route = respx.delete(f"{BASE_URL}/v1/sandboxes/sb-9").mock(return_value=httpx.Response(204))
     make_client().sandboxes.delete("sb-9")
     assert route.called
 
@@ -199,9 +197,7 @@ def test_delete_nonempty_dir_raises_conflict():
 
 @respx.mock
 def test_mkdir_with_recursive():
-    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/mkdir").mock(
-        return_value=httpx.Response(204)
-    )
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/mkdir").mock(return_value=httpx.Response(204))
     sb = make_client().sandboxes.attach("sb")
     sb.fs.mkdir("/a/b/c", recursive=True)
     sent = json.loads(route.calls[0].request.content.decode())
@@ -282,9 +278,7 @@ def test_exec_batch():
         )
     )
     sb = make_client().sandboxes.attach("sb")
-    results = sb.exec_batch(
-        [{"id": "a", "script": "echo 1"}, {"id": "b", "script": "false"}]
-    )
+    results = sb.exec_batch([{"id": "a", "script": "echo 1"}, {"id": "b", "script": "false"}])
     assert [r.id for r in results] == ["a", "b"]
     assert results[0].ok is True
     assert results[1].ok is False
@@ -293,9 +287,9 @@ def test_exec_batch():
 @respx.mock
 def test_exec_stream_yields_events_until_exit():
     sse_body = (
-        "event: stdout\ndata: {\"t\":0.1,\"data\":\"hello\\n\"}\n\n"
-        "event: stderr\ndata: {\"t\":0.2,\"data\":\"warn\\n\"}\n\n"
-        "event: exit\ndata: {\"t\":0.3,\"exitCode\":0,\"durationMs\":42}\n\n"
+        'event: stdout\ndata: {"t":0.1,"data":"hello\\n"}\n\n'
+        'event: stderr\ndata: {"t":0.2,"data":"warn\\n"}\n\n'
+        'event: exit\ndata: {"t":0.3,"exitCode":0,"durationMs":42}\n\n'
     )
     respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec").mock(
         return_value=httpx.Response(
@@ -338,9 +332,7 @@ def test_export_returns_bytes():
 @respx.mock
 def test_400_maps_to_validation_error():
     respx.post(f"{BASE_URL}/v1/sandboxes").mock(
-        return_value=httpx.Response(
-            400, json={"error": "bad", "code": "EINVAL", "details": ["x"]}
-        )
+        return_value=httpx.Response(400, json={"error": "bad", "code": "EINVAL", "details": ["x"]})
     )
     with pytest.raises(ValidationError) as exc:
         make_client().sandboxes.create(name="x")
