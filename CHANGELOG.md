@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9] - 2026-04-30
+
+### Added
+
+- `lefthook` pre-commit hooks: runs `ruff format --check` and `ruff check` against `clients/python/**` staged changes; runs `mypy src/` when `.py` files are staged. Hooks are installed automatically on `pnpm install` via the `prepare` script.
+- GitHub Actions workflow `python-sdk-ci.yml`: path-filtered CI for the Python SDK (lint, typecheck, test matrix on Python 3.9/3.11/3.13).
+- GitHub Actions workflow `python-sdk-release.yml`: automated PyPI publish via OIDC trusted publisher when `clients/python/**` changes land on `main`.
+- `clients/python/CHANGELOG.md` for Python SDK version tracking.
+
+### Changed
+
+- Python SDK PyPI distribution name renamed from `virtualfs` to `virtualfs-sdk`.
+- Fixed pre-existing mypy strict errors in `clients/python/src/virtualfs/_http.py` and `models.py`: typed `list`/`tuple` type arguments, cast `Literal` for `StreamEvent.type`.
+- Fixed pre-existing ruff lint/format issues in `clients/python/examples/perf_benchmark.py` and `tests/test_client.py`.
+
 ## [0.2.8] - 2026-04-28
 
 ### Added
