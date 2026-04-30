@@ -304,6 +304,31 @@ describe("SqlFs.reload() — retriggers prewarm (AC8)", () => {
 		expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(2);
 		expect(fs._contentCacheHas(1n)).toBe(true);
 	});
+
+	it("queues a follow-up prewarm when reload runs during an in-flight prewarm", async () => {
+		let resolveGate!: () => void;
+		const gate = new Promise<void>((r) => {
+			resolveGate = r;
+		});
+		const fileData = makeBytes(8, 0xdd);
+		const prewarmResult = [{ inodeId: 1n, sha256: sha(1), data: fileData }];
+		const { dialect, getBlobsForSandboxMock, waitForPrewarm } = makeDialect({ prewarmGate: gate, prewarmResult });
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue([fileEntry("/file.txt", 1n)]);
+
+		const fs = new SqlFs({ dialect, sandboxId: "s1" });
+		await fs.ready();
+		expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(1);
+
+		await fs.reload();
+		expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(1);
+
+		resolveGate();
+		await vi.waitFor(() => {
+			expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(2);
+		});
+		await waitForPrewarm();
+		expect(fs._contentCacheHas(1n)).toBe(true);
+	});
 });
 
 // ── Single-flight guard ───────────────────────────────────────────────────────

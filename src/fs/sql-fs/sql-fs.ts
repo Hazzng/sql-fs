@@ -124,6 +124,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * per-file SELECTs.
 	 */
 	#prewarmInFlight: Promise<void> | undefined;
+	/**
+	 * One-shot follow-up requested while a prewarm is already running.
+	 * Used when reload() clears contentCache during an in-flight prewarm.
+	 */
+	#prewarmQueued = false;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -328,8 +333,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		return fresh;
 	}
 
-	#startPrewarm(): void {
-		if (this.#prewarmInFlight !== undefined) return;
+	#startPrewarm(queueIfRunning = false): void {
+		if (this.#prewarmInFlight !== undefined) {
+			if (queueIfRunning) this.#prewarmQueued = true;
+			return;
+		}
 		const cap = this.#contentCache.maxSize;
 		const task = (async (): Promise<void> => {
 			try {
@@ -349,6 +357,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				);
 			} finally {
 				this.#prewarmInFlight = undefined;
+				if (this.#prewarmQueued) {
+					this.#prewarmQueued = false;
+					this.#startPrewarm();
+				}
 			}
 		})();
 		this.#prewarmInFlight = task;
@@ -390,7 +402,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
-				this.#startPrewarm();
+				this.#startPrewarm(true);
 			} finally {
 				this.#pendingReload = undefined;
 			}
