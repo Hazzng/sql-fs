@@ -119,10 +119,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 */
 	#pendingReload: Promise<void> | undefined;
 	/**
-	 * In-flight prewarm task. Set by `#startPrewarm()`; cleared when the task
-	 * resolves (either fulfilled or rejected — failures are non-fatal). Read by
-	 * `readFile`/`readFileBuffer` cache-miss paths to coalesce reads onto the
-	 * batched fetch instead of issuing per-file SELECTs in parallel with it.
+	 * In-flight prewarm task. Read by `readFile`/`readFileBuffer` cache-miss
+	 * paths to coalesce reads onto the batched fetch instead of racing it with
+	 * per-file SELECTs.
 	 */
 	#prewarmInFlight: Promise<void> | undefined;
 
@@ -360,10 +359,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * via a single recursive CTE query.  Must be called once before any FS op.
 	 */
 	async ready(): Promise<void> {
-		// Start the content prewarm BEFORE awaiting the path load. Both queries
-		// hit Postgres independently; the driver pipelines them on the pool, and
-		// `loadAllPaths` runs inside its own transaction so they don't interfere.
-		// ready() blocks ONLY on the path load — prewarm is non-fatal background.
+		// Background; ready() must not block on prewarm.
 		this.#startPrewarm();
 
 		const fresh = await this.#loadFreshPathCache();
@@ -394,9 +390,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
-				// After path cache is rebuilt and content cache is dropped, kick off
-				// a fresh prewarm so the next read after a cross-replica reload
-				// doesn't pay N RTTs in a row.
 				this.#startPrewarm();
 			} finally {
 				this.#pendingReload = undefined;
@@ -714,54 +707,35 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
 
-	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+	async #readBytes(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		// 1. Hot path: cache hit.
-		const cached = this.#contentCache.get(entry.inodeId);
-		if (cached !== undefined) return new TextDecoder().decode(cached);
-
-		// 2. If a prewarm is currently running, await it. Once it completes the
-		//    cache may have our bytes; recheck before falling through.
-		if (this.#prewarmInFlight !== undefined) {
-			await this.#prewarmInFlight;
-			const afterPrewarm = this.#contentCache.get(entry.inodeId);
-			if (afterPrewarm !== undefined) return new TextDecoder().decode(afterPrewarm);
-		}
-
-		// 3. Cold path: single pool-level SELECT (no transaction wrapper).
-		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
-		const bytes = data ?? new Uint8Array(0);
-		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
-		return new TextDecoder().decode(bytes);
-	}
-
-	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
-		const path = validatePath(inputPath);
-		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
-		const entry = await this.#resolveReadEntry(path);
-		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
-
-		// 1. Hot path: cache hit.
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// 2. If a prewarm is currently running, await it. Once it completes the
-		//    cache may have our bytes; recheck before falling through.
+		// Coalesce onto an in-flight prewarm fetch instead of racing it.
 		if (this.#prewarmInFlight !== undefined) {
 			await this.#prewarmInFlight;
 			const afterPrewarm = this.#contentCache.get(entry.inodeId);
 			if (afterPrewarm !== undefined) return afterPrewarm;
 		}
 
-		// 3. Cold path: single pool-level SELECT (no transaction wrapper).
+		// `blobs` is global (no RLS), so a transaction wrapper is unnecessary.
 		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
+	}
+
+	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+		return new TextDecoder().decode(await this.#readBytes(inputPath));
+	}
+
+	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
+		return this.#readBytes(inputPath);
 	}
 
 	async exists(inputPath: string): Promise<boolean> {

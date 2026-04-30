@@ -283,32 +283,18 @@ export interface SqlDialect<Tx = unknown> {
 	getBlobNoTx(sha256: Uint8Array): Promise<Uint8Array | null>;
 
 	/**
-	 * Bulk-fetches blob contents for every file inode in the given sandbox,
-	 * smallest-first up to a total of `maxBytes`. Used by `SqlFs.#prewarmContentCache`
-	 * to populate the in-memory content cache in a single round-trip.
+	 * Bulk-fetches blob contents for file inodes in the sandbox, ordered
+	 * smallest-first under a `maxBytes` running-total cap. Used to prewarm the
+	 * in-memory content cache in one round-trip.
 	 *
-	 * Implementations MUST:
-	 *  - skip directories and symlinks (return only kind=file rows with non-null
-	 *    content_sha256);
-	 *  - order by file size ascending so the byte cap is filled with the most
-	 *    blobs possible (a 50 MB cap consumed by one 50 MB file gives the agent
-	 *    no useful coverage; the same cap consumed by 5000 small files makes
-	 *    most greps free);
-	 *  - run without a transaction or sandbox-context setting (the join uses
-	 *    `inodes.sandbox_id` as a regular column filter, and `blobs` is global
-	 *    — confirmed in migrations/postgres/0000_create_tables.sql);
-	 *  - prefer the Redis L2 (`RedisBlobCache`) when configured: fetch metadata
-	 *    first, mget Redis, then Postgres-fetch only the misses in one batched
-	 *    SELECT.
+	 * Smallest-first matters: a 50 MB cap consumed by one 50 MB file gives
+	 * agents no coverage; the same cap consumed by 5000 small files makes most
+	 * greps free.
 	 *
-	 * Returns inode-id-keyed entries (NOT sha-keyed) because the cache is keyed
-	 * by inodeId. Two inodes that dedup to the same blob must each appear in
-	 * the result.
+	 * Returns one entry per qualifying inode (two inodes sharing a blob both
+	 * appear). Implementations should prefer Redis L2 over Postgres for misses.
 	 */
-	getBlobsForSandbox(
-		sandboxId: string,
-		maxBytes: number,
-	): Promise<Array<{ inodeId: bigint; sha256: Uint8Array; data: Uint8Array }>>;
+	getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>>;
 
 	/**
 	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.

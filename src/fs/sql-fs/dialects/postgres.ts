@@ -420,18 +420,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return bytes;
 	}
 
-	async getBlobsForSandbox(
-		sandboxId: string,
-		maxBytes: number,
-	): Promise<Array<{ inodeId: bigint; sha256: Uint8Array; data: Uint8Array }>> {
+	async getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>> {
 		if (maxBytes <= 0) return [];
 
-		// 1. Pull metadata (no payloads) for every file inode in the sandbox,
-		//    bounded by maxBytes via running-total window. Smallest-first so the
-		//    cap fills with as many blobs as possible.
-		//    NOTE: if RLS is later added to `inodes` requiring app.sandbox_id,
-		//    this query will need to set that context first. Until then, the
-		//    explicit WHERE i.sandbox_id = $1 filter is both necessary and sufficient.
+		// If RLS is later added to `inodes` requiring app.sandbox_id, this query
+		// will need to set that context first; today the WHERE filter suffices.
 		const metaRows = await this.db()<{ inode_id: string; content_sha256: Buffer; size: string }[]>`
 			WITH ranked AS (
 				SELECT
@@ -453,51 +446,42 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		if (metaRows.length === 0) return [];
 
 		const shas = metaRows.map((r) => new Uint8Array(r.content_sha256));
+		const shaHexes = shas.map((s) => Buffer.from(s).toString("hex"));
 
-		// 2. mget Redis (one pipelined call). Misses become null.
-		let redisHits: Array<Uint8Array | null>;
-		if (this.#blobCache !== undefined) {
-			redisHits = await this.#blobCache.mget(shas);
-		} else {
-			redisHits = shas.map(() => null);
-		}
+		const redisHits =
+			this.#blobCache !== undefined
+				? await this.#blobCache.mget(shas)
+				: (shas.map(() => null) as Array<Uint8Array | null>);
 
-		// 3. For Redis misses, do ONE batched Postgres fetch. Distinct shas only.
-		const missShasSet = new Map<string, Uint8Array>(); // hex → bytes
+		const missByHex = new Map<string, Uint8Array>();
 		for (let i = 0; i < shas.length; i++) {
-			if (redisHits[i] === null) {
-				const sha = shas[i]!;
-				missShasSet.set(Buffer.from(sha).toString("hex"), sha);
-			}
+			if (redisHits[i] === null) missByHex.set(shaHexes[i]!, shas[i]!);
 		}
-		const missShasArr = [...missShasSet.values()];
 
-		let pgHits = new Map<string, Uint8Array>(); // hex → bytes
-		if (missShasArr.length > 0) {
+		const pgHits = new Map<string, Uint8Array>();
+		if (missByHex.size > 0) {
 			const pgRows = await this.db()<{ sha256: Buffer; data: Buffer }[]>`
 				SELECT sha256, data
 				FROM blobs
-				WHERE sha256 = ANY(${missShasArr}::bytea[])
+				WHERE sha256 = ANY(${[...missByHex.values()]}::bytea[])
 			`;
-			pgHits = new Map(pgRows.map((r) => [Buffer.from(r.sha256).toString("hex"), new Uint8Array(r.data)]));
-
-			// Async backfill into Redis. Same fire-and-forget pattern as `getBlob`.
-			if (this.#blobCache !== undefined) {
-				for (const [hex, bytes] of pgHits) {
-					const sha = missShasSet.get(hex);
+			for (const r of pgRows) {
+				const hex = Buffer.from(r.sha256).toString("hex");
+				const bytes = new Uint8Array(r.data);
+				pgHits.set(hex, bytes);
+				// Fire-and-forget Redis backfill — see getBlob.
+				if (this.#blobCache !== undefined) {
+					const sha = missByHex.get(hex);
 					if (sha !== undefined) void this.#blobCache.set(sha, bytes);
 				}
 			}
 		}
 
-		// 4. Stitch the result. Order matches metaRows (smallest-first).
-		const out: Array<{ inodeId: bigint; sha256: Uint8Array; data: Uint8Array }> = [];
+		const out: Array<{ inodeId: bigint; data: Uint8Array }> = [];
 		for (let i = 0; i < metaRows.length; i++) {
-			const row = metaRows[i]!;
-			const sha = shas[i]!;
-			const bytes = redisHits[i] ?? pgHits.get(Buffer.from(sha).toString("hex"));
+			const bytes = redisHits[i] ?? pgHits.get(shaHexes[i]!);
 			if (bytes === undefined) continue; // referential-integrity gap; rare
-			out.push({ inodeId: BigInt(row.inode_id), sha256: sha, data: bytes });
+			out.push({ inodeId: BigInt(metaRows[i]!.inode_id), data: bytes });
 		}
 		return out;
 	}
