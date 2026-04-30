@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -92,7 +91,7 @@ def synth_dataset(count: int, avg_size: int) -> dict[str, bytes]:
     files: dict[str, bytes] = {}
     body_unit = (
         "def helper_{i}(x: int) -> int:\n"
-        "    \"\"\"TODO: tighten input validation.\"\"\"\n"
+        '    """TODO: tighten input validation."""\n'
         "    return x * {i} + {i}\n\n"
         "class Widget_{i}:\n"
         "    name = 'widget-{i}'\n"
@@ -121,11 +120,11 @@ def collect_folder(root: Path) -> dict[str, bytes]:
 
 
 def percentile(samples: list[float], p: float) -> float:
-    """Compute the p-th percentile (0–100) using nearest-rank."""
+    """Compute the p-th percentile (0-100) using nearest-rank."""
     if not samples:
         return float("nan")
     s = sorted(samples)
-    idx = max(0, min(len(s) - 1, int(round(p / 100.0 * (len(s) - 1)))))
+    idx = max(0, min(len(s) - 1, round(p / 100.0 * (len(s) - 1))))
     return s[idx]
 
 
@@ -180,10 +179,10 @@ def bench_ingest(
     n = len(files)
     print(f"[4/8] ingest — comparing 3 methods on {n} files / {total_bytes:,} B ...")
 
-    # 4a: per-file fs.write — quadratic in N round-trips. Capped to PERFILE_CAP
+    # 4a: per-file fs.write — quadratic in N round-trips. Capped to perfile_cap
     # so the benchmark stays bounded; we extrapolate to "estimated full" too.
-    PERFILE_CAP = min(20, n)
-    sub_files = list(files.items())[:PERFILE_CAP]
+    perfile_cap = min(20, n)
+    sub_files = list(files.items())[:perfile_cap]
     sub_bytes = sum(len(v) for _, v in sub_files)
     sb = client.sandboxes.create(name="bench-ingest-perfile")
     try:
@@ -192,21 +191,24 @@ def bench_ingest(
             sb.fs.write(f"{SANDBOX_BASE}/{path}", content)
         ms = (time.perf_counter() - t) * 1000
         kbs = (sub_bytes / 1024) / (ms / 1000) if ms > 0 else None
-        per_file_ms = ms / PERFILE_CAP
+        per_file_ms = ms / perfile_cap
+        est_full = f"~{per_file_ms:.0f} ms/file -> est. {per_file_ms * n / 1000:.1f} s for full {n}"
         rows.append(
             Row(
                 "ingest",
-                f"per-file fs.write × {PERFILE_CAP}  ({sub_bytes:,} B)",
+                f"per-file fs.write x{perfile_cap}  ({sub_bytes:,} B)",
                 ms=ms,
                 throughput_kbs=kbs,
-                note=f"~{per_file_ms:.0f} ms/file → est. {per_file_ms * n / 1000:.1f} s for full {n}",
+                note=est_full,
             )
         )
     finally:
         client.sandboxes.delete(sb.id)
 
     # 4b: fs.write_files — single round-trip, plain JSON (UTF-8 text only).
-    text_only = {f"{SANDBOX_BASE}/{p}": v.decode("utf-8", errors="replace") for p, v in files.items()}
+    text_only = {
+        f"{SANDBOX_BASE}/{p}": v.decode("utf-8", errors="replace") for p, v in files.items()
+    }
     sb = client.sandboxes.create(name="bench-ingest-writefiles")
     try:
         ms, _ = time_call(lambda: sb.fs.write_files(text_only))
@@ -265,7 +267,7 @@ def bench_exec(rows: list[Row], sb: Sandbox) -> None:
     rows.append(
         Row(
             "exec",
-            "exec(':') × 12 — p50",
+            "exec(':') x12 — p50",
             ms=percentile(samples, 50),
             extra={"samples_ms": samples},
         )
@@ -280,9 +282,12 @@ def bench_exec(rows: list[Row], sb: Sandbox) -> None:
         rows.append(
             Row(
                 "exec",
-                f"exec_batch × {n}",
+                f"exec_batch x{n}",
                 ms=ms,
-                note=f"avg {ms / n:.1f} ms/script (vs {percentile(samples, 50):.0f} ms each individually)",
+                note=(
+                    f"avg {ms / n:.1f} ms/script"
+                    f" (vs {percentile(samples, 50):.0f} ms each individually)"
+                ),
             )
         )
 
@@ -296,7 +301,12 @@ def bench_cache(rows: list[Row], sb: Sandbox) -> None:
     # Metadata-only command: pathCache hit, no DB content fetch.
     ms, r = time_call(lambda: sb.exec(find_cmd, timeout_ms=15_000))
     rows.append(
-        Row("cache", "find -type f | wc -l", ms=ms, note=f"{r.stdout.strip()} files (pathCache only)")
+        Row(
+            "cache",
+            "find -type f | wc -l",
+            ms=ms,
+            note=f"{r.stdout.strip()} files (pathCache only)",
+        )
     )
 
     # First content scan — cold contentCache: 1 SQL roundtrip per blob.
@@ -384,24 +394,34 @@ def render_table(rows: list[Row]) -> str:
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--folder",
         type=Path,
         help="Use a real folder for the ingest dataset (default: synthetic)",
     )
-    parser.add_argument("--files", type=int, default=100, help="synthetic file count (default: 100)")
     parser.add_argument(
-        "--file-size", type=int, default=10 * 1024, help="synthetic avg file size in bytes (default: 10240)"
+        "--files", type=int, default=100, help="synthetic file count (default: 100)"
+    )
+    parser.add_argument(
+        "--file-size",
+        type=int,
+        default=10 * 1024,
+        help="synthetic avg file size in bytes (default: 10240)",
     )
     parser.add_argument("--json", type=Path, help="also write results as JSON to PATH")
     parser.add_argument(
         "--skip",
         type=str,
         default="",
-        help="comma-separated section ids to skip (auth,lifecycle,single,ingest,tree,exec,cache,export)",
+        help="comma-separated section ids to skip: "
+        "auth,lifecycle,single,ingest,tree,exec,cache,export",
     )
-    parser.add_argument("--sub", type=str, default="bench-runner", help="JWT subject (default: bench-runner)")
+    parser.add_argument(
+        "--sub", type=str, default="bench-runner", help="JWT subject (default: bench-runner)"
+    )
     args = parser.parse_args(argv)
 
     base_url = os.environ.get("BASE_URL")
@@ -422,7 +442,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"dataset: walking {args.folder} ...")
         files = collect_folder(args.folder)
     else:
-        print(f"dataset: synthetic {args.files} files × ~{args.file_size} B ...")
+        print(f"dataset: synthetic {args.files} files x ~{args.file_size} B ...")
         files = synth_dataset(args.files, args.file_size)
     total_bytes = sum(len(v) for v in files.values())
     print(f"  {len(files)} files, {total_bytes:,} bytes")
@@ -433,7 +453,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "__meta__",
             "dataset",
             note=f"{len(files)} files, {total_bytes:,} bytes",
-            extra={"files": len(files), "bytes": total_bytes, "source": str(args.folder) if args.folder else "synthetic"},
+            extra={
+                "files": len(files),
+                "bytes": total_bytes,
+                "source": str(args.folder) if args.folder else "synthetic",
+            },
         )
     )
 

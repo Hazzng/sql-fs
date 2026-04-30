@@ -8,7 +8,7 @@ camelCase fields when parsing responses.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 
 @dataclass(frozen=True)
@@ -156,7 +156,11 @@ class StreamEvent:
                 error=payload.get("error"),
             )
         if event_name in ("stdout", "stderr"):
-            return cls(type=event_name, data=payload.get("data", ""), t=payload.get("t"))
+            return cls(
+                type=cast(Literal["stdout", "stderr"], event_name),
+                data=payload.get("data", ""),
+                t=payload.get("t"),
+            )
         raise ValueError(f"unknown SSE event: {event_name!r}")
 
 

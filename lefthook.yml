@@ -1,0 +1,13 @@
+pre-commit:
+  jobs:
+    - name: python-sdk-format
+      glob: "clients/python/**"
+      run: cd clients/python && uvx ruff format --check .
+
+    - name: python-sdk-lint
+      glob: "clients/python/**"
+      run: cd clients/python && uvx ruff check .
+
+    - name: python-sdk-typecheck
+      glob: "clients/python/**/*.py"
+      run: cd clients/python && uvx --with httpx mypy src/

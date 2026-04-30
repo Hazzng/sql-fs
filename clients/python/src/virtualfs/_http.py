@@ -15,7 +15,7 @@ import json
 import random
 import time
 from collections.abc import Iterator, Mapping
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -39,7 +39,7 @@ RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_S = 30.0
 
 
-JsonType = Union[Dict[str, Any], list, str, int, float, bool, None]
+JsonType = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
 
 
 def encode_path(path: str) -> str:
@@ -70,13 +70,9 @@ class Transport:
         http_client: Optional[httpx.Client] = None,
     ) -> None:
         if not (token or auth_secret or admin_secret):
-            raise ValueError(
-                "Provide one of: token=..., auth_secret=..., or admin_secret=..."
-            )
+            raise ValueError("Provide one of: token=..., auth_secret=..., or admin_secret=...")
         if (auth_secret or admin_secret) and not sub:
-            raise ValueError(
-                "`sub` is required when bootstrapping a token from a secret"
-            )
+            raise ValueError("`sub` is required when bootstrapping a token from a secret")
 
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -189,9 +185,7 @@ class Transport:
             except httpx.TransportError as e:
                 last_exc = e
                 if attempt >= self._max_retries:
-                    raise TransportError(
-                        f"network error after {attempt + 1} attempts: {e}"
-                    ) from e
+                    raise TransportError(f"network error after {attempt + 1} attempts: {e}") from e
                 self._sleep_backoff(attempt)
                 continue
 
@@ -285,12 +279,12 @@ class Transport:
     def _sleep_backoff(self, attempt: int) -> None:
         # Exponential backoff with full jitter: [0, base * 2^attempt)
         base = 0.25
-        delay = random.uniform(0, base * (2 ** attempt))
+        delay = random.uniform(0, base * (2**attempt))
         time.sleep(min(delay, 8.0))
 
 
 # ── module-level helpers ─────────────────────────────────────────────────────
-def _parse_error_body(resp: httpx.Response) -> tuple:
+def _parse_error_body(resp: httpx.Response) -> tuple[Dict[str, Any], Any, str, Any]:
     """Best-effort parse of `{ error, code, details }` JSON response body."""
     try:
         body = resp.json()
@@ -314,14 +308,14 @@ def _parse_retry_after(resp: httpx.Response) -> Optional[int]:
         return None
 
 
-def iter_sse_events(resp: httpx.Response) -> Iterator[tuple]:
+def iter_sse_events(resp: httpx.Response) -> Iterator[tuple[str, Any]]:
     """Iterate SSE events from a streaming response.
 
     Yields `(event_name, parsed_json)` tuples. `data:` lines are concatenated
     per event and parsed as JSON. Comment lines (`:`) are skipped.
     """
     event = "message"
-    data_lines: list = []
+    data_lines: List[str] = []
     for line in resp.iter_lines():
         if line == "":
             if data_lines:
@@ -337,9 +331,9 @@ def iter_sse_events(resp: httpx.Response) -> Iterator[tuple]:
         if line.startswith(":"):
             continue
         if line.startswith("event:"):
-            event = line[len("event:"):].strip()
+            event = line[len("event:") :].strip()
         elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip(" "))
+            data_lines.append(line[len("data:") :].lstrip(" "))
     # Trailing event without blank line
     if data_lines:
         raw = "\n".join(data_lines)
