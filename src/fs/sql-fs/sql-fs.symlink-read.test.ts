@@ -73,7 +73,8 @@ function makeFs(
 		listDirents: vi.fn(),
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
-		getBlob: getBlobMock,
+		getBlob: vi.fn(),
+		getBlobNoTx: getBlobMock,
 		gcOrphanBlobs: vi.fn(),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
@@ -118,9 +119,9 @@ describe("SqlFs.readFile — symlink semantics (US-042a)", () => {
 		expect(resolvePathMock).toHaveBeenCalledWith(expect.anything(), "/link.txt", true);
 	});
 
-	it("readFile on symlink calls getBlob with target's contentSha256", async () => {
+	it("readFile on symlink calls getBlobNoTx with target's contentSha256", async () => {
 		await fs.readFile("/link.txt");
-		expect(getBlobMock).toHaveBeenCalledWith(expect.anything(), sha256);
+		expect(getBlobMock).toHaveBeenCalledWith(sha256);
 	});
 
 	it("readFile on symlink caches content under the resolved (target) inodeId", async () => {

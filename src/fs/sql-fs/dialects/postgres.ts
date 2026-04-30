@@ -403,6 +403,23 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return bytes;
 	}
 
+	async getBlobNoTx(sha256: Uint8Array): Promise<Uint8Array | null> {
+		if (this.#blobCache !== undefined) {
+			const cached = await this.#blobCache.get(sha256);
+			if (cached !== null) return cached;
+		}
+		const rows = await this.db()<{ data: Buffer }[]>`
+			SELECT data FROM blobs WHERE sha256 = ${sha256}
+		`;
+		const data = rows[0]?.data;
+		if (!data) return null;
+		const bytes = new Uint8Array(data);
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, bytes);
+		}
+		return bytes;
+	}
+
 	// US-014
 	async gcOrphanBlobs(tx: PgTx): Promise<number> {
 		const rows = await tx<{ sha256: Buffer }[]>`
