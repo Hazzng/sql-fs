@@ -30,6 +30,7 @@ function makeFs(): SqlFs<unknown> {
 		upsertBlob: async () => {},
 		getBlob: async () => null,
 		gcOrphanBlobs: async () => 0,
+		getBlobsForSandbox: async () => [],
 		loadAllPaths: async () => [],
 		loadSubtreeInodes: async () => [],
 		bulkIngest: async () => {},

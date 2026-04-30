@@ -508,6 +508,7 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 			upsertBlob: vi.fn(),
 			getBlob: getBlobMock,
 			gcOrphanBlobs: vi.fn(),
+			getBlobsForSandbox: vi.fn(async () => []),
 			loadSubtreeInodes: vi.fn(async () => [10n]),
 			bulkIngest: vi.fn(),
 			resolvePath: vi.fn(),

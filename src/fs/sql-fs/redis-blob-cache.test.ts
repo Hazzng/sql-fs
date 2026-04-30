@@ -15,11 +15,17 @@ interface StoredEntry {
 class FakeRedis {
 	readonly store = new Map<string, StoredEntry>();
 	failGet = false;
+	failMget = false;
 	failSet = false;
 
 	async getBuffer(key: string): Promise<Buffer | null> {
 		if (this.failGet) throw new Error("redis get failed");
 		return this.store.get(key)?.data ?? null;
+	}
+
+	async mgetBuffer(...keys: string[]): Promise<Array<Buffer | null>> {
+		if (this.failMget) throw new Error("redis mget failed");
+		return keys.map((k) => this.store.get(k)?.data ?? null);
 	}
 
 	async set(key: string, value: Buffer, _px: "PX", ttlMs: number): Promise<"OK"> {
@@ -144,6 +150,50 @@ describe("RedisBlobCache.set limits", () => {
 		const cache = new RedisBlobCache(client, "default");
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		await expect(cache.set(sha(7), new Uint8Array([1]))).resolves.toBeUndefined();
+		expect(errSpy).toHaveBeenCalled();
+		errSpy.mockRestore();
+	});
+});
+
+describe("RedisBlobCache.mget", () => {
+	it("returns null for all entries when cache is disabled", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default", { enabled: false });
+		fake.store.set(`vfs:default:blob:${hexSha(0x01)}`, { data: Buffer.from([1]), ttlMs: 1000 });
+		const result = await cache.mget([sha(0x01), sha(0x02)]);
+		expect(result).toEqual([null, null]);
+	});
+
+	it("returns empty array for empty input", async () => {
+		const { client } = makeClient();
+		const cache = new RedisBlobCache(client, "default");
+		const result = await cache.mget([]);
+		expect(result).toEqual([]);
+	});
+
+	it("returns bytes for hits and null for misses in order", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default");
+		const data1 = new Uint8Array([0xaa, 0xbb]);
+		const data3 = new Uint8Array([0xcc, 0xdd, 0xee]);
+		fake.store.set(`vfs:default:blob:${hexSha(0x01)}`, { data: Buffer.from(data1), ttlMs: 1000 });
+		fake.store.set(`vfs:default:blob:${hexSha(0x03)}`, { data: Buffer.from(data3), ttlMs: 1000 });
+
+		const result = await cache.mget([sha(0x01), sha(0x02), sha(0x03)]);
+
+		expect(result).toHaveLength(3);
+		expect(result[0]).toEqual(data1);
+		expect(result[1]).toBeNull();
+		expect(result[2]).toEqual(data3);
+	});
+
+	it("returns all-null and swallows Redis errors (fail open)", async () => {
+		const { fake, client } = makeClient();
+		fake.failMget = true;
+		const cache = new RedisBlobCache(client, "default");
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await cache.mget([sha(0x01), sha(0x02)]);
+		expect(result).toEqual([null, null]);
 		expect(errSpy).toHaveBeenCalled();
 		errSpy.mockRestore();
 	});

@@ -52,6 +52,7 @@ function makeFs(
 		getBlob: vi.fn(),
 		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

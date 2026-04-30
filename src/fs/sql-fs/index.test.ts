@@ -35,6 +35,7 @@ vi.mock("./dialects/postgres.js", () => ({
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadAllPaths: vi.fn().mockResolvedValue([]),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),

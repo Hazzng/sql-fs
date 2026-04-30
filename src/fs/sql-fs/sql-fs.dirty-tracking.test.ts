@@ -67,6 +67,7 @@ function makeDialect(): SqlDialect<unknown> {
 		getBlob: vi.fn(async () => new Uint8Array(0)),
 		getBlobNoTx: vi.fn(async () => new Uint8Array(0)),
 		gcOrphanBlobs: vi.fn(),
+		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n, 5n]),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),

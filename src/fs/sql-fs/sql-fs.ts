@@ -118,6 +118,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * against the DB simultaneously.
 	 */
 	#pendingReload: Promise<void> | undefined;
+	/**
+	 * In-flight prewarm task. Set by `#startPrewarm()`; cleared when the task
+	 * resolves (either fulfilled or rejected — failures are non-fatal). Read by
+	 * `readFile`/`readFileBuffer` cache-miss paths to coalesce reads onto the
+	 * batched fetch instead of issuing per-file SELECTs in parallel with it.
+	 */
+	#prewarmInFlight: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -322,11 +329,43 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		return fresh;
 	}
 
+	#startPrewarm(): void {
+		if (this.#prewarmInFlight !== undefined) return;
+		const cap = this.#contentCache.maxSize;
+		const task = (async (): Promise<void> => {
+			try {
+				const blobs = await this.#dialect.getBlobsForSandbox(this.#sandboxId, cap);
+				for (const { inodeId, data } of blobs) {
+					if (data.byteLength > 0) this.#contentCache.set(inodeId, data);
+				}
+				console.log(JSON.stringify({ event: "content_prewarm_ok", sandboxId: this.#sandboxId, entries: blobs.length }));
+			} catch (err) {
+				// Non-fatal: lazy fetch via getBlobNoTx still works.
+				console.error(
+					JSON.stringify({
+						event: "content_prewarm_error",
+						sandboxId: this.#sandboxId,
+						error: (err as Error).message,
+					}),
+				);
+			} finally {
+				this.#prewarmInFlight = undefined;
+			}
+		})();
+		this.#prewarmInFlight = task;
+	}
+
 	/**
 	 * Initialises the in-memory pathCache by loading all paths from the DB
 	 * via a single recursive CTE query.  Must be called once before any FS op.
 	 */
 	async ready(): Promise<void> {
+		// Start the content prewarm BEFORE awaiting the path load. Both queries
+		// hit Postgres independently; the driver pipelines them on the pool, and
+		// `loadAllPaths` runs inside its own transaction so they don't interfere.
+		// ready() blocks ONLY on the path load — prewarm is non-fatal background.
+		this.#startPrewarm();
+
 		const fresh = await this.#loadFreshPathCache();
 		this.#pathCache.clear();
 		for (const [p, e] of fresh) this.#pathCache.set(p, e);
@@ -355,6 +394,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
+				// After path cache is rebuilt and content cache is dropped, kick off
+				// a fresh prewarm so the next read after a cross-replica reload
+				// doesn't pay N RTTs in a row.
+				this.#startPrewarm();
 			} finally {
 				this.#pendingReload = undefined;
 			}
@@ -677,12 +720,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		// Cache hit: return decoded bytes without any DB call
+		// 1. Hot path: cache hit.
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return new TextDecoder().decode(cached);
 
-		// Cache miss: fetch blob directly from pool — no transaction needed because
-		// the blobs table is global (no sandbox_id, no RLS).
+		// 2. If a prewarm is currently running, await it. Once it completes the
+		//    cache may have our bytes; recheck before falling through.
+		if (this.#prewarmInFlight !== undefined) {
+			await this.#prewarmInFlight;
+			const afterPrewarm = this.#contentCache.get(entry.inodeId);
+			if (afterPrewarm !== undefined) return new TextDecoder().decode(afterPrewarm);
+		}
+
+		// 3. Cold path: single pool-level SELECT (no transaction wrapper).
 		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
@@ -695,12 +745,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		// Cache hit: return raw bytes without any DB call
+		// 1. Hot path: cache hit.
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
-		// Cache miss: fetch blob directly from pool — no transaction needed because
-		// the blobs table is global (no sandbox_id, no RLS).
+		// 2. If a prewarm is currently running, await it. Once it completes the
+		//    cache may have our bytes; recheck before falling through.
+		if (this.#prewarmInFlight !== undefined) {
+			await this.#prewarmInFlight;
+			const afterPrewarm = this.#contentCache.get(entry.inodeId);
+			if (afterPrewarm !== undefined) return afterPrewarm;
+		}
+
+		// 3. Cold path: single pool-level SELECT (no transaction wrapper).
 		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
