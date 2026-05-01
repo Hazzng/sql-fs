@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.12] - 2026-05-01
+
+### Changed
+
+- Reorganized colocated `*.test.ts` files into per-module `tests/` directories so source and tests are visually separated. Affects `src/api/`, `src/api/lib/`, `src/fs/sql-fs/`, `src/fs/sql-fs/dialects/`, and `src/redis/`. No source or runtime changes.
+
 ## [0.2.11] - 2026-04-30
 
 ### Added
