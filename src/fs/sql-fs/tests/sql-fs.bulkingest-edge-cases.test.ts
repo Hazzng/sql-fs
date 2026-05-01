@@ -44,12 +44,14 @@ function makeDialect(overrides?: Partial<{ bulkIngestImpl: SqlDialect<unknown>["
 	dialect: SqlDialect<unknown>;
 	bulkIngestMock: ReturnType<typeof vi.fn>;
 	loadAllPathsMock: ReturnType<typeof vi.fn>;
+	getBlobNoTxMock: ReturnType<typeof vi.fn>;
 } {
 	const transactionMock = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({}));
 	const bulkIngestMock = overrides?.bulkIngestImpl
 		? vi.fn(overrides.bulkIngestImpl)
 		: vi.fn(async () => new Map<string, PathCacheEntry>());
 	const loadAllPathsMock = vi.fn(async () => [] as Array<{ path: string } & PathCacheEntry>);
+	const getBlobNoTxMock = vi.fn(async () => new Uint8Array(0));
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
@@ -75,13 +77,14 @@ function makeDialect(overrides?: Partial<{ bulkIngestImpl: SqlDialect<unknown>["
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
+		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: bulkIngestMock,
 		resolvePath: vi.fn(),
 	} as unknown as SqlDialect<unknown>;
-	return { dialect, bulkIngestMock, loadAllPathsMock };
+	return { dialect, bulkIngestMock, loadAllPathsMock, getBlobNoTxMock };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,43 +201,42 @@ describe("bulkIngest — overwrite semantics (Codex issue 2)", () => {
 		expect((await fs.stat("/a.txt")).size).toBe(7);
 	});
 
-	it("overwrite evicts old inode from contentCache", async () => {
-		const { dialect, bulkIngestMock, loadAllPathsMock } = makeDialect();
+	it("overwrite evicts old inode and seeds new inode in contentCache", async () => {
+		const { dialect, bulkIngestMock, loadAllPathsMock, getBlobNoTxMock } = makeDialect();
 		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n), fileEntry("/data.bin", 100n, 10)]);
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 		await fs.ready();
 
-		// Populate content cache for old inode
-		fs._contentCacheSet(100n, new Uint8Array(10).fill(0x01));
-		expect(fs._contentCacheHas(100n)).toBe(true);
-
-		// Overwrite → new inode 200n
+		const newContent = new Uint8Array(5).fill(0x02);
+		// Overwrite → new inode 200n, seeds cache with newContent
 		bulkIngestMock.mockResolvedValueOnce(new Map<string, PathCacheEntry>([["/data.bin", cacheEntry(200n, 5)]]));
+		await fs.bulkIngest([{ path: "/data.bin", content: newContent, mode: 0o644 }]);
 
-		await fs.bulkIngest([{ path: "/data.bin", content: new Uint8Array(5), mode: 0o644 }]);
-
-		expect(fs._contentCacheHas(100n)).toBe(false);
+		// New inode is seeded in cache — readFileBuffer must be a hit (no getBlobNoTx)
+		expect(await fs.readFileBuffer("/data.bin")).toEqual(newContent);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 		expect(fs._getPathCache().get("/data.bin")?.inodeId).toBe(200n);
 	});
 
 	it("same inode ID on overwrite does NOT evict contentCache (content-addressable dedup)", async () => {
-		const { dialect, bulkIngestMock, loadAllPathsMock } = makeDialect();
+		const { dialect, bulkIngestMock, loadAllPathsMock, getBlobNoTxMock } = makeDialect();
 		loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n), fileEntry("/same.txt", 42n, 5)]);
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 		await fs.ready();
 
-		fs._contentCacheSet(42n, new TextEncoder().encode("hello"));
-
 		// Dialect returns same inode ID (hypothetical same-content scenario)
+		const content = new TextEncoder().encode("hello");
 		bulkIngestMock.mockResolvedValueOnce(new Map<string, PathCacheEntry>([["/same.txt", cacheEntry(42n, 5)]]));
+		await fs.bulkIngest([{ path: "/same.txt", content, mode: 0o644 }]);
 
-		await fs.bulkIngest([{ path: "/same.txt", content: new TextEncoder().encode("hello"), mode: 0o644 }]);
-
-		expect(fs._contentCacheHas(42n)).toBe(true);
+		// Inode 42n was seeded (not evicted since ID unchanged) — cache hit
+		const result = await fs.readFileBuffer("/same.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toEqual(content);
 	});
 
 	it("multiple files with some overwrites and some new — both handled correctly", async () => {
-		const { dialect, bulkIngestMock, loadAllPathsMock } = makeDialect();
+		const { dialect, bulkIngestMock, loadAllPathsMock, getBlobNoTxMock } = makeDialect();
 		loadAllPathsMock.mockResolvedValueOnce([
 			dirEntry("/", 1n),
 			dirEntry("/d", 2n),
@@ -243,8 +245,8 @@ describe("bulkIngest — overwrite semantics (Codex issue 2)", () => {
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 		await fs.ready();
 
-		fs._contentCacheSet(10n, new TextEncoder().encode("old"));
-
+		const existingContent = new Uint8Array(7).fill(0x11);
+		const newContent = new Uint8Array(4).fill(0x22);
 		bulkIngestMock.mockResolvedValueOnce(
 			new Map<string, PathCacheEntry>([
 				["/d/existing.txt", cacheEntry(50n, 7)],
@@ -253,14 +255,15 @@ describe("bulkIngest — overwrite semantics (Codex issue 2)", () => {
 		);
 
 		await fs.bulkIngest([
-			{ path: "/d/existing.txt", content: new Uint8Array(7), mode: 0o644 },
-			{ path: "/d/brand-new.txt", content: new Uint8Array(4), mode: 0o644 },
+			{ path: "/d/existing.txt", content: existingContent, mode: 0o644 },
+			{ path: "/d/brand-new.txt", content: newContent, mode: 0o644 },
 		]);
 
-		// Overwritten file: old content evicted, new inode in cache
-		expect(fs._contentCacheHas(10n)).toBe(false);
+		// Both inodes seeded in cache — reads must be cache hits
+		expect(await fs.readFileBuffer("/d/existing.txt")).toEqual(existingContent);
+		expect(await fs.readFileBuffer("/d/brand-new.txt")).toEqual(newContent);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 		expect(fs._getPathCache().get("/d/existing.txt")?.inodeId).toBe(50n);
-		// New file: present in cache
 		expect(fs._getPathCache().get("/d/brand-new.txt")?.inodeId).toBe(51n);
 	});
 });

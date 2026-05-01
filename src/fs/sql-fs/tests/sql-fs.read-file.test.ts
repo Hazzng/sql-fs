@@ -116,13 +116,6 @@ describe("SqlFs.readFileBuffer", () => {
 		expect(data).toBeInstanceOf(Uint8Array);
 	});
 
-	it("stores fetched content in contentCache after cache miss", async () => {
-		expect(fs._contentCacheHas(inodeId)).toBe(false);
-		await fs.readFileBuffer(filePath);
-		expect(fs._contentCacheHas(inodeId)).toBe(true);
-		expect(fs._contentCacheGet(inodeId)).toEqual(fileContent);
-	});
-
 	it("returns cached Uint8Array on cache hit without calling getBlobNoTx", async () => {
 		await fs.readFileBuffer(filePath); // prime cache
 		getBlobNoTxMock.mockClear();

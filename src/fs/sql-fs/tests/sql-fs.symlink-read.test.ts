@@ -126,10 +126,12 @@ describe("SqlFs.readFile — symlink semantics (US-042a)", () => {
 	});
 
 	it("readFile on symlink caches content under the resolved (target) inodeId", async () => {
-		await fs.readFile("/link.txt");
-		// Content should be cached under fileInodeId (target), not linkInodeId (symlink)
-		expect(fs._contentCacheHas(fileInodeId)).toBe(true);
-		expect(fs._contentCacheHas(linkInodeId)).toBe(false);
+		await fs.readFile("/link.txt"); // fetches content, caches under fileInodeId (target)
+		getBlobMock.mockClear();
+
+		// Direct read of the target file must hit the same cache entry (no new DB call)
+		await fs.readFile("/actual.txt");
+		expect(getBlobMock).not.toHaveBeenCalled();
 	});
 
 	it("second readFile on same symlink uses cache (getBlob not called again)", async () => {
@@ -191,9 +193,12 @@ describe("SqlFs.readFileBuffer — symlink semantics (US-042a)", () => {
 	});
 
 	it("readFileBuffer on symlink caches content under resolved inodeId", async () => {
-		await fs.readFileBuffer("/link.bin");
-		expect(fs._contentCacheHas(fileInodeId)).toBe(true);
-		expect(fs._contentCacheHas(linkInodeId)).toBe(false);
+		await fs.readFileBuffer("/link.bin"); // fetches content, caches under fileInodeId (target)
+		getBlobMock.mockClear();
+
+		// Direct read of the target file must hit the same cache entry (no new DB call)
+		await fs.readFileBuffer("/actual.bin");
+		expect(getBlobMock).not.toHaveBeenCalled();
 	});
 
 	it("second readFileBuffer on symlink uses cache (no extra getBlob call)", async () => {

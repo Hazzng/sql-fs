@@ -26,11 +26,13 @@ function makeDialect(): {
 	transactionMock: ReturnType<typeof vi.fn>;
 	bulkIngestMock: ReturnType<typeof vi.fn>;
 	getBlobMock: ReturnType<typeof vi.fn>;
+	getBlobNoTxMock: ReturnType<typeof vi.fn>;
 	loadAllPathsMock: ReturnType<typeof vi.fn>;
 } {
 	const transactionMock = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({}));
 	const bulkIngestMock = vi.fn(async () => new Map<string, PathCacheEntry>());
 	const getBlobMock = vi.fn(async () => new Uint8Array(0));
+	const getBlobNoTxMock = vi.fn(async () => new Uint8Array(0));
 	const loadAllPathsMock = vi.fn(async () => [] as Array<{ path: string } & PathCacheEntry>);
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
@@ -57,13 +59,14 @@ function makeDialect(): {
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
 		getBlob: getBlobMock,
+		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: bulkIngestMock,
 		resolvePath: vi.fn(),
 	} as unknown as SqlDialect<unknown>;
-	return { dialect, transactionMock, bulkIngestMock, getBlobMock, loadAllPathsMock };
+	return { dialect, transactionMock, bulkIngestMock, getBlobMock, getBlobNoTxMock, loadAllPathsMock };
 }
 
 describe("SqlFs.bulkIngest — content cache seeding (AC 1–6)", () => {
@@ -71,12 +74,14 @@ describe("SqlFs.bulkIngest — content cache seeding (AC 1–6)", () => {
 	let transactionMock: ReturnType<typeof vi.fn>;
 	let bulkIngestMock: ReturnType<typeof vi.fn>;
 	let getBlobMock: ReturnType<typeof vi.fn>;
+	let getBlobNoTxMock: ReturnType<typeof vi.fn>;
 
 	beforeEach(async () => {
 		const m = makeDialect();
 		transactionMock = m.transactionMock;
 		bulkIngestMock = m.bulkIngestMock;
 		getBlobMock = m.getBlobMock;
+		getBlobNoTxMock = m.getBlobNoTxMock;
 		m.loadAllPathsMock.mockResolvedValueOnce([dirEntry("/", 1n)]);
 		fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
 		await fs.ready();
@@ -88,8 +93,10 @@ describe("SqlFs.bulkIngest — content cache seeding (AC 1–6)", () => {
 
 		await fs.bulkIngest([{ path: "/a.txt", content, mode: 0o644 }]);
 
-		expect(fs._contentCacheHas(2n)).toBe(true);
-		expect(fs._contentCacheGet(2n)).toBe(content);
+		// readFileBuffer should serve from cache (no getBlobNoTx call)
+		const result = await fs.readFileBuffer("/a.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toBe(content);
 	});
 
 	it("AC2 — readFileBuffer after bulkIngest issues zero dialect calls", async () => {
@@ -106,31 +113,33 @@ describe("SqlFs.bulkIngest — content cache seeding (AC 1–6)", () => {
 		expect(getBlobMock).not.toHaveBeenCalled();
 	});
 
-	it("AC3 — empty files are not cached", async () => {
+	it("AC3 — empty files are not cached (readFileBuffer falls through to DB)", async () => {
 		const empty = new Uint8Array(0);
 		bulkIngestMock.mockResolvedValueOnce(new Map([["/empty.txt", fileEntry(4n, 0)]]));
 
 		await fs.bulkIngest([{ path: "/empty.txt", content: empty, mode: 0o644 }]);
 
-		expect(fs._contentCacheHas(4n)).toBe(false);
+		// Empty file not seeded in cache — readFileBuffer must call getBlobNoTx
+		await fs.readFileBuffer("/empty.txt");
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 	});
 
 	it("AC4 — replacement: old inode evicted, new inode populated", async () => {
 		const bytesA = new TextEncoder().encode("version A");
 		const bytesB = new TextEncoder().encode("version B");
 
-		// First ingest: /x.txt → inode 10n
+		// First ingest: /x.txt → inode 10n (seeded in cache)
 		bulkIngestMock.mockResolvedValueOnce(new Map([["/x.txt", fileEntry(10n, bytesA.byteLength)]]));
 		await fs.bulkIngest([{ path: "/x.txt", content: bytesA, mode: 0o644 }]);
-		expect(fs._contentCacheHas(10n)).toBe(true);
 
-		// Second ingest: /x.txt → inode 11n (replacement)
+		// Second ingest: /x.txt → inode 11n (evicts 10n, seeds 11n)
 		bulkIngestMock.mockResolvedValueOnce(new Map([["/x.txt", fileEntry(11n, bytesB.byteLength)]]));
 		await fs.bulkIngest([{ path: "/x.txt", content: bytesB, mode: 0o644 }]);
 
-		expect(fs._contentCacheHas(10n)).toBe(false);
-		expect(fs._contentCacheHas(11n)).toBe(true);
-		expect(fs._contentCacheGet(11n)).toBe(bytesB);
+		// Reading must return bytesB from cache (no getBlobNoTx) — proves 11n is seeded
+		const result = await fs.readFileBuffer("/x.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toBe(bytesB);
 	});
 
 	it("AC5 — two paths sharing identical bytes each get their own cache entry", async () => {
@@ -148,10 +157,12 @@ describe("SqlFs.bulkIngest — content cache seeding (AC 1–6)", () => {
 			{ path: "/p2.txt", content: shared, mode: 0o644 },
 		]);
 
-		expect(fs._contentCacheHas(20n)).toBe(true);
-		expect(fs._contentCacheHas(21n)).toBe(true);
-		expect(fs._contentCacheGet(20n)).toBe(shared);
-		expect(fs._contentCacheGet(21n)).toBe(shared);
+		// Both paths served from cache — no getBlobNoTx calls
+		const r1 = await fs.readFileBuffer("/p1.txt");
+		const r2 = await fs.readFileBuffer("/p2.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(r1).toBe(shared);
+		expect(r2).toBe(shared);
 	});
 
 	it("AC6 — empty input is a no-op, cache untouched", async () => {

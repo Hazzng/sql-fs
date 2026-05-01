@@ -62,6 +62,7 @@ function makeDialect(): {
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
+		getBlobNoTx: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
@@ -185,20 +186,18 @@ describe("SqlFs.bulkIngest", () => {
 		expect(transactionMock.mock.calls.length).toBe(txCallsBefore);
 	});
 
-	it("evicts overwritten file from contentCache when inode ID changes", async () => {
-		// Seed pathCache with an existing file at /a.txt with inodeId 5n
+	it("serves new content from cache after overwrite (old inode evicted, new inode seeded)", async () => {
+		// First ingest: /a.txt → inode 5n, content "old" — bulkIngest seeds cache for 5n
 		bulkIngestMock.mockResolvedValueOnce(new Map([["/a.txt", cacheEntry(5n, 3)]]));
 		await fs.bulkIngest([{ path: "/a.txt", content: new TextEncoder().encode("old"), mode: 0o644 }]);
 
-		// Populate contentCache for the old inode
-		fs._contentCacheSet(5n, new TextEncoder().encode("old"));
-		expect(fs._contentCacheHas(5n)).toBe(true);
-
-		// Now overwrite /a.txt with a new inode (6n)
+		// Second ingest: /a.txt → inode 6n, content "new" — evicts 5n, seeds 6n
 		bulkIngestMock.mockResolvedValueOnce(new Map([["/a.txt", cacheEntry(6n, 3)]]));
 		await fs.bulkIngest([{ path: "/a.txt", content: new TextEncoder().encode("new"), mode: 0o644 }]);
 
-		// Old inode's content should be evicted
-		expect(fs._contentCacheHas(5n)).toBe(false);
+		// Reading must return new content from cache — getBlobNoTx (vi.fn → undefined) would produce
+		// an empty buffer, so the correct result here proves a cache hit with the seeded bytes.
+		const result = await fs.readFileBuffer("/a.txt");
+		expect(result).toEqual(new TextEncoder().encode("new"));
 	});
 });

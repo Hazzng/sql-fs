@@ -1,22 +1,57 @@
 /**
  * Unit tests for SqlFs contentCache (LRU).
  * US-022: LRU content cache setup
+ *
+ * Cache behaviour is verified through the public API: a readFileBuffer miss
+ * calls getBlobNoTx; a hit does not. LRU eviction and promotion are verified
+ * by observing which subsequent reads hit the DB.
  */
 
 import { describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../sql-fs.js";
-import type { SqlDialect } from "../types.js";
+import { INODE_KIND } from "../types.js";
+import type { PathCacheEntry, SqlDialect } from "../types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeDialect(): SqlDialect<unknown> {
+const now = new Date("2026-01-01T00:00:00Z");
+
+function fileEntry(path: string, inodeId: bigint, size: number): { path: string } & PathCacheEntry {
 	return {
+		path,
+		inodeId,
+		kind: INODE_KIND.FILE,
+		mode: 0o644,
+		size,
+		mtime: now,
+		contentSha256: new Uint8Array(32).fill(Number(inodeId)),
+		symlinkTarget: null,
+	};
+}
+
+function makeBytes(size: number): Uint8Array {
+	return new Uint8Array(size).fill(1);
+}
+
+function makeDialect(
+	paths: Array<{ path: string } & PathCacheEntry>,
+	blobsByInodeId: Map<bigint, Uint8Array>,
+): { dialect: SqlDialect<unknown>; getBlobNoTxMock: ReturnType<typeof vi.fn> } {
+	const getBlobNoTxMock = vi.fn(async (sha256: Uint8Array) => {
+		for (const [inodeId, data] of blobsByInodeId) {
+			const expected = new Uint8Array(32).fill(Number(inodeId));
+			if (sha256.every((b, i) => b === expected[i])) return data;
+		}
+		return null;
+	});
+
+	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
 		setSandboxContextWithLock: vi.fn(),
-		loadAllPaths: vi.fn(async () => []),
+		loadAllPaths: vi.fn(async () => paths),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
 		createInode: vi.fn(),
@@ -32,81 +67,127 @@ function makeDialect(): SqlDialect<unknown> {
 		moveDirent: vi.fn(),
 		upsertBlob: vi.fn(),
 		getBlob: vi.fn(),
-		getBlobNoTx: vi.fn(),
+		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),
 	} as unknown as SqlDialect<unknown>;
-}
 
-function makeBytes(size: number): Uint8Array {
-	return new Uint8Array(size).fill(1);
+	return { dialect, getBlobNoTxMock };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("SqlFs contentCache — LRU setup", () => {
-	it("stores and retrieves entries by inodeId", () => {
-		const fs = new SqlFs({ dialect: makeDialect(), sandboxId: "s1" });
+	it("serves readFileBuffer from cache on second read (no getBlobNoTx on cache hit)", async () => {
 		const data = makeBytes(10);
+		const blobs = new Map([[1n, data]]);
+		const { dialect, getBlobNoTxMock } = makeDialect([fileEntry("/f.txt", 1n, 10)], blobs);
+		const fs = new SqlFs({ dialect, sandboxId: "s1" });
+		await fs.ready();
 
-		fs._contentCacheSet(42n, data);
+		await fs.readFileBuffer("/f.txt"); // miss → getBlobNoTx called
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 
-		expect(fs._contentCacheHas(42n)).toBe(true);
-		expect(fs._contentCacheGet(42n)).toEqual(data);
+		await fs.readFileBuffer("/f.txt"); // hit → no getBlobNoTx call
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce(); // still once
 	});
 
-	it("returns undefined for entries not in cache", () => {
-		const fs = new SqlFs({ dialect: makeDialect(), sandboxId: "s1" });
+	it("cache miss calls getBlobNoTx on every new read", async () => {
+		const blobs = new Map([
+			[1n, makeBytes(5)],
+			[2n, makeBytes(5)],
+		]);
+		const { dialect, getBlobNoTxMock } = makeDialect([fileEntry("/f1.txt", 1n, 5), fileEntry("/f2.txt", 2n, 5)], blobs);
+		const fs = new SqlFs({ dialect, sandboxId: "s1" });
+		await fs.ready();
 
-		expect(fs._contentCacheHas(99n)).toBe(false);
-		expect(fs._contentCacheGet(99n)).toBeUndefined();
+		await fs.readFileBuffer("/f1.txt");
+		await fs.readFileBuffer("/f2.txt");
+		expect(getBlobNoTxMock).toHaveBeenCalledTimes(2);
 	});
 
-	it("evicts oldest-accessed entry when byte budget is exceeded", () => {
-		// Budget: 25 bytes. Three entries of 10 bytes each — third insert exceeds budget; evicts 1n.
-		const fs = new SqlFs({ dialect: makeDialect(), sandboxId: "s1", contentCacheMaxBytes: 25 });
+	it("evicts oldest-accessed entry when byte budget is exceeded", async () => {
+		// Budget: 25 bytes. Three 10-byte files → adding file3 evicts file1 (LRU).
+		const blobs = new Map([
+			[1n, makeBytes(10)],
+			[2n, makeBytes(10)],
+			[3n, makeBytes(10)],
+		]);
+		const { dialect, getBlobNoTxMock } = makeDialect(
+			[fileEntry("/f1.txt", 1n, 10), fileEntry("/f2.txt", 2n, 10), fileEntry("/f3.txt", 3n, 10)],
+			blobs,
+		);
+		const fs = new SqlFs({ dialect, sandboxId: "s1", contentCacheMaxBytes: 25 });
+		await fs.ready();
 
-		fs._contentCacheSet(1n, makeBytes(10)); // oldest
-		fs._contentCacheSet(2n, makeBytes(10));
-		fs._contentCacheSet(3n, makeBytes(10)); // newest; adding this should evict 1n (LRU)
+		await fs.readFileBuffer("/f1.txt"); // oldest
+		await fs.readFileBuffer("/f2.txt");
+		await fs.readFileBuffer("/f3.txt"); // newest; adding this should evict f1 (LRU)
+		getBlobNoTxMock.mockClear();
 
-		expect(fs._contentCacheHas(1n)).toBe(false); // evicted
-		expect(fs._contentCacheHas(2n)).toBe(true);
-		expect(fs._contentCacheHas(3n)).toBe(true);
+		// f2 and f3 are still in cache — must be hits (no DB calls)
+		await fs.readFileBuffer("/f2.txt");
+		await fs.readFileBuffer("/f3.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+
+		// f1 was evicted — must be a miss
+		await fs.readFileBuffer("/f1.txt");
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 	});
 
-	it("promotes accessed entry so it is not evicted first", () => {
-		// Budget: 20 bytes. Insert 1n and 2n (fills budget), access 1n, then insert 3n — 2n is evicted.
-		const fs = new SqlFs({ dialect: makeDialect(), sandboxId: "s1", contentCacheMaxBytes: 20 });
+	it("promotes accessed entry so it is not evicted first", async () => {
+		// Budget: 20 bytes. Read f1, f2 (fills budget), re-read f1 (promotes), read f3 (evicts f2).
+		const blobs = new Map([
+			[1n, makeBytes(10)],
+			[2n, makeBytes(10)],
+			[3n, makeBytes(10)],
+		]);
+		const { dialect, getBlobNoTxMock } = makeDialect(
+			[fileEntry("/f1.txt", 1n, 10), fileEntry("/f2.txt", 2n, 10), fileEntry("/f3.txt", 3n, 10)],
+			blobs,
+		);
+		const fs = new SqlFs({ dialect, sandboxId: "s1", contentCacheMaxBytes: 20 });
+		await fs.ready();
 
-		fs._contentCacheSet(1n, makeBytes(10));
-		fs._contentCacheSet(2n, makeBytes(10));
+		await fs.readFileBuffer("/f1.txt"); // miss
+		await fs.readFileBuffer("/f2.txt"); // miss, budget full
+		await fs.readFileBuffer("/f1.txt"); // hit, promotes f1 to MRU
+		await fs.readFileBuffer("/f3.txt"); // miss, evicts f2 (LRU, not f1)
+		getBlobNoTxMock.mockClear();
 
-		// Access 1n to make it recently used
-		fs._contentCacheGet(1n);
+		await fs.readFileBuffer("/f1.txt"); // still cached
+		await fs.readFileBuffer("/f3.txt"); // still cached
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 
-		// Now insert 3n — budget exceeded, 2n is LRU and should be evicted
-		fs._contentCacheSet(3n, makeBytes(10));
-
-		expect(fs._contentCacheHas(1n)).toBe(true); // accessed recently — kept
-		expect(fs._contentCacheHas(2n)).toBe(false); // LRU — evicted
-		expect(fs._contentCacheHas(3n)).toBe(true);
+		await fs.readFileBuffer("/f2.txt"); // evicted → DB call
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 	});
 
-	it("respects contentCacheMaxBytes option (default 50 MB)", () => {
-		// Default instance should accept a large number of small entries without eviction
-		const fs = new SqlFs({ dialect: makeDialect(), sandboxId: "s1" });
-
-		for (let i = 0n; i < 100n; i++) {
-			fs._contentCacheSet(i, makeBytes(1));
+	it("respects contentCacheMaxBytes option (default 50 MB)", async () => {
+		const blobs = new Map<bigint, Uint8Array>();
+		const paths: Array<{ path: string } & PathCacheEntry> = [];
+		for (let i = 1n; i <= 100n; i++) {
+			blobs.set(i, makeBytes(1));
+			paths.push(fileEntry(`/f${i}.txt`, i, 1));
 		}
+		const { dialect, getBlobNoTxMock } = makeDialect(paths, blobs);
+		const fs = new SqlFs({ dialect, sandboxId: "s1" });
+		await fs.ready();
 
-		// All 100 entries (100 bytes total) should survive in a 50 MB cache
-		for (let i = 0n; i < 100n; i++) {
-			expect(fs._contentCacheHas(i)).toBe(true);
+		// First pass: all 100 misses (100 bytes << 50 MB budget)
+		for (let i = 1n; i <= 100n; i++) {
+			await fs.readFileBuffer(`/f${i}.txt`);
 		}
+		expect(getBlobNoTxMock).toHaveBeenCalledTimes(100);
+		getBlobNoTxMock.mockClear();
+
+		// Second pass: all should be cache hits
+		for (let i = 1n; i <= 100n; i++) {
+			await fs.readFileBuffer(`/f${i}.txt`);
+		}
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 	});
 });
