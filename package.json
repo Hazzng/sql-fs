@@ -19,7 +19,7 @@
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:unit": "vitest run --exclude 'src/**/integration/**'",
-		"test:integration": "vitest run src/fs/sql-fs/integration src/api/__tests__/integration",
+		"test:integration": "vitest run src/fs/sql-fs/integration src/api/tests/integration",
 		"test:comparison": "vitest run --config vitest.comparison.config.ts",
 		"db:generate": "drizzle-kit generate",
 		"db:migrate": "drizzle-kit migrate",

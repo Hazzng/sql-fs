@@ -161,7 +161,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 ### Testing
 
 - **Framework:** Vitest
-- **File naming:** `*.test.ts` colocated with source, or in `__tests__/` for integration tests
+- **File naming:** `*.test.ts` files live in a `tests/` subdirectory next to the source they cover (e.g., `src/fs/sql-fs/tests/`); integration tests live under `tests/integration/` or a sibling `integration/` directory.
 - **Unit tests:** Mock the `SqlDialect` interface. Test SqlFs methods in isolation. No real DB needed.
 - **Integration tests:** Run against real databases. Skip gracefully if DB URL env var is not set: `describe.skipIf(!process.env.DATABASE_URL)(...)`
 - **Assert full output:** Prefer exact match (`toBe`, `toEqual`) over partial (`toContain`). Assert both success and error cases.
@@ -241,7 +241,7 @@ src/
       tools.ts                   ← Tool definitions + handlers
     cli/
       gc.ts                      ← Blob GC CLI
-    __tests__/                   ← API e2e tests
+    tests/                       ← API unit + e2e tests (integration/ inside)
 tasks/
   prd-virtual-fs-api.md          ← 105 user stories (23 epics)
   IMPLEMENT.md                   ← 6-phase implementation plan

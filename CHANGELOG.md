@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Reorganized colocated `*.test.ts` files into per-module `__tests__/` directories so source and tests are visually separated. Affects `src/api/`, `src/api/lib/`, `src/fs/sql-fs/`, `src/fs/sql-fs/dialects/`, and `src/redis/`. No source or runtime changes.
+- Reorganized colocated `*.test.ts` files into per-module `tests/` directories so source and tests are visually separated. Affects `src/api/`, `src/api/lib/`, `src/fs/sql-fs/`, `src/fs/sql-fs/dialects/`, and `src/redis/`. No source or runtime changes.
 
 ## [0.2.11] - 2026-04-30
 
