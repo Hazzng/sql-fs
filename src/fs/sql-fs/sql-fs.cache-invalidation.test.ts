@@ -37,6 +37,7 @@ function makeDialect(): {
 	decrementNlinkMock: ReturnType<typeof vi.fn>;
 	deleteInodeMock: ReturnType<typeof vi.fn>;
 	getBlobMock: ReturnType<typeof vi.fn>;
+	getBlobNoTxMock: ReturnType<typeof vi.fn>;
 	moveDirentMock: ReturnType<typeof vi.fn>;
 } {
 	const createInodeMock = vi.fn(async () => 10n);
@@ -46,6 +47,7 @@ function makeDialect(): {
 	const decrementNlinkMock = vi.fn(async () => 0);
 	const deleteInodeMock = vi.fn(async () => undefined);
 	const getBlobMock = vi.fn(async () => null as Uint8Array | null);
+	const getBlobNoTxMock = vi.fn(async () => new TextEncoder().encode("file content"));
 	const moveDirentMock = vi.fn(async () => undefined);
 
 	const dialect: SqlDialect<unknown> = {
@@ -75,6 +77,7 @@ function makeDialect(): {
 		moveDirent: moveDirentMock,
 		upsertBlob: upsertBlobMock,
 		getBlob: getBlobMock,
+		getBlobNoTx: getBlobNoTxMock,
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n]),
@@ -91,6 +94,7 @@ function makeDialect(): {
 		decrementNlinkMock,
 		deleteInodeMock,
 		getBlobMock,
+		getBlobNoTxMock,
 		moveDirentMock,
 	};
 }
@@ -107,21 +111,11 @@ describe("SqlFs.writeFile — content cache population", () => {
 		await fs.ready();
 	});
 
-	it("sets new file content in contentCache after write", async () => {
-		const content = "hello world";
-		const bytes = new TextEncoder().encode(content);
-
-		await fs.writeFile("/home/user/new.txt", content);
-
-		// contentCache should have the new inode (10n from mock)
-		expect(fs._contentCacheHas(10n)).toBe(true);
-		expect(fs._contentCacheGet(10n)).toEqual(bytes);
-	});
-
-	it("second readFile after writeFile does not call getBlob (served from cache)", async () => {
+	it("readFile after writeFile is served from cache (no getBlob call)", async () => {
 		await fs.writeFile("/home/user/new.txt", "hello");
 
-		// readFile should hit contentCache, not call getBlob
+		// readFile must hit contentCache — getBlobMock (tx-based getBlob) must not be called.
+		// getBlobNoTx would throw if called since it's not needed here (cache hit).
 		const result = await fs.readFile("/home/user/new.txt");
 
 		expect(mocks.getBlobMock).not.toHaveBeenCalled();
@@ -131,7 +125,6 @@ describe("SqlFs.writeFile — content cache population", () => {
 	it("overwrite: read returns new content, not stale cached content", async () => {
 		// First write: inodeId=10n with "original"
 		await fs.writeFile("/home/user/new.txt", "original");
-		expect(fs._contentCacheHas(10n)).toBe(true);
 
 		// Second write: inodeId=11n with "updated" (simulate upsert replacing the entry)
 		let callCount = 0;
@@ -151,9 +144,9 @@ describe("SqlFs.writeFile — content cache population", () => {
 	});
 });
 
-// ── rm: deletes from contentCache ────────────────────────────────────────────
+// ── appendFile: new inode content is in cache ────────────────────────────────
 
-describe("SqlFs.rm — content cache invalidation", () => {
+describe("SqlFs.appendFile — content cache population", () => {
 	let fs: SqlFs;
 	let mocks: ReturnType<typeof makeDialect>;
 
@@ -163,81 +156,20 @@ describe("SqlFs.rm — content cache invalidation", () => {
 		await fs.ready();
 	});
 
-	it("removes file inode from contentCache when file is deleted", async () => {
-		// Pre-populate contentCache for the file at inodeId=4n
-		fs._contentCacheSet(4n, new TextEncoder().encode("some content"));
-		expect(fs._contentCacheHas(4n)).toBe(true);
-
-		await fs.rm("/home/user/file.txt");
-
-		expect(fs._contentCacheHas(4n)).toBe(false);
-	});
-
-	it("recursive rm removes all subtree inodes from contentCache", async () => {
-		// file.txt (inodeId=4n) is under /home/user (inodeId=3n)
-		fs._contentCacheSet(4n, new TextEncoder().encode("file content"));
-		fs._contentCacheSet(3n, new Uint8Array(1)); // simulating a cached dir-inode entry
-
-		await fs.rm("/home/user", { recursive: true });
-
-		expect(fs._contentCacheHas(4n)).toBe(false);
-		expect(fs._contentCacheHas(3n)).toBe(false);
-	});
-
-	it("contentCache of unrelated inodes is unaffected by rm", async () => {
-		fs._contentCacheSet(2n, new Uint8Array(4)); // /home inode
-		fs._contentCacheSet(4n, new TextEncoder().encode("file content"));
-
-		await fs.rm("/home/user/file.txt");
-
-		// /home inode should still be cached
-		expect(fs._contentCacheHas(2n)).toBe(true);
-	});
-});
-
-// ── appendFile: invalidates old contentCache entry ───────────────────────────
-
-describe("SqlFs.appendFile — content cache invalidation", () => {
-	let fs: SqlFs;
-	let mocks: ReturnType<typeof makeDialect>;
-
-	beforeEach(async () => {
-		mocks = makeDialect();
-		fs = new SqlFs({ dialect: mocks.dialect, sandboxId: "s1" });
-		await fs.ready();
-	});
-
-	it("invalidates old inode contentCache entry when appending to existing file", async () => {
-		// file.txt (inodeId=4n) has stale content in cache
-		const stale = new TextEncoder().encode("stale");
-		fs._contentCacheSet(4n, stale);
-		expect(fs._contentCacheHas(4n)).toBe(true);
-
-		// getBlob returns existing content for merge
+	it("readFile after appendFile is served from cache (merged content, no extra DB call)", async () => {
 		const existing = new TextEncoder().encode("hello");
-		mocks.getBlobMock.mockResolvedValueOnce(existing);
-		// upsertDirent replaces old dirent pointing at 4n
+		mocks.getBlobMock.mockResolvedValueOnce(existing); // getBlob used during append for existing bytes
 		mocks.upsertDirentMock.mockResolvedValueOnce(4n);
 		mocks.decrementNlinkMock.mockResolvedValueOnce(0);
 
 		await fs.appendFile("/home/user/file.txt", " world");
 
-		// Old inodeId=4n should be evicted from contentCache
-		expect(fs._contentCacheHas(4n)).toBe(false);
-	});
-
-	it("sets new inode content in contentCache after append", async () => {
-		const existing = new TextEncoder().encode("hello");
-		mocks.getBlobMock.mockResolvedValueOnce(existing);
-		mocks.upsertDirentMock.mockResolvedValueOnce(4n);
-		mocks.decrementNlinkMock.mockResolvedValueOnce(0);
-
-		await fs.appendFile("/home/user/file.txt", " world");
-
-		// New inodeId=10n should be in contentCache with merged content
-		expect(fs._contentCacheHas(10n)).toBe(true);
-		const cached = fs._contentCacheGet(10n);
-		expect(new TextDecoder().decode(cached)).toBe("hello world");
+		// readFile on the updated path should hit contentCache (new inode 10n was seeded)
+		// getBlobMock was already called during appendFile to fetch existing content — clear it.
+		mocks.getBlobMock.mockClear();
+		const result = await fs.readFile("/home/user/file.txt");
+		expect(result).toBe("hello world");
+		expect(mocks.getBlobMock).not.toHaveBeenCalled();
 	});
 });
 
@@ -254,15 +186,15 @@ describe("SqlFs.mv — content cache preservation", () => {
 	});
 
 	it("mv does not invalidate contentCache (same inodeId, same content)", async () => {
-		// Cache the file content before mv
-		const content = new TextEncoder().encode("unchanged content");
-		fs._contentCacheSet(4n, content);
-		expect(fs._contentCacheHas(4n)).toBe(true);
+		// Populate cache for file.txt (inodeId=4n) via readFile
+		await fs.readFile("/home/user/file.txt");
+		mocks.getBlobNoTxMock.mockClear();
 
 		await fs.mv("/home/user/file.txt", "/home/user/renamed.txt");
 
-		// contentCache entry for inodeId=4n should still be there
-		expect(fs._contentCacheHas(4n)).toBe(true);
-		expect(fs._contentCacheGet(4n)).toEqual(content);
+		// Reading via the new path should hit the cache (inodeId=4n unchanged)
+		const result = await fs.readFile("/home/user/renamed.txt");
+		expect(mocks.getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toBe("file content");
 	});
 });

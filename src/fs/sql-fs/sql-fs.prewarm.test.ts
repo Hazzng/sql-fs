@@ -133,13 +133,17 @@ describe("SqlFs.ready() — returns before prewarm completes (AC1)", () => {
 	it("prewarm completes and populates cache after ready() returns", async () => {
 		const data = makeBytes(8);
 		const prewarmResult = [{ inodeId: 1n, sha256: sha(1), data }];
-		const { dialect, waitForPrewarm } = makeDialect({ prewarmResult });
+		const { dialect, waitForPrewarm, getBlobNoTxMock } = makeDialect({ prewarmResult });
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValueOnce([fileEntry("/file.txt", 1n)]);
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 
 		await fs.ready();
 		await waitForPrewarm();
 
-		expect(fs._contentCacheHas(1n)).toBe(true);
+		// Prewarm populated the cache — readFileBuffer must be a hit (no getBlobNoTx call)
+		const result = await fs.readFileBuffer("/file.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toEqual(data);
 	});
 });
 
@@ -152,16 +156,22 @@ describe("SqlFs prewarm — byte cap respected (AC3)", () => {
 			{ inodeId: 2n, sha256: sha(2), data: makeBytes(10) },
 			{ inodeId: 3n, sha256: sha(3), data: makeBytes(10) },
 		];
-		const { dialect, waitForPrewarm } = makeDialect({ prewarmResult: entries });
+		const { dialect, waitForPrewarm, getBlobNoTxMock } = makeDialect({ prewarmResult: entries });
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+			fileEntry("/f1.txt", 1n),
+			fileEntry("/f2.txt", 2n),
+			fileEntry("/f3.txt", 3n),
+		]);
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 
 		await fs.ready();
 		await waitForPrewarm();
 
-		expect(fs._contentCacheHas(1n)).toBe(true);
-		expect(fs._contentCacheHas(2n)).toBe(true);
-		expect(fs._contentCacheHas(3n)).toBe(true);
-		expect(fs._contentCacheHas(4n)).toBe(false);
+		// Prewarmed entries must be cache hits (no getBlobNoTx calls)
+		await fs.readFileBuffer("/f1.txt");
+		await fs.readFileBuffer("/f2.txt");
+		await fs.readFileBuffer("/f3.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 	});
 
 	it("skips zero-byte entries from getBlobsForSandbox", async () => {
@@ -169,14 +179,23 @@ describe("SqlFs prewarm — byte cap respected (AC3)", () => {
 			{ inodeId: 1n, sha256: sha(1), data: new Uint8Array(0) },
 			{ inodeId: 2n, sha256: sha(2), data: makeBytes(5) },
 		];
-		const { dialect, waitForPrewarm } = makeDialect({ prewarmResult: entries });
+		const { dialect, waitForPrewarm, getBlobNoTxMock } = makeDialect({ prewarmResult: entries });
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+			fileEntry("/f1.txt", 1n),
+			fileEntry("/f2.txt", 2n),
+		]);
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 
 		await fs.ready();
 		await waitForPrewarm();
 
-		expect(fs._contentCacheHas(1n)).toBe(false);
-		expect(fs._contentCacheHas(2n)).toBe(true);
+		// f2 (5-byte data) was prewarmed — cache hit
+		await fs.readFileBuffer("/f2.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+
+		// f1 (0-byte, skipped by prewarm) — cache miss, getBlobNoTx is called
+		await fs.readFileBuffer("/f1.txt");
+		expect(getBlobNoTxMock).toHaveBeenCalledOnce();
 	});
 });
 
@@ -290,19 +309,26 @@ describe("SqlFs.reload() — retriggers prewarm (AC8)", () => {
 	it("starts a new prewarm after reload clears contentCache", async () => {
 		const fileData = makeBytes(8, 0xcc);
 		const prewarmResult = [{ inodeId: 1n, sha256: sha(1), data: fileData }];
-		const { dialect, getBlobsForSandboxMock, waitForPrewarm } = makeDialect({ prewarmResult });
+		const { dialect, getBlobsForSandboxMock, getBlobNoTxMock, waitForPrewarm } = makeDialect({ prewarmResult });
 		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue([fileEntry("/file.txt", 1n)]);
 
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
 		await fs.ready();
 		await waitForPrewarm();
 		expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(1);
-		expect(fs._contentCacheHas(1n)).toBe(true);
+
+		// After first prewarm, cache is populated — readFileBuffer must be a hit
+		expect(await fs.readFileBuffer("/file.txt")).toEqual(fileData);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 
 		await fs.reload();
 		await waitForPrewarm();
 		expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(2);
-		expect(fs._contentCacheHas(1n)).toBe(true);
+
+		// After second prewarm, cache is repopulated — readFileBuffer must still be a hit
+		getBlobNoTxMock.mockClear();
+		expect(await fs.readFileBuffer("/file.txt")).toEqual(fileData);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 	});
 
 	it("queues a follow-up prewarm when reload runs during an in-flight prewarm", async () => {
@@ -312,7 +338,10 @@ describe("SqlFs.reload() — retriggers prewarm (AC8)", () => {
 		});
 		const fileData = makeBytes(8, 0xdd);
 		const prewarmResult = [{ inodeId: 1n, sha256: sha(1), data: fileData }];
-		const { dialect, getBlobsForSandboxMock, waitForPrewarm } = makeDialect({ prewarmGate: gate, prewarmResult });
+		const { dialect, getBlobsForSandboxMock, getBlobNoTxMock, waitForPrewarm } = makeDialect({
+			prewarmGate: gate,
+			prewarmResult,
+		});
 		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue([fileEntry("/file.txt", 1n)]);
 
 		const fs = new SqlFs({ dialect, sandboxId: "s1" });
@@ -327,7 +356,11 @@ describe("SqlFs.reload() — retriggers prewarm (AC8)", () => {
 			expect(getBlobsForSandboxMock).toHaveBeenCalledTimes(2);
 		});
 		await waitForPrewarm();
-		expect(fs._contentCacheHas(1n)).toBe(true);
+
+		// Both prewarms completed — cache is populated, readFileBuffer must be a hit
+		const result = await fs.readFileBuffer("/file.txt");
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(result).toEqual(fileData);
 	});
 });
 

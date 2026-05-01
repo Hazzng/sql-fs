@@ -151,34 +151,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	// ── Dirty tracking (Phase D) ──────────────────────────────────────────────
 
-	/** @internal Used by tests to simulate a mutation. */
-	_markDirty(): void {
-		this.#dirty = true;
-	}
-
 	wasDirty(): boolean {
 		return this.#dirty;
 	}
 
 	clearDirty(): void {
 		this.#dirty = false;
-	}
-
-	// ── Content cache helpers (for use by readFile/writeFile in later stories) ──
-
-	/** @internal Used by unit tests and future readFile/writeFile implementations. */
-	_contentCacheGet(inodeId: bigint): Uint8Array | undefined {
-		return this.#contentCache.get(inodeId);
-	}
-
-	/** @internal Used by unit tests and future readFile/writeFile implementations. */
-	_contentCacheSet(inodeId: bigint, data: Uint8Array): void {
-		this.#contentCache.set(inodeId, data);
-	}
-
-	/** @internal Used by unit tests. */
-	_contentCacheHas(inodeId: bigint): boolean {
-		return this.#contentCache.has(inodeId);
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────

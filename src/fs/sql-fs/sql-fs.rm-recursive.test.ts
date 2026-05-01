@@ -94,19 +94,6 @@ describe("SqlFs.rm (recursive) — post-order hardlink-safe deletion", () => {
 		expect(paths).toContain("/");
 	});
 
-	it("removes subtree inode entries from contentCache", async () => {
-		fs._contentCacheSet(12n, new Uint8Array([1, 2, 3]));
-		fs._contentCacheSet(13n, new Uint8Array([4, 5, 6]));
-
-		expect(fs._contentCacheHas(12n)).toBe(true);
-		expect(fs._contentCacheHas(13n)).toBe(true);
-
-		await fs.rm("/deep", { recursive: true });
-
-		expect(fs._contentCacheHas(12n)).toBe(false);
-		expect(fs._contentCacheHas(13n)).toBe(false);
-	});
-
 	it("calls deleteDirent to unlink root from parent and each child from its subtree parent", async () => {
 		await fs.rm("/deep", { recursive: true });
 

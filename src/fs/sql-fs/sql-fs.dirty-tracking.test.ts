@@ -93,8 +93,8 @@ describe("SqlFs dirty-tracking: mutations flip wasDirty", () => {
 		expect(fs.wasDirty()).toBe(false);
 	});
 
-	it("clearDirty resets the flag", () => {
-		fs._markDirty();
+	it("clearDirty resets the flag", async () => {
+		await fs.writeFile("/home/user/reset-test.txt", "hello");
 		expect(fs.wasDirty()).toBe(true);
 		fs.clearDirty();
 		expect(fs.wasDirty()).toBe(false);

@@ -91,24 +91,4 @@ describe("SqlFs.readFile — content cache", () => {
 		expect(getBlobMock).toHaveBeenCalledOnce();
 		expect(content).toBe("hello world");
 	});
-
-	it("stores fetched content in contentCache after cache miss", async () => {
-		expect(fs._contentCacheHas(inodeId)).toBe(false);
-
-		await fs.readFile(filePath);
-
-		expect(fs._contentCacheHas(inodeId)).toBe(true);
-		expect(fs._contentCacheGet(inodeId)).toEqual(fileContent);
-	});
-
-	it("returns cached content directly on cache hit without DB call", async () => {
-		// Pre-populate cache manually (simulates a prior write that stored content)
-		const cachedBytes = new TextEncoder().encode("cached content");
-		fs._contentCacheSet(inodeId, cachedBytes);
-
-		const content = await fs.readFile(filePath);
-
-		expect(getBlobMock).not.toHaveBeenCalled();
-		expect(content).toBe("cached content");
-	});
 });
