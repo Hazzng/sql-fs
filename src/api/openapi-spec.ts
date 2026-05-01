@@ -78,7 +78,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.2.12",
+		version: "0.2.13",
 		description:
 			"Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres, MySQL, Azure SQL, or Azure FileShare.",
 	},

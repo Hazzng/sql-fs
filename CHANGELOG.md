@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.13] - 2026-05-01
+
+### Added
+
+- `scripts/benchmark_remote_bash.py`: end-to-end Remote Bash latency benchmark hitting the live HTTP API via the Python SDK. Runs in two phases — sandbox lifecycle (create / ingest / delete over N fresh sandboxes) and exec latency (find / grep / rg / write / delete / mkdir / mv cases on a warm sandbox). Reports wall-clock ms and server-side `duration_ms` (avg / p50 / p95 / max) as markdown tables. Supports both `virtualfs` and `daytona` providers via `--provider`, auto-detects writable home dir on Daytona, and sweeps leftover `bench-*` sandboxes on exit. Run with `pnpm bench:remote-bash`. See README for full instructions.
+
+### Removed
+
+- `src/fs/sql-fs/benchmark.ts` and the `bench:sql-fs-cache` npm script. Replaced by the more comprehensive `scripts/benchmark_remote_bash.py` which exercises the actual HTTP API path instead of the dialect directly.
+
 ## [0.2.12] - 2026-05-01
 
 ### Changed
