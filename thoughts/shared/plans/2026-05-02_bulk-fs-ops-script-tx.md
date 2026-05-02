@@ -1014,15 +1014,47 @@ Note: bulk methods do NOT affect these numbers yet — just-bash still calls `fs
 
 ### Phase 3: Success Criteria
 
-- [ ] Multi-op benchmark cases show >= 2x latency improvement
-- [ ] Single-op cases show no regression
-- [ ] Read-only scripts show no regression
-- [ ] No transaction timeout errors during benchmark run
-- [ ] Session-pooler connection works correctly for long-lived txs
+- [x] No transaction timeout errors during benchmark run (direct connection)
+- [x] Read-only scripts show no regression (1–5ms, no tx opened, confirmed)
+- [ ] Multi-op benchmark cases show >= 2x latency improvement — **partially met** (see notes below)
+- [ ] Single-op cases show no regression — **partially met** (see notes below)
+- [ ] Session-pooler connection works correctly for long-lived txs — **blocked** (Neon port 6432 unreachable from test host)
 
 ### Phase 3: Discoveries and Notable Information
 
-_To be filled during implementation._
+**Bug 1 — `#withBareTx` deadlock with open script-tx (fixed)**
+
+`appendFile` for an existing file calls `#withTx` (to read the blob content), which opens the script-tx and acquires `pg_advisory_xact_lock`. It then calls `#withBareTx` → `writeFileComposite`, which starts a NEW transaction and immediately deadlocks on the same advisory lock. Fix: `#withBareTx` routes through the already-open `#scriptTx` when `this.#scriptTx !== undefined`, preventing the new transaction and the deadlock. This is a **minimal fix** — it does not eagerly open the script-tx for bare operations (which would add overhead), only prevents the deadlock when the lock is already held.
+
+**Bug 2 — Unhandled rejection crash when Neon closes the connection mid-transaction (fixed)**
+
+When the Neon compute closes the connection while the script-tx's deferred `endPromise` is still awaiting, `#scriptTxPromise` rejects. In Node.js 15+, unhandled promise rejections crash the process. Fix: attach `.catch(() => {})` to `#scriptTxPromise` immediately after assignment in `#openScriptTx()`. The `endScriptScope()` `await this.#scriptTxPromise` still sees the rejection (`.catch()` creates a derived chain, not a swallow of the original rejection). Also added `Promise.race([txReady, this.#scriptTxPromise])` to propagate connection failures that happen before `resolveTxReady()` fires rather than hanging forever at `await txReady`.
+
+**Transaction-pooler vs session-pooler (Neon)**
+
+The Neon transaction-pooler URL (`-pooler` hostname, default port 5432) terminates long-lived transactions and is incompatible with script-tx. Session-pooler (port 6432) was unreachable from the test host. The benchmark was run against the **direct connection** (no `-pooler` suffix), which supports long-lived transactions but may be closed by Neon's idle-in-transaction timeout.
+
+**Composite write optimization interaction**
+
+The "fused CTE" composite writes (`writeFileComposite`, `rmComposite`, `mvComposite`, `mkdirComposite`) use `#withBareTx` rather than `#withTx`. These operations create their own transactions and embed `pg_advisory_xact_lock` in the CTE. As a result, script-tx **does not open** for pure write/rm/mv/mkdir-non-recursive scripts — each operation still gets its own transaction with the same 3-RTT overhead as before. Script-tx only engages when `#withTx` is called: appending to an **existing** file (blob read) and recursive mkdir.
+
+Benchmark results (Neon ap-southeast-2, ~42ms RTT from Darwin):
+
+| Case | Single-op time (ref) | Multi-op actual | Est. without script-tx | Improvement |
+|---|---|---|---|---|
+| write: echo small | 125ms | 125ms | 125ms | ≈1x |
+| write: append 3x | — | 604ms | ~625ms | ~1.03x |
+| delete: single file | 249ms | 249ms | 249ms | ≈1x |
+| delete: 3 files | 249ms | 731ms | ~747ms | ~1.02x |
+| mkdir: single | 301ms | 301ms | 301ms | ≈1x |
+| mkdir: nested deep | 301ms | 1892ms | ~1806ms | ~0.95x |
+| mv: rename file | 364ms | 364ms | 364ms | ≈1x |
+| mv: move 3 files | — | 1460ms | ~2334ms | ~1.6x |
+| read-only (echo) | — | 1.6ms | 1.6ms | ≈1x |
+
+**Root cause of modest improvement**: The CTE composite optimization (merged earlier) already collapsed the per-operation RTTs from 4 to 3. Script-tx saves the BEGIN+COMMIT envelope (2 RTTs) but only for `#withTx` callers. Operations that go through `#withBareTx` (most writes) are unaffected.
+
+**Future work**: To extend script-tx benefits to composite operations, the composite CTEs would need a "no-lock" variant that skips `pg_advisory_xact_lock` when running inside an already-locked script-tx. This is a separate optimization, not a bug fix.
 
 ---
 
