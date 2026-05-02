@@ -102,6 +102,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=1, help="Discarded exec warmup runs per case (default: 1)")
     p.add_argument("--runs", type=int, default=5, help="Measured exec runs per case (default: 5)")
     p.add_argument("--timeout-ms", type=int, default=60_000, help="Per-exec timeout ms (default: 60000)")
+    p.add_argument(
+        "--api-warmup-rounds",
+        type=int,
+        default=2,
+        help="API/Postgres warmup rounds before measurement (default: 2); 0 to skip",
+    )
     return p.parse_args()
 
 
@@ -486,6 +492,40 @@ def run_exec_case(
     return wall_samples, srv_samples, last_stdout
 
 
+# ── API / Postgres warmup ─────────────────────────────────────────────────────
+
+def run_api_warmup(provider: Provider, base: str, rounds: int, timeout_ms: int) -> None:
+    """Create a sandbox, run trivial execs to prime the connection pool and
+    session manager, then delete it.  Repeated `rounds` times so multiple
+    pool slots are warmed before measurement begins."""
+    print()
+    print(f"Phase 0: API / Postgres warmup ({rounds} round(s))")
+    print("─" * 50)
+    for i in range(rounds):
+        print(f"  warmup round {i + 1}/{rounds}…", end="", flush=True)
+        t0 = time.perf_counter()
+        sandbox = provider.create_sandbox(f"bench-warmup-{i}")
+        t_create = (time.perf_counter() - t0) * 1000.0
+        try:
+            # A handful of cheap execs: prime just-bash process + DB session context
+            for script in [
+                "echo warmup",
+                f"ls {base} 2>/dev/null || true",
+                "echo done",
+            ]:
+                provider.exec_script(sandbox, script, timeout_ms)
+            t_total = (time.perf_counter() - t0) * 1000.0
+            print(f" create {t_create:.0f} ms  total {t_total:.0f} ms")
+        except Exception as exc:
+            print(f" WARNING: {exc}", file=sys.stderr)
+        finally:
+            try:
+                provider.delete_sandbox(sandbox)
+            except Exception:
+                pass
+    print("  Warmup complete — pool and session manager are hot.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -571,9 +611,13 @@ def main() -> None:
     else:
         print(f"API:      {args.daytona_api_url}")
     print(f"Source:   {args.src_dir}  →  {base}  ({len(files)} files)")
-    print(f"Lifecycle runs: {args.lifecycle_runs}  |  Exec warmup: {args.warmup}  |  Exec runs: {args.runs}")
+    print(f"API warmup rounds: {args.api_warmup_rounds}  |  Lifecycle runs: {args.lifecycle_runs}  |  Exec warmup: {args.warmup}  |  Exec runs: {args.runs}")
 
     try:
+        # ── Phase 0: API / Postgres warmup ──
+        if args.api_warmup_rounds > 0:
+            run_api_warmup(provider, base, args.api_warmup_rounds, args.timeout_ms)
+
         # ── Phase 1: Lifecycle ──
         print()
         print("Phase 1: Sandbox lifecycle (create / ingest / delete)")
