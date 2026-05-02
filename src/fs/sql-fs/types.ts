@@ -253,6 +253,32 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	moveDirent(tx: Tx, oldParentId: bigint, oldName: string, newParentId: bigint, newName: string): Promise<void>;
 
+	// ── Composite write operations (optional) ────────────────────────────────────
+
+	mkdirComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint>;
+
+	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string): Promise<bigint>;
+
+	writeFileComposite?(
+		tx: Tx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		size: number,
+		sha256: Uint8Array,
+		data: Uint8Array,
+	): Promise<bigint>;
+
+	mvComposite?(
+		tx: Tx,
+		sandboxId: string,
+		oldParentId: bigint,
+		oldName: string,
+		newParentId: bigint,
+		newName: string,
+	): Promise<void>;
+
 	// ── Blob storage ──────────────────────────────────────────────────────────────
 
 	/**
