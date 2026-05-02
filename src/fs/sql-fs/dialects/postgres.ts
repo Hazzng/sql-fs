@@ -273,12 +273,24 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
 		try {
-			const rows = await tx<{ owner: string | null; name: string | null; python: boolean; javascript: boolean }[]>`
+			const rows = await tx<
+				{
+					owner: string | null;
+					name: string | null;
+					python: boolean;
+					javascript: boolean;
+				}[]
+			>`
 				SELECT owner, name, python, javascript FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
-			return { owner: r.owner, name: r.name, python: r.python, javascript: r.javascript };
+			return {
+				owner: r.owner,
+				name: r.name,
+				python: r.python,
+				javascript: r.javascript,
+			};
 		} catch (err) {
 			throw translateSqlError(err, sandboxId);
 		}
@@ -297,7 +309,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			throw translateSqlError(err, sandboxId);
 		}
 		if (rows.length === 0) {
-			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), {
+				code: "ENOENT",
+			});
 		}
 	}
 
@@ -607,10 +621,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 		const pgHits = new Map<string, Uint8Array>();
 		if (missByHex.size > 0) {
+			const missHexes = [...missByHex.keys()];
 			const pgRows = await this.db()<{ sha256: Buffer; data: Buffer }[]>`
-				SELECT sha256, data
-				FROM blobs
-				WHERE sha256 = ANY(${[...missByHex.values()]}::bytea[])
+				SELECT b.sha256, b.data
+				FROM blobs b
+				JOIN unnest(${missHexes}::text[]) AS v(sha256_hex)
+					ON b.sha256 = decode(v.sha256_hex, 'hex')
 			`;
 			for (const r of pgRows) {
 				const hex = Buffer.from(r.sha256).toString("hex");
@@ -758,7 +774,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		for (const depth of sortedDepths) {
 			const dirsAtDepth = dirsByDepth.get(depth)!;
 
-			const candidates: Array<{ dirPath: string; name: string; parentInodeId: bigint }> = [];
+			const candidates: Array<{
+				dirPath: string;
+				name: string;
+				parentInodeId: bigint;
+			}> = [];
 			for (const dirPath of dirsAtDepth) {
 				if (dirMap.has(dirPath)) continue;
 				const parts = dirPath.split("/").filter(Boolean);
@@ -772,7 +792,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			if (candidates.length === 0) continue;
 
 			const checkValues = candidates.map((c) => [String(c.parentInodeId), c.name]);
-			const existingRows = await tx<{ parent_inode_id: string; name: string; inode_id: string; kind: number }[]>`
+			const existingRows = await tx<
+				{
+					parent_inode_id: string;
+					name: string;
+					inode_id: string;
+					kind: number;
+				}[]
+			>`
 				SELECT d.parent_inode_id, d.name, d.inode_id, i.kind
 				FROM dirents d
 				JOIN inodes i ON i.id = d.inode_id
@@ -877,7 +904,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		for (const f of filesWithHash) {
 			const key = f.sha256.toString("hex");
 			if (!uniqueBlobs.has(key)) {
-				uniqueBlobs.set(key, { sha256: f.sha256, data: f.content, size: f.content.length });
+				uniqueBlobs.set(key, {
+					sha256: f.sha256,
+					data: f.content,
+					size: f.content.length,
+				});
 			}
 		}
 		if (uniqueBlobs.size > 0) {
@@ -902,7 +933,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 		const toUpdate: Array<[string, string, string]> = [];
 		const oldInodeIds: bigint[] = [];
-		const toInsert: Array<{ parent_inode_id: string; name: string; inode_id: string; sandbox_id: string }> = [];
+		const toInsert: Array<{
+			parent_inode_id: string;
+			name: string;
+			inode_id: string;
+			sandbox_id: string;
+		}> = [];
 
 		for (let i = 0; i < filesWithHash.length; i++) {
 			const f = filesWithHash[i]!;
