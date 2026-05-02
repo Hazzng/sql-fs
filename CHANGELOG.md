@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.14] - 2026-05-02
+
+### Performance
+
+- `PostgresDialect`: fuse `setSandboxContextWithLock` into a single `SELECT` (saves 1 RTT on all non-composite write paths).
+- `PostgresDialect`: add `writeFileComposite`, `mkdirComposite`, `rmComposite`, `mvComposite` — single-CTE methods that embed sandbox context setup + advisory lock + all operation queries, reducing each write transaction from 3–7 RTTs to 1.
+- `SqlFs`: `writeFile`, `appendFile`, `mkdir` (non-recursive), `rm` (single), and `mv` now use composite CTEs when the dialect provides them via a new `#withBareTx` helper; fall back to the existing sequential path for MySQL/Azure SQL dialects.
+- `SqlDialect` interface: four new optional composite method signatures (`writeFileComposite?`, `mkdirComposite?`, `rmComposite?`, `mvComposite?`) — backward-compatible, no changes required for existing dialect implementations.
+
+### Tests
+
+- Add `sql-fs.composite.test.ts`: 22 unit tests verifying composite paths call composite methods instead of sequential methods, skip `setSandboxContextWithLock`, and produce correct pathCache updates.
+
 ## [0.2.13] - 2026-05-01
 
 ### Added
