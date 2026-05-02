@@ -102,6 +102,14 @@ export interface ICoherentFs extends IFileSystem {
 	bulkIngest(files: BulkIngestFile[]): Promise<void>;
 }
 
+export interface IScriptTxFs extends ICoherentFs {
+	beginScriptScope(): void;
+	endScriptScope(): Promise<void>;
+	abortScriptScope(): Promise<void>;
+	readonly scriptScopeActive: boolean;
+	readonly scriptTxOpen: boolean;
+}
+
 export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
@@ -129,6 +137,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * Used when reload() clears contentCache during an in-flight prewarm.
 	 */
 	#prewarmQueued = false;
+	#scriptScope = false;
+	#scriptTx: Tx | undefined;
+	#scriptTxEnd: (() => void) | undefined;
+	#scriptTxAbort: ((err: Error) => void) | undefined;
+	#scriptTxPromise: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -162,8 +175,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-		// Writers: acquire the per-sandbox advisory lock alongside RLS context so
-		// concurrent mutators across replicas serialize at the DB layer.
+		if (this.#scriptScope) {
+			if (this.#scriptTx === undefined) {
+				await this.#openScriptTx();
+			}
+			return fn(this.#scriptTx!);
+		}
 		return this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
 			return await fn(tx);
@@ -176,13 +193,55 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		if (this.#scriptScope && this.#scriptTx !== undefined) {
+			return fn(this.#scriptTx);
+		}
 		return this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await fn(tx);
 		});
 	}
 
+	async #openScriptTx(): Promise<void> {
+		let resolveTxReady!: () => void;
+		const txReady = new Promise<void>((r) => {
+			resolveTxReady = r;
+		});
+
+		let resolveEnd!: () => void;
+		let rejectEnd!: (err: Error) => void;
+		const endPromise = new Promise<void>((resolve, reject) => {
+			resolveEnd = resolve;
+			rejectEnd = reject;
+		});
+		this.#scriptTxEnd = resolveEnd;
+		this.#scriptTxAbort = rejectEnd;
+
+		this.#scriptTxPromise = this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+			this.#scriptTx = tx;
+			resolveTxReady();
+			await endPromise;
+		});
+		// Guard against unhandled rejection if the connection closes before endScriptScope/abortScriptScope.
+		// endScriptScope still sees the rejection via `await this.#scriptTxPromise` because .catch() creates
+		// a new derived chain without affecting the original promise's rejected state.
+		this.#scriptTxPromise.catch(() => {});
+
+		// Race txReady against #scriptTxPromise so that a connection failure before
+		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
+		// immediately rather than leaving this call hanging forever.
+		await Promise.race([txReady, this.#scriptTxPromise]);
+	}
+
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
+		// When the script-tx is already open it holds the advisory lock — starting a new transaction
+		// here would deadlock trying to acquire the same lock. Route through the existing script-tx.
+		// When no script-tx is open yet, use a fresh transaction (original behavior, no extra RTT).
+		if (this.#scriptTx !== undefined) {
+			return fn(this.#scriptTx);
+		}
 		return this.#dialect.transaction(fn);
 	}
 
@@ -391,6 +450,64 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		})();
 		this.#pendingReload = p;
 		return p;
+	}
+
+	// ── Script-scoped transaction (lazy) ─────────────────────────────────────────
+
+	get scriptScopeActive(): boolean {
+		return this.#scriptScope;
+	}
+
+	get scriptTxOpen(): boolean {
+		return this.#scriptTx !== undefined;
+	}
+
+	beginScriptScope(): void {
+		if (this.#scriptScope) {
+			throw new Error("beginScriptScope: a script scope is already active");
+		}
+		this.#scriptScope = true;
+	}
+
+	async endScriptScope(): Promise<void> {
+		if (!this.#scriptScope) return;
+		this.#scriptScope = false;
+
+		try {
+			if (this.#scriptTxEnd !== undefined) {
+				this.#scriptTxEnd();
+				await this.#scriptTxPromise;
+			}
+		} finally {
+			this.#scriptTx = undefined;
+			this.#scriptTxEnd = undefined;
+			this.#scriptTxAbort = undefined;
+			this.#scriptTxPromise = undefined;
+		}
+	}
+
+	async abortScriptScope(): Promise<void> {
+		if (!this.#scriptScope) return;
+		this.#scriptScope = false;
+
+		const hadTx = this.#scriptTx !== undefined;
+		const abort = this.#scriptTxAbort;
+		const txPromise = this.#scriptTxPromise;
+		this.#scriptTx = undefined;
+		this.#scriptTxEnd = undefined;
+		this.#scriptTxAbort = undefined;
+		this.#scriptTxPromise = undefined;
+
+		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
+		// and releases the connection/advisory lock. Without this the callback awaits
+		// endPromise forever and the connection leaks until Postgres' idle timeout fires.
+		if (abort !== undefined) abort(new Error("script-tx aborted"));
+		if (txPromise !== undefined) txPromise.catch(() => {});
+
+		if (hadTx) {
+			await this.reload();
+			this.clearDirty();
+		}
 	}
 
 	// `#dirty = true` must be set AFTER `reload()` because `reload()` clears it,
