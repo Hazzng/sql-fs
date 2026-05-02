@@ -7,6 +7,6 @@ export default defineConfig({
 		hookTimeout: 15_000,
 		passWithNoTests: true,
 		setupFiles: ["./vitest.setup.ts"],
-		exclude: ["**/node_modules/**", "**/dist/**", "src/comparison-tests/**/*.comparison.test.ts"],
+		exclude: ["**/node_modules/**", "**/dist/**", "comparison/**/*.comparison.test.ts"],
 	},
 });
