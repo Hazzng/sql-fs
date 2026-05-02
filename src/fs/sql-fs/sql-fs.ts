@@ -222,11 +222,25 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			resolveTxReady();
 			await endPromise;
 		});
+		// Guard against unhandled rejection if the connection closes before endScriptScope/abortScriptScope.
+		// endScriptScope still sees the rejection via `await this.#scriptTxPromise` because .catch() creates
+		// a new derived chain without affecting the original promise's rejected state.
+		this.#scriptTxPromise.catch(() => {});
 
-		await txReady;
+		// Race txReady against #scriptTxPromise so that a connection failure before
+		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
+		// immediately rather than leaving this call hanging forever.
+		await Promise.race([txReady, this.#scriptTxPromise]);
 	}
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
+		// When the script-tx is already open it holds the advisory lock — starting a new transaction
+		// here would deadlock trying to acquire the same lock. Route through the existing script-tx.
+		// When no script-tx is open yet, use a fresh transaction (original behavior, no extra RTT).
+		if (this.#scriptTx !== undefined) {
+			return fn(this.#scriptTx);
+		}
 		return this.#dialect.transaction(fn);
 	}
 
