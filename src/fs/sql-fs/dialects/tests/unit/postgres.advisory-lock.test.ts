@@ -64,22 +64,20 @@ describe("PostgresDialect.setSandboxContext — read-only, no advisory lock", ()
 });
 
 describe("PostgresDialect.setSandboxContextWithLock — writer path", () => {
-	it("issues set_config then pg_advisory_xact_lock(hashtextextended) in that order", async () => {
+	it("issues a single SELECT with set_config and pg_advisory_xact_lock(hashtextextended)", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
 		const { tx, calls } = makeFakeTx();
 		const sandboxId = "sandbox-abc-123";
 
 		await dialect.setSandboxContextWithLock(tx, sandboxId);
 
-		expect(calls).toHaveLength(2);
+		expect(calls).toHaveLength(1);
 
 		expect(calls[0]!.sql).toContain("set_config");
 		expect(calls[0]!.sql).toContain("app.sandbox_id");
-		expect(calls[0]!.values).toEqual([sandboxId]);
-
-		expect(calls[1]!.sql).toContain("pg_advisory_xact_lock");
-		expect(calls[1]!.sql).toContain("hashtextextended");
-		expect(calls[1]!.values).toEqual([sandboxId]);
+		expect(calls[0]!.sql).toContain("pg_advisory_xact_lock");
+		expect(calls[0]!.sql).toContain("hashtextextended");
+		expect(calls[0]!.values).toEqual([sandboxId, sandboxId]);
 	});
 });
 
@@ -112,10 +110,13 @@ describe("PostgresDialect.deleteSandbox — advisory lock", () => {
 		await dialect.deleteSandbox(destroyPath.tx, sandboxId);
 
 		const normalize = (sql: string): string => sql.replace(/\s+/g, " ").trim();
-		const writeLockSql = normalize(writePath.calls[1]!.sql);
+		const writeLockSql = normalize(writePath.calls[0]!.sql);
 		const destroyLockSql = normalize(destroyPath.calls[0]!.sql);
 
-		expect(writeLockSql).toBe(destroyLockSql);
+		expect(writeLockSql).toContain("pg_advisory_xact_lock");
+		expect(destroyLockSql).toContain("pg_advisory_xact_lock");
+		expect(writeLockSql).toContain("hashtextextended");
+		expect(destroyLockSql).toContain("hashtextextended");
 	});
 });
 

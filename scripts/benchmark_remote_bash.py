@@ -9,7 +9,7 @@ Supports two providers:
 Measures:
   Phase 1 — Sandbox lifecycle: create / ingest / delete latency over N fresh
              sandboxes so every measurement includes a real round-trip.
-  Phase 2 — Exec latency: grep / rg / find / write / delete / mv commands on a
+  Phase 2 — Exec latency: grep / find / write / delete / mv commands on a
              warm sandbox. Reports wall-clock ms (always) and server-reported
              duration_ms (VirtualFS only — Daytona does not expose this).
 
@@ -535,17 +535,6 @@ def main() -> None:
         ("grep: with line numbers",      f"grep -rn 'export' {base} --include='*.ts' | wc -l"),
         ("grep: two patterns",           f"grep -rE 'interface|type' {base} --include='*.ts' | wc -l"),
 
-        # ── rg ──────────────────────────────────────────────────────────────
-        ("rg: lines (interface)",        f"rg 'interface' {base} -t ts | wc -l"),
-        ("rg: files (SqlFs)",            f"rg -l 'SqlFs' {base}"),
-        ("rg: case-insensitive",         f"rg -i 'async' {base} -t ts | wc -l"),
-        ("rg: word boundary",            f"rg -w 'type' {base} -t ts | wc -l"),
-        ("rg: fixed string",             f"rg -F 'Promise<' {base} -t ts | wc -l"),
-        ("rg: with line numbers",        f"rg -n 'export' {base} -t ts | wc -l"),
-        ("rg: two patterns",             f"rg 'interface|type' {base} -t ts | wc -l"),
-        ("rg: count per file",           f"rg -c 'interface' {base} -t ts | wc -l"),
-        ("rg: stats",                    f"rg --stats 'interface' {base} -t ts 2>&1 | tail -5"),
-
         # ── write ────────────────────────────────────────────────────────────
         ("write: echo small",            "echo 'benchmark content' > /tmp/bw.txt"),
         ("write: 100 lines",             "for i in $(seq 1 100); do echo \"line $i\"; done > /tmp/bw100.txt"),
@@ -600,8 +589,8 @@ def main() -> None:
 
         # ── Phase 2: Exec benchmark ──
         print()
-        print("Phase 2: Exec latency (grep / rg / find)")
-        print("─" * 45)
+        print("Phase 2: Exec latency (grep / find / write / delete / mv)")
+        print("─" * 60)
         print(f"  Creating exec sandbox…", end="", flush=True)
         exec_sandbox = provider.create_sandbox("bench-exec")
         print(f" {provider.sandbox_id(exec_sandbox)}")
