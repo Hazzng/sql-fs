@@ -108,7 +108,7 @@ method names, parameter spellings, and known gotchas from the SDK.
 
 ---
 
-## ⛔ Method policy — exec-only sandbox interaction
+## Method policy — exec-only sandbox interaction
 
 This mirrors the `api` skill's policy, applied to SDK method names. **All
 read / write / list interaction with a live sandbox MUST go through the exec
@@ -149,6 +149,26 @@ via exec (e.g. streaming a 100 MB binary download to disk), surface that as a
 question rather than silently using a banned method.
 
 ---
+
+## Atomicity — read-modify-write must be one script
+
+The sandbox lock is held for the **entire duration of one `exec` call**, then released. Two separate calls are two separate lock acquisitions. Another agent can slip in between them:
+
+```python
+# WRONG — race condition
+balance = int(sb.exec("cat balance.txt").stdout)
+# ← another agent can write here
+sb.exec(f"echo {balance - 50} > balance.txt")  # may silently overwrite their change
+```
+
+```python
+# CORRECT — entire operation inside one lock acquisition
+sb.exec("balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt")
+```
+
+**Rule:** if you read state and then write based on it, the read, compute, and write must all be in a single bash script string. Any Python logic between two `exec` calls is outside the lock.
+
+`exec_batch` acquires the lock **once for the whole batch** — scripts within a batch are safe relative to each other. The same caveat applies between two separate `exec_batch` calls.
 
 ## Performance heuristics
 

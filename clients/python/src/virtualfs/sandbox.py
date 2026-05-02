@@ -175,7 +175,20 @@ class Sandbox:
         timeout_ms: int = 30_000,
         debug: bool = False,
     ) -> ExecResult:
-        """`POST /exec-sync` — run a bash script and return the buffered result."""
+        """`POST /exec-sync` — run a bash script and return the buffered result.
+
+        The sandbox-level lock is held for the entire duration of this call.
+        All reads, computes, and writes that must be atomic relative to other
+        callers MUST be bundled into a single script. Two separate `exec` calls
+        are two separate lock acquisitions — another agent can slip in between:
+
+            # WRONG — race between read and write
+            balance = int(sb.exec("cat balance.txt").stdout)
+            sb.exec(f"echo {balance - 50} > balance.txt")  # another agent may have written here
+
+            # CORRECT — lock held for the whole operation
+            sb.exec("balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt")
+        """
         body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
         if cwd is not None:
             body["cwd"] = cwd
@@ -201,11 +214,20 @@ class Sandbox:
         *,
         timeout_ms: int = 30_000,
     ) -> List[BatchExecResult]:
-        """`POST /exec-sync-batch` — run up to 50 scripts sequentially.
+        """`POST /exec-sync-batch` — run up to 50 scripts sequentially in one request.
 
         `scripts` is a list of `{"id": "...", "script": "..."}` dicts. The
         single `timeout_ms` budget covers all scripts; if it is exhausted,
         the remaining results carry `exit_code=-1` and `error="timeout"`.
+
+        The lock is acquired once for the entire batch — all scripts in the
+        batch are atomic relative to other callers. Use this for exploration
+        (find, grep, cat) to collapse N round-trips into 1.
+
+        Atomicity caveat: the same read-modify-write rule applies. If your
+        batch reads state in script 1 and writes in script 50, that is safe
+        (same lock acquisition). If you need to do Python computation between
+        a read and a write, that logic must live inside a single script string.
         """
         body = {"scripts": [dict(s) for s in scripts], "timeoutMs": timeout_ms}
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
