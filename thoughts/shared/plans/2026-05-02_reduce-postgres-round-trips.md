@@ -194,15 +194,18 @@ Note: every composite takes `sandboxId` because it handles `set_config` internal
 ### Phase 2: Success Criteria
 
 #### Phase 2: Automated Verification
-- [ ] `pnpm typecheck` passes (optional methods don't break existing implementations)
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test:unit` passes (no behavior change yet)
+- [x] `pnpm typecheck` passes (optional methods don't break existing implementations)
+- [x] `pnpm lint:fix` passes
+- [x] `pnpm test:unit` passes (no behavior change yet)
 
 #### Phase 2: Manual Verification
-- [ ] Verify MySQL/Azure SQL dialects still compile without implementing the new methods
+- [x] Verify MySQL/Azure SQL dialects still compile without implementing the new methods
 
 ### Phase 2: Discoveries and Notable Information
-[Filled during implementation]
+
+**Implementation Adaptations:**
+- Omitted JSDoc comments from the composite method signatures per project coding standards (no comments unless the WHY is non-obvious). The method names and parameter lists are self-documenting.
+- The `?` optional modifier on each method is sufficient to preserve backward compatibility — `pnpm typecheck` confirms MySQL and Azure SQL dialects compile without changes (they don't implement the new methods, and TypeScript doesn't require optional interface members to be present).
 
 ---
 
