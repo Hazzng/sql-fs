@@ -127,46 +127,66 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 	});
 
 	it("marks remaining scripts as timeout when budget expires", async () => {
-		const { sessionManager } = await makeTestEnv();
-		const app = makeTestApp(sessionManager);
-		const token = await makeToken();
+		vi.useFakeTimers();
+		try {
+			const { sessionManager } = await makeTestEnv();
+			const app = makeTestApp(sessionManager);
+			const token = await makeToken();
 
-		const batchSandboxId = `${SANDBOX_ID}-timeout`;
-		const session = await sessionManager.getOrCreate("default", batchSandboxId);
+			const batchSandboxId = `${SANDBOX_ID}-timeout`;
+			const session = await sessionManager.getOrCreate("default", batchSandboxId);
 
-		let callCount = 0;
-		vi.spyOn(session.bash, "exec").mockImplementation((_script, opts) => {
-			callCount++;
-			if (callCount === 1) {
-				return new Promise((_resolve, reject) => {
-					const handle = setTimeout(() => {}, 60_000);
-					opts?.signal?.addEventListener("abort", () => {
-						clearTimeout(handle);
-						reject(new DOMException("The operation was aborted", "AbortError"));
+			// Latch resolves the moment the first exec call begins blocking, which is
+			// AFTER batch-exec.ts has registered its budget setTimeout. Advancing the
+			// fake clock only after this latch fires avoids a race where advanceTimers
+			// runs before the setTimeout is registered.
+			let latchResolve!: () => void;
+			const execBlocking = new Promise<void>((r) => {
+				latchResolve = r;
+			});
+
+			let callCount = 0;
+			vi.spyOn(session.bash, "exec").mockImplementation((_script, opts) => {
+				callCount++;
+				if (callCount === 1) {
+					return new Promise((_resolve, reject) => {
+						latchResolve();
+						opts?.signal?.addEventListener("abort", () => {
+							reject(new DOMException("The operation was aborted", "AbortError"));
+						});
 					});
-				});
-			}
-			return Promise.resolve({ stdout: "ok\n", stderr: "", exitCode: 0, env: {} });
-		});
+				}
+				return Promise.resolve({ stdout: "ok\n", stderr: "", exitCode: 0, env: {} });
+			});
 
-		const res = await app.request(`/v1/sandboxes/${batchSandboxId}/exec-sync-batch`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-			body: JSON.stringify({
-				scripts: [
-					{ id: "slow", script: "sleep 1000" },
-					{ id: "never", script: "echo unreachable" },
-				],
-				timeoutMs: 50,
-			}),
-		});
+			const resPromise = app.request(`/v1/sandboxes/${batchSandboxId}/exec-sync-batch`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+				body: JSON.stringify({
+					scripts: [
+						{ id: "slow", script: "sleep 1000" },
+						{ id: "never", script: "echo unreachable" },
+					],
+					timeoutMs: 50,
+				}),
+			});
 
-		expect(res.status).toBe(200);
-		const body = (await res.json()) as { results: BatchResult[] };
-		expect(body.results[0]!.error).toBe("timeout");
-		expect(body.results[0]!.exitCode).toBe(-1);
-		expect(body.results[1]!.error).toBe("timeout");
-		expect(body.results[1]!.exitCode).toBe(-1);
+			// Wait until the mock is blocking — the budget setTimeout is registered
+			// synchronously before bash.exec is called in batch-exec.ts, so once the
+			// latch fires the fake timer is already in the queue.
+			await execBlocking;
+			await vi.advanceTimersByTimeAsync(50);
+
+			const res = await resPromise;
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { results: BatchResult[] };
+			expect(body.results[0]!.error).toBe("timeout");
+			expect(body.results[0]!.exitCode).toBe(-1);
+			expect(body.results[1]!.error).toBe("timeout");
+			expect(body.results[1]!.exitCode).toBe(-1);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("rejects empty scripts array", async () => {
