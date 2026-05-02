@@ -182,6 +182,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		});
 	}
 
+	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		return this.#dialect.transaction(fn);
+	}
+
 	// ── Path helpers ──────────────────────────────────────────────────────────────
 
 	/** Returns the parent path of an absolute path. '/' has no parent. */
@@ -443,22 +447,35 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
 		const mtime = new Date();
 
-		const inodeId = await this.#withTx(async (tx) => {
-			await this.#dialect.upsertBlob(tx, sha256, bytes);
-			const id = await this.#dialect.createInode(tx, {
-				sandboxId: this.#sandboxId,
-				kind: INODE_KIND.FILE,
-				mode: 0o644,
-				size: bytes.length,
-				contentSha256: sha256,
-			});
-			const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
-			if (oldInodeId !== null) {
-				const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
-				if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
-			}
-			return id;
-		});
+		const inodeId = this.#dialect.writeFileComposite
+			? await this.#withBareTx((tx) =>
+					this.#dialect.writeFileComposite!(
+						tx,
+						this.#sandboxId,
+						parentEntry.inodeId,
+						name,
+						0o644,
+						bytes.length,
+						sha256,
+						bytes,
+					),
+				)
+			: await this.#withTx(async (tx) => {
+					await this.#dialect.upsertBlob(tx, sha256, bytes);
+					const id = await this.#dialect.createInode(tx, {
+						sandboxId: this.#sandboxId,
+						kind: INODE_KIND.FILE,
+						mode: 0o644,
+						size: bytes.length,
+						contentSha256: sha256,
+					});
+					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
+					if (oldInodeId !== null) {
+						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
+						if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
+					}
+					return id;
+				});
 
 		this.#pathCache.set(path, {
 			inodeId,
@@ -496,26 +513,37 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const sha256 = new Uint8Array(createHash("sha256").update(fullBytes).digest());
 		const { name, parentEntry } = this.#requireParentDir(path);
 
-		let replacedInodeId: bigint | null = null;
-		const inodeId = await this.#withTx(async (tx) => {
-			await this.#dialect.upsertBlob(tx, sha256, fullBytes);
-			const id = await this.#dialect.createInode(tx, {
-				sandboxId: this.#sandboxId,
-				kind: INODE_KIND.FILE,
-				mode: 0o644,
-				size: fullBytes.length,
-				contentSha256: sha256,
-			});
-			const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
-			if (oldInodeId !== null) {
-				replacedInodeId = oldInodeId;
-				const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
-				if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
-			}
-			return id;
-		});
+		const inodeId = this.#dialect.writeFileComposite
+			? await this.#withBareTx((tx) =>
+					this.#dialect.writeFileComposite!(
+						tx,
+						this.#sandboxId,
+						parentEntry.inodeId,
+						name,
+						0o644,
+						fullBytes.length,
+						sha256,
+						fullBytes,
+					),
+				)
+			: await this.#withTx(async (tx) => {
+					await this.#dialect.upsertBlob(tx, sha256, fullBytes);
+					const id = await this.#dialect.createInode(tx, {
+						sandboxId: this.#sandboxId,
+						kind: INODE_KIND.FILE,
+						mode: 0o644,
+						size: fullBytes.length,
+						contentSha256: sha256,
+					});
+					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
+					if (oldInodeId !== null) {
+						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
+						if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
+					}
+					return id;
+				});
 
-		if (replacedInodeId !== null) this.#contentCache.delete(replacedInodeId);
+		if (existing) this.#contentCache.delete(existing.inodeId);
 		if (fullBytes.byteLength > 0) this.#contentCache.set(inodeId, fullBytes);
 		this.#pathCache.set(path, {
 			inodeId,
@@ -579,16 +607,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		if (this.#pathCache.has(path)) throw createEexist(path);
 		const { name, parentEntry } = this.#requireParentDir(path);
 
-		const inodeId = await this.#withTx(async (tx) => {
-			const id = await this.#dialect.createInode(tx, {
-				sandboxId: this.#sandboxId,
-				kind: INODE_KIND.DIRECTORY,
-				mode: 0o755,
-				size: 0,
-			});
-			await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
-			return id;
-		});
+		const inodeId = this.#dialect.mkdirComposite
+			? await this.#withBareTx((tx) =>
+					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+				)
+			: await this.#withTx(async (tx) => {
+					const id = await this.#dialect.createInode(tx, {
+						sandboxId: this.#sandboxId,
+						kind: INODE_KIND.DIRECTORY,
+						mode: 0o755,
+						size: 0,
+					});
+					await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
+					return id;
+				});
 
 		this.#pathCache.set(path, {
 			inodeId,
@@ -658,11 +690,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			if (this.#childPaths(path).length > 0) throw createEnotempty(path);
 		}
 
-		await this.#withTx(async (tx) => {
-			const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
-			const newNlink = await this.#dialect.decrementNlink(tx, removedInodeId);
-			if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
-		});
+		if (this.#dialect.rmComposite) {
+			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+		} else {
+			await this.#withTx(async (tx) => {
+				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
+				const newNlink = await this.#dialect.decrementNlink(tx, removedInodeId);
+				if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
+			});
+		}
 
 		this.#contentCache.delete(entry.inodeId);
 		this.#pathCache.delete(path);
@@ -914,15 +950,26 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		// Capture displaced dest inode before async work
 		const destEntry = this.#pathCache.get(dest);
 
-		await this.#withTx(async (tx) => {
-			// If destination exists, decrement nlink on the displaced inode.
-			// moveDirent will DELETE the dest dirent in SQL; we handle the inode lifecycle here.
-			if (destEntry) {
-				const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
-				if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
-			}
-			await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
-		});
+		if (this.#dialect.mvComposite) {
+			await this.#withBareTx((tx) =>
+				this.#dialect.mvComposite!(
+					tx,
+					this.#sandboxId,
+					srcParentEntry.inodeId,
+					srcName,
+					destParentEntry.inodeId,
+					destName,
+				),
+			);
+		} else {
+			await this.#withTx(async (tx) => {
+				if (destEntry) {
+					const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
+					if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
+				}
+				await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
+			});
+		}
 
 		// Snapshot src subtree before mutating the cache
 		const srcPaths = this.#allPathsUnder(src);

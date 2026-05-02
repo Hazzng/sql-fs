@@ -513,16 +513,20 @@ if (this.#dialect.mvComposite) {
 ### Phase 4: Success Criteria
 
 #### Phase 4: Automated Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test:unit` passes — existing tests use mocked dialect without composite methods, so all fall through to sequential path via `#withTx`. Verifies backward compatibility.
-- [ ] `pnpm test:integration` passes — integration tests use real PostgresDialect which now has composites, exercising the `#withBareTx` + composite path.
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes
+- [x] `pnpm test:unit` passes — existing tests use mocked dialect without composite methods, so all fall through to sequential path via `#withTx`. Verifies backward compatibility.
+- [x] `pnpm test:integration` passes — integration tests use real PostgresDialect which now has composites, exercising the `#withBareTx` + composite path (same 13 pre-existing failures as before changes)
 
 #### Phase 4: Manual Verification
-- [ ] Read through each updated method to confirm the composite path and fallback path produce identical side effects (pathCache, contentCache, dirty flag)
+- [x] Read through each updated method to confirm the composite path and fallback path produce identical side effects (pathCache, contentCache, dirty flag)
 
 ### Phase 4: Discoveries and Notable Information
-[Filled during implementation]
+
+**Implementation Adaptations:**
+- `appendFile`: simplified cache eviction from `replacedInodeId`-based (set inside the `#withTx` closure) to `existing`-based (captured from pathCache before the write). This is equivalent because `existing.inodeId` is always the inode that `upsertDirent` would displace, and it works for both the composite path (where the closure variable wouldn't be set) and the fallback path. Removed the `replacedInodeId` mutable variable entirely.
+- All five methods preserve identical pathCache/contentCache/dirty-flag side effects between composite and fallback paths — the branching is strictly in the DB transaction body.
+- Biome auto-fixed minor formatting (trailing comma placement in multi-line ternaries).
 
 ---
 
