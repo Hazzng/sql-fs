@@ -61,11 +61,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
-		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
-		// Cross-replica write serialization at the DB layer.
-		// Transaction-scoped; auto-released on COMMIT/ROLLBACK.
-		// Works with transaction-mode pooling (Neon/pgbouncer) — session-scoped would not.
-		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 	}
 
 	// ── Private helpers ───────────────────────────────────────────────────────────
