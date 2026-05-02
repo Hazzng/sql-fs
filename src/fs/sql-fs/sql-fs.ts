@@ -100,9 +100,6 @@ export interface ICoherentFs extends IFileSystem {
 	 * pathCache via reload() and marks the FS dirty.
 	 */
 	bulkIngest(files: BulkIngestFile[]): Promise<void>;
-	mvBulk(pairs: ReadonlyArray<{ src: string; dest: string }>): Promise<void>;
-	rmBulk(paths: readonly string[], options?: RmOptions): Promise<void>;
-	cpBulk(pairs: ReadonlyArray<{ src: string; dest: string }>, options?: CpOptions): Promise<void>;
 }
 
 export interface IScriptTxFs extends ICoherentFs {
@@ -143,6 +140,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	#scriptScope = false;
 	#scriptTx: Tx | undefined;
 	#scriptTxEnd: (() => void) | undefined;
+	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
@@ -211,10 +209,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		});
 
 		let resolveEnd!: () => void;
-		const endPromise = new Promise<void>((r) => {
-			resolveEnd = r;
+		let rejectEnd!: (err: Error) => void;
+		const endPromise = new Promise<void>((resolve, reject) => {
+			resolveEnd = resolve;
+			rejectEnd = reject;
 		});
 		this.#scriptTxEnd = resolveEnd;
+		this.#scriptTxAbort = rejectEnd;
 
 		this.#scriptTxPromise = this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
@@ -280,15 +281,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			if (key !== dirPath && key.startsWith(prefix)) result.push(key);
 		}
 		return result;
-	}
-
-	#snapshotPathCache(): Map<string, PathCacheEntry> {
-		return new Map(this.#pathCache);
-	}
-
-	#restorePathCache(snapshot: Map<string, PathCacheEntry>): void {
-		this.#pathCache.clear();
-		for (const [k, v] of snapshot) this.#pathCache.set(k, v);
 	}
 
 	/**
@@ -481,13 +473,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		if (!this.#scriptScope) return;
 		this.#scriptScope = false;
 
-		if (this.#scriptTxEnd !== undefined) {
-			this.#scriptTxEnd();
-			await this.#scriptTxPromise;
+		try {
+			if (this.#scriptTxEnd !== undefined) {
+				this.#scriptTxEnd();
+				await this.#scriptTxPromise;
+			}
+		} finally {
+			this.#scriptTx = undefined;
+			this.#scriptTxEnd = undefined;
+			this.#scriptTxAbort = undefined;
+			this.#scriptTxPromise = undefined;
 		}
-		this.#scriptTx = undefined;
-		this.#scriptTxEnd = undefined;
-		this.#scriptTxPromise = undefined;
 	}
 
 	async abortScriptScope(): Promise<void> {
@@ -495,12 +491,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
+		const abort = this.#scriptTxAbort;
+		const txPromise = this.#scriptTxPromise;
 		this.#scriptTx = undefined;
 		this.#scriptTxEnd = undefined;
-		if (this.#scriptTxPromise !== undefined) {
-			this.#scriptTxPromise.catch(() => {});
-		}
+		this.#scriptTxAbort = undefined;
 		this.#scriptTxPromise = undefined;
+
+		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
+		// and releases the connection/advisory lock. Without this the callback awaits
+		// endPromise forever and the connection leaks until Postgres' idle timeout fires.
+		if (abort !== undefined) abort(new Error("script-tx aborted"));
+		if (txPromise !== undefined) txPromise.catch(() => {});
 
 		if (hadTx) {
 			await this.reload();
@@ -820,70 +822,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#dirty = true;
 	}
 
-	async rmBulk(inputPaths: readonly string[], options?: RmOptions): Promise<void> {
-		if (inputPaths.length === 0) return;
-		if (inputPaths.length === 1) return this.rm(inputPaths[0]!, options);
-
-		const paths = inputPaths.map(validatePath);
-		const snapshot = this.#snapshotPathCache();
-
-		try {
-			await this.#withTx(async (tx) => {
-				for (const path of paths) {
-					const entry = this.#pathCache.get(path);
-					if (!entry) {
-						if (options?.force) continue;
-						throw createEnoent(path);
-					}
-
-					const parentPath = this.#parentOf(path);
-					const name = this.#nameOf(path);
-					const parentEntry = this.#pathCache.get(parentPath);
-
-					if (options?.recursive && entry.kind === INODE_KIND.DIRECTORY) {
-						const subtreePaths = this.#allPathsUnder(path);
-						subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length);
-
-						if (parentEntry) {
-							await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
-						}
-						for (const p of subtreePaths) {
-							const e = this.#pathCache.get(p)!;
-							if (p !== path) {
-								const pParent = this.#pathCache.get(this.#parentOf(p));
-								if (pParent) {
-									await this.#dialect.deleteDirent(tx, pParent.inodeId, this.#nameOf(p));
-								}
-							}
-							const newNlink = await this.#dialect.decrementNlink(tx, e.inodeId);
-							if (newNlink === 0) await this.#dialect.deleteInode(tx, e.inodeId);
-						}
-
-						for (const p of subtreePaths) {
-							const e = this.#pathCache.get(p);
-							if (e) this.#contentCache.delete(e.inodeId);
-							this.#pathCache.delete(p);
-						}
-					} else {
-						if (entry.kind === INODE_KIND.DIRECTORY) {
-							if (this.#childPaths(path).length > 0) throw createEnotempty(path);
-						}
-						const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
-						const newNlink = await this.#dialect.decrementNlink(tx, removedInodeId);
-						if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
-
-						this.#contentCache.delete(entry.inodeId);
-						this.#pathCache.delete(path);
-					}
-				}
-			});
-		} catch (err) {
-			this.#restorePathCache(snapshot);
-			throw err;
-		}
-		this.#dirty = true;
-	}
-
 	async chmod(inputPath: string, mode: number): Promise<void> {
 		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
@@ -1100,90 +1038,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#dirty = true;
 	}
 
-	async cpBulk(pairs: ReadonlyArray<{ src: string; dest: string }>, options?: CpOptions): Promise<void> {
-		if (pairs.length === 0) return;
-		if (pairs.length === 1) return this.cp(pairs[0]!.src, pairs[0]!.dest, options);
-
-		const normalized = pairs.map(({ src, dest }) => ({
-			src: validatePath(src),
-			dest: validatePath(dest),
-		}));
-
-		const mtime = new Date();
-		const snapshot = this.#snapshotPathCache();
-
-		try {
-			await this.#withTx(async (tx) => {
-				for (const { src, dest } of normalized) {
-					const srcEntry = this.#pathCache.get(src);
-					if (!srcEntry) throw createEnoent(src);
-
-					if (srcEntry.kind === INODE_KIND.DIRECTORY) {
-						if (!options?.recursive) throw createEisdir(src);
-
-						const srcPaths = this.#allPathsUnder(src);
-						srcPaths.sort((a, b) => a.split("/").length - b.split("/").length);
-						this.#requireParentDir(dest);
-
-						const newInodeIds = new Map<string, bigint>();
-						for (const srcPath of srcPaths) {
-							const entry = this.#pathCache.get(srcPath)!;
-							const destPath = dest + srcPath.slice(src.length);
-							const entryName = this.#nameOf(destPath);
-							const entryParent = this.#parentOf(destPath);
-							const parentInodeId = newInodeIds.get(entryParent) ?? this.#pathCache.get(entryParent)?.inodeId;
-							if (parentInodeId === undefined) throw createEnoent(entryParent);
-
-							const newId = await this.#dialect.createInode(tx, {
-								sandboxId: this.#sandboxId,
-								kind: entry.kind,
-								mode: entry.mode,
-								size: entry.size,
-								contentSha256: entry.contentSha256,
-								symlinkTarget: entry.symlinkTarget,
-							});
-							await this.#dialect.insertDirent(tx, parentInodeId, entryName, newId);
-							newInodeIds.set(destPath, newId);
-						}
-
-						for (const [destPath, inodeId] of newInodeIds) {
-							const srcPath = src + destPath.slice(dest.length);
-							const srcE = this.#pathCache.get(srcPath)!;
-							this.#pathCache.set(destPath, { ...srcE, inodeId, mtime });
-						}
-					} else {
-						const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(dest);
-						const newInodeId = await this.#dialect.createInode(tx, {
-							sandboxId: this.#sandboxId,
-							kind: INODE_KIND.FILE,
-							mode: srcEntry.mode,
-							size: srcEntry.size,
-							contentSha256: srcEntry.contentSha256,
-						});
-						const oldInodeId = await this.#dialect.upsertDirent(tx, destParentEntry.inodeId, destName, newInodeId);
-						if (oldInodeId !== null) {
-							const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
-							if (newNlink === 0) await this.#dialect.deleteInode(tx, oldInodeId);
-						}
-						this.#pathCache.set(dest, {
-							inodeId: newInodeId,
-							kind: INODE_KIND.FILE,
-							mode: srcEntry.mode,
-							size: srcEntry.size,
-							mtime,
-							contentSha256: srcEntry.contentSha256,
-							symlinkTarget: null,
-						});
-					}
-				}
-			});
-		} catch (err) {
-			this.#restorePathCache(snapshot);
-			throw err;
-		}
-		this.#dirty = true;
-	}
-
 	async mv(inputSrc: string, inputDest: string): Promise<void> {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
@@ -1252,68 +1106,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		// Re-insert src entries under dest (remap prefix src → dest)
 		for (const [oldPath, entry] of snapshot) {
 			this.#pathCache.set(dest + oldPath.slice(src.length), entry);
-		}
-		this.#dirty = true;
-	}
-
-	async mvBulk(pairs: ReadonlyArray<{ src: string; dest: string }>): Promise<void> {
-		if (pairs.length === 0) return;
-		if (pairs.length === 1) return this.mv(pairs[0]!.src, pairs[0]!.dest);
-
-		const normalized = pairs.map(({ src, dest }) => ({
-			src: validatePath(src),
-			dest: validatePath(dest),
-		}));
-
-		const snapshot = this.#snapshotPathCache();
-		try {
-			await this.#withTx(async (tx) => {
-				for (const { src, dest } of normalized) {
-					const srcEntry = this.#pathCache.get(src);
-					if (!srcEntry) throw createEnoent(src);
-
-					const srcParentPath = this.#parentOf(src);
-					const srcName = this.#nameOf(src);
-					const destParentPath = this.#parentOf(dest);
-					const destName = this.#nameOf(dest);
-
-					const srcParentEntry = this.#pathCache.get(srcParentPath);
-					if (!srcParentEntry) throw createEnoent(srcParentPath);
-					const destParentEntry = this.#pathCache.get(destParentPath);
-					if (!destParentEntry) throw createEnoent(destParentPath);
-					if (destParentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(destParentPath);
-
-					if (srcEntry.kind === INODE_KIND.DIRECTORY) {
-						const srcPrefix = src === "/" ? "/" : `${src}/`;
-						if (dest.startsWith(srcPrefix) || dest === src) throw createEinval(src);
-					}
-
-					const destEntry = this.#pathCache.get(dest);
-					if (destEntry) {
-						const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
-						if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
-					}
-					await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
-
-					const srcPaths = this.#allPathsUnder(src);
-					const srcSnapshot = new Map<string, PathCacheEntry>();
-					for (const p of srcPaths) {
-						const e = this.#pathCache.get(p);
-						if (e) srcSnapshot.set(p, e);
-					}
-					for (const p of srcPaths) this.#pathCache.delete(p);
-					const destPrefix = dest === "/" ? "/" : `${dest}/`;
-					for (const key of [...this.#pathCache.keys()]) {
-						if (key === dest || key.startsWith(destPrefix)) this.#pathCache.delete(key);
-					}
-					for (const [oldPath, entry] of srcSnapshot) {
-						this.#pathCache.set(dest + oldPath.slice(src.length), entry);
-					}
-				}
-			});
-		} catch (err) {
-			this.#restorePathCache(snapshot);
-			throw err;
 		}
 		this.#dirty = true;
 	}
