@@ -102,6 +102,14 @@ export interface ICoherentFs extends IFileSystem {
 	bulkIngest(files: BulkIngestFile[]): Promise<void>;
 }
 
+export interface IScriptTxFs extends ICoherentFs {
+	beginScriptScope(): void;
+	endScriptScope(): Promise<void>;
+	abortScriptScope(): Promise<void>;
+	readonly scriptScopeActive: boolean;
+	readonly scriptTxOpen: boolean;
+}
+
 export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
@@ -129,6 +137,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * Used when reload() clears contentCache during an in-flight prewarm.
 	 */
 	#prewarmQueued = false;
+	#scriptScope = false;
+	#scriptTx: Tx | undefined;
+	#scriptTxEnd: (() => void) | undefined;
+	#scriptTxPromise: Promise<void> | undefined;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -162,8 +174,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-		// Writers: acquire the per-sandbox advisory lock alongside RLS context so
-		// concurrent mutators across replicas serialize at the DB layer.
+		if (this.#scriptScope) {
+			if (this.#scriptTx === undefined) {
+				await this.#openScriptTx();
+			}
+			return fn(this.#scriptTx!);
+		}
 		return this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
 			return await fn(tx);
@@ -176,10 +192,35 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		if (this.#scriptScope && this.#scriptTx !== undefined) {
+			return fn(this.#scriptTx);
+		}
 		return this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await fn(tx);
 		});
+	}
+
+	async #openScriptTx(): Promise<void> {
+		let resolveTxReady!: () => void;
+		const txReady = new Promise<void>((r) => {
+			resolveTxReady = r;
+		});
+
+		let resolveEnd!: () => void;
+		const endPromise = new Promise<void>((r) => {
+			resolveEnd = r;
+		});
+		this.#scriptTxEnd = resolveEnd;
+
+		this.#scriptTxPromise = this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+			this.#scriptTx = tx;
+			resolveTxReady();
+			await endPromise;
+		});
+
+		await txReady;
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -387,6 +428,54 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		})();
 		this.#pendingReload = p;
 		return p;
+	}
+
+	// ── Script-scoped transaction (lazy) ─────────────────────────────────────────
+
+	get scriptScopeActive(): boolean {
+		return this.#scriptScope;
+	}
+
+	get scriptTxOpen(): boolean {
+		return this.#scriptTx !== undefined;
+	}
+
+	beginScriptScope(): void {
+		if (this.#scriptScope) {
+			throw new Error("beginScriptScope: a script scope is already active");
+		}
+		this.#scriptScope = true;
+	}
+
+	async endScriptScope(): Promise<void> {
+		if (!this.#scriptScope) return;
+		this.#scriptScope = false;
+
+		if (this.#scriptTxEnd !== undefined) {
+			this.#scriptTxEnd();
+			await this.#scriptTxPromise;
+		}
+		this.#scriptTx = undefined;
+		this.#scriptTxEnd = undefined;
+		this.#scriptTxPromise = undefined;
+	}
+
+	async abortScriptScope(): Promise<void> {
+		if (!this.#scriptScope) return;
+		this.#scriptScope = false;
+
+		const hadTx = this.#scriptTx !== undefined;
+		this.#scriptTx = undefined;
+		this.#scriptTxEnd = undefined;
+		if (this.#scriptTxPromise !== undefined) {
+			this.#scriptTxPromise.catch(() => {});
+		}
+		this.#scriptTxPromise = undefined;
+
+		if (hadTx) {
+			await this.reload();
+			this.clearDirty();
+		}
 	}
 
 	// `#dirty = true` must be set AFTER `reload()` because `reload()` clears it,

@@ -20,7 +20,8 @@ import type { BashExecResult } from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
-import type { ICoherentFs } from "../fs/sql-fs/sql-fs.js";
+import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
+import type { ICoherentFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -50,6 +51,21 @@ function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	return undefined;
 }
 
+function asScriptTxFs(fs: IFileSystem): IScriptTxFs | undefined {
+	const partial = fs as Partial<IScriptTxFs>;
+	if (
+		typeof partial.beginScriptScope === "function" &&
+		typeof partial.endScriptScope === "function" &&
+		typeof partial.abortScriptScope === "function" &&
+		typeof partial.reload === "function" &&
+		typeof partial.wasDirty === "function" &&
+		typeof partial.clearDirty === "function"
+	) {
+		return fs as IScriptTxFs;
+	}
+	return undefined;
+}
+
 /**
  * Per-sandbox runtime opt-in flags. Runtimes must be declared at session creation
  * because `just-bash` decides which commands to register when the `Bash` instance is built.
@@ -71,6 +87,7 @@ export interface Session {
 	readonly bash: Bash;
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
+	readonly scriptTx: SessionScopedFs | undefined;
 	lastUsed: number;
 	inFlight: number;
 	readonly mutex: Mutex;
@@ -285,6 +302,8 @@ export class SessionManager {
 					javascript: resolvedRuntime.javascript || undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
+				const scriptTxFs = asScriptTxFs(fs);
+				const scriptTx = scriptTxFs !== undefined ? new SessionScopedFs(scriptTxFs) : undefined;
 
 				let initialVersion = 0;
 				if (this.redis !== undefined) {
@@ -301,6 +320,7 @@ export class SessionManager {
 					bash,
 					runtimeOptions: resolvedRuntime,
 					tenantId,
+					scriptTx,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					mutex: new Mutex(),
@@ -607,8 +627,23 @@ export class SessionManager {
 		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
-		if (!usesPython && !usesJs) {
+		const execFn = async (): Promise<BashExecResult> => {
+			if (session.scriptTx !== undefined) {
+				session.scriptTx.beginScope();
+				try {
+					const result = await session.bash.exec(script, opts);
+					await session.scriptTx.endScope();
+					return result;
+				} catch (err) {
+					await session.scriptTx.abortScope();
+					throw err;
+				}
+			}
 			return session.bash.exec(script, opts);
+		};
+
+		if (!usesPython && !usesJs) {
+			return execFn();
 		}
 
 		if (usesPython) await this.acquireSlot(this.pythonSem);
@@ -622,7 +657,7 @@ export class SessionManager {
 		}
 
 		try {
-			return await session.bash.exec(script, opts);
+			return await execFn();
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);
