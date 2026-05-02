@@ -201,14 +201,23 @@ Locks and caches are entirely per-sandbox. Requests on different sandboxes are a
 
 ## What Is NOT Guaranteed
 
-**Multi-step client atomicity.** Two separate `exec` calls are two separate lock acquisitions. Another request can slip in between them:
+**Multi-step client atomicity.** The lock is acquired and released per `exec` call, not across your entire agent session. Two separate exec calls with logic in between leave a window where another agent can slip in:
 
 ```
-Agent A: exec { read state }  →  compute new state  →  exec { write state }
-Agent B:                                           exec { also writes state }  ← races here
+Agent A: exec "cat balance.txt"         → Python: 100 - 50 = 50    → exec "echo 50 > balance.txt"
+Agent B:                          exec "echo 0 > balance.txt"
+                                  ↑ acquired the lock here, overwrote to 0
+                                                                        ↑ Agent A now writes 50 — B's write is lost
 ```
 
-If you need read-modify-write atomicity, bundle the entire sequence into a single bash script. The lock is held for the full duration of one script, not across multiple requests.
+**Fix: bundle the read, compute, and write into one script.** The lock is held for the entire duration of a single script.
+
+```bash
+# One exec call — nothing can slip in between the read and the write
+balance=$(cat balance.txt)
+new=$((balance - 50))
+echo $new > balance.txt
+```
 
 **Script atomicity under pathological GC pauses.** If the Node.js GC pauses longer than the Redis lock lease (`REDIS_EXEC_LOCK_LEASE_MS`, default 60s), the lock expires, another replica can acquire, and two scripts may interleave in time. Postgres data integrity is preserved by Lock 3 — no corruption, but bash-level semantics are not guaranteed for the affected request.
 

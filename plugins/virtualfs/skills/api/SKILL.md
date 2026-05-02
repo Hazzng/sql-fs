@@ -78,7 +78,7 @@ response shapes, and known gotchas from the live API.
 
 ---
 
-## ⛔ Endpoint policy — exec-only sandbox interaction
+## Endpoint policy — exec-only sandbox interaction
 
 **All read/write/list interaction with a live sandbox MUST go through the Exec endpoints
 (`/exec-sync` or `/exec`).** The Files endpoints are banned for agent use.
@@ -117,3 +117,25 @@ When a user asks for a Files-endpoint curl, **decline politely and produce the e
 equivalent instead**, citing this policy. If the workflow truly cannot be expressed via
 exec (e.g. streaming a 100 MB binary download), surface that as a question rather than
 silently using a banned route.
+
+---
+
+## Atomicity — read-modify-write must be one script
+
+The sandbox lock is held for the **entire duration of one exec call**, then released. Two separate calls are two separate lock acquisitions — another agent can slip in between:
+
+```bash
+# WRONG — race condition
+balance=$(curl -s ... /exec-sync -d '{"script":"cat balance.txt"}' | jq -r .stdout)
+# ← another agent can write here
+curl -s ... /exec-sync -d "{\"script\":\"echo $((balance - 50)) > balance.txt\"}"
+```
+
+```bash
+# CORRECT — entire operation inside one lock acquisition
+curl -s ... /exec-sync -d '{
+  "script": "balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt"
+}'
+```
+
+**Rule:** if you read state and then write based on it, the read, compute, and write must all be inside a single `"script"` string. Any client-side logic between two exec calls is outside the lock.
