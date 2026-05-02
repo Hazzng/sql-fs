@@ -12,7 +12,7 @@ import { createSandboxFs, destroySandbox, loadBackendConfig } from "../../index.
 import { SqlFs } from "../../sql-fs.js";
 
 // Mock the PostgresDialect so no real DB connection is made.
-vi.mock("../dialects/postgres.js", () => ({
+vi.mock("../../dialects/postgres.js", () => ({
 	PostgresDialect: vi.fn().mockImplementation(() => ({
 		connect: vi.fn().mockResolvedValue(undefined),
 		disconnect: vi.fn().mockResolvedValue(undefined),
