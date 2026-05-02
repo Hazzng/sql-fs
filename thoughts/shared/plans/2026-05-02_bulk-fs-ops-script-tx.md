@@ -903,22 +903,22 @@ async cpBulk(
 
 #### Phase 2: Automated Verification
 
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes
-- [ ] `pnpm test:unit` passes (existing tests unchanged)
-- [ ] New test files pass:
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes
+- [x] `pnpm test:unit` passes (existing tests unchanged)
+- [x] New test files pass:
   - `src/fs/sql-fs/tests/sql-fs.mv-bulk.test.ts`
   - `src/fs/sql-fs/tests/sql-fs.rm-bulk.test.ts`
   - `src/fs/sql-fs/tests/sql-fs.cp-bulk.test.ts`
 
 #### Phase 2: Manual Verification
 
-- [ ] Each bulk method invokes `dialect.transaction` exactly once for N operations (verify via mock call count)
-- [ ] pathCache state after successful bulk ops matches the state after N sequential individual ops
-- [ ] Error in any pair: tx rolls back AND pathCache restored from snapshot (no partial state)
-- [ ] `pairs.length === 1` delegates to the single-op method (no snapshot overhead)
-- [ ] `pairs.length === 0` returns immediately
-- [ ] Bulk method inside active script-scope: reuses script-tx (verify `dialect.transaction` not called again)
+- [x] Each bulk method invokes `dialect.transaction` exactly once for N operations (verify via mock call count)
+- [x] pathCache state after successful bulk ops matches the state after N sequential individual ops
+- [x] Error in any pair: tx rolls back AND pathCache restored from snapshot (no partial state)
+- [x] `pairs.length === 1` delegates to the single-op method (no snapshot overhead)
+- [x] `pairs.length === 0` returns immediately
+- [x] Bulk method inside active script-scope: reuses script-tx (verify `dialect.transaction` not called again)
 
 ### Phase 2: Test Plan
 
@@ -965,7 +965,19 @@ Each bulk method gets its own test file following the project pattern (`beforeEa
 
 ### Phase 2: Discoveries and Notable Information
 
-_To be filled during implementation._
+**Technical Discoveries:**
+- The `#snapshotPathCache` / `#restorePathCache` pattern cleanly handles both in-loop cache mutations and rollback recovery. The snapshot is a shallow `new Map(this.#pathCache)` copy — `PathCacheEntry` values are read-only objects so sharing references is safe.
+- Bulk methods that delegate to single-op for `length === 1` skip the snapshot overhead entirely, since the single-op methods handle their own cache consistency.
+- The `rmBulk` implementation needed to handle both recursive (subtree deletion) and non-recursive (single entry) paths within the same loop iteration, mirroring the branching structure of single `rm()`.
+
+**Implementation Adaptations:**
+- Plan specified ~17 test cases for `sql-fs.mv-bulk.test.ts`; implemented 12 covering all plan scenarios plus a "later pair sees earlier pair's cache changes" case that validates in-loop cache coherence.
+- Plan specified ~14 test cases each for rm-bulk and cp-bulk; implemented 13 and 14 respectively, adding "dirty remains false on error" tests and "recursive rm of multiple dirs" tests not explicitly listed.
+- All three test files follow the established pattern of clearing `transactionMock` after `fs.ready()` to isolate transaction counts to the method under test.
+
+**Future Considerations:**
+- When just-bash upstream adds `fs.mvBulk()` detection, the existing bulk methods will be called directly from shell builtins, compounding the script-tx benefit (fewer per-op queries inside the shared tx).
+- The `contentCache` is not snapshot/restored in bulk methods — only `pathCache` is. This is acceptable because `contentCache` is an LRU read cache; stale entries just trigger a re-fetch on next read.
 
 ---
 
