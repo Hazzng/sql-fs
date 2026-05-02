@@ -64,6 +64,157 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 	}
 
+	// ── Composite write operations ────────────────────────────────────────────────
+
+	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint> {
+		const rows = await tx<{ id: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			),
+			new_inode AS (
+				INSERT INTO inodes (sandbox_id, kind, mode, size)
+				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx
+				RETURNING id
+			)
+			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+			SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
+			FROM new_inode
+			RETURNING inode_id AS id
+		`;
+		const row = rows[0];
+		if (!row) throw new Error("mkdirComposite: INSERT returned no rows");
+		return BigInt(row.id);
+	}
+
+	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string): Promise<bigint> {
+		const rows = await tx<{ removed_inode_id: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			),
+			removed_dirent AS (
+				DELETE FROM dirents
+				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+				RETURNING inode_id
+			),
+			decremented AS (
+				UPDATE inodes
+				SET nlink = nlink - 1
+				FROM removed_dirent
+				WHERE inodes.id = removed_dirent.inode_id
+				RETURNING inodes.id, inodes.nlink
+			),
+			cleaned AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+			)
+			SELECT inode_id AS removed_inode_id FROM removed_dirent
+		`;
+		const row = rows[0];
+		if (!row) throw createEnoent(name);
+		return BigInt(row.removed_inode_id);
+	}
+
+	async writeFileComposite(
+		tx: PgTx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		size: number,
+		sha256: Uint8Array,
+		data: Uint8Array,
+	): Promise<bigint> {
+		const rows = await tx<{ new_inode_id: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			),
+			blob_insert AS (
+				INSERT INTO blobs (sha256, data, size)
+				SELECT ${sha256}, ${data}, ${size} FROM ctx
+				ON CONFLICT (sha256) DO NOTHING
+			),
+			new_inode AS (
+				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
+				VALUES (${sandboxId}, 1, ${mode}, ${size}, ${sha256})
+				RETURNING id
+			),
+			old_dirent AS (
+				SELECT inode_id FROM dirents
+				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+			),
+			upserted AS (
+				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+				SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
+				FROM new_inode
+				ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id
+				RETURNING inode_id
+			),
+			decremented AS (
+				UPDATE inodes
+				SET nlink = nlink - 1
+				FROM old_dirent
+				WHERE inodes.id = old_dirent.inode_id
+				RETURNING inodes.id, inodes.nlink
+			),
+			cleaned AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+			)
+			SELECT id AS new_inode_id FROM new_inode
+		`;
+		const row = rows[0];
+		if (!row) throw new Error("writeFileComposite: INSERT returned no rows");
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, data);
+		}
+		return BigInt(row.new_inode_id);
+	}
+
+	async mvComposite(
+		tx: PgTx,
+		sandboxId: string,
+		oldParentId: bigint,
+		oldName: string,
+		newParentId: bigint,
+		newName: string,
+	): Promise<void> {
+		const rows = await tx<{ inode_id: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			),
+			old_dest AS (
+				DELETE FROM dirents
+				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+				RETURNING inode_id
+			),
+			decremented AS (
+				UPDATE inodes
+				SET nlink = nlink - 1
+				FROM old_dest
+				WHERE inodes.id = old_dest.inode_id
+				RETURNING inodes.id, inodes.nlink
+			),
+			cleaned AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+			),
+			moved AS (
+				UPDATE dirents
+				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+				RETURNING inode_id
+			)
+			SELECT inode_id FROM moved
+		`;
+		if (rows.length === 0) throw createEnoent(oldName);
+	}
+
 	// ── Private helpers ───────────────────────────────────────────────────────────
 
 	private db(): postgres.Sql {
