@@ -204,6 +204,15 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `SESSION_IDLE_MS` | No (default: 600000) | Idle timeout before session eviction (ms) |
 | `MAX_CONCURRENT_PYTHON` | No (default: 5) | Max concurrent Python executions across all sessions. CPython WASM workers cost ~80MB each (EXIT_RUNTIME per invocation); the semaphore caps concurrency to prevent OOM. Excess scripts queue FIFO. |
 | `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
+| `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. |
+| `REDIS_EXEC_LOCK_LEASE_MS` | No (default: 60000) | Distributed exec lock lease duration (ms). Lock auto-expires if the holder dies. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
+| `REDIS_EXEC_LOCK_RENEW_MS` | No (default: 20000) | Heartbeat interval for exec lock renewal (ms). Must be strictly less than `REDIS_EXEC_LOCK_LEASE_MS` to guarantee renewal fires before expiry. |
+| `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No (default: 300000) | Max time to wait to acquire the exec lock before returning 503 (ms). |
+| `REDIS_BLOB_CACHE_ENABLED` | No (default: true) | Set to `false` to disable the Redis blob cache. Blob reads always fall through to Postgres when disabled. |
+| `REDIS_BLOB_CACHE_TTL_MS` | No (default: 86400000) | TTL for blob cache entries (ms, default 24h). |
+| `REDIS_BLOB_MAX_BYTES` | No (default: 8388608) | Max blob size cached in Redis (bytes, default 8 MB). Blobs larger than this bypass Redis entirely. |
+| `REDIS_PATH_SNAPSHOT_ENABLED` | No (default: false) | Set to `true` to enable the Redis path snapshot cache. When enabled, cold-start pathCache is loaded from Redis instead of a full Postgres `loadAllPaths` scan. Requires `REDIS_URL`. |
+| `REDIS_PATH_SNAPSHOT_TTL_MS` | No (default: 3600000) | TTL for path snapshot entries (ms, default 1h). |
 
 ## File Layout
 

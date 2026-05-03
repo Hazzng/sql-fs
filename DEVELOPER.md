@@ -10,7 +10,7 @@ virtualFS is a **stateless HTTP server** backed by Postgres, with warm in-proces
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
-In-process caches (pathCache, contentCache) exist purely for speed during a single exec. Redis exists for two things: serializing requests across replicas, and caching blob bytes to avoid Postgres round-trips. If you dropped Redis and all in-process caches, the system would still be correct — just slower.
+In-process caches (pathCache, contentCache) exist purely for speed during a single exec. Redis exists for four things: serializing requests across replicas, tracking cache freshness via a version counter, caching blob bytes to avoid Postgres round-trips, and snapshotting the path tree to speed up cold starts. If you dropped Redis and all in-process caches, the system would still be correct — just slower.
 
 ---
 
@@ -55,6 +55,7 @@ SessionManager.withSession(tenantId, sandboxId, fn)
      │       if #dirty:
      │         INCR vfs:{tenant}:ver:{sandboxId}
      │         session.lastSeenVersion = newVersion
+     │         pathSnapshot.write(ver, pathCache) → Redis   ← cold-start cache (optional)
      │         clearDirty()
      │
      └─[7] Release Redis exec lock (Lua check-and-del)
@@ -141,6 +142,23 @@ Reads during an exec hit these at zero latency. They may be arbitrarily stale *b
 - **Size cap per entry:** `REDIS_BLOB_MAX_BYTES` (default 8 MB); larger blobs bypass Redis entirely to prevent a single large file from flushing the working set
 - **Eviction:** Redis `allkeys-lru` + per-key TTL (default 24 h)
 
+### L2b — Redis path snapshot
+
+- **Key:** `vfs:{tenant}:snap:{sandboxId}` → msgpack-encoded full `pathCache` with embedded version number
+- **Purpose:** cold-start optimization — lets a replica bootstrap its `pathCache` from Redis instead of running a full `loadAllPaths` Postgres CTE scan
+- **Write path:** `publishVersionIfDirty` (session-manager) → after `INCR ver`, writes the current `pathCache` to Redis via `pathSnapshot.write(tenantId, sandboxId, newVersion, pathCache)`. Only fires if `pathSnapshot` is configured.
+- **Read path:** `SqlFs.#loadFreshPathCache()` (called by `ready()` on session creation and `reload()` on cache refresh) → reads snapshot, checks embedded version matches `vfs:ver:{sandboxId}` exactly; any mismatch, miss, or Redis error falls through to `loadAllPaths` from Postgres
+- **Correctness:** the embedded version acts as a consistency guard — a snapshot is only used if it was written by the exact same exec that last bumped the version counter. Stale or partially-written snapshots are always rejected
+- **Failure mode:** all Redis errors fail open — `read` returns `null`, `write` logs and returns. The system falls back to Postgres silently
+- **TTL:** 1 hour (default); sandbox delete also calls `pathSnapshot.delete()` eagerly
+- **Enabled by:** set `REDIS_PATH_SNAPSHOT_ENABLED=true` (requires Redis to also be configured). `server.ts` constructs the `RedisPathSnapshot` instance and passes it to `SessionManager` when both conditions are met.
+
+```
+Cold start without snapshot:  session created → loadAllPaths (Postgres CTE, proportional to file count)
+Cold start with snapshot hit: session created → GET snap key → msgpack decode → pathCache ready
+Cold start with snapshot miss: snapshot absent or version mismatch → falls through to Postgres
+```
+
 ### L3 — Postgres
 
 Always the source of truth. Every mutation writes here first before any cache is updated. A cache miss at any layer falls through to Postgres.
@@ -213,6 +231,109 @@ Locks and caches are entirely per-sandbox. Requests on different sandboxes are a
 
 ---
 
+## Session Lifecycle
+
+### Creation
+
+`getOrCreate` builds a session lazily on first access for a `(tenantId, sandboxId)` pair. It constructs the `SqlFs` instance (which runs `loadAllPaths` or loads from path snapshot), creates a `Bash` instance with the filesystem wired in, reads the current version counter from Redis, and stores the session in the in-process map. Concurrent creation requests for the same sandbox coalesce onto a single `Promise` via the `pending` map — only one `SqlFs` + `Bash` is ever constructed.
+
+### Rehydration from cold storage
+
+`withSessionOrRehydrate` is used by exec routes. If the session is not in the in-process map (evicted or first access on this replica), it calls `getSandboxMetaFn` to restore owner and runtime flags (python/javascript) from Postgres, then constructs a **brand new** `SqlFs` + `Bash`. There is no reuse of the old instances — they were evicted and are gone.
+
+```
+Request hits Replica B, session not in memory
+  → getSandboxMetaFn(tenantId, sandboxId) → Postgres → { owner, python, javascript }
+  → getOrCreate → new SqlFs + new Bash   ← full construction, not reuse
+      → ready() → loadAllPaths from Postgres (or Redis snapshot if enabled)
+  → withSessionEntry → exec proceeds normally
+```
+
+What rehydration saves is knowing *which* owner and runtime flags to reconstruct with — the client does not need to re-specify them. It does not avoid the `SqlFs` initialization cost.
+
+**The actual cold-start speedup** comes from the path snapshot (`REDIS_PATH_SNAPSHOT_ENABLED=true`), not rehydration. Without the snapshot, `ready()` runs a full `loadAllPaths` Postgres CTE scan proportional to the number of files. With the snapshot, it becomes a single Redis GET + msgpack decode. Rehydration and path snapshot are complementary: rehydration restores metadata, the snapshot restores the path tree.
+
+### Eviction (reaper)
+
+A background reaper runs every 60s and evicts sessions that are either:
+- **Idle** — `now - lastUsed > idleMs` (default 600s)
+- **Over budget** — `pathCacheBytes > pathCacheMaxBytes` (default 50 MB); triggered when a sandbox has too many files to fit in the path cache
+
+Sessions with in-flight requests (`inFlight !== 0`) are never evicted. Eviction just removes the entry from the session map — the next request for that sandbox will rehydrate it from Postgres.
+
+### Content prewarm
+
+After the path cache is loaded, `SqlFs` spawns a background task that bulk-fetches all blob bytes for the sandbox from Postgres into the in-memory content cache in a single query. This avoids N individual `readFile` queries when a script reads many files on cold start. If `reload()` clears the cache while prewarm is running, a queued flag ensures a follow-up prewarm fires.
+
+---
+
+## Script Transaction Scope
+
+Every `bash.exec(script)` call on the Postgres backend is wrapped in a database transaction that spans the entire script. This is the `scriptTx` mechanism (`SessionScopedFs` + `IScriptTxFs`).
+
+```
+bash.exec(script)
+  → scriptTx.beginScope()     ← sets #scriptScope = true (no DB call yet)
+  → script runs:
+      first write → #openScriptTx() ← NOW opens the DB transaction (lazy)
+      subsequent writes reuse the same open transaction
+  → scriptTx.endScope()       ← COMMIT
+  on error:
+  → scriptTx.abortScope()     ← ROLLBACK + reload() to clear stale in-process caches
+```
+
+**What it buys:** if a script creates 5 files and then fails, all 5 writes are rolled back atomically. Without this, partial writes would persist. The script either fully succeeds or leaves no trace.
+
+**The transaction is lazy:** `beginScope()` only sets a flag. The actual DB transaction is opened on the first write operation inside `#withTx`. Read-only scripts never open a DB transaction at all — they just run through `#withReadTx` with no advisory lock.
+
+**What it does NOT change:** the three lock layers still operate identically. The transaction scope is an additional DB-level atomicity guarantee layered on top of the existing locking.
+
+**Backend support:** the session manager duck-types the `IFileSystem` instance for `IScriptTxFs` at session creation time. `SqlFs` always implements it, so `scriptTx` is always active in production. If the backend doesn't support it (e.g., `InMemoryFs` in tests), `scriptTx` is `undefined` and `bash.exec` runs without the transaction wrapper.
+
+---
+
+## Runtime Semaphores
+
+Two per-replica semaphores cap concurrent CPU-intensive language runtimes:
+
+| Semaphore | Default limit | Trigger condition |
+|---|---|---|
+| `pythonSem` | 5 | script text matches `\bpython3?\b` and session has `python: true` |
+| `jsSem` | 5 | script text matches `\bjs-exec\b` or `\bnode\b` and session has `javascript: true` |
+
+Before calling `bash.exec`, `execWithRuntimeThrottle` acquires the relevant slot(s). Excess requests queue on the semaphore's `waiters` array and fire FIFO as slots free. Slots are always released in `finally`.
+
+**Why this matters:** CPython WASM workers consume ~80 MB each; QuickJS workers ~64 MB each. Without a cap, 20 concurrent Python scripts on one replica would consume 1.6 GB and likely OOM. Bash-only scripts are completely unaffected — they bypass both semaphores.
+
+**Scope:** per-replica, not global. A fleet of 3 replicas has an effective Python concurrency of 15.
+
+---
+
+## Multi-Tenancy
+
+### Two modes
+
+**Single-tenant (default):** set `DATABASE_URL`. The connection string is registered under the fixed tenant id `"default"`. All sandboxes share one Postgres database, isolated by RLS on `sandbox_id`. `tenantId` is always `"default"` — the multi-tenant machinery is present but a no-op.
+
+**Multi-tenant:** set `TENANT_DATABASES` as a JSON object:
+```
+TENANT_DATABASES={"acme":"postgres://acme-db/...", "widgets":"postgres://widgets-db/..."}
+```
+Each tenant maps to a separate Postgres database. Per-tenant connection pools are lazily constructed on first access and cached for the lifetime of the process. `DATABASE_URL` is ignored when `TENANT_DATABASES` is set.
+
+### Isolation layers
+
+Every session key, Redis key, and exec lock key is prefixed with `tenantId` so the isolation holds even when tenants share the same Redis instance:
+
+| Layer | Isolation mechanism |
+|---|---|
+| Session map | Key is `${tenantId}:${sandboxId}` |
+| Redis keys | All prefixed `vfs:{tenant}:...` |
+| Postgres | Separate database per tenant (multi-tenant mode); RLS on `sandbox_id` within each database |
+| Exec lock | Key includes `tenantId` — no cross-tenant lock contention |
+
+---
+
 ## What Is NOT Guaranteed
 
 **Multi-step client atomicity.** The lock is acquired and released per `exec` call, not across your entire agent session. Two separate exec calls with logic in between leave a window where another agent can slip in:
@@ -239,6 +360,19 @@ echo $new > balance.txt
 
 ---
 
+## Redis Key Inventory
+
+All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
+
+| Key pattern | Type | Purpose | Written by | Read by |
+|---|---|---|---|---|
+| `vfs:{tenant}:lock:{sandboxId}` | string (token) | Distributed exec mutex — one replica holds exec at a time | `withDistributedLock` (SET NX PX) | `withDistributedLock` (Lua renew + release) |
+| `vfs:{tenant}:ver:{sandboxId}` | integer | Monotonic version counter — cache freshness signal | `publishVersionIfDirty` (INCR) | `ensureFreshCache` (GET), `#loadFreshPathCache` (GET) |
+| `vfs:{tenant}:blob:{sha256hex}` | bytes | Blob content cache — avoids Postgres round-trips for file reads | `PostgresDialect.upsertBlob` (fire-and-forget SET) | `PostgresDialect.getBlob` (GET before Postgres) |
+| `vfs:{tenant}:snap:{sandboxId}` | bytes (msgpack) | Path snapshot — cold-start pathCache bootstrap | `publishVersionIfDirty` → `pathSnapshot.write` | `SqlFs.#loadFreshPathCache` → `pathSnapshot.read` |
+
+---
+
 ## Key Source Files
 
 | File | What it does |
@@ -248,6 +382,29 @@ echo $new > balance.txt
 | `src/fs/sql-fs/dialects/postgres.ts` | Postgres dialect — `setSandboxContext` (RLS + advisory lock), blob cache read/write, all SQL |
 | `src/fs/sql-fs/session-scoped-fs.ts` | `ICoherentFs` interface — `reload`, `wasDirty`, `clearDirty` |
 | `src/fs/sql-fs/redis-blob-cache.ts` | Redis blob cache — `get`/`set` with TTL and size cap |
-| `src/fs/sql-fs/redis-path-snapshot.ts` | Version key helpers; path snapshot (off by default) |
+| `src/fs/sql-fs/redis-path-snapshot.ts` | Version key helpers; path snapshot — cold-start pathCache bootstrap from Redis (off by default) |
 | `src/api/routes/exec.ts` | HTTP exec routes — funnels through `withSession` |
 | `tasks/arch-redis-caching-and-locking.md` | Full design doc for the multi-replica architecture |
+
+---
+
+## Consensus Algorithm Discussion
+
+virtualFS does not implement a consensus algorithm (Raft, Paxos, or similar). This is a deliberate design choice, not an oversight.
+
+Consensus algorithms are needed when multiple nodes must agree on a sequence of writes with no single authoritative source. virtualFS avoids that requirement entirely by keeping Postgres as the single authoritative source and serializing all writes to a sandbox through a single exec lock at any given time.
+
+Each concern that consensus typically solves is handled more simply here:
+
+| Concern | Consensus approach | virtualFS approach |
+|---|---|---|
+| Leader election | Raft leader vote, quorum | Redis `SET NX` — whoever wins the atomic SET owns the exec |
+| Distributed state agreement | Log replication across nodes | Version counter (`INCR ver`) + reload from Postgres on mismatch |
+| Conflict resolution | Consensus on write order | Not needed — exec serialization prevents concurrent writes to the same sandbox |
+| Partition tolerance | Quorum reads/writes | Fail closed → 503 when Redis is unreachable (CP, not AP) |
+
+**Why this works here but wouldn't in the general case:**
+
+The key constraint is that all writes to a sandbox are serialized through a single exec at a time (Lock 2). This collapses the consistency requirement from *continuous* (nodes must agree at all times) to *exec-boundary only* (a replica only needs a fresh view at the start of each exec). A single monotonic integer answers that in one Redis GET — no voting, no quorum, no log replication.
+
+If the workload ever required two replicas to concurrently write the same sandbox, this model would break and a stronger coordination mechanism would be needed. The architecture avoids that requirement by design.
