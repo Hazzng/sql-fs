@@ -82,6 +82,20 @@ Three locks work together. Each is the fallback for the one above it.
 - **Held for:** entire `withSession` callback (wraps bash.exec + pre/post logic)
 - **Purpose:** only one replica runs exec for a given sandbox at a time
 - **Failure mode:** if a GC pause exceeds the lease interval, the lock expires and another replica can acquire. Lock 3 catches the resulting DB-level race. This is an accepted trade-off — data integrity is preserved but script atomicity for that one request is not.
+- **`LockLostError` is post-hoc, not preventive:** the heartbeat sets `lost = true` when the renew Lua script returns 0 (key no longer holds our token), but `lost` is only checked *after* `fn()` completes (`distributed-lock.ts:137`). By the time `LockLostError` is thrown, the bash script has already finished executing — including any DB writes — and Replica B has already been running concurrently. The error tells the caller the result is unreliable; it does not interrupt execution mid-script. Interrupting `fn()` mid-execution would leave `SqlFs` in a half-written state, which is worse than letting it finish and surfacing the error after.
+
+  ```
+  t=0s    Replica A acquires lock (leaseMs=60s)
+  t=20s   heartbeat fires → RENEW_SCRIPT returns 1 ✓
+  t=40s   heartbeat fires → RENEW_SCRIPT returns 1 ✓
+          ← Node.js GC pause starts (or Redis outage)
+  t=60s   lease expires — Replica B acquires the lock
+  t=60s   heartbeat fires → RENEW_SCRIPT returns 0 (key now holds B's token)
+          → lost = true
+          ← GC pause ends, Replica A resumes
+  t=61s   fn() finishes
+  t=61s   if (lost) throw new LockLostError  ← thrown here, but overlap already happened
+  ```
 - **Redis down:** fail closed → 503. Mutating endpoints never proceed without this lock.
 
 ### Lock 3 — `pg_advisory_xact_lock` (database)
