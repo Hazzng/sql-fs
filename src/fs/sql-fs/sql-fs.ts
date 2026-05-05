@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
+import { DefenseInDepthBox } from "just-bash";
 import { LRUCache } from "lru-cache";
 
 import {
@@ -179,12 +180,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
-			return fn(this.#scriptTx!);
+			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
 		}
-		return this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
-			return await fn(tx);
-		});
+		return DefenseInDepthBox.runTrustedAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				return await fn(tx);
+			}),
+		);
 	}
 
 	/**
@@ -194,12 +197,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope && this.#scriptTx !== undefined) {
-			return fn(this.#scriptTx);
+			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
 		}
-		return this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-			return await fn(tx);
-		});
+		return DefenseInDepthBox.runTrustedAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+				return await fn(tx);
+			}),
+		);
 	}
 
 	async #openScriptTx(): Promise<void> {
@@ -217,16 +222,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#scriptTxEnd = resolveEnd;
 		this.#scriptTxAbort = rejectEnd;
 
-		this.#scriptTxPromise = this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
-			this.#scriptTx = tx;
-			resolveTxReady();
-			await endPromise;
-		});
+		const scriptTxPromise = DefenseInDepthBox.runTrustedAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				this.#scriptTx = tx;
+				resolveTxReady();
+				await endPromise;
+			}),
+		);
+		this.#scriptTxPromise = scriptTxPromise;
 		// Guard against unhandled rejection if the connection closes before endScriptScope/abortScriptScope.
 		// endScriptScope still sees the rejection via `await this.#scriptTxPromise` because .catch() creates
 		// a new derived chain without affecting the original promise's rejected state.
-		this.#scriptTxPromise.catch(() => {});
+		scriptTxPromise.catch(() => {});
 
 		// Race txReady against #scriptTxPromise so that a connection failure before
 		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
@@ -240,9 +248,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		// here would deadlock trying to acquire the same lock. Route through the existing script-tx.
 		// When no script-tx is open yet, use a fresh transaction (original behavior, no extra RTT).
 		if (this.#scriptTx !== undefined) {
-			return fn(this.#scriptTx);
+			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
 		}
-		return this.#dialect.transaction(fn);
+		return DefenseInDepthBox.runTrustedAsync(() => this.#dialect.transaction(fn));
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -382,7 +390,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		const cap = this.#contentCache.maxSize;
 		const task = (async (): Promise<void> => {
 			try {
-				const blobs = await this.#dialect.getBlobsForSandbox(this.#sandboxId, cap);
+				const blobs = await DefenseInDepthBox.runTrustedAsync(() =>
+					this.#dialect.getBlobsForSandbox(this.#sandboxId, cap),
+				);
 				for (const { inodeId, data } of blobs) {
 					if (data.byteLength > 0) this.#contentCache.set(inodeId, data);
 				}
@@ -867,7 +877,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		}
 
 		// `blobs` is global (no RLS), so a transaction wrapper is unnecessary.
-		const data = await this.#dialect.getBlobNoTx(entry.contentSha256!);
+		const data = await DefenseInDepthBox.runTrustedAsync(() => this.#dialect.getBlobNoTx(entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
