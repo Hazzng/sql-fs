@@ -15,8 +15,7 @@
 import { Mutex } from "async-mutex";
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
-import type { ExecOptions, IFileSystem } from "just-bash";
-import type { BashExecResult } from "just-bash";
+import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem } from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
@@ -142,6 +141,19 @@ export interface SessionManagerOptions {
 	 * optionally filtered by owner.
 	 */
 	readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
+	/**
+	 * Override for `JUST_BASH_DEFENSE_IN_DEPTH` env var — used by tests and
+	 * non-default configurations. When `true`, enables just-bash's defense-in-depth
+	 * security layer on each `Bash` instance. Requires all DB calls to be wrapped
+	 * in `DefenseInDepthBox.runTrustedAsync` (Phase 1).
+	 */
+	readonly defenseInDepth?: boolean;
+	/**
+	 * Override for `JUST_BASH_DEFENSE_AUDIT_MODE` env var. When `true` (default),
+	 * violations are logged but not thrown — safe for initial rollout observation.
+	 * Flip to `false` once logs are clean to enforce the security boundary.
+	 */
+	readonly defenseAuditMode?: boolean;
 }
 
 interface Semaphore {
@@ -171,6 +183,8 @@ export class SessionManager {
 
 	private readonly pythonSem: Semaphore;
 	private readonly jsSem: Semaphore;
+	private readonly defenseInDepth: boolean;
+	private readonly defenseAuditMode: boolean;
 
 	constructor({
 		tenantConfig,
@@ -187,6 +201,8 @@ export class SessionManager {
 		getSandboxMetaFn,
 		persistSandboxMetaFn,
 		listSandboxesFn,
+		defenseInDepth,
+		defenseAuditMode,
 	}: SessionManagerOptions) {
 		this.tenantConfig = tenantConfig;
 		this.createFsOverride = createFs;
@@ -216,6 +232,8 @@ export class SessionManager {
 			inFlight: 0,
 			waiters: [],
 		};
+		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
+		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -296,10 +314,14 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			try {
 				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
+				const defenseInDepthConfig: DefenseInDepthConfig | undefined = this.defenseInDepth
+					? { enabled: true, auditMode: this.defenseAuditMode }
+					: undefined;
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
+					defenseInDepth: defenseInDepthConfig,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
