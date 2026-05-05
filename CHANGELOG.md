@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-06
+
+### Added
+
+- Defense-in-depth security layer for just-bash execution: opt-in via `JUST_BASH_DEFENSE_IN_DEPTH=true`. When enabled, just-bash monkey-patches host globals (`setTimeout`, `eval`, `Function`, dynamic `import`) during `bash.exec` to prevent sandbox escape. All Postgres I/O chokepoints (`#withTx`, `#withReadTx`, `#withBareTx`, `getBlobNoTx`) are wrapped in `DefenseInDepthBox.runTrustedAsync` to keep DB access functional.
+- `JUST_BASH_DEFENSE_AUDIT_MODE` env var (default `true`): controls whether violations throw (`false`) or are logged only (`true`). Recommended rollout: enable with audit mode on, watch for `defense_in_depth_violation` logs, then flip to enforce mode once clean.
+- Structured violation logging: violations emit a JSON line `{ event: "defense_in_depth_violation", sandboxId, ... }` via `onViolation` callback for easy grep/alerting.
+
 ## [0.2.15] - 2026-05-02
 
 ### Fixed

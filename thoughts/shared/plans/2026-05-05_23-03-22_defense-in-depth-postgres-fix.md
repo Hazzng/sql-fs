@@ -353,8 +353,8 @@ Per `CLAUDE.md` "Changelog & Version Bump Requirement": minor bump (new feature)
 ### Phase 5: Success Criteria
 
 #### Phase 5: Automated Verification
-- [ ] `pnpm install --lockfile-only` produces only the version diff.
-- [ ] All four version sites match.
+- [x] `pnpm install --lockfile-only` produces only the version diff.
+- [x] All four version sites match.
 
 #### Phase 5: Manual Verification
 - [ ] CHANGELOG entry under `Added` reads clearly to a future reader.
