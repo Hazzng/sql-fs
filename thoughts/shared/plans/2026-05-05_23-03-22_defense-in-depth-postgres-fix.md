@@ -339,7 +339,7 @@ Document the two new env vars and the rollout posture.
 ### Phase 4: Success Criteria
 
 #### Phase 4: Automated Verification
-- [ ] No automated check.
+- [x] No automated check.
 
 #### Phase 4: Manual Verification
 - [ ] CLAUDE.md renders cleanly; the two new rows are in the env table; the security note matches the actual implementation.

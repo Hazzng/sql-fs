@@ -140,6 +140,7 @@ blobs (sha256, data, size)  — content-addressable, global dedup
 - **Auth:** Every `/v1/*` route requires Bearer token. Validate before any DB access.
 - **SQL injection:** Use parameterized queries only. Never interpolate user input into SQL strings. The `postgres` driver's tagged templates and Drizzle's query builder handle this automatically — do not bypass them with raw string concatenation.
 - **Prototype pollution:** Use `Object.create(null)` for objects with user-controlled keys. Use `Map` where possible.
+- **Defense-in-depth:** Opt-in via `JUST_BASH_DEFENSE_IN_DEPTH=true`. When enabled, just-bash monkey-patches host globals (`setTimeout`, `eval`, `Function`, dynamic `import`) during `bash.exec`. All Postgres I/O chokepoints (`#withTx`, `#withReadTx`, `#withBareTx`, `getBlobNoTx`) are wrapped in `DefenseInDepthBox.runTrustedAsync` to bypass the patch. When adding new dialects (MySQL, Azure SQL), this wrapping must be preserved — omitting it will throw `WorkerSecurityViolationError` at runtime.
 
 ### Null Prototype Objects
 
@@ -213,6 +214,8 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `REDIS_BLOB_MAX_BYTES` | No (default: 8388608) | Max blob size cached in Redis (bytes, default 8 MB). Blobs larger than this bypass Redis entirely. |
 | `REDIS_PATH_SNAPSHOT_ENABLED` | No (default: false) | Set to `true` to enable the Redis path snapshot cache. When enabled, cold-start pathCache is loaded from Redis instead of a full Postgres `loadAllPaths` scan. Requires `REDIS_URL`. |
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No (default: 3600000) | TTL for path snapshot entries (ms, default 1h). |
+| `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |
+| `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
 
 ## File Layout
 
