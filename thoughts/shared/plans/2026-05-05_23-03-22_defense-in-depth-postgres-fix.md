@@ -293,15 +293,23 @@ describe.skipIf(!process.env.DATABASE_URL)("defenseInDepth + Postgres", () => {
 ### Phase 3: Success Criteria
 
 #### Phase 3: Automated Verification
-- [ ] `DATABASE_URL=... pnpm test:integration` runs the new test green.
-- [ ] Without `DATABASE_URL`, the test is skipped (not failed).
+- [x] `DATABASE_URL=... pnpm test:integration` runs the new test green.
+- [x] Without `DATABASE_URL`, the test is skipped (not failed).
 
 #### Phase 3: Manual Verification
 - [ ] Temporarily revert Phase 1 wrappers — confirm the new test fails with `WorkerSecurityViolationError`. Re-apply Phase 1 — green again.
 
 ### Phase 3: Discoveries and Notable Information
 
-[Filled by implementing agent.]
+**Technical Discoveries:**
+- The `integration/` directory under `src/fs/sql-fs/` does not exist as a top-level sibling — the plan's stated file path (`src/fs/sql-fs/integration/`) is wrong. Existing integration tests live under `src/fs/sql-fs/tests/integration/`. Placed new file there for consistency.
+- `Bash` from `just-bash` accepts `defenseInDepth: { enabled: true, auditMode: false }` — the `enabled` field is required alongside `auditMode`; the plan scaffold omitted it.
+- `createdSandboxIds` array pattern (push + splice in `afterEach`) is cleaner than a single shared `sandboxId` because each test creates its own sandbox; the plan scaffold reused one id across all tests which would cause `EEXIST` on the second `createPostgresSandboxFs` call for the same sandbox.
+
+**Implementation Adaptations:**
+- Used `{ enabled: true, auditMode: false }` on `defenseInDepth` config to match just-bash's `DefenseInDepthConfig` interface.
+- Each test creates its own sandbox via a helper `makeSandboxId()` to avoid cross-test collisions.
+- Biome auto-organised the `vitest` import to follow `just-bash` alphabetically (import reorder).
 
 ---
 

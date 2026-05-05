@@ -319,9 +319,7 @@ export class SessionManager {
 							enabled: true,
 							auditMode: this.defenseAuditMode,
 							onViolation: (v: SecurityViolation) =>
-								console.log(
-									JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v }),
-								),
+								console.log(JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v })),
 						}
 					: undefined;
 				const bash = new Bash({
