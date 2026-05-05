@@ -227,9 +227,9 @@ The exact shape of `DefenseInDepthConfig` is described in `node_modules/just-bas
 ### Phase 2: Success Criteria
 
 #### Phase 2: Automated Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm test:unit` passes
-- [ ] Existing API e2e tests in `src/api/tests/` pass with no env flag set (default-off path)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm test:unit` passes
+- [x] Existing API e2e tests in `src/api/tests/` pass with no env flag set (default-off path)
 
 #### Phase 2: Manual Verification
 - [ ] With `JUST_BASH_DEFENSE_IN_DEPTH=true JUST_BASH_DEFENSE_AUDIT_MODE=true pnpm dev`, run a script that does `echo hi > /tmp/x && cat /tmp/x` against the dev Postgres — output is `hi` and any violations appear as warnings in logs without breaking the request.
@@ -237,7 +237,13 @@ The exact shape of `DefenseInDepthConfig` is described in `node_modules/just-bas
 
 ### Phase 2: Discoveries and Notable Information
 
-[Filled by implementing agent.]
+**Technical Discoveries:**
+- `createConsoleViolationCallback()` from `just-bash` uses `console.warn` and plain multi-line text, not structured JSON — not suitable for machine-greppable logs.
+- `SecurityViolation` type is importable directly from `"just-bash"` alongside `DefenseInDepthConfig`.
+
+**Implementation Adaptations:**
+- Used a custom inline `onViolation` callback (`console.log(JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v }))`) instead of `createConsoleViolationCallback` to emit structured, greppable log lines. The `sandboxId` is included for correlation.
+- All Phase 2 code was already committed (commit `b9219ec`) before this session; only the `onViolation` wiring was missing.
 
 ---
 

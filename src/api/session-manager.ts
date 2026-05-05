@@ -15,7 +15,7 @@
 import { Mutex } from "async-mutex";
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
-import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem } from "just-bash";
+import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
@@ -315,7 +315,14 @@ export class SessionManager {
 			try {
 				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
 				const defenseInDepthConfig: DefenseInDepthConfig | undefined = this.defenseInDepth
-					? { enabled: true, auditMode: this.defenseAuditMode }
+					? {
+							enabled: true,
+							auditMode: this.defenseAuditMode,
+							onViolation: (v: SecurityViolation) =>
+								console.log(
+									JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v }),
+								),
+						}
 					: undefined;
 				const bash = new Bash({
 					fs,
