@@ -5,6 +5,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { DefenseInDepthBox } from "just-bash";
 import postgres from "postgres";
 import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
@@ -38,11 +39,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Connection ────────────────────────────────────────────────────────────────
 
 	async connect(): Promise<void> {
-		this.pool = postgres(this.connectionString, { prepare: false });
+		this.pool = await DefenseInDepthBox.runTrustedAsync(() =>
+			Promise.resolve(postgres(this.connectionString, { prepare: false })),
+		);
 	}
 
 	async disconnect(): Promise<void> {
-		await this.pool?.end();
+		await DefenseInDepthBox.runTrustedAsync(() => this.pool?.end() ?? Promise.resolve());
 		this.pool = null;
 	}
 
