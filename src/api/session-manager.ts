@@ -314,14 +314,14 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			try {
 				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
-				const defenseInDepthConfig: DefenseInDepthConfig | undefined = this.defenseInDepth
+				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
 					? {
 							enabled: true,
 							auditMode: this.defenseAuditMode,
 							onViolation: (v: SecurityViolation) =>
 								console.log(JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v })),
 						}
-					: undefined;
+					: false;
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
