@@ -30,7 +30,7 @@ describe("SessionManager defense-in-depth wiring", () => {
 
 	it("default (no env var, no override) is disabled and passes false", async () => {
 		const prev = process.env.JUST_BASH_DEFENSE_IN_DEPTH;
-		delete process.env.JUST_BASH_DEFENSE_IN_DEPTH;
+		process.env.JUST_BASH_DEFENSE_IN_DEPTH = undefined;
 		try {
 			const sm = new SessionManager({
 				createFs: async () => new InMemoryFs(),
