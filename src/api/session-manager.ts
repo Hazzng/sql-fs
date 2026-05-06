@@ -23,6 +23,7 @@ import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
+import { logAudit } from "./lib/audit.js";
 import type { TenantConfig } from "./tenants.js";
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
@@ -144,8 +145,7 @@ export interface SessionManagerOptions {
 	/**
 	 * Override for `JUST_BASH_DEFENSE_IN_DEPTH` env var — used by tests and
 	 * non-default configurations. When `true`, enables just-bash's defense-in-depth
-	 * security layer on each `Bash` instance. Requires all DB calls to be wrapped
-	 * in `DefenseInDepthBox.runTrustedAsync` (Phase 1).
+	 * security layer on each `Bash` instance.
 	 */
 	readonly defenseInDepth?: boolean;
 	/**
@@ -318,8 +318,7 @@ export class SessionManager {
 					? {
 							enabled: true,
 							auditMode: this.defenseAuditMode,
-							onViolation: (v: SecurityViolation) =>
-								console.log(JSON.stringify({ event: "defense_in_depth_violation", sandboxId, ...v })),
+							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
 						}
 					: false;
 				const bash = new Bash({
