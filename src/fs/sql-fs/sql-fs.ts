@@ -180,7 +180,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
-			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
+			const tx = this.#scriptTx as Tx;
+			return DefenseInDepthBox.runTrustedAsync(() => fn(tx));
 		}
 		return DefenseInDepthBox.runTrustedAsync(() =>
 			this.#dialect.transaction(async (tx) => {
@@ -196,8 +197,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-		if (this.#scriptScope && this.#scriptTx !== undefined) {
-			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
+		const scriptTx = this.#scriptTx;
+		if (this.#scriptScope && scriptTx !== undefined) {
+			return DefenseInDepthBox.runTrustedAsync(() => fn(scriptTx));
 		}
 		return DefenseInDepthBox.runTrustedAsync(() =>
 			this.#dialect.transaction(async (tx) => {
@@ -247,8 +249,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		// When the script-tx is already open it holds the advisory lock — starting a new transaction
 		// here would deadlock trying to acquire the same lock. Route through the existing script-tx.
 		// When no script-tx is open yet, use a fresh transaction (original behavior, no extra RTT).
-		if (this.#scriptTx !== undefined) {
-			return DefenseInDepthBox.runTrustedAsync(() => fn(this.#scriptTx!));
+		const scriptTx = this.#scriptTx;
+		if (scriptTx !== undefined) {
+			return DefenseInDepthBox.runTrustedAsync(() => fn(scriptTx));
 		}
 		return DefenseInDepthBox.runTrustedAsync(() => this.#dialect.transaction(fn));
 	}

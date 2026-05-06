@@ -1,8 +1,8 @@
 /**
  * Integration tests: DefenseInDepth + Postgres SqlFs.
  *
- * Proves that the DefenseInDepthBox.runTrustedAsync wrappers applied in Phase 1
- * prevent WorkerSecurityViolationError for common filesystem operations when
+ * Proves that the DefenseInDepthBox.runTrustedAsync wrappers prevent
+ * WorkerSecurityViolationError for common filesystem operations when
  * defenseInDepth is enabled and auditMode is false.
  *
  * Skipped when DATABASE_URL is not set so CI without a DB still passes.
