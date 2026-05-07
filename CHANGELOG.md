@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-05-07
+
+### Added
+
+- Synchronous blob pre-fetch on cold-start snapshot hit: when `REDIS_PATH_SNAPSHOT_ENABLED=true` and `REDIS_BLOB_CACHE_ENABLED=true`, `SqlFs.ready()` now issues a single Redis `mget` for all file-inode sha256s from the path snapshot before returning the session to the caller. This eliminates the race window where `readFile` calls during background prewarm each paid an individual Postgres round-trip. Background prewarm (`getBlobsForSandbox`) continues to fire as the Postgres fallback for blobs not yet in Redis.
+
 ## [0.2.16] - 2026-05-06
 
 ### Added

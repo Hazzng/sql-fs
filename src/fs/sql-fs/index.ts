@@ -73,6 +73,7 @@ export async function createPostgresSandboxFs(
 		tenantId: opts.tenantId,
 		redis: opts.redis,
 		pathSnapshot: opts.pathSnapshot,
+		blobCache: opts.blobCache,
 	});
 	await fs.ready();
 	return { fs, resolvedOwner };
