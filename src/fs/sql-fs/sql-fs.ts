@@ -22,6 +22,7 @@ import {
 	createEnotempty,
 	createEperm,
 } from "./errors.js";
+import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
 import { type BulkIngestFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
@@ -79,6 +80,13 @@ interface SqlFsOptions<Tx> {
 	readonly redis?: Redis;
 	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
 	readonly pathSnapshot?: RedisPathSnapshot;
+	/**
+	 * Tenant-scoped Redis blob cache. When set alongside `pathSnapshot`, a
+	 * synchronous `mget` pre-populates `contentCache` on snapshot hit before
+	 * `ready()` returns — eliminating the race window between session handoff
+	 * and background prewarm completion.
+	 */
+	readonly blobCache?: RedisBlobCache;
 }
 
 /**
@@ -120,6 +128,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #allowSymlinks: boolean;
 	readonly #redis: Redis | undefined;
 	readonly #pathSnapshot: RedisPathSnapshot | undefined;
+	readonly #blobCache: RedisBlobCache | undefined;
 	#dirty = false;
 	/**
 	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
@@ -151,6 +160,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
 		this.#redis = opts.redis;
 		this.#pathSnapshot = opts.pathSnapshot;
+		this.#blobCache = opts.blobCache;
 		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
@@ -340,7 +350,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * `vfs:{tenantId}:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
 	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
-	async #loadFreshPathCache(): Promise<Map<string, PathCacheEntry>> {
+	async #loadFreshPathCache(): Promise<{ entries: Map<string, PathCacheEntry>; fromSnapshot: boolean }> {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
@@ -360,7 +370,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 							entries: snap.entries.size,
 						}),
 					);
-					return snap.entries;
+					return { entries: snap.entries, fromSnapshot: true };
 				}
 			} catch (err) {
 				missReason = "error";
@@ -374,15 +384,52 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 			}
 		}
 		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
-		const entries = await this.#dialect.transaction(async (tx) => {
+		const rows = await this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 			return await this.#dialect.loadAllPaths(tx);
 		});
 		const fresh = new Map<string, PathCacheEntry>();
-		for (const { path, ...entry } of entries) {
+		for (const { path, ...entry } of rows) {
 			fresh.set(path, entry);
 		}
-		return fresh;
+		return { entries: fresh, fromSnapshot: false };
+	}
+
+	/**
+	 * Synchronously pre-populates `#contentCache` from Redis blob cache using a
+	 * single `mget` round-trip. Called on snapshot hit before `ready()` returns,
+	 * eliminating the race window where exec reads files before background
+	 * prewarm completes. Fails open: any Redis error is logged; background
+	 * prewarm covers the rest via Postgres.
+	 */
+	async #prefetchBlobsFromSnapshot(entries: Map<string, PathCacheEntry>): Promise<void> {
+		if (this.#blobCache === undefined) return;
+		const inodeIds: bigint[] = [];
+		const sha256s: Uint8Array[] = [];
+		for (const entry of entries.values()) {
+			if (entry.kind === INODE_KIND.FILE && entry.contentSha256 !== null) {
+				inodeIds.push(entry.inodeId);
+				sha256s.push(entry.contentSha256);
+			}
+		}
+		if (sha256s.length === 0) return;
+		const blobs = await this.#blobCache.mget(sha256s);
+		let hits = 0;
+		for (let i = 0; i < blobs.length; i++) {
+			const data = blobs[i];
+			if (data != null && data.byteLength > 0) {
+				this.#contentCache.set(inodeIds[i]!, data);
+				hits++;
+			}
+		}
+		console.log(
+			JSON.stringify({
+				event: "snapshot_blob_prefetch_ok",
+				sandboxId: this.#sandboxId,
+				requested: sha256s.length,
+				hits,
+			}),
+		);
 	}
 
 	#startPrewarm(queueIfRunning = false): void {
@@ -425,12 +472,21 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	 * via a single recursive CTE query.  Must be called once before any FS op.
 	 */
 	async ready(): Promise<void> {
-		// Background; ready() must not block on prewarm.
+		// Speculative background Postgres prewarm starts in parallel with pathCache
+		// load. Covers blobs not in Redis and the non-snapshot path.
 		this.#startPrewarm();
 
-		const fresh = await this.#loadFreshPathCache();
+		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
 		this.#pathCache.clear();
-		for (const [p, e] of fresh) this.#pathCache.set(p, e);
+		for (const [p, e] of entries) this.#pathCache.set(p, e);
+
+		// On snapshot hit: synchronous Redis mget pre-populates contentCache before
+		// this method returns, eliminating the race window for Redis-cached blobs.
+		// Only fires when both REDIS_PATH_SNAPSHOT_ENABLED and REDIS_BLOB_CACHE_ENABLED
+		// are true (i.e. pathSnapshot and blobCache are both configured).
+		if (fromSnapshot) {
+			await this.#prefetchBlobsFromSnapshot(entries);
+		}
 	}
 
 	/**
@@ -451,9 +507,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		}
 		const p = (async (): Promise<void> => {
 			try {
-				const fresh = await this.#loadFreshPathCache();
+				const { entries } = await this.#loadFreshPathCache();
 				this.#pathCache.clear();
-				for (const [path, entry] of fresh) this.#pathCache.set(path, entry);
+				for (const [path, entry] of entries) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
 				this.#startPrewarm(true);
