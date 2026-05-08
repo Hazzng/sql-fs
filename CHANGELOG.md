@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-05-08
+
+### Changed
+
+- Updated `just-bash` from `2.14.2` → `2.14.5` (latest stable). Patch releases include upstream bugfixes and stability improvements to the WASM bash runtime.
+
 ## [0.2.16] - 2026-05-06
 
 ### Added
