@@ -147,7 +147,11 @@ export async function withDistributedLock<T>(
 			} catch {
 				lost = true;
 			}
-			if (!stopped) scheduleRenew();
+			// Once the lock is lost (or a renew has timed out), stop scheduling
+			// further renewals. Otherwise on a hung Redis we'd keep enqueuing
+			// EVAL commands every renewMs that pile up in the ioredis send queue
+			// while their predecessors are still in-flight.
+			if (!stopped && !lost) scheduleRenew();
 		}, renewMs);
 	};
 	scheduleRenew();

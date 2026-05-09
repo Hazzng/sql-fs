@@ -165,6 +165,23 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
+		// Reject oversized uploads up-front via Content-Length so we never buffer
+		// a too-large body into memory.
+		const contentLength = c.req.header("content-length");
+		if (contentLength !== undefined) {
+			const declared = Number(contentLength);
+			if (Number.isFinite(declared) && declared > MAX_RAW_FILE_WRITE_BYTES) {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`File body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
+		}
+
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
 		if (content.byteLength > MAX_RAW_FILE_WRITE_BYTES) {

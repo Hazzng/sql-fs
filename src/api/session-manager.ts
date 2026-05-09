@@ -335,6 +335,9 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
 	): Promise<Session> {
+		if (this.shuttingDown) {
+			throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
+		}
 		const key = this.sessionKey(tenantId, sandboxId);
 		const existing = this.sessions.get(key);
 		if (existing !== undefined) {
@@ -381,6 +384,12 @@ export class SessionManager {
 					}
 				}
 
+				// Shutdown may have begun while buildFs() was running. If so, refuse
+				// to register the session — shutdown's snapshot has already been
+				// taken and would never see this fs, leaking its dialect pool.
+				if (this.shuttingDown) {
+					throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
+				}
 				const session: Session = {
 					fs,
 					bash,
@@ -805,8 +814,20 @@ export class SessionManager {
 			if (session.state === "closing") continue;
 			if (session.inFlight !== 0) continue;
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
+				// Mark closing FIRST so any request that already captured this
+				// session reference but hasn't yet entered the mutex will
+				// observe ESESSIONCLOSING in withSessionEntry instead of running
+				// against a disconnected filesystem.
+				session.state = "closing";
 				this.sessions.delete(key);
-				void this.disconnectFs(session.fs);
+				void session.mutex
+					.runExclusive(async () => {
+						/* drain queued waiters; they will throw ESESSIONCLOSING */
+					})
+					.catch(() => {})
+					.finally(() => {
+						void this.disconnectFs(session.fs);
+					});
 			}
 		}
 	}
