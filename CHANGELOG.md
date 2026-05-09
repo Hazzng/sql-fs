@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.18] - 2026-05-09
+
+### Fixed
+
+- Connection leak: `SessionManager.destroy()` and the idle-session reaper now call `dialect.disconnect()` on the evicted session's `SqlFs`, releasing the Postgres connection pool back to the server. Previously, sandbox deletion left pools open indefinitely until process exit.
+- Added `SqlFs.disconnect()` as a thin public wrapper over `dialect.disconnect()` to support clean teardown without exposing the dialect directly.
+
 ## [0.2.17] - 2026-05-07
 
 ### Added

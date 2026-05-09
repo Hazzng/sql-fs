@@ -590,6 +590,7 @@ export class SessionManager {
 				if (this.pathSnapshot !== undefined) {
 					await this.pathSnapshot.delete(tenantId, sandboxId);
 				}
+				await this.disconnectFs(session.fs);
 			});
 			session.destroyPromise = p;
 
@@ -626,6 +627,18 @@ export class SessionManager {
 			if (session.inFlight !== 0) continue;
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
 				this.sessions.delete(key);
+				void this.disconnectFs(session.fs);
+			}
+		}
+	}
+
+	private async disconnectFs(fs: IFileSystem): Promise<void> {
+		const disconnectable = fs as { disconnect?: () => Promise<void> };
+		if (typeof disconnectable.disconnect === "function") {
+			try {
+				await disconnectable.disconnect();
+			} catch {
+				// best-effort — pool is being torn down
 			}
 		}
 	}

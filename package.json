@@ -1,7 +1,7 @@
 {
 	"name": "virtualfs-api",
-	"version": "0.2.17",
-	"description": "Persistent filesystem backends (Postgres/MySQL/Azure SQL/FileShare) + HTTP/MCP API for just-bash sandboxes",
+	"version": "0.2.18",
+	"description": "Persistent filesystem backend (Postgres) + HTTP/MCP API for just-bash sandboxes",
 	"type": "module",
 	"license": "MIT",
 	"author": "Harry Nguyen",
@@ -25,6 +25,8 @@
 		"db:migrate": "drizzle-kit migrate",
 		"db:gc": "tsx src/api/cli/gc.ts",
 		"token:create": "tsx src/api/cli/token.ts",
+		"changeset": "changeset",
+		"changeset:version": "changeset version && node scripts/sync-openapi-version.mjs && pnpm install --lockfile-only",
 		"prepare": "lefthook install"
 	},
 	"dependencies": {
@@ -46,6 +48,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.0",
+		"@changesets/cli": "^2.31.0",
 		"@types/mssql": "^9.1.0",
 		"@types/node": "^22.0.0",
 		"drizzle-kit": "^0.30.0",

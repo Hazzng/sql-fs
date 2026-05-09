@@ -173,6 +173,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		return this.#pathCache;
 	}
 
+	async disconnect(): Promise<void> {
+		await this.#dialect.disconnect();
+	}
+
 	// ── Dirty tracking (Phase D) ──────────────────────────────────────────────
 
 	wasDirty(): boolean {
