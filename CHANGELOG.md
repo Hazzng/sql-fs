@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.19] - 2026-05-09
+
+### Fixed
+
+- Wired production lifecycle: `SessionManager.startReaper()` and `startMcpSessionSweeper()` called at boot; `SIGTERM`/`SIGINT` now runs a full ordered shutdown — MCP transports → session drain + FS disconnect → meta dialects → Redis `quit()`.
+- Postgres pool caps on `PostgresDialect.connect()` (`max: 2`, `idle_timeout: 30s`, `connect_timeout: 30s`, `max_lifetime: 30m`) to prevent connection exhaustion under load.
+- `createPostgresSandboxFs()` now disconnects the dialect on any post-`connect()` failure (sandbox bootstrap, `fs.ready()`, etc.) so pools cannot leak on setup errors.
+- `SessionManager.getOrCreate()` disconnects the created FS if session construction throws after `buildFs()` returns.
+- `SessionManager.destroy()` disconnects the FS in a `finally` block so the pool is always released even when `destroySandboxFn` or Redis cleanup throws.
+- `publishVersionIfDirty()`: Redis `INCR` failure now surfaces as `ECOHERENCE` (HTTP 503), sets `publishPending` for retry on the next turn, and forces a reload via `lastSeenVersion = -1`. Previously the failure was silently swallowed.
+- Distributed lock heartbeat replaced `setInterval(async)` with a sequential `setTimeout` chain to prevent overlapping Redis `EVAL` commands under slow Redis; renewal command is now bounded by `Promise.race`.
+- Runtime semaphore waiters are now abort-aware: cancelled via `AbortSignal`, evicted on per-waiter timeout, and bounded by `MAX_PYTHON_QUEUE`/`MAX_JS_QUEUE`. Backpressure surfaces as `ERUNTIME_BUSY` (HTTP 503).
+- Added `SessionManager.shutdown()` for graceful drain and FS disconnect of all live sessions.
+- Added MCP session TTL (`MCP_SESSION_IDLE_MS`), cap (`MCP_SESSION_MAX`), idle sweeper, and `shutdownMcp()` to bound transport memory growth.
+- Added `closeRedisClient()` with `quit()` + `disconnect()` fallback for clean Redis teardown on shutdown.
+- Capped raw `PUT /files/*` body size and bulk `writeFiles` file count + total bytes to prevent OOM from unbounded upload buffering.
+- Mapped `ECOHERENCE` and `ERUNTIME_BUSY` error codes to HTTP 503.
+
 ## [0.2.18] - 2026-05-09
 
 ### Fixed

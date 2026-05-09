@@ -26,6 +26,17 @@ import {
 /** Transaction handle type used throughout this dialect. */
 type PgTx = postgres.TransactionSql;
 
+/**
+ * Reads a positive integer env var, returns the fallback when unset / malformed.
+ * Used for pool tuning so deploys can override without code changes.
+ */
+function envInt(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
@@ -39,8 +50,24 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Connection ────────────────────────────────────────────────────────────────
 
 	async connect(): Promise<void> {
+		// Bound the pool: each PostgresDialect instance is owned by one warm
+		// session, so a tiny `max` is sufficient. Without these caps a runaway
+		// session could exhaust the upstream Postgres connection limit
+		// (especially Neon, where pooler endpoints have small per-tenant caps).
+		const max = envInt("PG_POOL_MAX", 2);
+		const idleTimeout = envInt("PG_POOL_IDLE_TIMEOUT_S", 30);
+		const connectTimeout = envInt("PG_POOL_CONNECT_TIMEOUT_S", 30);
+		const maxLifetime = envInt("PG_POOL_MAX_LIFETIME_S", 60 * 30);
 		this.pool = await DefenseInDepthBox.runTrustedAsync(() =>
-			Promise.resolve(postgres(this.connectionString, { prepare: false })),
+			Promise.resolve(
+				postgres(this.connectionString, {
+					prepare: false,
+					max,
+					idle_timeout: idleTimeout,
+					connect_timeout: connectTimeout,
+					max_lifetime: maxLifetime,
+				}),
+			),
 		);
 	}
 

@@ -43,3 +43,34 @@ export function getRedisClient(): Redis | undefined {
 	});
 	return client;
 }
+
+/**
+ * Gracefully close the shared Redis client. Issues `quit()` (drains pending
+ * commands), and falls back to `disconnect()` on timeout or failure so a
+ * misbehaving Redis cannot block process shutdown.
+ *
+ * Safe to call multiple times. After the first successful close, subsequent
+ * calls are no-ops. Once closed, `getRedisClient()` will not reinitialize.
+ */
+export async function closeRedisClient(timeoutMs = 5_000): Promise<void> {
+	const c = client;
+	if (c === undefined) {
+		// Mark as initialized so future getRedisClient() calls don't construct a new client during shutdown.
+		initialized = true;
+		return;
+	}
+	client = undefined;
+	try {
+		await Promise.race([
+			c.quit(),
+			new Promise<void>((_, reject) => setTimeout(() => reject(new Error("redis_quit_timeout")), timeoutMs)),
+		]);
+	} catch (err) {
+		console.error(JSON.stringify({ event: "redis_quit_error", error: (err as Error).message }));
+		try {
+			c.disconnect();
+		} catch {
+			// best-effort
+		}
+	}
+}

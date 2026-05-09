@@ -54,29 +54,45 @@ export async function createPostgresSandboxFs(
 ): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
 	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
 	await dialect.connect();
-	// Initialize the sandbox in the DB (creates root inode structure).
-	// On unique violation (23505) the sandbox already exists — read its owner back.
-	let resolvedOwner = owner;
+	// All post-connect work runs inside try/catch so a failure (sandbox bootstrap,
+	// metadata lookup, SqlFs construction, or fs.ready) cannot leak the dialect's
+	// connection pool. The pg pool stays alive until disconnect() is awaited.
 	try {
-		await dialect.transaction(async (tx) => {
-			await dialect.createSandbox(tx, sandboxId, owner);
+		let resolvedOwner = owner;
+		try {
+			await dialect.transaction(async (tx) => {
+				await dialect.createSandbox(tx, sandboxId, owner);
+			});
+		} catch (e) {
+			const sqlErr = e as { code?: string };
+			if (sqlErr.code !== "23505") throw e;
+			const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
+			resolvedOwner = meta?.owner ?? "";
+		}
+		const fs = new SqlFs({
+			dialect,
+			sandboxId,
+			tenantId: opts.tenantId,
+			redis: opts.redis,
+			pathSnapshot: opts.pathSnapshot,
+			blobCache: opts.blobCache,
 		});
-	} catch (e) {
-		const sqlErr = e as { code?: string };
-		if (sqlErr.code !== "23505") throw e;
-		const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
-		resolvedOwner = meta?.owner ?? "";
+		await fs.ready();
+		return { fs, resolvedOwner };
+	} catch (err) {
+		try {
+			await dialect.disconnect();
+		} catch (cleanupErr) {
+			console.error(
+				JSON.stringify({
+					event: "postgres_dialect_cleanup_failed",
+					sandboxId,
+					error: (cleanupErr as Error).message,
+				}),
+			);
+		}
+		throw err;
 	}
-	const fs = new SqlFs({
-		dialect,
-		sandboxId,
-		tenantId: opts.tenantId,
-		redis: opts.redis,
-		pathSnapshot: opts.pathSnapshot,
-		blobCache: opts.blobCache,
-	});
-	await fs.ready();
-	return { fs, resolvedOwner };
 }
 
 /**

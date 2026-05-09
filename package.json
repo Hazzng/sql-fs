@@ -1,6 +1,6 @@
 {
 	"name": "virtualfs-api",
-	"version": "0.2.18",
+	"version": "0.2.19",
 	"description": "Persistent filesystem backend (Postgres) + HTTP/MCP API for just-bash sandboxes",
 	"type": "module",
 	"license": "MIT",
