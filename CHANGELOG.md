@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.20] - 2026-05-09
+
+### Fixed
+
+- `SessionManager.getOrCreate()` refuses new sessions once `shutdown()` has begun (checked at entry and again after `buildFs()` returns) so a request accepted before shutdown cannot register a session after the shutdown snapshot, leaking its dialect pool.
+- Reaper now marks `state="closing"` before deleting and drains via `mutex.runExclusive` before disconnecting, so a request that already captured the session reference but has not yet entered the mutex observes `ESESSIONCLOSING` instead of running against a disconnected filesystem.
+- Raw `PUT /v1/sandboxes/:id/files/*` pre-checks `Content-Length` and rejects oversized uploads (`PAYLOAD_TOO_LARGE`) before buffering the request body.
+- Distributed lock heartbeat stops scheduling further `EVAL` renewals once the lock is lost or a renew times out, preventing command pile-up in the ioredis send queue when Redis is hung.
+- `RedisBlobCache.mget()` chunks calls at 1024 keys per round-trip to bound peak reply size on warm sandboxes with large blob counts.
+
 ## [0.2.19] - 2026-05-09
 
 ### Fixed
