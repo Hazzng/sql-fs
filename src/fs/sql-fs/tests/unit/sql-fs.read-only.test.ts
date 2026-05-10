@@ -12,6 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readOnlyContext } from "../../../../api/read-only-context.js";
 import { SqlFs } from "../../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
 
@@ -92,15 +93,26 @@ describe("SqlFs.readOnlyScope", () => {
 		expect(fs.readOnlyScopeActive).toBe(false);
 	});
 
-	it("nested begin throws", () => {
+	it("ref-counts nested begin/end (parallel readers)", () => {
 		fs.beginReadOnlyScope();
-		expect(() => fs.beginReadOnlyScope()).toThrow(/already active/);
+		fs.beginReadOnlyScope();
+		expect(fs.readOnlyScopeActive).toBe(true);
 		fs.endReadOnlyScope();
+		expect(fs.readOnlyScopeActive).toBe(true); // still held by the first begin
+		fs.endReadOnlyScope();
+		expect(fs.readOnlyScopeActive).toBe(false);
+	});
+
+	it("endReadOnlyScope without an active scope throws", () => {
+		expect(() => fs.endReadOnlyScope()).toThrow(/no active read-only scope/);
 	});
 
 	it("writeFile throws EREADONLY before issuing any DB call", async () => {
 		fs.beginReadOnlyScope();
-		await expect(fs.writeFile("/new.txt", "x")).rejects.toMatchObject({ code: "EREADONLY" });
+		const ctx = { violated: false };
+		await readOnlyContext.run(ctx, async () => {
+			await expect(fs.writeFile("/new.txt", "x")).rejects.toMatchObject({ code: "EREADONLY" });
+		});
 		// The throw happens before any new transaction is opened — only the
 		// initial loadAllPaths transaction from ready() may have run.
 		expect(dialect.upsertBlob).not.toHaveBeenCalled();
@@ -108,22 +120,43 @@ describe("SqlFs.readOnlyScope", () => {
 		expect(dialect.upsertDirent).not.toHaveBeenCalled();
 		expect(dialect.deleteDirent).not.toHaveBeenCalled();
 		expect(dialect.updateInode).not.toHaveBeenCalled();
-		expect(fs.readOnlyViolated).toBe(true);
+		expect(ctx.violated).toBe(true);
+		fs.endReadOnlyScope();
+	});
+
+	it("violation marks only the originating reader's context, not concurrent ones", async () => {
+		fs.beginReadOnlyScope();
+		fs.beginReadOnlyScope();
+		const ctxLying = { violated: false };
+		const ctxInnocent = { violated: false };
+
+		await readOnlyContext.run(ctxLying, async () => {
+			await expect(fs.writeFile("/lie.txt", "x")).rejects.toMatchObject({ code: "EREADONLY" });
+		});
+		await readOnlyContext.run(ctxInnocent, async () => {
+			await fs.exists("/file.txt");
+		});
+
+		expect(ctxLying.violated).toBe(true);
+		expect(ctxInnocent.violated).toBe(false);
+		fs.endReadOnlyScope();
 		fs.endReadOnlyScope();
 	});
 
 	it("appendFile, mkdir, rm, chmod, utimes, cp, mv, link all throw EREADONLY", async () => {
 		fs.beginReadOnlyScope();
-		await expect(fs.appendFile("/file.txt", "y")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.mkdir("/d")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.rm("/file.txt")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.chmod("/file.txt", 0o600)).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.utimes("/file.txt", now, now)).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.cp("/file.txt", "/copy.txt")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.mv("/file.txt", "/moved.txt")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.link("/file.txt", "/link.txt")).rejects.toMatchObject({ code: "EREADONLY" });
-		await expect(fs.bulkIngest([{ path: "/x", content: new Uint8Array([1]), mode: 0o644 }])).rejects.toMatchObject({
-			code: "EREADONLY",
+		await readOnlyContext.run({ violated: false }, async () => {
+			await expect(fs.appendFile("/file.txt", "y")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.mkdir("/d")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.rm("/file.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.chmod("/file.txt", 0o600)).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.utimes("/file.txt", now, now)).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.cp("/file.txt", "/copy.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.mv("/file.txt", "/moved.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.link("/file.txt", "/link.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+			await expect(fs.bulkIngest([{ path: "/x", content: new Uint8Array([1]), mode: 0o644 }])).rejects.toMatchObject({
+				code: "EREADONLY",
+			});
 		});
 		// The throw happens before any new transaction is opened — only the
 		// initial loadAllPaths transaction from ready() may have run.
@@ -137,7 +170,9 @@ describe("SqlFs.readOnlyScope", () => {
 
 	it("symlink also throws EREADONLY (even before the symlinks-disabled check)", async () => {
 		fs.beginReadOnlyScope();
-		await expect(fs.symlink("/file.txt", "/link.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+		await readOnlyContext.run({ violated: false }, async () => {
+			await expect(fs.symlink("/file.txt", "/link.txt")).rejects.toMatchObject({ code: "EREADONLY" });
+		});
 		fs.endReadOnlyScope();
 	});
 
@@ -151,19 +186,24 @@ describe("SqlFs.readOnlyScope", () => {
 		fs.endReadOnlyScope();
 	});
 
-	it("after end, writes succeed again and the violated flag persists until the next begin", async () => {
+	it("after the last end, writes succeed again and #assertWritable is a no-op", async () => {
 		fs.beginReadOnlyScope();
-		await expect(fs.writeFile("/x.txt", "y")).rejects.toMatchObject({ code: "EREADONLY" });
-		expect(fs.readOnlyViolated).toBe(true);
+		const ctx = { violated: false };
+		await readOnlyContext.run(ctx, async () => {
+			await expect(fs.writeFile("/x.txt", "y")).rejects.toMatchObject({ code: "EREADONLY" });
+		});
+		expect(ctx.violated).toBe(true);
 		fs.endReadOnlyScope();
+		expect(fs.readOnlyScopeActive).toBe(false);
 
-		// Outside the scope the violated flag is sticky until the next
-		// beginReadOnlyScope resets it — that's intentional so the session
-		// manager can read it after fn returns.
-		expect(fs.readOnlyViolated).toBe(true);
-
-		fs.beginReadOnlyScope();
-		expect(fs.readOnlyViolated).toBe(false);
-		fs.endReadOnlyScope();
+		// A fresh context outside any scope is never marked as violated —
+		// even if a context is in scope, writes are unguarded once depth is 0.
+		const fresh = { violated: false };
+		await readOnlyContext.run(fresh, async () => {
+			// Reads obviously work; writes would also work (we don't actually
+			// fire one to avoid the dialect mocks; the depth check is enough).
+			expect(fs.readOnlyScopeActive).toBe(false);
+		});
+		expect(fresh.violated).toBe(false);
 	});
 });

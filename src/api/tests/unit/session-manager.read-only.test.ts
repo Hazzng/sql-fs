@@ -15,43 +15,46 @@ import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
+import { readOnlyContext } from "../../read-only-context.js";
 import { SessionManager } from "../../session-manager.js";
 
 const T = "default";
 
 /**
- * Minimal IReadOnlyScopeFs that piggybacks on InMemoryFs. Tracks scope
- * begin/end calls and exposes a `simulateViolation()` switch the test can
- * flip to mark the FS as having attempted a write under read-only scope.
+ * Reference-counted IReadOnlyScopeFs that piggybacks on InMemoryFs. The
+ * production SqlFs uses the same refcount + AsyncLocalStorage scheme — this
+ * mock tracks depth so concurrent readers don't collide on a boolean flag.
+ *
+ * The host also exposes `simulateViolation(ctx)` so a test can mark a
+ * specific reader's `readOnlyContext` store as violated, exercising the
+ * per-cohort attribution path the SessionManager uses.
  */
 class TestReadOnlyFs {
 	readonly inner: InMemoryFs;
-	readOnlyScopeActive = false;
-	readOnlyViolated = false;
+	depth = 0;
 	beginCount = 0;
 	endCount = 0;
 	constructor() {
 		this.inner = new InMemoryFs();
 	}
+	get readOnlyScopeActive(): boolean {
+		return this.depth > 0;
+	}
 	beginReadOnlyScope(): void {
-		if (this.readOnlyScopeActive) throw new Error("scope already active");
-		this.readOnlyScopeActive = true;
-		this.readOnlyViolated = false;
+		this.depth++;
 		this.beginCount++;
 	}
 	endReadOnlyScope(): void {
-		this.readOnlyScopeActive = false;
+		if (this.depth === 0) throw new Error("no active read-only scope");
+		this.depth--;
 		this.endCount++;
-	}
-	simulateViolation(): void {
-		this.readOnlyViolated = true;
 	}
 }
 
 function adaptReadOnlyFs(host: TestReadOnlyFs): IFileSystem {
 	// Proxy: forward IFileSystem calls to InMemoryFs but expose the
-	// IReadOnlyScopeFs surface (begin/end/active/violated) on the same
-	// object so SessionManager's `asReadOnlyFs` duck-typed check sees it.
+	// IReadOnlyScopeFs surface (begin/end/active) on the same object so
+	// SessionManager's `asReadOnlyFs` duck-typed check sees it.
 	const fs = host.inner as unknown as Record<string, unknown>;
 	const merged = new Proxy(host as unknown as Record<string, unknown>, {
 		get(target, prop, receiver) {
@@ -94,15 +97,21 @@ function adaptCoherentFs(host: CoherentInMemoryFs): IFileSystem {
 }
 
 describe("SessionManager.withSessionRead", () => {
-	it("multiple readOnly calls run in parallel on the same sandbox", async () => {
-		const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+	it("multiple readOnly calls run in parallel on the same sandbox (refcounted scope)", async () => {
+		// Uses a real IReadOnlyScopeFs mock so the refcount path is exercised.
+		// The pre-fix impl threw "scope already active" on the second concurrent
+		// reader against a scoped FS; this test would have caught that.
+		const host = new TestReadOnlyFs();
+		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
 		await sm.getOrCreate(T, "sb-parallel");
 
 		let active = 0;
 		let peak = 0;
+		let peakDepth = 0;
 		const work = async (): Promise<void> => {
 			active++;
 			peak = Math.max(peak, active);
+			peakDepth = Math.max(peakDepth, host.depth);
 			await new Promise((r) => setImmediate(r));
 			active--;
 		};
@@ -114,8 +123,11 @@ describe("SessionManager.withSessionRead", () => {
 			sm.withSessionRead(T, "sb-parallel", work),
 		]);
 
-		expect(peak).toBeGreaterThanOrEqual(2); // at minimum, parallel
-		expect(peak).toBe(4); // exact: all four ran simultaneously
+		expect(peak).toBe(4); // all four ran simultaneously
+		expect(peakDepth).toBe(4); // refcount tracked all four under shared scope
+		expect(host.depth).toBe(0); // last reader cleared the scope
+		expect(host.beginCount).toBe(4);
+		expect(host.endCount).toBe(4);
 	});
 
 	it("readOnly waits for an in-flight writer", async () => {
@@ -195,20 +207,54 @@ describe("SessionManager.withSessionRead", () => {
 		expect(host.endCount).toBe(1);
 	});
 
-	it("surfaces EREADONLY_VIOLATION when fn returns successfully but the FS recorded a violation", async () => {
+	it("surfaces EREADONLY_VIOLATION when the per-call context was marked", async () => {
 		const host = new TestReadOnlyFs();
 		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
 		await sm.getOrCreate(T, "sb-violation");
 
 		await expect(
 			sm.withSessionRead(T, "sb-violation", async () => {
-				host.simulateViolation();
+				// Simulate the SqlFs `#assertWritable` path marking *this* call's
+				// AsyncLocalStorage context.
+				const ctx = readOnlyContext.getStore();
+				if (ctx !== undefined) ctx.violated = true;
 			}),
 		).rejects.toMatchObject({ code: "EREADONLY_VIOLATION" });
 
 		// Scope is still closed even on the violation throw
 		expect(host.readOnlyScopeActive).toBe(false);
 		expect(host.endCount).toBe(1);
+	});
+
+	it("does not falsely flag an innocent concurrent reader when a sibling is lying", async () => {
+		// Two readers run in parallel under one shared scope. Reader A's fn
+		// triggers a violation on its own ALS context. Reader B's context
+		// stays clean — it must not surface EREADONLY_VIOLATION.
+		const host = new TestReadOnlyFs();
+		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
+		await sm.getOrCreate(T, "sb-mixed");
+
+		let releaseInnocent!: () => void;
+		const innocentBlocker = new Promise<void>((r) => {
+			releaseInnocent = r;
+		});
+
+		const liarP = sm.withSessionRead(T, "sb-mixed", async () => {
+			// Wait until innocent reader is also in-flight so depth is 2.
+			await new Promise((r) => setImmediate(r));
+			expect(host.depth).toBe(2);
+			const ctx = readOnlyContext.getStore();
+			if (ctx !== undefined) ctx.violated = true;
+		});
+
+		const innocentP = sm.withSessionRead(T, "sb-mixed", async () => {
+			await innocentBlocker;
+		});
+
+		await expect(liarP).rejects.toMatchObject({ code: "EREADONLY_VIOLATION" });
+		releaseInnocent();
+		await expect(innocentP).resolves.toBeUndefined();
+		expect(host.depth).toBe(0);
 	});
 
 	it("preserves the original error when fn throws even if a violation was recorded", async () => {
@@ -218,11 +264,28 @@ describe("SessionManager.withSessionRead", () => {
 
 		await expect(
 			sm.withSessionRead(T, "sb-violation-throw", async () => {
-				host.simulateViolation();
+				const ctx = readOnlyContext.getStore();
+				if (ctx !== undefined) ctx.violated = true;
 				throw new Error("script blew up");
 			}),
 		).rejects.toThrow("script blew up");
 		expect(host.readOnlyScopeActive).toBe(false);
+	});
+
+	it("does not leak inFlight when fn throws", async () => {
+		const host = new TestReadOnlyFs();
+		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
+		const session = await sm.getOrCreate(T, "sb-inflight");
+		expect(session.inFlight).toBe(0);
+
+		await expect(
+			sm.withSessionRead(T, "sb-inflight", async () => {
+				throw new Error("boom");
+			}),
+		).rejects.toThrow("boom");
+
+		expect(session.inFlight).toBe(0);
+		expect(host.depth).toBe(0);
 	});
 
 	it("single-flights ensureFreshCache across parallel readers", async () => {

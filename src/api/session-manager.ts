@@ -23,6 +23,7 @@ import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sq
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
@@ -53,11 +54,7 @@ function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 
 function asReadOnlyFs(fs: IFileSystem): IReadOnlyScopeFs | undefined {
 	const partial = fs as Partial<IReadOnlyScopeFs>;
-	if (
-		typeof partial.beginReadOnlyScope === "function" &&
-		typeof partial.endReadOnlyScope === "function" &&
-		typeof partial.readOnlyScopeActive === "boolean"
-	) {
+	if (typeof partial.beginReadOnlyScope === "function" && typeof partial.endReadOnlyScope === "function") {
 		return fs as IReadOnlyScopeFs;
 	}
 	return undefined;
@@ -549,43 +546,50 @@ export class SessionManager {
 			if (session.state === "closing") {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
+			const roFs = asReadOnlyFs(session.fs);
+			const ctx: ReadOnlyContext = { violated: false };
+
 			session.inFlight++;
 			session.lastUsed = Date.now();
-			const roFs = asReadOnlyFs(session.fs);
 			let scopeOpened = false;
-			if (roFs !== undefined) {
-				roFs.beginReadOnlyScope();
-				scopeOpened = true;
-			}
-			let primaryError: unknown;
-			let result: T | undefined;
-			let succeeded = false;
 			try {
-				result = await fn(session);
-				succeeded = true;
-			} catch (err) {
-				primaryError = err;
-			}
-			const violated = scopeOpened && roFs !== undefined && roFs.readOnlyViolated;
-			if (scopeOpened && roFs !== undefined) {
-				try {
-					roFs.endReadOnlyScope();
-				} catch {
-					// best-effort: scope toggle should not mask the primary error
+				if (roFs !== undefined) {
+					roFs.beginReadOnlyScope();
+					scopeOpened = true;
 				}
+				// `readOnlyContext.run` propagates `ctx` down the async stack into
+				// `bash.exec` → `SqlFs.#assertWritable`, which marks *this* call's
+				// context (not a shared FS flag). Innocent concurrent readers keep
+				// their own `ctx.violated === false`.
+				const result = await readOnlyContext.run(ctx, () => fn(session));
+				if (ctx.violated) {
+					logAudit("read_only_violation", { tenantId, sandboxId });
+					throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
+						code: "EREADONLY_VIOLATION",
+					});
+				}
+				return result;
+			} finally {
+				if (scopeOpened && roFs !== undefined) {
+					try {
+						roFs.endReadOnlyScope();
+					} catch (err) {
+						// Scope toggle must not mask the primary error; log and continue.
+						console.error(
+							JSON.stringify({
+								event: "end_read_only_scope_error",
+								tenantId,
+								sandboxId,
+								error: (err as Error).message,
+							}),
+						);
+					}
+				}
+				session.inFlight--;
+				// readOnly path never writes — no path-budget refresh, no version
+				// publish. The dirty flag is preserved so a subsequent writer's
+				// publishVersionIfDirty still fires (defense-in-depth).
 			}
-			session.inFlight--;
-			// readOnly path never writes — no path-budget refresh, no version
-			// publish. The dirty flag is preserved so a subsequent writer's
-			// publishVersionIfDirty still fires (defense-in-depth).
-			if (primaryError !== undefined) throw primaryError;
-			if (violated && succeeded) {
-				logAudit("read_only_violation", { tenantId, sandboxId });
-				throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
-					code: "EREADONLY_VIOLATION",
-				});
-			}
-			return result as T;
 		});
 	}
 
@@ -1064,8 +1068,13 @@ export class SessionManager {
 		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
+		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
+		// EREADONLY before any DB call, so the per-script transaction has
+		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
+		// would race across concurrent parallel readers.
+		const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
 		const execFn = async (): Promise<BashExecResult> => {
-			if (session.scriptTx !== undefined) {
+			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
 					const result = await session.bash.exec(script, opts);

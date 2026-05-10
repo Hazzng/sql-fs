@@ -13,6 +13,7 @@ import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptio
 import { DefenseInDepthBox } from "just-bash";
 import { LRUCache } from "lru-cache";
 
+import { readOnlyContext } from "../../api/read-only-context.js";
 import {
 	createEexist,
 	createEinval,
@@ -126,21 +127,17 @@ export interface IScriptTxFs extends ICoherentFs {
  * EREADONLY immediately — the offending bash command fails fast and no
  * partial state escapes to other concurrent readers.
  *
- * SqlFs satisfies this interface; the `memory` backend does not (its
- * factory wraps it separately when needed).
+ * Reference-counted: every concurrent reader calls `beginReadOnlyScope`
+ * on entry and `endReadOnlyScope` on exit. The scope stays active while
+ * any reader holds it. Violation attribution is per-call via the
+ * `readOnlyContext` AsyncLocalStorage rather than an FS-level flag, so
+ * a lying script in one reader cannot falsely flag innocent readers
+ * sharing the same FS.
  */
 export interface IReadOnlyScopeFs extends IFileSystem {
 	beginReadOnlyScope(): void;
 	endReadOnlyScope(): void;
 	readonly readOnlyScopeActive: boolean;
-	/**
-	 * True iff at least one mutating syscall was attempted while the
-	 * read-only scope was active. Cleared on the next `beginReadOnlyScope`.
-	 * Used by the session manager to surface a structured violation error
-	 * after the bash script returns even though the offending command
-	 * itself just exited non-zero.
-	 */
-	readonly readOnlyViolated: boolean;
 }
 
 export class SqlFs<Tx = unknown> implements ICoherentFs {
@@ -176,8 +173,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
-	#readOnlyScope = false;
-	#readOnlyViolated = false;
+	#readOnlyDepth = 0;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -571,28 +567,31 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// ── Read-only scope (parallel readOnly bash exec) ────────────────────────────
 
 	get readOnlyScopeActive(): boolean {
-		return this.#readOnlyScope;
+		return this.#readOnlyDepth > 0;
 	}
 
-	get readOnlyViolated(): boolean {
-		return this.#readOnlyViolated;
-	}
-
+	/**
+	 * Reference-counted: every concurrent reader bumps the depth, the last
+	 * one to exit clears it. The shared SqlFs is mutation-locked while any
+	 * reader holds a scope. Per-cohort violation attribution is delegated
+	 * to `readOnlyContext` (AsyncLocalStorage) so a lying script in one
+	 * reader never falsely flags innocent concurrent readers.
+	 */
 	beginReadOnlyScope(): void {
-		if (this.#readOnlyScope) {
-			throw new Error("beginReadOnlyScope: a read-only scope is already active");
-		}
-		this.#readOnlyScope = true;
-		this.#readOnlyViolated = false;
+		this.#readOnlyDepth++;
 	}
 
 	endReadOnlyScope(): void {
-		this.#readOnlyScope = false;
+		if (this.#readOnlyDepth === 0) {
+			throw new Error("endReadOnlyScope: no active read-only scope");
+		}
+		this.#readOnlyDepth--;
 	}
 
 	#assertWritable(path: string, op: string): void {
-		if (this.#readOnlyScope) {
-			this.#readOnlyViolated = true;
+		if (this.#readOnlyDepth > 0) {
+			const ctx = readOnlyContext.getStore();
+			if (ctx !== undefined) ctx.violated = true;
 			throw createEreadonly(path, op);
 		}
 	}
