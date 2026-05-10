@@ -50,6 +50,16 @@ export function createEinval(path: string): Error {
 	return makeFsError("EINVAL", `EINVAL: invalid argument, '${path}'`, path);
 }
 
+/**
+ * EREADONLY: write attempted while the filesystem is in read-only scope.
+ * Surfaced when a `readOnly: true` exec script tries to mutate state. The
+ * session-manager wraps the script-level handler so the offending command
+ * fails fast and other concurrent readers never observe partial state.
+ */
+export function createEreadonly(path: string, op: string): Error {
+	return makeFsError("EREADONLY", `EREADONLY: read-only filesystem, ${op} '${path}'`, path);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-10
+
+### Added
+
+- Parallel readOnly bash exec on the same sandbox (single-replica). Callers opt in by passing `readOnly: true` on `/v1/sandboxes/:id/exec`, `/exec-sync`, `/exec-sync-batch`, and the MCP `bash_exec` / `bash_exec_batch` tools. ReadOnly execs route through the new `SessionManager.withSessionRead`: they take a per-session async readers-writer lock in *shared* mode (multiple readers run concurrently), skip the distributed exec lock, and share one single-flighted `ensureFreshCache` probe + reload across the cohort. Writes still take the lock exclusively and are writer-priority — a queued writer blocks new readers, preventing reader starvation.
+- Read-only safety net on `SqlFs`: while a read-only scope is active every mutating syscall (`writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes`, `cp`, `mv`, `symlink`, `link`, `bulkIngest`) throws `EREADONLY` *before* any DB work, and the FS records the violation. After the script returns, the session manager surfaces a structured `EREADONLY_VIOLATION` error mapped to HTTP **422** so a lying readOnly script never silently succeeds. Violations are emitted via `logAudit("read_only_violation", ...)`.
+- New async readers-writer lock primitive `RWLock` (`src/api/rw-lock.ts`) replaces `async-mutex`'s `Mutex` on `Session`. Drop-in `runExclusive` for existing call sites plus a new `runShared`. AbortSignal support cancels pending acquisitions cleanly.
+
+### Changed
+
+- `Session.mutex: Mutex` is now `Session.lock: RWLock`. The `async-mutex` runtime dependency is no longer used by `SessionManager`. All exclusive-mode call sites (`withSessionEntry`, `destroy`, reaper, shutdown) are unchanged in semantics.
+
 ## [0.2.20] - 2026-05-09
 
 ### Fixed

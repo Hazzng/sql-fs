@@ -12,7 +12,6 @@
  * collisions are impossible.
  */
 
-import { Mutex } from "async-mutex";
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
@@ -20,10 +19,11 @@ import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/in
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
 import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
-import type { ICoherentFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
+import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
@@ -47,6 +47,18 @@ function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 		typeof partial.clearDirty === "function"
 	) {
 		return fs as ICoherentFs;
+	}
+	return undefined;
+}
+
+function asReadOnlyFs(fs: IFileSystem): IReadOnlyScopeFs | undefined {
+	const partial = fs as Partial<IReadOnlyScopeFs>;
+	if (
+		typeof partial.beginReadOnlyScope === "function" &&
+		typeof partial.endReadOnlyScope === "function" &&
+		typeof partial.readOnlyScopeActive === "boolean"
+	) {
+		return fs as IReadOnlyScopeFs;
 	}
 	return undefined;
 }
@@ -90,7 +102,12 @@ export interface Session {
 	readonly scriptTx: SessionScopedFs | undefined;
 	lastUsed: number;
 	inFlight: number;
-	readonly mutex: Mutex;
+	/**
+	 * Per-session async readers-writer lock. Writes (default exec path,
+	 * destroy, reaper, shutdown) take exclusive mode; readOnly execs take
+	 * shared mode and run in parallel.
+	 */
+	readonly lock: RWLock;
 	state: "active" | "closing";
 	owner: string;
 	name: string | null;
@@ -99,6 +116,13 @@ export interface Session {
 	overBudget: boolean;
 	destroyPromise?: Promise<void>;
 	lastSeenVersion: number;
+	/**
+	 * Single-flight guard for `ensureFreshCache`. While set, parallel readers
+	 * (and any concurrent writer entry) await the same probe + reload rather
+	 * than each issuing their own Redis GET / coherent.reload(). Cleared on
+	 * settle (success or failure).
+	 */
+	freshCacheInflight?: Promise<void>;
 	/**
 	 * Set to true when a previous turn's `publishVersionIfDirty` call failed
 	 * (the write committed to Postgres but the Redis INCR errored). The next
@@ -398,7 +422,7 @@ export class SessionManager {
 					scriptTx,
 					lastUsed: Date.now(),
 					inFlight: 0,
-					mutex: new Mutex(),
+					lock: new RWLock(),
 					state: "active",
 					owner: resolvedOwner,
 					name: null,
@@ -441,7 +465,7 @@ export class SessionManager {
 		return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
 	}
 
-	/** Shared entry logic for all session wrappers. Must be called inside the distributed exec lock. */
+	/** Shared entry logic for all exclusive (write) session wrappers. */
 	private async withSessionEntry<T>(
 		tenantId: string,
 		sandboxId: string,
@@ -454,7 +478,7 @@ export class SessionManager {
 
 		await this.ensureFreshCache(tenantId, sandboxId, session);
 
-		return session.mutex.runExclusive(async () => {
+		return session.lock.runExclusive(async () => {
 			if (session.state === "closing") {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 			}
@@ -499,29 +523,109 @@ export class SessionManager {
 		});
 	}
 
+	/**
+	 * Shared entry logic for the readOnly path. Holds the per-session RWLock
+	 * in shared mode so multiple readers run in parallel, and skips the
+	 * distributed exec lock + script-tx (no writes are permitted). The
+	 * session FS is put into read-only scope before fn runs and restored on
+	 * exit so any mutating syscall throws EREADONLY.
+	 *
+	 * Single-replica only: cross-replica visibility relies on the eventual
+	 * version-probe done by `ensureFreshCache` on the next op, same as today.
+	 */
+	private async withSessionReadEntry<T>(
+		tenantId: string,
+		sandboxId: string,
+		session: Session,
+		fn: (session: Session) => Promise<T>,
+	): Promise<T> {
+		if (session.state === "closing") {
+			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+		}
+
+		await this.ensureFreshCache(tenantId, sandboxId, session);
+
+		return session.lock.runShared(async () => {
+			if (session.state === "closing") {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
+			}
+			session.inFlight++;
+			session.lastUsed = Date.now();
+			const roFs = asReadOnlyFs(session.fs);
+			let scopeOpened = false;
+			if (roFs !== undefined) {
+				roFs.beginReadOnlyScope();
+				scopeOpened = true;
+			}
+			let primaryError: unknown;
+			let result: T | undefined;
+			let succeeded = false;
+			try {
+				result = await fn(session);
+				succeeded = true;
+			} catch (err) {
+				primaryError = err;
+			}
+			const violated = scopeOpened && roFs !== undefined && roFs.readOnlyViolated;
+			if (scopeOpened && roFs !== undefined) {
+				try {
+					roFs.endReadOnlyScope();
+				} catch {
+					// best-effort: scope toggle should not mask the primary error
+				}
+			}
+			session.inFlight--;
+			// readOnly path never writes — no path-budget refresh, no version
+			// publish. The dirty flag is preserved so a subsequent writer's
+			// publishVersionIfDirty still fires (defense-in-depth).
+			if (primaryError !== undefined) throw primaryError;
+			if (violated && succeeded) {
+				logAudit("read_only_violation", { tenantId, sandboxId });
+				throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
+					code: "EREADONLY_VIOLATION",
+				});
+			}
+			return result as T;
+		});
+	}
+
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 
-		let current: number;
-		try {
-			const raw = await this.redis.get(versionKey(tenantId, sandboxId));
-			current = raw === null ? 0 : Number(raw) || 0;
-		} catch (err) {
-			// Redis unavailable — can't determine whether the cache is fresh.
-			// Reload from Postgres so we don't serve stale data.
-			console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
-			await coherent.reload();
-			return;
-		}
+		// Single-flight: parallel readers (and the rare writer that races
+		// them) share one Redis GET + reload() round trip. Without this,
+		// N concurrent readOnly execs would each issue their own probe and
+		// — on version mismatch — N concurrent loadAllPaths against
+		// Postgres.
+		const existing = session.freshCacheInflight;
+		if (existing !== undefined) return existing;
 
-		if (session.lastSeenVersion !== current) {
-			await coherent.reload();
-			session.lastSeenVersion = current;
-			coherent.clearDirty();
-			return;
-		}
+		const probe = (async (): Promise<void> => {
+			let current: number;
+			try {
+				const raw = await this.redis!.get(versionKey(tenantId, sandboxId));
+				current = raw === null ? 0 : Number(raw) || 0;
+			} catch (err) {
+				// Redis unavailable — can't determine whether the cache is fresh.
+				// Reload from Postgres so we don't serve stale data.
+				console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
+				await coherent.reload();
+				return;
+			}
+
+			if (session.lastSeenVersion !== current) {
+				await coherent.reload();
+				session.lastSeenVersion = current;
+				coherent.clearDirty();
+			}
+		})().finally(() => {
+			session.freshCacheInflight = undefined;
+		});
+
+		session.freshCacheInflight = probe;
+		return probe;
 	}
 
 	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
@@ -593,6 +697,53 @@ export class SessionManager {
 			}
 			return this.withSessionEntry(tenantId, sandboxId, session, fn);
 		});
+	}
+
+	/**
+	 * readOnly entry point. Acquires the per-session RWLock in shared mode so
+	 * multiple readers run in parallel, skips the distributed exec lock, and
+	 * activates a read-only scope on the session FS so any mutating syscall
+	 * throws EREADONLY at the offending command.
+	 *
+	 * Falls back to Postgres rehydrate (like withSessionOrRehydrate) when the
+	 * session was evicted from the in-memory pool but the sandbox still
+	 * exists in the persistent store.
+	 */
+	async withSessionRead<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
+		if (session !== undefined && session.state !== "closing") {
+			return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
+		}
+		return this.rehydrateAndExecRead(tenantId, sandboxId, fn, runtimeOptions);
+	}
+
+	private async rehydrateAndExecRead<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (session: Session) => Promise<T>,
+		runtimeOptions?: RuntimeOptions,
+	): Promise<T> {
+		let meta: SandboxMeta | null | undefined;
+		if (this.getSandboxMetaFn !== undefined) {
+			meta = await this.getSandboxMetaFn(tenantId, sandboxId);
+			if (meta === null) {
+				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+			}
+		} else {
+			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
+		}
+		const resolvedRuntime: RuntimeOptions = meta
+			? { python: meta.python, javascript: meta.javascript }
+			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
+		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
+		if (meta?.owner) session.owner = meta.owner;
+		if (meta?.name !== undefined) session.name = meta.name;
+		return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
 	}
 
 	/**
@@ -679,7 +830,7 @@ export class SessionManager {
 
 			session.state = "closing";
 
-			const p = session.mutex.runExclusive(async () => {
+			const p = session.lock.runExclusive(async () => {
 				this.sessions.delete(key);
 				// Disconnect the FS unconditionally — even if destroySandboxFn,
 				// version-key deletion, or path-snapshot cleanup throws — so the
@@ -777,7 +928,7 @@ export class SessionManager {
 				const remaining = Math.max(0, deadline - Date.now());
 				try {
 					await Promise.race([
-						session.mutex.runExclusive(async () => {
+						session.lock.runExclusive(async () => {
 							/* drain */
 						}),
 						new Promise<void>((resolve) => setTimeout(resolve, remaining)),
@@ -820,7 +971,7 @@ export class SessionManager {
 				// against a disconnected filesystem.
 				session.state = "closing";
 				this.sessions.delete(key);
-				void session.mutex
+				void session.lock
 					.runExclusive(async () => {
 						/* drain queued waiters; they will throw ESESSIONCLOSING */
 					})

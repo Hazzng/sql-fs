@@ -21,6 +21,7 @@ import {
 	createEnotdir,
 	createEnotempty,
 	createEperm,
+	createEreadonly,
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
@@ -119,6 +120,29 @@ export interface IScriptTxFs extends ICoherentFs {
 	readonly scriptTxOpen: boolean;
 }
 
+/**
+ * Read-only scope hooks used by the parallel-readOnly bash exec path. While
+ * the scope is active every mutating method on the filesystem throws
+ * EREADONLY immediately — the offending bash command fails fast and no
+ * partial state escapes to other concurrent readers.
+ *
+ * SqlFs satisfies this interface; the `memory` backend does not (its
+ * factory wraps it separately when needed).
+ */
+export interface IReadOnlyScopeFs extends IFileSystem {
+	beginReadOnlyScope(): void;
+	endReadOnlyScope(): void;
+	readonly readOnlyScopeActive: boolean;
+	/**
+	 * True iff at least one mutating syscall was attempted while the
+	 * read-only scope was active. Cleared on the next `beginReadOnlyScope`.
+	 * Used by the session manager to surface a structured violation error
+	 * after the bash script returns even though the offending command
+	 * itself just exited non-zero.
+	 */
+	readonly readOnlyViolated: boolean;
+}
+
 export class SqlFs<Tx = unknown> implements ICoherentFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
@@ -152,6 +176,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	#readOnlyScope = false;
+	#readOnlyViolated = false;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -542,6 +568,35 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 		this.#scriptScope = true;
 	}
 
+	// ── Read-only scope (parallel readOnly bash exec) ────────────────────────────
+
+	get readOnlyScopeActive(): boolean {
+		return this.#readOnlyScope;
+	}
+
+	get readOnlyViolated(): boolean {
+		return this.#readOnlyViolated;
+	}
+
+	beginReadOnlyScope(): void {
+		if (this.#readOnlyScope) {
+			throw new Error("beginReadOnlyScope: a read-only scope is already active");
+		}
+		this.#readOnlyScope = true;
+		this.#readOnlyViolated = false;
+	}
+
+	endReadOnlyScope(): void {
+		this.#readOnlyScope = false;
+	}
+
+	#assertWritable(path: string, op: string): void {
+		if (this.#readOnlyScope) {
+			this.#readOnlyViolated = true;
+			throw createEreadonly(path, op);
+		}
+	}
+
 	async endScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
 		this.#scriptScope = false;
@@ -594,6 +649,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	// shadowing each other — the dialect would commit only one and drop the rest.
 	async bulkIngest(files: BulkIngestFile[]): Promise<void> {
 		if (files.length === 0) return;
+		this.#assertWritable("/", "bulkIngest");
 		const normalized: BulkIngestFile[] = [];
 		const seen = new Set<string>();
 		const bytesByPath = new Map<string, Uint8Array>();
@@ -631,6 +687,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "writeFile");
 		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
@@ -682,6 +739,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "appendFile");
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const mtime = new Date();
@@ -749,6 +807,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async mkdir(inputPath: string, options?: MkdirOptions): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "mkdir");
 		const recursive = options?.recursive ?? false;
 		const mtime = new Date();
 
@@ -826,6 +885,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async rm(inputPath: string, options?: RmOptions): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "rm");
 		const entry = this.#pathCache.get(path);
 
 		if (!entry) {
@@ -897,6 +957,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async chmod(inputPath: string, mode: number): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "chmod");
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -910,6 +971,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async utimes(inputPath: string, _atime: Date, mtime: Date): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertWritable(path, "utimes");
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -1026,6 +1088,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	async cp(inputSrc: string, inputDest: string, options?: CpOptions): Promise<void> {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
+		this.#assertWritable(dest, "cp");
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
@@ -1114,6 +1177,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	async mv(inputSrc: string, inputDest: string): Promise<void> {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
+		this.#assertWritable(dest, "mv");
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
@@ -1191,6 +1255,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 
 	async symlink(target: string, inputLinkPath: string): Promise<void> {
 		const linkPath = validatePath(inputLinkPath);
+		this.#assertWritable(linkPath, "symlink");
 		// Note: target is intentionally not normalized - it's stored as-is
 		if (target.includes("\0")) throw createEinval(target);
 		if (!this.#allowSymlinks) throw createEperm(linkPath, "symlink");
@@ -1226,6 +1291,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs {
 	async link(inputExistingPath: string, inputNewPath: string): Promise<void> {
 		const existingPath = validatePath(inputExistingPath);
 		const newPath = validatePath(inputNewPath);
+		this.#assertWritable(newPath, "link");
 		const srcEntry = this.#pathCache.get(existingPath);
 		if (!srcEntry) throw createEnoent(existingPath);
 		if (srcEntry.kind === INODE_KIND.DIRECTORY) throw createEperm(existingPath, "link");

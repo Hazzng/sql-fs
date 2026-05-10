@@ -42,3 +42,29 @@ export async function withOwnedSessionOrRehydrate<T>(
 		runtimeOptions,
 	);
 }
+
+/**
+ * readOnly variant of withOwnedSessionOrRehydrate. Routes through
+ * `SessionManager.withSessionRead` (shared RWLock, no distributed exec
+ * lock, FS in read-only scope). The owner check still runs inside the
+ * session's shared scope so cold sandboxes restored from Postgres are
+ * authorized under lock rather than via a racy in-memory snapshot.
+ */
+export async function withOwnedSessionRead<T>(
+	sessionManager: SessionManager,
+	tenantId: string,
+	sandboxId: string,
+	caller: string,
+	fn: (session: Session) => Promise<T>,
+	runtimeOptions?: RuntimeOptions,
+): Promise<T> {
+	return sessionManager.withSessionRead(
+		tenantId,
+		sandboxId,
+		async (session) => {
+			assertSessionOwner(session, caller);
+			return fn(session);
+		},
+		runtimeOptions,
+	);
+}
