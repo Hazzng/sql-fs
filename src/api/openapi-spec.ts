@@ -60,6 +60,11 @@ const execBodySchema = {
 			type: "boolean",
 			description: "When true, prepends 'set -x' for command-level tracing in stderr.",
 		},
+		readOnly: {
+			type: "boolean",
+			description:
+				"When true, runs the script in read-only mode: parallel reads against the same sandbox are unblocked (no exclusive lock), and any mutating filesystem op is rejected with EREADONLY at the offending command. If the script attempts a write, the request fails with HTTP 422 EREADONLY_VIOLATION after the script returns. Single-replica only: cross-replica writers are still serialized via the distributed exec lock.",
+		},
 	},
 	required: ["script"],
 } as const;
@@ -78,7 +83,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.2.20",
+		version: "0.3.0",
 		description: "Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres.",
 	},
 	servers: [{ url: "/v1", description: "API v1" }],
@@ -685,6 +690,10 @@ export const openapiSpec = {
 							},
 						},
 					},
+					"422": {
+						description: "readOnly script attempted to mutate the filesystem",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 		},
@@ -717,6 +726,11 @@ export const openapiSpec = {
 										maxItems: 50,
 									},
 									timeoutMs: { type: "integer", example: 30000, minimum: 1, maximum: 300000 },
+									readOnly: {
+										type: "boolean",
+										description:
+											"When true, runs all scripts in the batch in read-only mode: parallel reads are unblocked across calls and any mutating filesystem op is rejected with EREADONLY at the offending command. Returns HTTP 422 EREADONLY_VIOLATION if any script attempts a write.",
+									},
 								},
 								required: ["scripts"],
 							},
@@ -761,6 +775,10 @@ export const openapiSpec = {
 					},
 					"404": {
 						description: "Sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"422": {
+						description: "readOnly batch attempted to mutate the filesystem",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
 				},

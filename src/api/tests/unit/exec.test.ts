@@ -305,6 +305,71 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("readOnly:true routes through withSessionRead (parallel-safe path)", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		const readSpy = vi.spyOn(sessionManager, "withSessionRead");
+		const writeSpy = vi.spyOn(sessionManager, "withSessionOrRehydrate");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ script: "echo readonly", readOnly: true }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(readSpy).toHaveBeenCalledTimes(1);
+		expect(writeSpy).not.toHaveBeenCalled();
+
+		vi.restoreAllMocks();
+	});
+
+	it("readOnly:false (default) keeps using withSessionOrRehydrate", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+		const readSpy = vi.spyOn(sessionManager, "withSessionRead");
+		const writeSpy = vi.spyOn(sessionManager, "withSessionOrRehydrate");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ script: "echo write" }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(writeSpy).toHaveBeenCalledTimes(1);
+		expect(readSpy).not.toHaveBeenCalled();
+
+		vi.restoreAllMocks();
+	});
+
+	it("EREADONLY_VIOLATION from a lying readOnly script returns HTTP 422", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		// Force the lock-managed read entry to throw the violation we'd see
+		// from the safety net. We're testing the route mapping, not the
+		// underlying enforcement (which is unit-tested at SqlFs level).
+		vi.spyOn(sessionManager, "withSessionRead").mockRejectedValue(
+			Object.assign(new Error("EREADONLY_VIOLATION"), { code: "EREADONLY_VIOLATION" }),
+		);
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ script: "echo lying > /tmp/x", readOnly: true }),
+		});
+
+		expect(res.status).toBe(422);
+		const body = (await res.json()) as { code: string };
+		expect(body.code).toBe("EREADONLY_VIOLATION");
+
+		vi.restoreAllMocks();
+	});
+
 	it("debug mode prepends set -x and produces trace output in stderr", async () => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);
