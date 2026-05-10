@@ -18,8 +18,69 @@ interface SessionEntry {
 	readonly transport: WebStandardStreamableHTTPServerTransport;
 	readonly owner: string;
 	readonly tenant: string;
+	lastSeen: number;
 }
 const sessions = new Map<string, SessionEntry>();
+
+const MCP_SESSION_IDLE_MS = Number(process.env.MCP_SESSION_IDLE_MS ?? "1800000"); // 30 min
+const MCP_SESSION_MAX = Number(process.env.MCP_SESSION_MAX ?? "1000");
+const MCP_SWEEP_INTERVAL_MS = Number(process.env.MCP_SWEEP_INTERVAL_MS ?? "60000");
+
+let sweeperTimer: ReturnType<typeof setInterval> | undefined;
+
+function closeTransport(entry: SessionEntry): void {
+	const t = entry.transport as { close?: () => void | Promise<void> };
+	try {
+		if (typeof t.close === "function") void t.close();
+	} catch {
+		// best-effort
+	}
+}
+
+/** Evict the oldest (by lastSeen) session to keep the map under MCP_SESSION_MAX. */
+function evictOldest(): void {
+	let oldestId: string | undefined;
+	let oldestSeen = Number.POSITIVE_INFINITY;
+	for (const [id, entry] of sessions) {
+		if (entry.lastSeen < oldestSeen) {
+			oldestSeen = entry.lastSeen;
+			oldestId = id;
+		}
+	}
+	if (oldestId !== undefined) {
+		const entry = sessions.get(oldestId);
+		sessions.delete(oldestId);
+		if (entry !== undefined) closeTransport(entry);
+	}
+}
+
+function sweepIdleMcpSessions(): void {
+	const now = Date.now();
+	for (const [id, entry] of sessions) {
+		if (now - entry.lastSeen > MCP_SESSION_IDLE_MS) {
+			sessions.delete(id);
+			closeTransport(entry);
+		}
+	}
+}
+
+/** Start the idle sweeper. Idempotent; safe to call once at server startup. */
+export function startMcpSessionSweeper(intervalMs: number = MCP_SWEEP_INTERVAL_MS): void {
+	if (sweeperTimer !== undefined) return;
+	sweeperTimer = setInterval(sweepIdleMcpSessions, intervalMs);
+	if (typeof sweeperTimer.unref === "function") sweeperTimer.unref();
+}
+
+/** Stop the sweeper and close every active MCP transport. Used during shutdown. */
+export async function shutdownMcp(): Promise<void> {
+	if (sweeperTimer !== undefined) {
+		clearInterval(sweeperTimer);
+		sweeperTimer = undefined;
+	}
+	const entries = [...sessions.values()];
+	sessions.clear();
+	for (const entry of entries) closeTransport(entry);
+}
 
 /**
  * Creates a new MCP server instance with virtualfs server info.
@@ -55,8 +116,16 @@ export async function handleMcpRequest(
 					headers: { "Content-Type": "application/json" },
 				});
 			}
+			existing.lastSeen = Date.now();
 			return existing.transport.handleRequest(req);
 		}
+	}
+
+	// Cap total live MCP sessions: each session holds an MCP server + transport
+	// in memory, so unbounded growth from short-lived clients can leak.
+	if (sessions.size >= MCP_SESSION_MAX) {
+		sweepIdleMcpSessions();
+		if (sessions.size >= MCP_SESSION_MAX) evictOldest();
 	}
 
 	const server = createMcpServer();
@@ -64,7 +133,7 @@ export async function handleMcpRequest(
 	const transport = new WebStandardStreamableHTTPServerTransport({
 		sessionIdGenerator: () => randomUUID(),
 		onsessioninitialized: (id) => {
-			sessions.set(id, { transport, owner, tenant });
+			sessions.set(id, { transport, owner, tenant, lastSeen: Date.now() });
 		},
 		onsessionclosed: (id) => {
 			sessions.delete(id);

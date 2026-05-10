@@ -301,7 +301,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(stub.reloadCount).toBe(0);
 	});
 
-	it("swallows transient INCR error, preserves dirty flag for next-turn retry", async () => {
+	it("surfaces ECOHERENCE on transient INCR error, preserves dirty flag, forces stale lastSeenVersion", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
@@ -315,16 +315,21 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Next turn: mutation happens, but INCR throws once.
 		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValueOnce(new Error("ECONNRESET"));
 
+		// The write committed but cross-replica coherence did not — caller must
+		// see ECOHERENCE so they can retry instead of falsely thinking the write
+		// fully succeeded.
 		await expect(
 			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true;
 			}),
-		).resolves.toBeUndefined();
+		).rejects.toMatchObject({ code: "ECOHERENCE" });
 
 		// Dirty flag must survive — the publish failed and the next turn needs
 		// to retry the bump.
 		expect(stub.dirty).toBe(true);
-		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(0);
+		// lastSeenVersion is forced to -1 so the next ensureFreshCache reloads
+		// from Postgres before serving any read.
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(-1);
 		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
 
 		// Next turn: INCR works, the pending bump flushes.

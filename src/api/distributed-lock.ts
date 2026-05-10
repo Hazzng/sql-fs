@@ -121,15 +121,40 @@ export async function withDistributedLock<T>(
 	}
 
 	// ── Heartbeat ──
+	// Non-overlapping renewal: schedule the next renewal only after the
+	// previous Redis call settles. `setInterval(async ...)` would let slow
+	// Redis commands stack — every `renewMs` we'd queue another EVAL even if
+	// the previous one hasn't returned yet, eventually overwhelming the
+	// connection. Sequential scheduling keeps at most one renewal in flight
+	// and bounds command latency naturally.
 	let lost = false;
-	const renewer = setInterval(async () => {
-		try {
-			const res = await redis.eval(RENEW_SCRIPT, 1, key, token, String(leaseMs));
-			if (res !== 1) lost = true;
-		} catch {
-			lost = true;
-		}
-	}, renewMs);
+	let stopped = false;
+	let renewTimer: ReturnType<typeof setTimeout> | undefined;
+	const scheduleRenew = (): void => {
+		if (stopped) return;
+		renewTimer = setTimeout(async () => {
+			if (stopped) return;
+			// Cap renewal command wait so a stalled Redis can't block release.
+			// We use a generous bound (renewMs) — any longer and the lease has
+			// already expired anyway.
+			try {
+				const renewPromise = redis.eval(RENEW_SCRIPT, 1, key, token, String(leaseMs));
+				const timeoutPromise = new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("renew_timeout")), renewMs),
+				);
+				const res = await Promise.race([renewPromise, timeoutPromise]);
+				if (res !== 1) lost = true;
+			} catch {
+				lost = true;
+			}
+			// Once the lock is lost (or a renew has timed out), stop scheduling
+			// further renewals. Otherwise on a hung Redis we'd keep enqueuing
+			// EVAL commands every renewMs that pile up in the ioredis send queue
+			// while their predecessors are still in-flight.
+			if (!stopped && !lost) scheduleRenew();
+		}, renewMs);
+	};
+	scheduleRenew();
 
 	// ── Critical section ──
 	try {
@@ -137,7 +162,8 @@ export async function withDistributedLock<T>(
 		if (lost) throw new LockLostError(key);
 		return result;
 	} finally {
-		clearInterval(renewer);
+		stopped = true;
+		if (renewTimer !== undefined) clearTimeout(renewTimer);
 		try {
 			await redis.eval(RELEASE_SCRIPT, 1, key, token);
 		} catch (err) {

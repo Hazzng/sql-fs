@@ -47,6 +47,10 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ELOCKLOST":
 			return 500;
+		case "ECOHERENCE":
+			return 503;
+		case "ERUNTIME_BUSY":
+			return 503;
 		default:
 			return 500;
 	}

@@ -77,6 +77,10 @@ function parentDir(filePath: string): string {
 	return lastSlash <= 0 ? "/" : filePath.slice(0, lastSlash);
 }
 
+const MAX_RAW_FILE_WRITE_BYTES = Number(process.env.MAX_FILE_WRITE_BYTES ?? `${64 * 1024 * 1024}`);
+const MAX_BULK_WRITE_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
+const MAX_BULK_WRITE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
+
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
@@ -161,8 +165,35 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
+		// Reject oversized uploads up-front via Content-Length so we never buffer
+		// a too-large body into memory.
+		const contentLength = c.req.header("content-length");
+		if (contentLength !== undefined) {
+			const declared = Number(contentLength);
+			if (Number.isFinite(declared) && declared > MAX_RAW_FILE_WRITE_BYTES) {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`File body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
+		}
+
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
+		if (content.byteLength > MAX_RAW_FILE_WRITE_BYTES) {
+			return c.json(
+				{
+					error: "payload_too_large",
+					code: "PAYLOAD_TOO_LARGE",
+					details: [`File body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+				},
+				413 as ContentfulStatusCode,
+			);
+		}
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
@@ -254,10 +285,35 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		const { files } = body;
+		const fileEntries = Object.entries(files);
+		if (fileEntries.length > MAX_BULK_WRITE_FILES) {
+			return c.json(
+				{
+					error: "payload_too_large",
+					code: "PAYLOAD_TOO_LARGE",
+					details: [`Bulk write exceeds file count limit (${MAX_BULK_WRITE_FILES})`],
+				},
+				413 as ContentfulStatusCode,
+			);
+		}
+		let totalBytes = 0;
+		for (const [, content] of fileEntries) {
+			totalBytes += Buffer.byteLength(content, "utf8");
+			if (totalBytes > MAX_BULK_WRITE_BYTES) {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`Bulk write exceeds total byte limit (${MAX_BULK_WRITE_BYTES})`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
+		}
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				for (const [filePath, content] of Object.entries(files)) {
+				for (const [filePath, content] of fileEntries) {
 					const parent = parentDir(filePath);
 					if (parent !== "/") {
 						try {

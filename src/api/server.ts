@@ -12,12 +12,12 @@ import { translateSqlError } from "../fs/sql-fs/errors.js";
 import { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../fs/sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
-import { getRedisClient } from "../redis/client.js";
+import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
 import { type AuthVariables, createAuthMiddleware } from "./auth.js";
 import { mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
-import { handleMcpRequest } from "./mcp/server.js";
+import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
 import { authRoutes } from "./routes/auth.js";
@@ -223,6 +223,8 @@ app.onError((err, c) => {
 		"EINVAL",
 		"ELOCKTIMEOUT",
 		"ELOCKLOST",
+		"ECOHERENCE",
+		"ERUNTIME_BUSY",
 	];
 	const message = knownFsCodes.includes(code) ? err.message : "Internal server error";
 
@@ -248,16 +250,46 @@ if (isMain) {
 			console.log(JSON.stringify({ event: "server_start", port, tenantCount: tenantConfig.tenantIds.length }));
 		});
 
+		// Wire production lifecycle: reaper sweeps idle warm sessions; MCP
+		// sweeper evicts idle MCP transports.
+		sessionManager.startReaper();
+		startMcpSessionSweeper();
+
 		let shuttingDown = false;
 		const shutdown = (): void => {
 			if (shuttingDown) return;
 			shuttingDown = true;
+			console.log(JSON.stringify({ event: "shutdown_begin" }));
+			// Force-exit guard so a hung Postgres or Redis cleanup cannot keep
+			// the process alive past the orchestrator's grace period.
+			const forceExit = setTimeout(() => {
+				console.error(JSON.stringify({ event: "shutdown_force_exit" }));
+				process.exit(1);
+			}, 60_000);
+			if (typeof forceExit.unref === "function") forceExit.unref();
 			server.close(async () => {
 				try {
-					await closeMetaFns();
-				} finally {
-					process.exit(0);
+					await shutdownMcp();
+				} catch (err) {
+					console.error(JSON.stringify({ event: "shutdown_mcp_error", error: (err as Error).message }));
 				}
+				try {
+					await sessionManager.shutdown();
+				} catch (err) {
+					console.error(JSON.stringify({ event: "shutdown_session_manager_error", error: (err as Error).message }));
+				}
+				try {
+					await closeMetaFns();
+				} catch (err) {
+					console.error(JSON.stringify({ event: "shutdown_close_meta_error", error: (err as Error).message }));
+				}
+				try {
+					await closeRedisClient();
+				} catch (err) {
+					console.error(JSON.stringify({ event: "shutdown_redis_error", error: (err as Error).message }));
+				}
+				console.log(JSON.stringify({ event: "shutdown_complete" }));
+				process.exit(0);
 			});
 		};
 		process.once("SIGINT", shutdown);

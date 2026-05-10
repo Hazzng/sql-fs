@@ -53,13 +53,26 @@ export class RedisBlobCache {
 	 */
 	async mget(sha256s: ReadonlyArray<Uint8Array>): Promise<Array<Uint8Array | null>> {
 		if (!this.#enabled || sha256s.length === 0) return sha256s.map(() => null);
+		// Chunk MGET to bound a single round-trip's keyspace and response size.
+		// A 50k-blob warm sandbox would otherwise issue one MGET that requires
+		// Redis to assemble the entire response array before returning, spiking
+		// memory on both client and server.
+		const CHUNK = 1024;
+		const out: Array<Uint8Array | null> = new Array(sha256s.length);
 		try {
-			const keys = sha256s.map((s) => this.#key(s));
-			// ioredis exposes mgetBuffer for binary-safe pipelined gets.
-			const bufs = await (
+			const mgetBuffer = (
 				this.#client as unknown as { mgetBuffer(...keys: string[]): Promise<Array<Buffer | null>> }
-			).mgetBuffer(...keys);
-			return bufs.map((b) => (b ? new Uint8Array(b) : null));
+			).mgetBuffer.bind(this.#client);
+			for (let i = 0; i < sha256s.length; i += CHUNK) {
+				const slice = sha256s.slice(i, i + CHUNK);
+				const keys = slice.map((s) => this.#key(s));
+				const bufs = await mgetBuffer(...keys);
+				for (let j = 0; j < bufs.length; j++) {
+					const b = bufs[j];
+					out[i + j] = b ? new Uint8Array(b) : null;
+				}
+			}
+			return out;
 		} catch (err) {
 			console.error(JSON.stringify({ event: "redis_blob_mget_error", error: (err as Error).message }));
 			return sha256s.map(() => null); // fail open

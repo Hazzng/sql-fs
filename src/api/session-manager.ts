@@ -99,6 +99,16 @@ export interface Session {
 	overBudget: boolean;
 	destroyPromise?: Promise<void>;
 	lastSeenVersion: number;
+	/**
+	 * Set to true when a previous turn's `publishVersionIfDirty` call failed
+	 * (the write committed to Postgres but the Redis INCR errored). The next
+	 * successful turn must publish a version bump even if no new mutations
+	 * occurred on the FS — this is what guarantees other replicas eventually
+	 * see the prior write.
+	 *
+	 * Cleared after a successful publish.
+	 */
+	publishPending: boolean;
 }
 
 /** Per-tenant lazy Postgres backend state. */
@@ -156,10 +166,29 @@ export interface SessionManagerOptions {
 	readonly defenseAuditMode?: boolean;
 }
 
+interface SemaphoreWaiter {
+	readonly resolve: () => void;
+	readonly reject: (err: Error) => void;
+	readonly timer: ReturnType<typeof setTimeout> | undefined;
+	readonly onAbort: (() => void) | undefined;
+	readonly signal: AbortSignal | undefined;
+	settled: boolean;
+}
+
 interface Semaphore {
 	readonly limit: number;
+	readonly maxWaiters: number;
+	readonly waitTimeoutMs: number;
 	inFlight: number;
-	readonly waiters: Array<() => void>;
+	readonly waiters: SemaphoreWaiter[];
+}
+
+export class RuntimeBackpressureError extends Error {
+	readonly code = "ERUNTIME_BUSY";
+	constructor(runtime: string) {
+		super(`ERUNTIME_BUSY: ${runtime} runtime queue is full or wait timed out`);
+		this.name = "RuntimeBackpressureError";
+	}
 }
 
 export class SessionManager {
@@ -185,6 +214,7 @@ export class SessionManager {
 	private readonly jsSem: Semaphore;
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
+	private shuttingDown = false;
 
 	constructor({
 		tenantConfig,
@@ -222,13 +252,21 @@ export class SessionManager {
 		this.getSandboxMetaFn = getSandboxMetaFn;
 		this.persistSandboxMetaFn = persistSandboxMetaFn;
 		this.listSandboxesFn = listSandboxesFn;
+		const maxPyWaiters = Number(process.env.MAX_PYTHON_QUEUE ?? "100");
+		const maxJsWaiters = Number(process.env.MAX_JS_QUEUE ?? "100");
+		const pyTimeout = Number(process.env.PYTHON_QUEUE_TIMEOUT_MS ?? "60000");
+		const jsTimeout = Number(process.env.JS_QUEUE_TIMEOUT_MS ?? "60000");
 		this.pythonSem = {
 			limit: maxConcurrentPython ?? Number(process.env.MAX_CONCURRENT_PYTHON ?? "5"),
+			maxWaiters: maxPyWaiters,
+			waitTimeoutMs: pyTimeout,
 			inFlight: 0,
 			waiters: [],
 		};
 		this.jsSem = {
 			limit: maxConcurrentJs ?? Number(process.env.MAX_CONCURRENT_JS ?? "5"),
+			maxWaiters: maxJsWaiters,
+			waitTimeoutMs: jsTimeout,
 			inFlight: 0,
 			waiters: [],
 		};
@@ -297,6 +335,9 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
 	): Promise<Session> {
+		if (this.shuttingDown) {
+			throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
+		}
 		const key = this.sessionKey(tenantId, sandboxId);
 		const existing = this.sessions.get(key);
 		if (existing !== undefined) {
@@ -312,8 +353,10 @@ export class SessionManager {
 		const resolvedRuntime: RuntimeOptions = runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS;
 
 		const creationPromise = (async (): Promise<Session> => {
+			let createdFs: IFileSystem | undefined;
 			try {
 				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
+				createdFs = fs;
 				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
 					? {
 							enabled: true,
@@ -341,6 +384,12 @@ export class SessionManager {
 					}
 				}
 
+				// Shutdown may have begun while buildFs() was running. If so, refuse
+				// to register the session — shutdown's snapshot has already been
+				// taken and would never see this fs, leaking its dialect pool.
+				if (this.shuttingDown) {
+					throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
+				}
 				const session: Session = {
 					fs,
 					bash,
@@ -357,9 +406,23 @@ export class SessionManager {
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
+					publishPending: false,
 				};
 				this.sessions.set(key, session);
+				createdFs = undefined; // ownership transferred to session
 				return session;
+			} catch (err) {
+				// Disconnect any FS we built before the failure so the dialect
+				// pool doesn't leak when session construction throws
+				// post-buildFs() (e.g., new Bash(), Redis version probe, etc.).
+				if (createdFs !== undefined) {
+					try {
+						await this.disconnectFs(createdFs);
+					} catch {
+						// best-effort
+					}
+				}
+				throw err;
 			} finally {
 				this.pending.delete(key);
 			}
@@ -397,28 +460,42 @@ export class SessionManager {
 			}
 			session.inFlight++;
 			session.lastUsed = Date.now();
+			let primaryError: unknown;
+			let result: T | undefined;
+			let succeeded = false;
 			try {
-				return await fn(session);
-			} finally {
-				const coherent = asCoherentFs(session.fs);
-				const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
-				try {
-					await this.publishVersionIfDirty(tenantId, sandboxId, session);
-				} catch (err) {
-					console.error(
-						JSON.stringify({
-							event: "publish_version_finally_error",
-							sandboxId,
-							error: (err as Error).message,
-						}),
-					);
-				}
-				session.inFlight--;
-				if (shouldRefreshPathBudget) {
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
+				result = await fn(session);
+				succeeded = true;
+			} catch (err) {
+				primaryError = err;
 			}
+			const coherent = asCoherentFs(session.fs);
+			const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
+			let publishError: unknown;
+			try {
+				await this.publishVersionIfDirty(tenantId, sandboxId, session);
+			} catch (err) {
+				publishError = err;
+				console.error(
+					JSON.stringify({
+						event: "publish_version_finally_error",
+						sandboxId,
+						error: (err as Error).message,
+					}),
+				);
+			}
+			session.inFlight--;
+			if (shouldRefreshPathBudget) {
+				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+			}
+			// Order of precedence:
+			// 1. The handler's own error (most specific) takes priority.
+			// 2. Otherwise, surface the publish failure so the client knows the
+			//    write committed but cross-replica coherence did not (503).
+			if (primaryError !== undefined) throw primaryError;
+			if (publishError !== undefined && succeeded) throw publishError;
+			return result as T;
 		});
 	}
 
@@ -451,15 +528,26 @@ export class SessionManager {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
-		if (!coherent.wasDirty()) return;
+		const dirty = coherent.wasDirty();
+		if (!dirty && !session.publishPending) return;
 
 		const key = versionKey(tenantId, sandboxId);
 		let newVersion: number;
 		try {
 			newVersion = Number(await this.redis.incr(key));
 		} catch (err) {
+			// The local write committed to Postgres but we could not publish a
+			// new version to Redis — other replicas will continue to serve
+			// stale reads from their local pathCache. Preserve the dirty flag
+			// (do NOT clearDirty), force the next exec on this replica to
+			// reload from Postgres, and surface a caller-visible 503 so the
+			// client knows cross-replica coherence is broken.
 			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
-			return;
+			session.lastSeenVersion = -1;
+			session.publishPending = true;
+			throw Object.assign(new Error("ECOHERENCE: write committed but version publish failed; client should retry"), {
+				code: "ECOHERENCE",
+			});
 		}
 		try {
 			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);
@@ -469,10 +557,18 @@ export class SessionManager {
 		if (this.pathSnapshot !== undefined) {
 			const writer = asSnapshotWriter(coherent);
 			if (writer !== undefined) {
-				await this.pathSnapshot.write(tenantId, sandboxId, newVersion, writer._getPathCache());
+				try {
+					await this.pathSnapshot.write(tenantId, sandboxId, newVersion, writer._getPathCache());
+				} catch (err) {
+					// snapshot write is a perf optimization — losing it is fine
+					console.error(
+						JSON.stringify({ event: "path_snapshot_write_error", sandboxId, error: (err as Error).message }),
+					);
+				}
 			}
 		}
 		session.lastSeenVersion = newVersion;
+		session.publishPending = false;
 		coherent.clearDirty();
 	}
 
@@ -585,12 +681,41 @@ export class SessionManager {
 
 			const p = session.mutex.runExclusive(async () => {
 				this.sessions.delete(key);
-				await this.destroySandboxFn(tenantId, sandboxId);
-				await this.deleteVersionKey(tenantId, sandboxId);
-				if (this.pathSnapshot !== undefined) {
-					await this.pathSnapshot.delete(tenantId, sandboxId);
+				// Disconnect the FS unconditionally — even if destroySandboxFn,
+				// version-key deletion, or path-snapshot cleanup throws — so the
+				// per-session Postgres pool can never leak. Errors from the
+				// individual cleanup steps are surfaced to the caller via
+				// rethrow at the end.
+				let cleanupError: unknown;
+				try {
+					try {
+						await this.destroySandboxFn(tenantId, sandboxId);
+					} catch (e) {
+						cleanupError ??= e;
+						console.error(
+							JSON.stringify({
+								event: "destroy_sandbox_error",
+								sandboxId,
+								error: (e as Error).message,
+							}),
+						);
+					}
+					try {
+						await this.deleteVersionKey(tenantId, sandboxId);
+					} catch (e) {
+						cleanupError ??= e;
+					}
+					if (this.pathSnapshot !== undefined) {
+						try {
+							await this.pathSnapshot.delete(tenantId, sandboxId);
+						} catch (e) {
+							cleanupError ??= e;
+						}
+					}
+				} finally {
+					await this.disconnectFs(session.fs);
 				}
-				await this.disconnectFs(session.fs);
+				if (cleanupError !== undefined) throw cleanupError;
 			});
 			session.destroyPromise = p;
 
@@ -611,6 +736,69 @@ export class SessionManager {
 	startReaper(intervalMs = 60_000): void {
 		if (this.reaperTimer !== undefined) return;
 		this.reaperTimer = setInterval(() => this.runReaper(), intervalMs);
+		// Reaper should never block process exit — a Node timer with `unref()`
+		// lets graceful shutdown proceed even if the reaper interval is mid-tick.
+		if (typeof this.reaperTimer.unref === "function") this.reaperTimer.unref();
+	}
+
+	/**
+	 * Graceful shutdown: stops the reaper, marks every session as closing,
+	 * waits (up to a bound) for in-flight work, and disconnects every live
+	 * filesystem so dialect connection pools don't leak.
+	 *
+	 * Safe to call multiple times.
+	 */
+	async shutdown(opts: { drainTimeoutMs?: number } = {}): Promise<void> {
+		if (this.shuttingDown) return;
+		this.shuttingDown = true;
+		this.stopReaper();
+
+		const drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
+
+		// Mark every session closing so new entries reject early.
+		for (const session of this.sessions.values()) {
+			session.state = "closing";
+		}
+
+		// Reject any queued runtime semaphore waiters: they would otherwise
+		// hold their request closures alive past shutdown.
+		for (const sem of [this.pythonSem, this.jsSem]) {
+			while (sem.waiters.length > 0) {
+				const w = sem.waiters.shift();
+				if (w === undefined) break;
+				w.reject(new RuntimeBackpressureError("shutting_down"));
+			}
+		}
+
+		const deadline = Date.now() + drainTimeoutMs;
+		const sessionsSnapshot = [...this.sessions.entries()];
+		await Promise.allSettled(
+			sessionsSnapshot.map(async ([key, session]) => {
+				const remaining = Math.max(0, deadline - Date.now());
+				try {
+					await Promise.race([
+						session.mutex.runExclusive(async () => {
+							/* drain */
+						}),
+						new Promise<void>((resolve) => setTimeout(resolve, remaining)),
+					]);
+				} catch {
+					// best-effort
+				}
+				this.sessions.delete(key);
+				try {
+					await this.disconnectFs(session.fs);
+				} catch {
+					// best-effort
+				}
+			}),
+		);
+		this.sessions.clear();
+	}
+
+	/** Alias for shutdown() — matches the plan's `closeAll()` naming. */
+	async closeAll(opts?: { drainTimeoutMs?: number }): Promise<void> {
+		return this.shutdown(opts);
 	}
 
 	stopReaper(): void {
@@ -626,8 +814,20 @@ export class SessionManager {
 			if (session.state === "closing") continue;
 			if (session.inFlight !== 0) continue;
 			if (session.overBudget || now - session.lastUsed > this.idleMs) {
+				// Mark closing FIRST so any request that already captured this
+				// session reference but hasn't yet entered the mutex will
+				// observe ESESSIONCLOSING in withSessionEntry instead of running
+				// against a disconnected filesystem.
+				session.state = "closing";
 				this.sessions.delete(key);
-				void this.disconnectFs(session.fs);
+				void session.mutex
+					.runExclusive(async () => {
+						/* drain queued waiters; they will throw ESESSIONCLOSING */
+					})
+					.catch(() => {})
+					.finally(() => {
+						void this.disconnectFs(session.fs);
+					});
 			}
 		}
 	}
@@ -643,20 +843,67 @@ export class SessionManager {
 		}
 	}
 
-	private acquireSlot(sem: Semaphore): Promise<void> {
+	private acquireSlot(sem: Semaphore, signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) {
+			return Promise.reject(Object.assign(new Error("ABORTED"), { code: "ABORTED", name: "AbortError" }));
+		}
 		if (sem.inFlight < sem.limit) {
 			sem.inFlight++;
 			return Promise.resolve();
 		}
-		return new Promise<void>((resolve) => {
-			sem.waiters.push(resolve);
+		if (sem.waiters.length >= sem.maxWaiters) {
+			return Promise.reject(new RuntimeBackpressureError("queue_full"));
+		}
+		return new Promise<void>((resolve, reject) => {
+			const waiter: SemaphoreWaiter = {
+				resolve: () => {
+					if (waiter.settled) return;
+					waiter.settled = true;
+					if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+					if (waiter.onAbort !== undefined && waiter.signal !== undefined) {
+						waiter.signal.removeEventListener("abort", waiter.onAbort);
+					}
+					resolve();
+				},
+				reject: (err: Error) => {
+					if (waiter.settled) return;
+					waiter.settled = true;
+					if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+					if (waiter.onAbort !== undefined && waiter.signal !== undefined) {
+						waiter.signal.removeEventListener("abort", waiter.onAbort);
+					}
+					// Remove from queue so the closure doesn't outlive the request.
+					const idx = sem.waiters.indexOf(waiter);
+					if (idx >= 0) sem.waiters.splice(idx, 1);
+					reject(err);
+				},
+				timer: undefined,
+				onAbort: undefined,
+				signal,
+				settled: false,
+			};
+			(waiter as { timer: ReturnType<typeof setTimeout> }).timer = setTimeout(
+				() => waiter.reject(new RuntimeBackpressureError("wait_timeout")),
+				sem.waitTimeoutMs,
+			);
+			if (signal !== undefined) {
+				const onAbort = (): void =>
+					waiter.reject(Object.assign(new Error("ABORTED"), { code: "ABORTED", name: "AbortError" }));
+				(waiter as { onAbort: () => void }).onAbort = onAbort;
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
+			sem.waiters.push(waiter);
 		});
 	}
 
 	private releaseSlot(sem: Semaphore): void {
-		const next = sem.waiters.shift();
-		if (next !== undefined) {
-			next();
+		// Skip waiters that already settled (aborted/timed out) but haven't
+		// been spliced — defensive belt-and-braces.
+		while (sem.waiters.length > 0) {
+			const next = sem.waiters.shift();
+			if (next === undefined) break;
+			if (next.settled) continue;
+			next.resolve();
 			return;
 		}
 		sem.inFlight--;
@@ -685,10 +932,11 @@ export class SessionManager {
 			return execFn();
 		}
 
-		if (usesPython) await this.acquireSlot(this.pythonSem);
+		const signal = opts?.signal;
+		if (usesPython) await this.acquireSlot(this.pythonSem, signal);
 		if (usesJs) {
 			try {
-				await this.acquireSlot(this.jsSem);
+				await this.acquireSlot(this.jsSem, signal);
 			} catch (e) {
 				if (usesPython) this.releaseSlot(this.pythonSem);
 				throw e;
