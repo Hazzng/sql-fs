@@ -83,7 +83,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "VirtualFS API",
-		version: "0.3.2",
+		version: "0.3.3",
 		description: "Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres.",
 	},
 	servers: [{ url: "/v1", description: "API v1" }],

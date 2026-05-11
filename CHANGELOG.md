@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-05-11
+
+### Changed
+
+- `DEVELOPER.md`: documented the parallel-readOnly architecture. Core Data Flow now covers both write (`runExclusive`) and read (`runShared`) paths; Lock 1 rewritten as the `RWLock` (writer-priority, batch-wake, AbortSignal); new "ReadOnly Safety Model" section explains the three cooperating mechanisms (shared lock + refcounted FS scope + `readOnlyContext` AsyncLocalStorage attribution) and the `EREADONLY` → `EREADONLY_VIOLATION` remap; same-replica concurrency matrix and "what each lock catches" table extended for readOnly; Key Source Files lists `rw-lock.ts`, `read-only-context.ts`, `ownership.ts`, and `mcp/tools.ts`.
+
 ## [0.3.2] - 2026-05-11
 
 ### Added
