@@ -290,6 +290,33 @@ describe("SessionManager.withSessionRead", () => {
 		expect(host.readOnlyScopeActive).toBe(false);
 	});
 
+	it("audits the violation even when fn throws an unrelated error (e.g. timeout)", async () => {
+		// Scenario: bash records EREADONLY mid-script (sets ctx.violated=true)
+		// but the script keeps running and later aborts on a timeout — bash.exec
+		// throws an AbortError. The original error must win as the caller-visible
+		// throw, but the violation must STILL be audited so the security event
+		// surfaces to monitoring.
+		const host = new TestReadOnlyFs();
+		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
+		await sm.getOrCreate(T, "sb-audit-on-throw");
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		await expect(
+			sm.withSessionRead(T, "sb-audit-on-throw", async () => {
+				const ctx = readOnlyContext.getStore();
+				if (ctx !== undefined) ctx.violated = true;
+				throw Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+			}),
+		).rejects.toThrow("The operation was aborted");
+
+		const audited = logSpy.mock.calls.some((call) => {
+			const arg = call[0];
+			return typeof arg === "string" && arg.includes('"event":"read_only_violation"');
+		});
+		expect(audited).toBe(true);
+		logSpy.mockRestore();
+	});
+
 	it("does not leak inFlight when fn throws", async () => {
 		const host = new TestReadOnlyFs();
 		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });

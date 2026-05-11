@@ -565,19 +565,27 @@ export class SessionManager {
 				try {
 					result = await readOnlyContext.run(ctx, () => fn(session));
 				} catch (err) {
+					const errCode = (err as Error & { code?: string }).code;
+					// Audit the violation even when an unrelated error (e.g. AbortError
+					// from a timeout) wins as the thrown error. Bash can record an
+					// EREADONLY rejection mid-script (ctx.violated=true) and later
+					// throw for an unrelated reason; the security event must still
+					// surface to monitoring.
+					if (ctx.violated || errCode === "EREADONLY") {
+						logAudit("read_only_violation", { tenantId, sandboxId });
+					}
 					// Some bash builtins (e.g. shell redirections `echo x > f`) let
 					// the raw EREADONLY rejection escape bash.exec instead of
 					// normalising it to a non-zero exit. Remap to EREADONLY_VIOLATION
 					// so the route layer sees a single uniform code regardless of
 					// whether the violation surfaced via ctx-tagging (script ran to
 					// completion with a non-zero exit) or as a thrown rejection.
-					if ((err as Error & { code?: string }).code === "EREADONLY") {
-						logAudit("read_only_violation", { tenantId, sandboxId });
-						throw Object.assign(
-							new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"),
-							{ code: "EREADONLY_VIOLATION" },
-						);
+					if (errCode === "EREADONLY") {
+						throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
+							code: "EREADONLY_VIOLATION",
+						});
 					}
+					// Unrelated error wins; the violation was already audited above.
 					throw err;
 				}
 				if (ctx.violated) {

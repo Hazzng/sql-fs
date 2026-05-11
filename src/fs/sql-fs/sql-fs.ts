@@ -140,7 +140,7 @@ export interface IReadOnlyScopeFs extends IFileSystem {
 	readonly readOnlyScopeActive: boolean;
 }
 
-export class SqlFs<Tx = unknown> implements ICoherentFs {
+export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
 	readonly #tenantId: string;
