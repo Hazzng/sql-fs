@@ -257,6 +257,24 @@ describe("SessionManager.withSessionRead", () => {
 		expect(host.depth).toBe(0);
 	});
 
+	it("remaps a raw EREADONLY thrown by fn to EREADONLY_VIOLATION", async () => {
+		// Bash redirections (`echo > f`) let SqlFs's synchronous EREADONLY
+		// reject through bash.exec rather than turning it into a non-zero exit.
+		// withSessionReadEntry must remap the raw fs error to EREADONLY_VIOLATION
+		// so route mapping is uniform.
+		const host = new TestReadOnlyFs();
+		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });
+		await sm.getOrCreate(T, "sb-raw-ereadonly");
+
+		await expect(
+			sm.withSessionRead(T, "sb-raw-ereadonly", async () => {
+				throw Object.assign(new Error("EREADONLY: read-only filesystem, writeFile '/x'"), { code: "EREADONLY" });
+			}),
+		).rejects.toMatchObject({ code: "EREADONLY_VIOLATION" });
+		expect(host.readOnlyScopeActive).toBe(false);
+		expect(host.endCount).toBe(1);
+	});
+
 	it("preserves the original error when fn throws even if a violation was recorded", async () => {
 		const host = new TestReadOnlyFs();
 		const sm = new SessionManager({ createFs: async () => adaptReadOnlyFs(host) });

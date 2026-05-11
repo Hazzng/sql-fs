@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-11
+
+### Fixed
+
+- ReadOnly bash exec: a synchronous `EREADONLY` thrown by `SqlFs#assertWritable` that escapes `bash.exec` (e.g. via shell redirections like `echo x > /file`) is now remapped to `EREADONLY_VIOLATION` in `withSessionReadEntry`, so route handlers consistently return HTTP **422** instead of falling through to the generic 500. The narrow `code === "EREADONLY"` check preserves the existing behavior of letting unrelated `fn` errors win over a recorded violation.
+
 ## [0.3.0] - 2026-05-10
 
 ### Added

@@ -561,7 +561,25 @@ export class SessionManager {
 				// `bash.exec` → `SqlFs.#assertWritable`, which marks *this* call's
 				// context (not a shared FS flag). Innocent concurrent readers keep
 				// their own `ctx.violated === false`.
-				const result = await readOnlyContext.run(ctx, () => fn(session));
+				let result: T;
+				try {
+					result = await readOnlyContext.run(ctx, () => fn(session));
+				} catch (err) {
+					// Some bash builtins (e.g. shell redirections `echo x > f`) let
+					// the raw EREADONLY rejection escape bash.exec instead of
+					// normalising it to a non-zero exit. Remap to EREADONLY_VIOLATION
+					// so the route layer sees a single uniform code regardless of
+					// whether the violation surfaced via ctx-tagging (script ran to
+					// completion with a non-zero exit) or as a thrown rejection.
+					if ((err as Error & { code?: string }).code === "EREADONLY") {
+						logAudit("read_only_violation", { tenantId, sandboxId });
+						throw Object.assign(
+							new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"),
+							{ code: "EREADONLY_VIOLATION" },
+						);
+					}
+					throw err;
+				}
 				if (ctx.violated) {
 					logAudit("read_only_violation", { tenantId, sandboxId });
 					throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
