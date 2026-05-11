@@ -14,7 +14,7 @@ import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
 import { executeBatch } from "../lib/batch-exec.js";
-import { withOwnedSessionOrRehydrate } from "../ownership.js";
+import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -156,13 +156,20 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			script: z.string(),
 			timeout: z.number().int().positive().optional(),
 			debug: z.boolean().optional().describe("When true, prepends 'set -x' for command-level tracing in stderr"),
+			readOnly: z
+				.boolean()
+				.optional()
+				.describe(
+					"When true, runs the script in read-only mode: parallel reads are unblocked across calls (no exclusive lock) and any mutating filesystem op is rejected with EREADONLY at the offending command.",
+				),
 		},
 		async (args) => {
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 			const scriptToRun = args.debug ? `set -x\n${args.script}` : args.script;
+			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 
 			try {
-				const result = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+				const result = await runner(sessionManager, tenant, args.id, owner, async (session) => {
 					const controller = new AbortController();
 					let timedOut = false;
 					const startMs = Date.now();
@@ -233,6 +240,21 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						],
 					};
 				}
+				if (code === "EREADONLY_VIOLATION") {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									stdout: "",
+									stderr: "EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem",
+									exitCode: 1,
+									code: "EREADONLY_VIOLATION",
+								}),
+							},
+						],
+					};
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: message, exitCode: 1 }) }],
@@ -262,12 +284,19 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				.min(1)
 				.max(50),
 			timeout: z.number().int().positive().optional(),
+			readOnly: z
+				.boolean()
+				.optional()
+				.describe(
+					"When true, runs all scripts in the batch in read-only mode: parallel reads are unblocked across calls and any mutating filesystem op is rejected with EREADONLY at the offending command.",
+				),
 		},
 		async (args) => {
 			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 
 			try {
-				const results = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) =>
+				const results = await runner(sessionManager, tenant, args.id, owner, async (session) =>
 					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs),
 				);
 
@@ -284,6 +313,20 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				if (code === "ENOENT") {
 					return {
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
+					};
+				}
+				if (code === "EREADONLY_VIOLATION") {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									ok: false,
+									code: "EREADONLY_VIOLATION",
+									error: "readOnly script attempted to mutate the filesystem",
+								}),
+							},
+						],
 					};
 				}
 				console.error(

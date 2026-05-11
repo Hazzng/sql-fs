@@ -12,9 +12,20 @@ virtualFS is a **stateless HTTP server** backed by Postgres, with warm in-proces
 
 In-process caches (pathCache, contentCache) exist purely for speed during a single exec. Redis exists for four things: serializing requests across replicas, tracking cache freshness via a version counter, caching blob bytes to avoid Postgres round-trips, and snapshotting the path tree to speed up cold starts. If you dropped Redis and all in-process caches, the system would still be correct — just slower.
 
+Within a single replica, two exec modes share the same `Session` and the same `SqlFs`:
+
+- **Write path (default)** — exclusive per-session lock; one exec at a time; the only path that can mutate the FS.
+- **Read path (`readOnly: true`)** — shared per-session lock; many concurrent execs; the FS is forced into a refcounted read-only scope and any mutating syscall throws `EREADONLY` pre-DB, surfaced to clients as HTTP **422 `EREADONLY_VIOLATION`**.
+
+The single-replica feature deliberately skips the distributed Redis exec lock for the read path — cross-replica coherence on reads still relies on the per-session version probe, see the "Multi-replica" sections below.
+
 ---
 
-## Core Data Flow: Single Exec
+## Core Data Flow
+
+There are two exec paths, distinguished by the caller-declared `readOnly` flag on the request body. Both share the same lock layer — they just acquire it in different modes (exclusive vs. shared).
+
+### Write path (`readOnly: false` — the default)
 
 ```
 POST /exec
@@ -31,12 +42,14 @@ SessionManager.withSession(tenantId, sandboxId, fn)
      │
      ├─[2] Version check ────────────────────────── cache freshness
      │       GET vfs:{tenant}:ver:{sandboxId}
+     │       (single-flighted across concurrent entries via session.freshCacheInflight,
+     │        so N parallel entries share one Redis GET + one fs.reload() if needed)
      │       if lastSeenVersion !== current
      │         → fs.reload() from Postgres
      │         → session.lastSeenVersion = current
      │
-     ├─[3] Acquire session.mutex ────────────────── in-process mutex
-     │       (async-mutex, per session, per replica)
+     ├─[3] Acquire session.lock in EXCLUSIVE mode ── in-process RWLock
+     │       (RWLock.runExclusive, per session, per replica)
      │
      ├─[4] bash.exec(script) ────────────────────── the actual work
      │       each SqlFs write:
@@ -49,16 +62,70 @@ SessionManager.withSession(tenantId, sandboxId, fn)
      │         blobCache.set(sha256, data) → Redis    ← fire-and-forget
      │         set #dirty = true
      │
-     ├─[5] Release session.mutex
-     │
-     ├─[6] publishVersionIfDirty
+     ├─[5] publishVersionIfDirty (still under exclusive lock)
      │       if #dirty:
      │         INCR vfs:{tenant}:ver:{sandboxId}
      │         session.lastSeenVersion = newVersion
      │         pathSnapshot.write(ver, pathCache) → Redis   ← cold-start cache (optional)
      │         clearDirty()
      │
+     ├─[6] Release session.lock (exclusive)
+     │       → RWLock dispatch wakes the next waiter:
+     │           • next exclusive writer (one), OR
+     │           • every consecutive shared (readOnly) waiter in one batch
+     │
      └─[7] Release Redis exec lock (Lua check-and-del)
+```
+
+### Read path (`readOnly: true`)
+
+Parallel readers on the same sandbox no longer queue behind each other. Multiple readOnly requests acquire the same `Session.lock` in **shared** mode and run concurrently.
+
+```
+POST /exec   { readOnly: true }
+     │
+     ▼
+Auth middleware
+     │
+     ▼
+SessionManager.withSessionRead(tenantId, sandboxId, fn)
+     │       ── NO distributed Redis exec lock (single-replica only feature; see "Multi-replica
+     │           consistency" caveat below)
+     │
+     ├─[1] Version check (single-flighted across the reader cohort)
+     │       same ensureFreshCache as write path
+     │
+     ├─[2] Acquire session.lock in SHARED mode ──── in-process RWLock
+     │       (RWLock.runShared — multiple readers run concurrently)
+     │       Writer-priority: if a writer is queued, new readers wait behind it.
+     │
+     ├─[3] fs.beginReadOnlyScope() ──────────────── refcounted, per-FS
+     │       every mutating SqlFs method now throws EREADONLY pre-DB
+     │       (writeFile, appendFile, mkdir, rm, chmod, utimes, cp, mv,
+     │        symlink, link, bulkIngest)
+     │
+     ├─[4] readOnlyContext.run(ctx, () => bash.exec(script))
+     │       AsyncLocalStorage propagates ctx down into SqlFs.#assertWritable,
+     │       which marks THIS call's ctx.violated rather than a shared FS flag.
+     │       → a lying script in one reader never falsely flags innocent siblings.
+     │       → scriptTx is SKIPPED — no writes can occur, and the shared
+     │         SessionScopedFs would race across concurrent readers.
+     │
+     ├─[5] After fn returns:
+     │       • if a raw EREADONLY escaped bash.exec (shell redirections like
+     │         `echo x > f` do this) → remap to EREADONLY_VIOLATION
+     │       • if ctx.violated (script completed but tagged a violation) →
+     │         throw EREADONLY_VIOLATION
+     │       → route layer maps EREADONLY_VIOLATION to HTTP 422
+     │
+     ├─[6] fs.endReadOnlyScope() ──────────────── decrements refcount;
+     │       last reader to leave clears the FS-level scope
+     │
+     └─[7] Release session.lock (shared)
+
+NOTE: the read path does NOT call publishVersionIfDirty. No writes ⇒ #dirty
+      stays false anyway, but the flag is preserved across read entries so a
+      subsequent writer's publish still fires correctly.
 ```
 
 ---
@@ -67,13 +134,28 @@ SessionManager.withSession(tenantId, sandboxId, fn)
 
 Three locks work together. Each is the fallback for the one above it.
 
-### Lock 1 — `session.mutex` (in-process)
+### Lock 1 — `session.lock` (in-process RWLock)
 
-- **Type:** `async-mutex` in the Node heap, one per `Session` object
+- **Type:** hand-rolled async readers-writer lock (`RWLock`, `src/api/rw-lock.ts`), one per `Session` object. Replaced the original `async-mutex`-based exclusive `Mutex` in `0.3.0`.
 - **Scope:** one replica, one sandbox
-- **Held for:** entire `bash.exec(script)` call
-- **Purpose:** prevents two concurrent requests on the *same replica* from interleaving inside `Bash` or `SqlFs`
-- **Cost:** zero network — pure microtask queue
+- **Modes:**
+  - **Exclusive** (`runExclusive`) — held for the entire `bash.exec(script)` call on the write path, plus `destroy`, reaper drain, and `shutdown`. One holder at a time.
+  - **Shared** (`runShared`) — held for the entire `bash.exec(script)` call on the readOnly path. Many holders at a time.
+- **Purpose:** prevents two writers on the *same replica* from interleaving inside `Bash` or `SqlFs`, while letting readOnly callers proceed in parallel against a refcounted read-only FS scope.
+- **Fairness:** writer-priority. A queued exclusive waiter blocks new shared acquisitions even when the lock is currently held in shared mode — readers cannot starve writers.
+- **Batch wake:** when a writer releases and the head of the wait queue is a reader, `#dispatch()` wakes *every* consecutive shared waiter in a single pass, so the whole reader cohort starts in parallel rather than via N separate dispatches.
+- **AbortSignal:** pending acquisitions (not held locks) honour `AbortSignal` — client disconnect / timeout on a queued reader/writer rejects cleanly with `code: "ABORTED"`.
+- **Cost:** zero network — pure microtask queue.
+
+**Invariants enforced by the lock:**
+
+| State | Meaning |
+|---|---|
+| `writerActive=true, readers=0` | one writer holds the lock; all other callers queue |
+| `writerActive=false, readers≥1` | N readers hold the lock; a writer queues, new readers also queue (writer-priority) |
+| `writerActive=false, readers=0` | lock is free; next dispatch picks the head waiter |
+
+Bypassing the lock to write directly to `SqlFs` from elsewhere in the codebase will break the read-only safety net. All exec entry must go through `SessionManager.withSession` / `withSessionRead` / `withSessionOrRehydrate`.
 
 ### Lock 2 — Redis exec lock (distributed)
 
@@ -112,11 +194,32 @@ Three locks work together. Each is the fallback for the one above it.
 
 | Scenario | Lock 1 | Lock 2 | Lock 3 |
 |---|---|---|---|
-| Two concurrent requests, same replica, same sandbox | blocks | redundant | redundant |
-| Two concurrent requests, different replicas, same sandbox | — | blocks | backstop |
+| Two concurrent writes, same replica, same sandbox | blocks (exclusive) | redundant | redundant |
+| Two concurrent writes, different replicas, same sandbox | — | blocks | backstop |
+| N concurrent readOnly reads, same replica, same sandbox | **lets them run in parallel (shared)** | (read path skips Lock 2) | not engaged (no writes) |
+| Mixed reader + writer, same replica | reader waits for writer / writer waits for readers; writer-priority | only the writer takes it | only the writer's DB tx |
 | GC pause > lease; second replica interleaves DB writes | — | fails | serializes at DB layer |
-| `DELETE /sandboxes/:id` races an active exec | — | blocks (routed through lock) | backstop |
+| `DELETE /sandboxes/:id` races an active exec | drains via exclusive acquire | blocks (routed through lock) | backstop |
 | Admin/test route bypasses `withSession` | — | — | still catches |
+
+---
+
+## ReadOnly Safety Model
+
+When `withSessionRead` is the entry point, three independent mechanisms cooperate to make parallel reads safe against a shared `SqlFs` instance:
+
+1. **`session.lock` in shared mode** — bounds the cohort. No writer can interleave; the FS instance is mutation-free for the duration.
+2. **`fs.beginReadOnlyScope()` / `endReadOnlyScope()`** on `SqlFs` — refcounted. Every mutating syscall (`writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes`, `cp`, `mv`, `symlink`, `link`, `bulkIngest`) throws `EREADONLY` *before* any DB call. The throw happens in `SqlFs.#assertWritable` and never reaches the dialect — so the dialect mocks in unit tests confirm zero spurious connections / transactions on violation.
+3. **`readOnlyContext` (AsyncLocalStorage)** — per-call violation attribution. When `SqlFs.#assertWritable` fires, it marks the *current* call's `ctx.violated = true`, not a boolean on the shared FS. This is what prevents a lying script in reader A from poisoning innocent reader B running in parallel.
+
+`SessionManager.withSessionReadEntry` then turns either signal into a uniform `EREADONLY_VIOLATION`:
+
+- If `bash.exec` rejects with a raw `EREADONLY` (some bash builtins, notably shell redirections like `echo x > f`, let the synchronous reject escape rather than normalising it to a non-zero exit), the catch re-throws as `EREADONLY_VIOLATION`.
+- Otherwise, after `fn` returns successfully, if `ctx.violated` was set, throw `EREADONLY_VIOLATION`.
+
+Route handlers (`/exec-sync`, `/exec` SSE, `/exec-sync-batch`, MCP `bash_exec` / `bash_exec_batch`) map `EREADONLY_VIOLATION` → HTTP **422**.
+
+**The `scriptTx` is intentionally bypassed in the read path** (`execWithRuntimeThrottle` inspects `readOnlyContext.getStore()`). The script transaction is a per-script DB transaction shared via `SessionScopedFs` — concurrent readers would race on its `beginScope`/`endScope`. Since no writes can occur, there is nothing for it to commit.
 
 ---
 
@@ -209,7 +312,16 @@ if fs.wasDirty():
 
 ### Same sandbox, same replica
 
-Request 2 acquires the Redis lock first (or tries to), then hits the `session.mutex`. It queues behind Request 1 at the mutex level. The two requests are fully serialized — no interleaving inside `Bash` or `SqlFs`.
+The behaviour depends on whether each request is `readOnly`:
+
+| Request A | Request B | Outcome on the same replica |
+|---|---|---|
+| write | write | B queues behind A at the Redis lock and at `session.lock` (exclusive). Fully serialized. |
+| write | readOnly | B skips the Redis lock but queues behind A at `session.lock` (shared waits for exclusive). |
+| readOnly | write | B grabs the Redis lock immediately, then queues at `session.lock` (exclusive waits for active readers). New readers arriving after B queue behind B (writer-priority). |
+| readOnly | readOnly | **Both run in parallel.** Both take `session.lock` in shared mode; the FS is in a refcounted read-only scope; any mutating syscall throws `EREADONLY` pre-DB and is remapped to HTTP 422 `EREADONLY_VIOLATION`. |
+
+Mixed read/write inside a *single script* is always handled on the write path — `readOnly` is a caller declaration, not auto-detected. An agent that issues a script with any chance of writing must leave `readOnly` unset (defaults to false).
 
 ### Same sandbox, different replicas
 
@@ -377,13 +489,18 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 
 | File | What it does |
 |---|---|
-| `src/api/session-manager.ts` | Owns the session pool, all three lock acquisitions, version check, dirty publish |
-| `src/fs/sql-fs/sql-fs.ts` | `SqlFs` class — all `IFileSystem` methods, pathCache, contentCache, `#dirty` flag, `reload()` |
+| `src/api/session-manager.ts` | Owns the session pool, all three lock acquisitions, write + read entries (`withSession`, `withSessionRead`, `withSessionOrRehydrate`), version check, dirty publish, `EREADONLY` → `EREADONLY_VIOLATION` remap |
+| `src/api/rw-lock.ts` | `RWLock` — hand-rolled async readers-writer lock used by `Session.lock`. Writer-priority, batch-wake for queued readers, `AbortSignal` support |
+| `src/api/read-only-context.ts` | `readOnlyContext` AsyncLocalStorage — per-call violation attribution for the parallel-readOnly path |
+| `src/api/ownership.ts` | `withOwnedSessionOrRehydrate` / `withOwnedSessionRead` — adds owner check inside the lock before delegating to `SessionManager` |
+| `src/fs/sql-fs/sql-fs.ts` | `SqlFs` class — all `IFileSystem` methods, pathCache, contentCache, `#dirty` flag, `reload()`, refcounted `beginReadOnlyScope`/`endReadOnlyScope`, `#assertWritable` |
 | `src/fs/sql-fs/dialects/postgres.ts` | Postgres dialect — `setSandboxContext` (RLS + advisory lock), blob cache read/write, all SQL |
 | `src/fs/sql-fs/session-scoped-fs.ts` | `ICoherentFs` interface — `reload`, `wasDirty`, `clearDirty` |
 | `src/fs/sql-fs/redis-blob-cache.ts` | Redis blob cache — `get`/`set` with TTL and size cap |
 | `src/fs/sql-fs/redis-path-snapshot.ts` | Version key helpers; path snapshot — cold-start pathCache bootstrap from Redis (off by default) |
-| `src/api/routes/exec.ts` | HTTP exec routes — funnels through `withSession` |
+| `src/api/routes/exec.ts` | HTTP exec routes — branches on `readOnly` to funnel through `withOwnedSessionOrRehydrate` (write) or `withOwnedSessionRead` (read); maps `EREADONLY_VIOLATION` → 422 |
+| `src/api/mcp/tools.ts` | MCP `bash_exec` / `bash_exec_batch` — same `readOnly` branching as HTTP routes |
+| `thoughts/shared/research/2026-05-10_13-03-37_parallel-readonly-bash-exec.md` | Design doc for the parallel-readOnly feature |
 | `tasks/arch-redis-caching-and-locking.md` | Full design doc for the multi-replica architecture |
 
 ---

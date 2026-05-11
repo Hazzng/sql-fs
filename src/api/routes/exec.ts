@@ -11,7 +11,12 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import { type BatchScriptResult, executeBatch } from "../lib/batch-exec.js";
-import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
+import {
+	forbiddenResponse,
+	isForbiddenError,
+	withOwnedSessionOrRehydrate,
+	withOwnedSessionRead,
+} from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -26,6 +31,7 @@ const execBodySchema = z.object({
 	env: z.record(z.string(), z.string()).optional(),
 	timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 	debug: z.boolean().optional(),
+	readOnly: z.boolean().optional(),
 });
 
 const batchExecBodySchema = z.object({
@@ -39,6 +45,7 @@ const batchExecBodySchema = z.object({
 		.min(1)
 		.max(MAX_BATCH_SCRIPTS),
 	timeoutMs: z.number().int().positive().optional(),
+	readOnly: z.boolean().optional(),
 });
 
 type ExecBody = z.infer<typeof execBodySchema>;
@@ -147,51 +154,56 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let execResult: ExecSyncResult;
 		try {
-			execResult = await withOwnedSessionOrRehydrate<ExecSyncResult>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
-					const controller = new AbortController();
-					let timedOut = false;
-					const startMs = Date.now();
+			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
+			execResult = await runner<ExecSyncResult>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+				const controller = new AbortController();
+				let timedOut = false;
+				const startMs = Date.now();
 
-					const timer = setTimeout(() => {
-						timedOut = true;
-						controller.abort();
-					}, timeoutMs);
+				const timer = setTimeout(() => {
+					timedOut = true;
+					controller.abort();
+				}, timeoutMs);
 
-					try {
-						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-							signal: controller.signal,
-							cwd: body.cwd,
-							env,
-						});
-						clearTimeout(timer);
+				try {
+					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
+						signal: controller.signal,
+						cwd: body.cwd,
+						env,
+					});
+					clearTimeout(timer);
 
-						if (timedOut) {
-							return { kind: "timeout", durationMs: Date.now() - startMs };
-						}
-
-						return {
-							kind: "ok",
-							stdout: result.stdout,
-							stderr: result.stderr,
-							exitCode: result.exitCode,
-							durationMs: Date.now() - startMs,
-						};
-					} catch (e) {
-						clearTimeout(timer);
-						if (timedOut) {
-							return { kind: "timeout", durationMs: Date.now() - startMs };
-						}
-						throw e;
+					if (timedOut) {
+						return { kind: "timeout", durationMs: Date.now() - startMs };
 					}
-				},
-			);
+
+					return {
+						kind: "ok",
+						stdout: result.stdout,
+						stderr: result.stderr,
+						exitCode: result.exitCode,
+						durationMs: Date.now() - startMs,
+					};
+				} catch (e) {
+					clearTimeout(timer);
+					if (timedOut) {
+						return { kind: "timeout", durationMs: Date.now() - startMs };
+					}
+					throw e;
+				}
+			});
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
+			if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
+				return c.json(
+					{
+						error: "read_only_violation",
+						code: "EREADONLY_VIOLATION",
+						details: ["readOnly script attempted to mutate the filesystem"],
+					},
+					422 as ContentfulStatusCode,
+				);
+			}
 			throw err;
 		}
 
@@ -228,8 +240,10 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const timeoutMs = body.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		const scriptToRun = body.debug ? wrapDebugScript(body.script) : body.script;
 		const env = body.env ? Object.assign(Object.create(null) as Record<string, string>, body.env) : undefined;
+		const readOnly = body.readOnly === true;
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
+			const ownerCheck = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
+			await ownerCheck(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			throw err;
@@ -250,51 +264,79 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				controller.abort();
 			}, timeoutMs);
 
-			await sessionManager.withExistingSession(tenant, sandboxId, async (session) => {
-				try {
-					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-						signal: controller.signal,
-						cwd: body.cwd,
-						env,
-					});
-					clearTimeout(timer);
+			const runner = readOnly
+				? sessionManager.withSessionRead.bind(sessionManager)
+				: sessionManager.withExistingSession.bind(sessionManager);
+			try {
+				await runner(tenant, sandboxId, async (session) => {
+					try {
+						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
+							signal: controller.signal,
+							cwd: body.cwd,
+							env,
+						});
+						clearTimeout(timer);
 
-					if (timedOut) {
+						if (timedOut) {
+							await stream.writeSSE({
+								event: "exit",
+								data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
+							});
+							return;
+						}
+
+						if (result.stdout) {
+							await stream.writeSSE({
+								event: "stdout",
+								data: JSON.stringify({ t: "stdout", data: result.stdout }),
+							});
+						}
+						if (result.stderr) {
+							await stream.writeSSE({
+								event: "stderr",
+								data: JSON.stringify({ t: "stderr", data: result.stderr }),
+							});
+						}
 						await stream.writeSSE({
 							event: "exit",
-							data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
+							data: JSON.stringify({ t: "exit", exitCode: result.exitCode, durationMs: Date.now() - startMs }),
 						});
-						return;
+					} catch (e) {
+						clearTimeout(timer);
+						if (timedOut) {
+							await stream.writeSSE({
+								event: "exit",
+								data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
+							});
+							return;
+						}
+						throw e;
 					}
-
-					if (result.stdout) {
-						await stream.writeSSE({
-							event: "stdout",
-							data: JSON.stringify({ t: "stdout", data: result.stdout }),
-						});
-					}
-					if (result.stderr) {
-						await stream.writeSSE({
-							event: "stderr",
-							data: JSON.stringify({ t: "stderr", data: result.stderr }),
-						});
-					}
+				});
+			} catch (err) {
+				clearTimeout(timer);
+				if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
+					await stream.writeSSE({
+						event: "error",
+						data: JSON.stringify({
+							t: "error",
+							code: "EREADONLY_VIOLATION",
+							error: "readOnly script attempted to mutate the filesystem",
+						}),
+					});
 					await stream.writeSSE({
 						event: "exit",
-						data: JSON.stringify({ t: "exit", exitCode: result.exitCode, durationMs: Date.now() - startMs }),
+						data: JSON.stringify({
+							t: "exit",
+							exitCode: -1,
+							durationMs: Date.now() - startMs,
+							error: "read_only_violation",
+						}),
 					});
-				} catch (e) {
-					clearTimeout(timer);
-					if (timedOut) {
-						await stream.writeSSE({
-							event: "exit",
-							data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
-						});
-						return;
-					}
-					throw e;
+					return;
 				}
-			});
+				throw err;
+			}
 		});
 	});
 
@@ -328,16 +370,22 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let results: BatchScriptResult[];
 		try {
-			results = await withOwnedSessionOrRehydrate<BatchScriptResult[]>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) =>
-					executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal),
+			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
+			results = await runner<BatchScriptResult[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) =>
+				executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
+			if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
+				return c.json(
+					{
+						error: "read_only_violation",
+						code: "EREADONLY_VIOLATION",
+						details: ["readOnly script attempted to mutate the filesystem"],
+					},
+					422 as ContentfulStatusCode,
+				);
+			}
 			throw err;
 		}
 
