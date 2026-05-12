@@ -21,7 +21,8 @@ import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snap
 import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
-import { type DistributedLockOptions, execLockKey, withDistributedLock } from "./distributed-lock.js";
+import { execLockKey, withDistributedLock } from "./distributed-lock.js";
+import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
@@ -153,7 +154,9 @@ export interface SessionManagerOptions {
 	readonly maxConcurrentPython?: number;
 	readonly maxConcurrentJs?: number;
 	readonly redis?: Redis;
-	readonly execLockOptions?: Partial<DistributedLockOptions>;
+	readonly execLockOptions?: Partial<DistributedRWLockOptions>;
+	/** Feature flag: use the distributed RW lock keyspace. Set to false during rolling deploys. Defaults to true. */
+	readonly rwlockEnabled?: boolean;
 	readonly pathSnapshot?: RedisPathSnapshot;
 	/** Factory constructing a per-tenant RedisBlobCache. Called at most once per tenant on first access (lazy). */
 	readonly blobCacheFactory?: (tenantId: string) => RedisBlobCache | undefined;
@@ -224,7 +227,8 @@ export class SessionManager {
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly redis: Redis | undefined;
-	private readonly execLockOptions: Partial<DistributedLockOptions> | undefined;
+	private readonly execLockOptions: Partial<DistributedRWLockOptions> | undefined;
+	private readonly rwlockEnabled: boolean;
 	private readonly pathSnapshot: RedisPathSnapshot | undefined;
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
@@ -247,6 +251,7 @@ export class SessionManager {
 		maxConcurrentJs,
 		redis,
 		execLockOptions,
+		rwlockEnabled,
 		pathSnapshot,
 		blobCacheFactory,
 		getSandboxMetaFn,
@@ -268,6 +273,7 @@ export class SessionManager {
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.redis = redis;
 		this.execLockOptions = execLockOptions;
+		this.rwlockEnabled = rwlockEnabled ?? true;
 		this.pathSnapshot = pathSnapshot;
 		this.blobCacheFactory = blobCacheFactory;
 		this.getSandboxMetaFn = getSandboxMetaFn;
@@ -457,9 +463,18 @@ export class SessionManager {
 		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
 	}
 
-	private async withExecLock<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+	private async withExecLockExclusive<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
 		if (this.redis === undefined) return fn();
-		return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+		if (!this.rwlockEnabled) {
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+		}
+		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "exclusive", fn, this.execLockOptions);
+	}
+
+	private async withExecLockShared<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+		if (this.redis === undefined) return fn();
+		if (!this.rwlockEnabled) return fn();
+		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
 	}
 
 	/** Shared entry logic for all exclusive (write) session wrappers. */
@@ -521,14 +536,12 @@ export class SessionManager {
 	}
 
 	/**
-	 * Shared entry logic for the readOnly path. Holds the per-session RWLock
-	 * in shared mode so multiple readers run in parallel, and skips the
-	 * distributed exec lock + script-tx (no writes are permitted). The
-	 * session FS is put into read-only scope before fn runs and restored on
-	 * exit so any mutating syscall throws EREADONLY.
-	 *
-	 * Single-replica only: cross-replica visibility relies on the eventual
-	 * version-probe done by `ensureFreshCache` on the next op, same as today.
+	 * Inner entry logic for the readOnly path. Called from within the
+	 * distributed shared lock held by `withSessionRead`. Holds the per-session
+	 * RWLock in shared mode so multiple readers run in parallel, and skips
+	 * script-tx (no writes are permitted). The session FS is put into
+	 * read-only scope before fn runs and restored on exit so any mutating
+	 * syscall throws EREADONLY.
 	 */
 	private async withSessionReadEntry<T>(
 		tenantId: string,
@@ -713,14 +726,14 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
 	): Promise<T> {
-		return this.withExecLock(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
 			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner);
 			return this.withSessionEntry(tenantId, sandboxId, session, fn);
 		});
 	}
 
 	async withExistingSession<T>(tenantId: string, sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-		return this.withExecLock(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
@@ -730,10 +743,10 @@ export class SessionManager {
 	}
 
 	/**
-	 * readOnly entry point. Acquires the per-session RWLock in shared mode so
-	 * multiple readers run in parallel, skips the distributed exec lock, and
-	 * activates a read-only scope on the session FS so any mutating syscall
-	 * throws EREADONLY at the offending command.
+	 * readOnly entry point. Acquires the distributed shared exec lock (so readers
+	 * across replicas run in parallel while writers are excluded), then the
+	 * per-session RWLock in shared mode, and activates a read-only scope on the
+	 * session FS so any mutating syscall throws EREADONLY.
 	 *
 	 * Falls back to Postgres rehydrate (like withSessionOrRehydrate) when the
 	 * session was evicted from the in-memory pool but the sandbox still
@@ -745,11 +758,13 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
-		if (session !== undefined && session.state !== "closing") {
-			return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
-		}
-		return this.rehydrateAndExecRead(tenantId, sandboxId, fn, runtimeOptions);
+		return this.withExecLockShared(tenantId, sandboxId, async () => {
+			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
+			if (session !== undefined && session.state !== "closing") {
+				return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
+			}
+			return this.rehydrateAndExecRead(tenantId, sandboxId, fn, runtimeOptions);
+		});
 	}
 
 	private async rehydrateAndExecRead<T>(
@@ -789,7 +804,7 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		return this.withExecLock(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session !== undefined && session.state !== "closing") {
 				return this.withSessionEntry(tenantId, sandboxId, session, fn);
@@ -840,7 +855,7 @@ export class SessionManager {
 	}
 
 	async destroy(tenantId: string, sandboxId: string): Promise<boolean> {
-		return this.withExecLock(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
 			const key = this.sessionKey(tenantId, sandboxId);
 			const session = this.sessions.get(key);
 

@@ -212,6 +212,8 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `REDIS_BLOB_CACHE_ENABLED` | No (default: true) | Set to `false` to disable the Redis blob cache. Blob reads always fall through to Postgres when disabled. |
 | `REDIS_BLOB_CACHE_TTL_MS` | No (default: 86400000) | TTL for blob cache entries (ms, default 24h). |
 | `REDIS_BLOB_MAX_BYTES` | No (default: 8388608) | Max blob size cached in Redis (bytes, default 8 MB). Blobs larger than this bypass Redis entirely. |
+| `REDIS_RWLOCK_ENABLED` | No (default: true) | Feature flag for the distributed RW lock keyspace. Set to `false` during rolling deploys when some replicas still run the old exclusive-only lock. When `false`, writers use the legacy SET-NX path and readers skip the distributed lock. Remove after all replicas are on the new code. |
+| `REDIS_RWLOCK_READER_LEASE_MS` | No (default: 60000) | TTL (ms) for reader entries in the distributed RW lock ZSET. Bounds the time a writer must wait for a crashed reader to be reaped. |
 | `REDIS_PATH_SNAPSHOT_ENABLED` | No (default: false) | Set to `true` to enable the Redis path snapshot cache. When enabled, cold-start pathCache is loaded from Redis instead of a full Postgres `loadAllPaths` scan. Requires `REDIS_URL`. |
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No (default: 3600000) | TTL for path snapshot entries (ms, default 1h). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |

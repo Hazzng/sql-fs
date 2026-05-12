@@ -43,8 +43,10 @@ const execLockOptions = redisClient
 			leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
 			renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
 			acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
+			readerLeaseMs: parseNonNegativeInt("REDIS_RWLOCK_READER_LEASE_MS", 60_000),
 		}
 	: undefined;
+const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
 const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
 const pathSnapshot =
 	pathSnapshotEnabled && redisClient
@@ -140,6 +142,7 @@ const sessionManager = new SessionManager({
 	tenantConfig,
 	redis: redisClient,
 	execLockOptions,
+	rwlockEnabled,
 	pathSnapshot,
 	blobCacheFactory:
 		redisClient && blobCacheOptions

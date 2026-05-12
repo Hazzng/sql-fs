@@ -352,6 +352,9 @@ describe("SessionManager.withSessionRead", () => {
 			}),
 			incr: vi.fn(async () => 1),
 			expire: vi.fn(async () => 1),
+			// eval is needed by withExecLockShared (distributed RW shared lock).
+			// Return 1 so all shared acquire/renew/release ops succeed.
+			eval: vi.fn(async () => 1),
 		};
 
 		const host = new CoherentInMemoryFs();
@@ -366,9 +369,14 @@ describe("SessionManager.withSessionRead", () => {
 		// Five readers in flight before the first GET resolves.
 		const readers = Array.from({ length: 5 }, () => sm.withSessionRead(T, "sb-single-flight", async () => "ok"));
 
-		// Let the readers reach ensureFreshCache.
-		await new Promise((r) => setImmediate(r));
-		await new Promise((r) => setImmediate(r));
+		// Let the readers progress through lock acquisition and reach ensureFreshCache.
+		await new Promise<void>((r) => {
+			const poll = (): void => {
+				if (getCalls.length > initialGets) r();
+				else setImmediate(poll);
+			};
+			setImmediate(poll);
+		});
 		// All five share one in-flight GET (single-flight ensureFreshCache).
 		expect(getCalls.length - initialGets).toBe(1);
 
