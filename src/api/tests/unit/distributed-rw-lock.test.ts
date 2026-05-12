@@ -590,6 +590,16 @@ describe("withDistributedRWLock", () => {
 			).rejects.toThrow(/renewMs.*must be strictly less than leaseMs/);
 		});
 
+		it("rejects renewMs >= readerLeaseMs (reader heartbeat must fire before ZSET entry expires)", async () => {
+			await expect(
+				withDistributedRWLock(asRedis(fake()), KEYS, "shared", async () => "ok", {
+					leaseMs: 60_000,
+					renewMs: 20_000,
+					readerLeaseMs: 5_000,
+				}),
+			).rejects.toThrow(/renewMs.*must be strictly less than readerLeaseMs/);
+		});
+
 		it("rejects non-positive readerLeaseMs", async () => {
 			await expect(
 				withDistributedRWLock(asRedis(fake()), KEYS, "shared", async () => "ok", { ...FAST, readerLeaseMs: 0 }),
@@ -607,7 +617,7 @@ describe("withDistributedRWLock", () => {
 
 	it("rwLockKeys generates the expected key namespace", () => {
 		const k = rwLockKeys("acme", "sandbox-1");
-		expect(k.writer).toBe("vfs:acme:rwlock:sandbox-1:writer");
-		expect(k.readers).toBe("vfs:acme:rwlock:sandbox-1:readers");
+		expect(k.writer).toBe("vfs:acme:rwlock:{sandbox-1}:writer");
+		expect(k.readers).toBe("vfs:acme:rwlock:{sandbox-1}:readers");
 	});
 });

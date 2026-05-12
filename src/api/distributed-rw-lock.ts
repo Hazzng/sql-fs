@@ -109,9 +109,12 @@ export interface RWLockKeys {
 }
 
 export function rwLockKeys(tenantId: string, sandboxId: string): RWLockKeys {
+	// The `{${sandboxId}}` braces are a Redis Cluster hash tag: every key that
+	// shares the same `{…}` substring hashes to the same slot, so the two-key
+	// EVAL scripts (writer + readers) below remain valid under Cluster routing.
 	return {
-		writer: `vfs:${tenantId}:rwlock:${sandboxId}:writer`,
-		readers: `vfs:${tenantId}:rwlock:${sandboxId}:readers`,
+		writer: `vfs:${tenantId}:rwlock:{${sandboxId}}:writer`,
+		readers: `vfs:${tenantId}:rwlock:{${sandboxId}}:readers`,
 	};
 }
 
@@ -130,6 +133,10 @@ function assertOptions(opts: DistributedRWLockOptions): void {
 		throw new Error(`DistributedRWLockOptions.acquireRetryMs must be > 0 (got ${opts.acquireRetryMs})`);
 	if (opts.readerLeaseMs <= 0)
 		throw new Error(`DistributedRWLockOptions.readerLeaseMs must be > 0 (got ${opts.readerLeaseMs})`);
+	if (opts.renewMs >= opts.readerLeaseMs)
+		throw new Error(
+			`DistributedRWLockOptions.renewMs (${opts.renewMs}) must be strictly less than readerLeaseMs (${opts.readerLeaseMs}); otherwise a live reader's ZSET entry can be reaped between heartbeats and a writer could enter while the read is still in flight`,
+		);
 }
 
 function sleep(ms: number): Promise<void> {
