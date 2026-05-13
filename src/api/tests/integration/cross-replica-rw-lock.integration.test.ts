@@ -338,10 +338,7 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 				await new Promise((r) => setTimeout(r, 100));
 			});
 
-		await timed(
-			"parallel-reads-with-content-check",
-			Promise.all([reader(smA), reader(smB), reader(smA), reader(smB)]),
-		);
+		await timed("parallel-reads-with-content-check", Promise.all([reader(smA), reader(smB), reader(smA), reader(smB)]));
 
 		// All four readers must have seen the same latest-committed value.
 		expect(results).toHaveLength(4);
@@ -405,9 +402,7 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 			(async () => {
 				for (let i = 0; i < increments; i++) {
 					await sm.withSession(TENANT, sandboxId, async (s) => {
-						await s.bash.exec(
-							`val=$(cat /counter.txt | tr -d '\\n'); echo $((val + 1)) > /counter.txt`,
-						);
+						await s.bash.exec(`val=$(cat /counter.txt | tr -d '\\n'); echo $((val + 1)) > /counter.txt`);
 					});
 				}
 			})();
