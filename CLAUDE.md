@@ -263,16 +263,19 @@ tasks/
 
 ## Changelog & Version Bump Requirement
 
-**Always update `CHANGELOG.md` AND bump the version before pushing any branch.** Rules:
+This project uses **Changesets** (`@changesets/cli`) to manage versions and changelogs. Do not manually edit `CHANGELOG.md` or bump versions in `package.json` / `openapi-spec.ts`.
 
-- **Never use `[Unreleased]`** — always use a concrete version number.
-- **Always auto-increment** from the current topmost version: patch bump (`0.1.0` → `0.1.1`) for fixes/chores/docs; minor bump (`0.1.x` → `0.2.0`) for new features; major bump for breaking changes.
-- Add a dated section header: `## [x.y.z] - YYYY-MM-DD` and one or more bullets under `Added` / `Changed` / `Fixed` / `Removed`.
-- **Bump the version in ALL of these places** (they must all match the new CHANGELOG version):
-  - `package.json` → `"version"` field
-  - `pnpm-lock.yaml` → run `pnpm install --lockfile-only` after updating package.json
-  - `src/api/openapi-spec.ts` → `info.version` field
-- The release pipeline reads the topmost versioned section to determine whether to cut a new GitHub Release — if the tag already exists it skips; a new version triggers a release automatically on merge to `main`.
+**Workflow:**
+
+1. After making changes on a branch, run `pnpm changeset` and describe what changed. This creates a `.changeset/*.md` file — commit it with the rest of the PR.
+2. On release (after merging to `main`), run `pnpm changeset:version`. This reads all pending `.changeset/*.md` files and automatically:
+   - Bumps the version in `package.json` (patch / minor / major based on the changeset kind you chose)
+   - Writes `CHANGELOG.md` from the changeset descriptions
+   - Syncs `src/api/openapi-spec.ts` `info.version` via `scripts/sync-openapi-version.mjs`
+   - Regenerates `pnpm-lock.yaml`
+   - Deletes the consumed changeset files
+
+The release pipeline cuts a GitHub Release on merge to `main` when the version has changed.
 
 ## Implementation Guidance
 
