@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-05-13
+
+### Added
+
+- Cross-replica reader-writer exec lock (`withDistributedRWLock`, `src/api/distributed-rw-lock.ts`). Parallel `readOnly` execs now run concurrently across replicas while writers maintain strong cross-replica consistency: writers take an exclusive Redis flag, readers register a TTL'd entry in a per-sandbox ZSET, and writer-priority prevents reader starvation. `SessionManager.withSessionRead` acquires the new shared lock; `withSession` / `withExistingSession` / `withSessionOrRehydrate` use the exclusive path. New env vars: `REDIS_RWLOCK_ENABLED` (default `true`, deploy-window flag) and `REDIS_RWLOCK_READER_LEASE_MS` (default `60000`). Issue #61.
+- Integration suite `cross-replica-rw-lock.integration.test.ts` covering parallel cross-replica readers, writer/reader blocking both directions, writer-priority under continuous readers, crashed-reader reaping, and version visibility after writes.
+
+### Changed
+
+- `rwLockKeys()` now wraps the sandbox id in a Redis Cluster hash tag (`vfs:{tenant}:rwlock:{<sandboxId>}:writer` / `…:readers`) so the two-key Lua scripts route to the same slot under Redis Cluster.
+
+### Fixed
+
+- `DistributedRWLockOptions` validation now requires `renewMs < readerLeaseMs` in addition to `renewMs < leaseMs`. Without this, a misconfigured `REDIS_RWLOCK_READER_LEASE_MS` shorter than `REDIS_EXEC_LOCK_RENEW_MS` could let a writer reap a live reader's ZSET entry between heartbeats and enter the critical section while a read was still in flight.
+
 ## [0.3.3] - 2026-05-11
 
 ### Changed

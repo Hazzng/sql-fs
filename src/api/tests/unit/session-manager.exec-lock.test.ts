@@ -1,5 +1,5 @@
 /**
- * Unit tests for SessionManager + distributed exec lock integration (Phase C).
+ * Unit tests for SessionManager + distributed exec lock integration.
  *
  * Exercises:
  *   - withSession/withExistingSession/destroy acquire the Redis lock (by key).
@@ -8,54 +8,124 @@
  *   - Destroy-vs-exec: destroy waits for in-flight exec.
  *   - ELOCKTIMEOUT propagates when the acquire window elapses.
  *
- * No real Redis — uses an in-process fake with SET NX PX + token-aware EVAL.
+ * No real Redis — uses an in-process fake that honours the RW lock's ZSET +
+ * string-key surface (same implementation as distributed-rw-lock.test.ts).
  */
 
 import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
-import { execLockKey } from "../../distributed-lock.js";
+import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 
-interface Entry {
+// ── FakeRedis (ZSET-aware) ────────────────────────────────────────────────────
+
+interface StringEntry {
 	value: string;
 	expiresAt: number;
 }
 
 class FakeRedis {
-	store = new Map<string, Entry>();
+	strings = new Map<string, StringEntry>();
+	zsets = new Map<string, Map<string, number>>();
 
-	private gc(): void {
+	private gcStrings(): void {
 		const now = Date.now();
-		for (const [k, e] of this.store) {
-			if (e.expiresAt <= now) this.store.delete(k);
+		for (const [k, e] of this.strings) if (e.expiresAt <= now) this.strings.delete(k);
+	}
+
+	private reapZset(key: string, nowMs: number): void {
+		const z = this.zsets.get(key);
+		if (!z) return;
+		for (const [m, score] of z) if (score <= nowMs) z.delete(m);
+	}
+
+	getZset(key: string): Map<string, number> {
+		let z = this.zsets.get(key);
+		if (!z) {
+			z = new Map();
+			this.zsets.set(key, z);
 		}
+		return z;
 	}
 
 	async set(key: string, value: string, _px: "PX", ms: number, _nx: "NX"): Promise<"OK" | null> {
-		this.gc();
-		if (this.store.has(key)) return null;
-		this.store.set(key, { value, expiresAt: Date.now() + ms });
+		this.gcStrings();
+		if (this.strings.has(key)) return null;
+		this.strings.set(key, { value, expiresAt: Date.now() + ms });
 		return "OK";
 	}
 
-	async eval(script: string, _n: number, key: string, token: string, ms?: string): Promise<number> {
-		this.gc();
-		if (script.includes("del")) {
-			const e = this.store.get(key);
-			if (e?.value === token) {
-				this.store.delete(key);
+	async eval(script: string, numKeys: number, ...args: string[]): Promise<unknown> {
+		this.gcStrings();
+		const keys = args.slice(0, numKeys);
+		const argv = args.slice(numKeys);
+
+		if (script.includes("ZREMRANGEBYSCORE") && script.includes("EXISTS")) {
+			const [writerKey, readersKey] = keys as [string, string];
+			const [token, nowStr, expireAtStr] = argv as [string, string, string];
+			this.reapZset(readersKey, Number(nowStr));
+			if (this.strings.has(writerKey)) return 0;
+			this.getZset(readersKey).set(token, Number(expireAtStr));
+			return 1;
+		}
+		if (script.includes("ZREM") && !script.includes("ZREMRANGEBYSCORE")) {
+			const [readersKey] = keys as [string];
+			const [token] = argv as [string];
+			const z = this.zsets.get(readersKey);
+			if (z?.has(token)) {
+				z.delete(token);
 				return 1;
 			}
 			return 0;
 		}
-		const e = this.store.get(key);
-		if (e?.value === token && ms !== undefined) {
-			e.expiresAt = Date.now() + Number(ms);
-			return 1;
+		if (script.includes("ZSCORE")) {
+			const [readersKey] = keys as [string];
+			const [token, expireAtStr] = argv as [string, string];
+			const z = this.zsets.get(readersKey);
+			if (z?.has(token)) {
+				z.set(token, Number(expireAtStr));
+				return 1;
+			}
+			return 0;
 		}
-		return 0;
+		if (script.includes("SET") && script.includes("NX")) {
+			const [writerKey] = keys as [string];
+			const [token, leaseMsStr] = argv as [string, string];
+			if (this.strings.has(writerKey)) return null;
+			this.strings.set(writerKey, { value: token, expiresAt: Date.now() + Number(leaseMsStr) });
+			return "OK";
+		}
+		if (script.includes("ZCARD")) {
+			const [writerKey, readersKey] = keys as [string, string];
+			const [token, nowStr] = argv as [string, string];
+			const entry = this.strings.get(writerKey);
+			if (entry?.value !== token) return -1;
+			this.reapZset(readersKey, Number(nowStr));
+			return this.zsets.get(readersKey)?.size ?? 0;
+		}
+		if (script.includes("PEXPIRE")) {
+			const [writerKey] = keys as [string];
+			const [token, leaseMsStr] = argv as [string, string];
+			const entry = this.strings.get(writerKey);
+			if (entry?.value === token) {
+				entry.expiresAt = Date.now() + Number(leaseMsStr);
+				return 1;
+			}
+			return 0;
+		}
+		if (script.includes("DEL")) {
+			const [writerKey] = keys as [string];
+			const [token] = argv as [string];
+			const entry = this.strings.get(writerKey);
+			if (entry?.value === token) {
+				this.strings.delete(writerKey);
+				return 1;
+			}
+			return 0;
+		}
+		throw new Error(`FakeRedis: unrecognised eval script: ${script.slice(0, 60)}`);
 	}
 }
 
@@ -69,18 +139,20 @@ function makeCreateFs() {
 	return vi.fn((_tenantId: string, _sandboxId: string): Promise<IFileSystem> => Promise.resolve(new InMemoryFs()));
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 describe("SessionManager + distributed exec lock", () => {
-	it("withSession takes and releases the Redis lock around fn", async () => {
+	it("withSession takes and releases the Redis writer lock around fn", async () => {
 		const redis = new FakeRedis();
 		const sm = new SessionManager({ createFs: makeCreateFs(), redis: asRedis(redis) });
 
-		let observedLock: Entry | undefined;
+		let observedLock: StringEntry | undefined;
 		await sm.withSession(T, "sbx-A", async () => {
-			observedLock = redis.store.get(execLockKey(T, "sbx-A"));
+			observedLock = redis.strings.get(rwLockKeys(T, "sbx-A").writer);
 		});
 
 		expect(observedLock).toBeDefined();
-		expect(redis.store.has(execLockKey(T, "sbx-A"))).toBe(false);
+		expect(redis.strings.has(rwLockKeys(T, "sbx-A").writer)).toBe(false);
 	});
 
 	it("two SessionManagers sharing the same Redis serialize concurrent withSession", async () => {
@@ -157,8 +229,11 @@ describe("SessionManager + distributed exec lock", () => {
 
 	it("ELOCKTIMEOUT propagates when acquire times out", async () => {
 		const redis = new FakeRedis();
-		// Plant a foreign lock that will never release within the acquire window.
-		redis.store.set(execLockKey(T, "sbx-T"), { value: "owned-by-someone-else", expiresAt: Date.now() + 60_000 });
+		// Plant a foreign writer lock that will never release within the acquire window.
+		redis.strings.set(rwLockKeys(T, "sbx-T").writer, {
+			value: "owned-by-someone-else",
+			expiresAt: Date.now() + 60_000,
+		});
 
 		const sm = new SessionManager({
 			createFs: makeCreateFs(),
@@ -173,5 +248,15 @@ describe("SessionManager + distributed exec lock", () => {
 		const sm = new SessionManager({ createFs: makeCreateFs() });
 		const result = await sm.withSession(T, "sbx-solo", async () => "solo-ok");
 		expect(result).toBe("solo-ok");
+	});
+
+	it("rwlockEnabled=false falls back to exclusive-only path (no reader ZSET)", async () => {
+		const redis = new FakeRedis();
+		const sm = new SessionManager({ createFs: makeCreateFs(), redis: asRedis(redis), rwlockEnabled: false });
+
+		await sm.withSession(T, "sbx-legacy", async () => {});
+
+		// Writer ZSET key must NOT exist (legacy path uses simple SET NX, not RW lock)
+		expect(redis.zsets.has(rwLockKeys(T, "sbx-legacy").readers)).toBe(false);
 	});
 });

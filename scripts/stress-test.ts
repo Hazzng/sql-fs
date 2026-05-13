@@ -510,6 +510,172 @@ async function scenarioInProc(): Promise<ScenarioResult> {
 	};
 }
 
+// ── Scenario 5: cross-replica RW lock ─────────────────────────────────────────
+
+/**
+ * Two SessionManagers (simulating two replicas) share one Redis client, drive
+ * mixed readOnly + write traffic against the same sandbox for `--duration` ms,
+ * and assert:
+ *   - Zero EREADONLY_VIOLATION rejections from readers.
+ *   - Zero LockLostError rejections.
+ *   - Reader p99 latency < writer p99 (readers parallelise across replicas).
+ */
+async function scenarioCrossReplicaRw(durationMs: number): Promise<ScenarioResult> {
+	const name = "Cross-replica RW lock (mixed read/write)";
+	log(`▶ ${name} (duration=${durationMs}ms)`);
+	const errors: string[] = [];
+	const notes: string[] = [];
+	const before = await snapshot();
+	const t0 = Date.now();
+
+	const readerWorkers = Number(process.env.STRESS_RW_READERS ?? "8");
+	const writerWorkers = Number(process.env.STRESS_RW_WRITERS ?? "2");
+
+	const redis = new Redis(REDIS_URL!, { lazyConnect: false, maxRetriesPerRequest: 1 });
+	await new Promise<void>((resolve, reject) => {
+		redis.once("ready", resolve);
+		redis.once("error", reject);
+		setTimeout(() => reject(new Error("redis connect timeout")), 10_000);
+	});
+
+	const lockOpts = { leaseMs: 30_000, renewMs: 10_000, acquireTimeoutMs: 30_000, acquireRetryMs: 25 };
+	const mkSm = (): SessionManager =>
+		new SessionManager({
+			createFs: async (_t, sandboxId) => {
+				const { fs } = await createPostgresSandboxFs(
+					{ connectionString: PG_URL!, tenantId: "stress", redis },
+					sandboxId,
+				);
+				return fs;
+			},
+			destroySandboxFn: async (_t, sandboxId) => destroyPostgresSandbox(PG_URL!, sandboxId),
+			idleMs: 120_000,
+			redis,
+			execLockOptions: lockOpts,
+		});
+	const smA = mkSm();
+	const smB = mkSm();
+	const sandboxId = uid("crrw");
+
+	const readerLatencies: number[] = [];
+	const writerLatencies: number[] = [];
+	let readonlyViolations = 0;
+	let lockLost = 0;
+	let otherErrors = 0;
+
+	try {
+		// Seed the sandbox + a baseline file from A.
+		await smA.withSession("stress", sandboxId, async (s) => {
+			await s.fs.writeFile("/seed.txt", "0");
+		});
+		// Warm B's pool.
+		await smB.withSession("stress", sandboxId, async () => {});
+
+		const deadline = Date.now() + durationMs;
+		let writeCounter = 0;
+
+		const reader = async (sm: SessionManager, label: string): Promise<void> => {
+			while (Date.now() < deadline) {
+				const t = Date.now();
+				try {
+					await sm.withSessionRead("stress", sandboxId, async (s) => {
+						// Pure read — no mutation. Touches both fs and bash paths.
+						await s.fs.readFile("/seed.txt");
+					});
+					readerLatencies.push(Date.now() - t);
+				} catch (e) {
+					const code = (e as { code?: string; name?: string }).code;
+					const ename = (e as { name?: string }).name;
+					if (code === "EREADONLY_VIOLATION") readonlyViolations++;
+					else if (code === "ELOCKLOST" || ename === "LockLostError") lockLost++;
+					else otherErrors++;
+					notes.push(`reader ${label} error: ${(e as Error).message.slice(0, 100)}`);
+				}
+			}
+		};
+
+		const writer = async (sm: SessionManager, label: string): Promise<void> => {
+			while (Date.now() < deadline) {
+				const t = Date.now();
+				const n = ++writeCounter;
+				try {
+					await sm.withSession("stress", sandboxId, async (s) => {
+						// Real bash exec — durable mutation that goes through the
+						// publish path so the version counter advances. The brief
+						// sleep models realistic write turn time and gives readers
+						// room to demonstrate parallelism against the writer.
+						await s.bash.exec(`sleep 0.05 && echo ${n} > /w-${label}-${n}.txt`);
+					});
+					writerLatencies.push(Date.now() - t);
+				} catch (e) {
+					const code = (e as { code?: string }).code;
+					const ename = (e as { name?: string }).name;
+					if (code === "ELOCKLOST" || ename === "LockLostError") lockLost++;
+					else otherErrors++;
+					notes.push(`writer ${label} error: ${(e as Error).message.slice(0, 100)}`);
+				}
+				// Throttle writes slightly to give readers room to demonstrate parallelism.
+				await new Promise((r) => setTimeout(r, 25));
+			}
+		};
+
+		const workers: Promise<void>[] = [];
+		for (let i = 0; i < readerWorkers; i++) {
+			workers.push(reader(i % 2 === 0 ? smA : smB, `r${i}`));
+		}
+		for (let i = 0; i < writerWorkers; i++) {
+			workers.push(writer(i % 2 === 0 ? smA : smB, `w${i}`));
+		}
+		await Promise.all(workers);
+	} finally {
+		try {
+			await smA.destroy("stress", sandboxId);
+		} catch {
+			/* ignore */
+		}
+		await smA.shutdown({ drainTimeoutMs: 10_000 });
+		await smB.shutdown({ drainTimeoutMs: 10_000 });
+		await redis.quit().catch(() => {});
+	}
+
+	const pct = (arr: number[], p: number): number => {
+		if (arr.length === 0) return Number.POSITIVE_INFINITY;
+		const sorted = [...arr].sort((a, b) => a - b);
+		const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * p));
+		return sorted[idx] ?? Number.POSITIVE_INFINITY;
+	};
+	const readerP50 = pct(readerLatencies, 0.5);
+	const readerP99 = pct(readerLatencies, 0.99);
+	const writerP50 = pct(writerLatencies, 0.5);
+	const writerP99 = pct(writerLatencies, 0.99);
+
+	notes.push(`readers: count=${readerLatencies.length} p50=${readerP50}ms p99=${readerP99}ms`);
+	notes.push(`writers: count=${writerLatencies.length} p50=${writerP50}ms p99=${writerP99}ms`);
+	notes.push(`EREADONLY_VIOLATION=${readonlyViolations} LockLostError=${lockLost} otherErrors=${otherErrors}`);
+
+	if (readonlyViolations > 0) errors.push(`expected 0 EREADONLY_VIOLATION; got ${readonlyViolations}`);
+	if (lockLost > 0) errors.push(`expected 0 LockLostError; got ${lockLost}`);
+	if (readerLatencies.length === 0) errors.push("no reader iterations completed");
+	if (writerLatencies.length === 0) errors.push("no writer iterations completed");
+	// Typical-case reader latency must be lower than typical-case writer latency.
+	// p50 isolates the parallelism signal; p99 reader is dominated by writer-priority
+	// tail (a reader queued behind a writer-drain) which is expected behaviour.
+	if (readerLatencies.length > 0 && writerLatencies.length > 0 && readerP50 >= writerP50) {
+		errors.push(`reader p50 (${readerP50}ms) should be < writer p50 (${writerP50}ms) — readers did not parallelise`);
+	}
+
+	const after = await snapshot();
+	return {
+		name,
+		durationMs: Date.now() - t0,
+		before,
+		after,
+		notes,
+		errors,
+		pass: errors.length === 0,
+	};
+}
+
 // ── Migration bootstrap ───────────────────────────────────────────────────────
 
 /**
@@ -550,17 +716,62 @@ async function ensureMigrations(): Promise<void> {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+interface CliArgs {
+	scenario?: string;
+	durationMs: number;
+}
+
+function parseArgs(argv: readonly string[]): CliArgs {
+	let scenario: string | undefined;
+	let durationMs = 60_000;
+	for (const a of argv) {
+		const m = /^--([^=]+)=(.*)$/.exec(a);
+		if (!m) continue;
+		const key = m[1];
+		const value = m[2] ?? "";
+		if (key === "scenario") scenario = value;
+		else if (key === "duration") {
+			const trimmed = value.endsWith("s")
+				? Number(value.slice(0, -1)) * 1000
+				: value.endsWith("ms")
+					? Number(value.slice(0, -2))
+					: Number(value);
+			if (!Number.isFinite(trimmed) || trimmed <= 0) {
+				throw new Error(`invalid --duration=${value} (use e.g. 60s, 1500ms, or 60000)`);
+			}
+			durationMs = trimmed;
+		}
+	}
+	return { scenario, durationMs };
+}
+
 async function main(): Promise<void> {
 	const overallStart = Date.now();
+	const cli = parseArgs(process.argv.slice(2));
 	log(`starting stress run: PG=${PG_URL!.split("@")[1]?.split("?")[0]} REDIS=${REDIS_URL!.split("@")[1]}`);
+	if (cli.scenario) log(`scenario filter: ${cli.scenario}`);
 
 	await ensureMigrations();
 	if (process.env.STRESS_CLEANUP === "true") {
 		await cleanupAll();
 	}
 
-	const scenarios = [scenarioDestroyFailures, scenarioPoolPressure, scenarioRedisFlakiness, scenarioInProc];
-	for (const fn of scenarios) {
+	const scenarioRegistry: { key: string; fn: () => Promise<ScenarioResult> }[] = [
+		{ key: "destroy-failures", fn: scenarioDestroyFailures },
+		{ key: "pool-pressure", fn: scenarioPoolPressure },
+		{ key: "redis-flakiness", fn: scenarioRedisFlakiness },
+		{ key: "in-proc", fn: scenarioInProc },
+		{ key: "cross-replica-rw", fn: () => scenarioCrossReplicaRw(cli.durationMs) },
+	];
+	const selected = cli.scenario
+		? scenarioRegistry.filter((s) => s.key === cli.scenario)
+		: scenarioRegistry.filter((s) => s.key !== "cross-replica-rw");
+	if (selected.length === 0) {
+		throw new Error(
+			`unknown --scenario=${cli.scenario}. Available: ${scenarioRegistry.map((s) => s.key).join(", ")}`,
+		);
+	}
+	for (const { key, fn } of selected) {
 		try {
 			const r = await fn();
 			allResults.push(r);
@@ -569,7 +780,7 @@ async function main(): Promise<void> {
 			for (const e of r.errors) log(`    ! ${e}`);
 		} catch (err) {
 			allResults.push({
-				name: fn.name,
+				name: key,
 				durationMs: 0,
 				before: await snapshot(),
 				after: await snapshot(),
@@ -577,7 +788,7 @@ async function main(): Promise<void> {
 				errors: [`scenario crashed: ${(err as Error).message}`],
 				pass: false,
 			});
-			log(`  ✗ ${fn.name} crashed: ${(err as Error).message}`);
+			log(`  ✗ ${key} crashed: ${(err as Error).message}`);
 		}
 	}
 

@@ -16,7 +16,7 @@
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../fs/sql-fs/index.js";
-import { execLockKey } from "../../distributed-lock.js";
+import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
 
@@ -55,7 +55,8 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 			} catch {
 				/* ignore */
 			}
-			await redis.del(execLockKey(TENANT, id));
+			const { writer, readers } = rwLockKeys(TENANT, id);
+			await redis.del(writer, readers);
 		}
 	});
 
@@ -162,7 +163,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 
 		// Simulate a dead replica still holding the lock: plant a foreign token with a short TTL.
 		const leaseMs = 1_500;
-		await redis.set(execLockKey(TENANT, sandboxId), "dead-replica-token", "PX", leaseMs);
+		await redis.set(rwLockKeys(TENANT, sandboxId).writer, "dead-replica-token", "PX", leaseMs);
 
 		const start = Date.now();
 		await timed(

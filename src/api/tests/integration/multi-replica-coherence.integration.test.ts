@@ -14,7 +14,7 @@
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../fs/sql-fs/index.js";
-import { execLockKey } from "../../distributed-lock.js";
+import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
 
@@ -56,7 +56,8 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 			} catch {
 				/* ignore */
 			}
-			await redis.del(execLockKey(TENANT, id));
+			const { writer, readers } = rwLockKeys(TENANT, id);
+			await redis.del(writer, readers);
 			await redis.del(versionKey(id));
 		}
 	});

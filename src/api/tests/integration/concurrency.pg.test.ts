@@ -96,9 +96,10 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 	});
 
 	it(`all ${N} writes return 204 — DB handles upsert serially`, async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -116,9 +117,10 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 	});
 
 	it("final GET returns one of the written values — pathCache and DB in sync", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -153,9 +155,10 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 	});
 
 	it(`all ${N} writes succeed and tree lists exactly ${N} files`, async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -189,9 +192,10 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 	});
 
 	it("N concurrent reads after delete all return 404 — no stale pathCache", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
 			method: "PUT",
@@ -217,9 +221,10 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 	});
 
 	it("tree after deleting half of N files shows exactly the remaining N/2", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 		const total = 10;
 		const keep = 5;
 
@@ -264,9 +269,10 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 	});
 
 	it("sequential overwrites: each read returns the just-written value", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/v.txt`, {
@@ -283,9 +289,10 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 	});
 
 	it("N concurrent overwrites then read — no stale content from contentCache", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
+		await sm.withSession("default", sbId, () => Promise.resolve());
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/counter.txt`, {
@@ -327,10 +334,14 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 	});
 
 	it("concurrent writes to same path in two sandboxes — each reads its own value", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
+		await Promise.all([
+			sm.withSession("default", sbA, () => Promise.resolve()),
+			sm.withSession("default", sbB, () => Promise.resolve()),
+		]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/shared.txt`, {
@@ -361,10 +372,14 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 	});
 
 	it("delete in sandbox A does not affect sandbox B", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbA = newId();
 		const sbB = newId();
+		await Promise.all([
+			sm.withSession("default", sbA, () => Promise.resolve()),
+			sm.withSession("default", sbB, () => Promise.resolve()),
+		]);
 
 		await Promise.all([
 			app.request(`/v1/sandboxes/${sbA}/files/home/user/common.txt`, {
@@ -412,13 +427,14 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 	// ── S1 ──────────────────────────────────────────────────────────────────────
 
 	it("S1 HTTP API: PUT auto-creates parents — mkdir || write both always succeed", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 
 		// HTTP PUT route calls mkdir(parent, {recursive:true}) before writeFile,
 		// so the write always succeeds regardless of whether mkdir ran first.
 		for (const label of ["mkdir-first", "write-first"] as const) {
 			const sbId = newId();
+			await sm.withSession("default", sbId, () => Promise.resolve());
 			const ops =
 				label === "mkdir-first"
 					? ([
@@ -540,11 +556,12 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 	});
 
 	it("S2 HTTP: whichever runs first, file is gone after both ops, delete is always 204", async () => {
-		const { app } = makePgEnv();
+		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 
 		for (const label of ["delete-first", "read-first"] as const) {
 			const sbId = newId();
+			await sm.withSession("default", sbId, () => Promise.resolve());
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
