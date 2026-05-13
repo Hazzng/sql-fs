@@ -217,7 +217,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — inode CRUD", () 
 		expect(inode!.mode).toBe(0o644);
 		expect(inode!.size).toBe(42);
 		expect(inode!.nlink).toBe(1);
-		expect(inode!.contentSha256).toEqual(sha256);
+		expect(new Uint8Array(inode!.contentSha256 as Buffer)).toEqual(sha256);
 		expect(inode!.symlinkTarget).toBeNull();
 	});
 
@@ -1026,7 +1026,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadAllPaths", (
 		expect(fileEntry!.kind).toBe(1);
 		expect(fileEntry!.mode).toBe(0o644);
 		expect(fileEntry!.size).toBe(fileData.length);
-		expect(fileEntry!.contentSha256).toEqual(sha256);
+		expect(new Uint8Array(fileEntry!.contentSha256 as Buffer)).toEqual(sha256);
 	});
 });
 
@@ -1185,7 +1185,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — resolvePath (fs_
 
 		// Apply stored procedure DDL (idempotent via CREATE OR REPLACE)
 		const migrationSql = readFileSync(
-			fileURLToPath(new URL("../migrations/postgres/0001_rls_and_procs.sql", import.meta.url)),
+			fileURLToPath(new URL("../../migrations/postgres/0001_rls_and_procs.sql", import.meta.url)),
 			"utf8",
 		);
 		await dialect.transaction(async (tx) => {
