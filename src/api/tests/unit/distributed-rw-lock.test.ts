@@ -161,7 +161,7 @@ class FakeRedis {
 		}
 
 		// RENEW_EXCLUSIVE_SCRIPT — contains pexpire
-		if (script.includes("pexpire")) {
+		if (script.includes("PEXPIRE")) {
 			if (this.forceExclusiveRenewLost) return 0;
 			const [writerKey] = keys as [string];
 			const [token, leaseMsStr] = argv as [string, string];
@@ -174,7 +174,7 @@ class FakeRedis {
 		}
 
 		// RELEASE_EXCLUSIVE_SCRIPT — contains del
-		if (script.includes("del")) {
+		if (script.includes("DEL")) {
 			const [writerKey] = keys as [string];
 			const [token] = argv as [string];
 			const entry = this.strings.get(writerKey);
@@ -414,7 +414,7 @@ describe("withDistributedRWLock", () => {
 		const origEval = r.eval.bind(r);
 
 		r.eval = async (script: string, numKeys: number, ...args: string[]) => {
-			if (script.includes("pexpire")) renewals.push(Date.now());
+			if (script.includes("PEXPIRE")) renewals.push(Date.now());
 			return origEval(script, numKeys, ...args);
 		};
 

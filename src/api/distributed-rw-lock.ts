@@ -25,7 +25,7 @@ import { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
  * Returns 1 on success, 0 when writer flag is present.
  */
 const ACQUIRE_SHARED_SCRIPT = `
-redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", "(" .. ARGV[2])
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 if redis.call("EXISTS", KEYS[1]) == 1 then return 0 end
 redis.call("ZADD", KEYS[2], ARGV[3], ARGV[1])
 return 1`;
@@ -64,21 +64,21 @@ return redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2], "NX")`;
  */
 const CHECK_READERS_DRAINED_SCRIPT = `
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then return -1 end
-redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", "(" .. ARGV[2])
+redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", ARGV[2])
 return redis.call("ZCARD", KEYS[2])`;
 
 /** Token-checked renew for the writer flag. */
 const RENEW_EXCLUSIVE_SCRIPT = `
-if redis.call("get", KEYS[1]) == ARGV[1] then
-  return redis.call("pexpire", KEYS[1], ARGV[2])
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 else
   return 0
 end`;
 
 /** Token-checked release for the writer flag. */
 const RELEASE_EXCLUSIVE_SCRIPT = `
-if redis.call("get", KEYS[1]) == ARGV[1] then
-  return redis.call("del", KEYS[1])
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
 else
   return 0
 end`;

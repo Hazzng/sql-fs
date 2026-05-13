@@ -106,7 +106,7 @@ class FakeRedis {
 			this.reapZset(readersKey, Number(nowStr));
 			return this.zsets.get(readersKey)?.size ?? 0;
 		}
-		if (script.includes("pexpire")) {
+		if (script.includes("PEXPIRE")) {
 			const [writerKey] = keys as [string];
 			const [token, leaseMsStr] = argv as [string, string];
 			const entry = this.strings.get(writerKey);
@@ -116,7 +116,7 @@ class FakeRedis {
 			}
 			return 0;
 		}
-		if (script.includes("del")) {
+		if (script.includes("DEL")) {
 			const [writerKey] = keys as [string];
 			const [token] = argv as [string];
 			const entry = this.strings.get(writerKey);
