@@ -9,6 +9,9 @@
  *   4. Writer-priority: a continuous reader stream on B doesn't starve a writer on A.
  *   5. A crashed reader (stale ZSET entry) cannot deadlock a writer — TTL reaper recovers.
  *   6. After a write on A commits + publishes, B's next withSessionRead sees the data.
+ *   7. Parallel readers from both replicas each read the latest committed data.
+ *   8. Reader on A reads fresh data after writer on B (symmetric of #6).
+ *   9. Concurrent writers from different replicas serialize — no lost updates.
  *
  * Skipped unless DATABASE_URL and REDIS_URL are both set.
  */
@@ -308,5 +311,121 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 
 		// B's session lastSeenVersion now matches A's published version.
 		expect(smB.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(versionAfterA);
+	});
+
+	it("parallel readers from both replicas each read the latest committed data", async () => {
+		const sandboxId = newId();
+		const smA = makeSm();
+		const smB = makeSm();
+		await warm(smA, smB, sandboxId);
+
+		// Commit a known value before the readers start.
+		await timed(
+			"seed-write",
+			smA.withSession(TENANT, sandboxId, async (s) => {
+				await s.bash.exec("echo latest-value > /shared.txt");
+			}),
+		);
+
+		// Four parallel readers — 2 from each replica. Every single one must
+		// see the committed content, not a stale cache snapshot.
+		const results: string[] = [];
+		const reader = (sm: SessionManager): Promise<void> =>
+			sm.withSessionRead(TENANT, sandboxId, async (s) => {
+				const content = await s.fs.readFile("/shared.txt");
+				results.push(String(content).trim());
+				// Hold briefly to maximise overlap window.
+				await new Promise((r) => setTimeout(r, 100));
+			});
+
+		await timed(
+			"parallel-reads-with-content-check",
+			Promise.all([reader(smA), reader(smB), reader(smA), reader(smB)]),
+		);
+
+		// All four readers must have seen the same latest-committed value.
+		expect(results).toHaveLength(4);
+		for (const v of results) {
+			expect(v).toBe("latest-value");
+		}
+	});
+
+	it("reader on A reads fresh data after writer on B (symmetric freshness)", async () => {
+		const sandboxId = newId();
+		const smA = makeSm();
+		const smB = makeSm();
+		await warm(smA, smB, sandboxId);
+
+		// B is the writer this time.
+		await timed(
+			"B-write",
+			smB.withSession(TENANT, sandboxId, async (s) => {
+				await s.bash.exec("echo from-b > /b-visible.txt");
+			}),
+		);
+
+		const versionAfterB = Number(await redis.get(versionKey(sandboxId)));
+		expect(versionAfterB).toBeGreaterThanOrEqual(1);
+
+		// A's ensureFreshCache must detect the version bump that B published
+		// and reload before running fn — so A sees B's file.
+		await timed(
+			"A-read",
+			smA.withSessionRead(TENANT, sandboxId, async (s) => {
+				const content = await s.fs.readFile("/b-visible.txt");
+				expect(String(content).trim()).toBe("from-b");
+				expect(s.fs.getAllPaths()).toContain("/b-visible.txt");
+			}),
+		);
+
+		expect(smA.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(versionAfterB);
+	});
+
+	it("concurrent writers from different replicas serialize — no lost updates", async () => {
+		const sandboxId = newId();
+		const smA = makeSm();
+		const smB = makeSm();
+		await warm(smA, smB, sandboxId);
+
+		// Seed a counter file.
+		await timed(
+			"seed",
+			smA.withSession(TENANT, sandboxId, async (s) => {
+				await s.bash.exec("echo 0 > /counter.txt");
+			}),
+		);
+
+		// Each replica increments the counter 5 times. Because withSession
+		// holds the distributed exclusive lock for the duration of fn, the
+		// read-increment-write is atomic cross-replica. If two writers ever
+		// ran concurrently the last-write-wins semantics would cause lost
+		// updates and the final value would be < 10.
+		const increments = 5;
+		const increment = (sm: SessionManager): Promise<void> =>
+			(async () => {
+				for (let i = 0; i < increments; i++) {
+					await sm.withSession(TENANT, sandboxId, async (s) => {
+						await s.bash.exec(
+							`val=$(cat /counter.txt | tr -d '\\n'); echo $((val + 1)) > /counter.txt`,
+						);
+					});
+				}
+			})();
+
+		// Both replicas run their increment loops concurrently.
+		await timed("concurrent-increments", Promise.all([increment(smA), increment(smB)]), 30_000);
+
+		// Read the final counter value from a fresh reader perspective.
+		let finalValue = -1;
+		await timed(
+			"read-final",
+			smA.withSessionRead(TENANT, sandboxId, async (s) => {
+				const content = await s.fs.readFile("/counter.txt");
+				finalValue = Number(String(content).trim());
+			}),
+		);
+
+		// Exactly 10 increments must have landed — no lost updates.
+		expect(finalValue).toBe(increments * 2);
 	});
 });
