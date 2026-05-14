@@ -265,17 +265,43 @@ tasks/
 
 This project uses **Changesets** (`@changesets/cli`) to manage versions and changelogs. Do not manually edit `CHANGELOG.md` or bump versions in `package.json` / `openapi-spec.ts`.
 
-**Workflow:**
+**Per-PR workflow (every feature/fix PR):**
 
 1. After making changes on a branch, run `pnpm changeset` and describe what changed. This creates a `.changeset/*.md` file — commit it with the rest of the PR.
-2. On release (after merging to `main`), run `pnpm changeset:version`. This reads all pending `.changeset/*.md` files and automatically:
-   - Bumps the version in `package.json` (patch / minor / major based on the changeset kind you chose)
-   - Writes `CHANGELOG.md` from the changeset descriptions
-   - Syncs `src/api/openapi-spec.ts` `info.version` via `scripts/sync-openapi-version.mjs`
-   - Regenerates `pnpm-lock.yaml`
-   - Deletes the consumed changeset files
+2. Merge the PR into `main` with the `.changeset/*.md` file included. Do NOT bump the version or edit `CHANGELOG.md` in feature PRs.
 
-The release pipeline cuts a GitHub Release on merge to `main` when the version has changed.
+**Release workflow (manual `chore: release` PR):**
+
+Release PRs are opened manually — there is no automation that opens them. When you're ready to cut a release, batch all pending changesets on `main` into a single release PR:
+
+```bash
+# 1. Start from a clean main
+git checkout main && git pull
+
+# 2. Cut a release branch
+git checkout -b chore/release
+
+# 3. Consume all pending .changeset/*.md files. This will:
+#    - Bump the version in package.json (patch / minor / major from the changeset kinds)
+#    - Write CHANGELOG.md entries from the changeset descriptions
+#    - Sync src/api/openapi-spec.ts info.version via scripts/sync-openapi-version.mjs
+#    - Regenerate pnpm-lock.yaml
+#    - Delete the consumed .changeset/*.md files
+pnpm changeset:version
+
+# 4. Sanity-check the diff (version bump, CHANGELOG entries, openapi spec, deleted changesets)
+git diff
+
+# 5. Commit and push
+git add -A
+git commit -m "chore: release vX.Y.Z"
+git push -u origin chore/release
+
+# 6. Open the PR
+gh pr create --title "chore: release vX.Y.Z" --body "Consumes pending changesets and bumps to vX.Y.Z."
+```
+
+After the release PR merges to `main`, the release pipeline cuts a GitHub Release automatically because the version in `package.json` changed.
 
 ## Implementation Guidance
 
