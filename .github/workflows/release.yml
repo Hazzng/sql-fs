@@ -29,12 +29,22 @@ jobs:
             exit 1
           fi
 
+          # Accept both heading styles, in this order of preference:
+          #   - Changesets default:    "## 0.3.6"
+          #   - Keep a Changelog:      "## [0.3.4] - 2026-05-13"
           VERSION=$(awk '
             /^## \[Unreleased\]/ { next }
             /^## \[[^]]+\]/ {
               line = $0
               sub(/^## \[/, "", line)
               sub(/\].*/, "", line)
+              print line
+              exit
+            }
+            /^## [0-9]/ {
+              line = $0
+              sub(/^## /, "", line)
+              sub(/[[:space:]].*/, "", line)
               print line
               exit
             }
@@ -66,10 +76,19 @@ jobs:
         run: |
           VERSION="${{ steps.detect.outputs.VERSION }}"
 
+          # Match either heading style for this version:
+          #   - Changesets:           "## 0.3.6"            (exact, or followed by whitespace)
+          #   - Keep a Changelog:     "## [0.3.6]" / "## [0.3.6] - 2026-..."
+          # Stop at the next "## " heading of either style.
           CONTENT=$(awk -v ver="$VERSION" '
-            BEGIN { header = "## [" ver "]" }
-            index($0, header) == 1 { found=1; next }
-            found && /^## \[/ { exit }
+            BEGIN {
+              header_old = "## [" ver "]"
+              header_new = "## " ver
+            }
+            !found && (index($0, header_old) == 1 || $0 == header_new || index($0, header_new " ") == 1) {
+              found=1; next
+            }
+            found && /^## (\[|[0-9])/ { exit }
             found { print }
           ' CHANGELOG.md | sed '/^$/d')
 
