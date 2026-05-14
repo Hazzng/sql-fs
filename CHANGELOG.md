@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6
+
+### Patch Changes
+
+- 8d50059: add distributed lock for R-W so strong consistency is enforced
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -42,8 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Parallel readOnly bash exec on the same sandbox (single-replica). Callers opt in by passing `readOnly: true` on `/v1/sandboxes/:id/exec`, `/exec-sync`, `/exec-sync-batch`, and the MCP `bash_exec` / `bash_exec_batch` tools. ReadOnly execs route through the new `SessionManager.withSessionRead`: they take a per-session async readers-writer lock in *shared* mode (multiple readers run concurrently), skip the distributed exec lock, and share one single-flighted `ensureFreshCache` probe + reload across the cohort. Writes still take the lock exclusively and are writer-priority — a queued writer blocks new readers, preventing reader starvation.
-- Read-only safety net on `SqlFs`: while a read-only scope is active every mutating syscall (`writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes`, `cp`, `mv`, `symlink`, `link`, `bulkIngest`) throws `EREADONLY` *before* any DB work. The scope is **reference-counted** so multiple concurrent readers share a single FS instance safely. Violation attribution uses an `AsyncLocalStorage`-based `readOnlyContext` so a lying script in one reader never falsely flags innocent concurrent readers — only the originating call's context is marked, and the session manager surfaces `EREADONLY_VIOLATION` (HTTP **422**) on that one call. Violations are emitted via `logAudit("read_only_violation", ...)`.
+- Parallel readOnly bash exec on the same sandbox (single-replica). Callers opt in by passing `readOnly: true` on `/v1/sandboxes/:id/exec`, `/exec-sync`, `/exec-sync-batch`, and the MCP `bash_exec` / `bash_exec_batch` tools. ReadOnly execs route through the new `SessionManager.withSessionRead`: they take a per-session async readers-writer lock in _shared_ mode (multiple readers run concurrently), skip the distributed exec lock, and share one single-flighted `ensureFreshCache` probe + reload across the cohort. Writes still take the lock exclusively and are writer-priority — a queued writer blocks new readers, preventing reader starvation.
+- Read-only safety net on `SqlFs`: while a read-only scope is active every mutating syscall (`writeFile`, `appendFile`, `mkdir`, `rm`, `chmod`, `utimes`, `cp`, `mv`, `symlink`, `link`, `bulkIngest`) throws `EREADONLY` _before_ any DB work. The scope is **reference-counted** so multiple concurrent readers share a single FS instance safely. Violation attribution uses an `AsyncLocalStorage`-based `readOnlyContext` so a lying script in one reader never falsely flags innocent concurrent readers — only the originating call's context is marked, and the session manager surfaces `EREADONLY_VIOLATION` (HTTP **422**) on that one call. Violations are emitted via `logAudit("read_only_violation", ...)`.
 - New async readers-writer lock primitive `RWLock` (`src/api/rw-lock.ts`) replaces `async-mutex`'s `Mutex` on `Session`. Drop-in `runExclusive` for existing call sites plus a new `runShared`. AbortSignal support cancels pending acquisitions cleanly.
 - OpenAPI spec documents the new `readOnly` request field on `/exec-sync`, `/exec`, and `/exec-sync-batch`, and the corresponding 422 response.
 
