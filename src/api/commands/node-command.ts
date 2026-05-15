@@ -51,7 +51,10 @@ export const nodeCommand = defineCommand("node", async (args: string[], ctx: Com
 		return hintResult(127);
 	}
 
-	const first = args[0];
+	// args.length === 0 guard above ensures args[0] is present; the non-null
+	// assertion is required because noUncheckedIndexedAccess types it as
+	// `string | undefined` even after the length check.
+	const first = args[0]!;
 
 	// --help / -h — print the hint with a success exit so callers can detect
 	// that the command exists and the user explicitly asked for help.
@@ -80,7 +83,8 @@ export const nodeCommand = defineCommand("node", async (args: string[], ctx: Com
 
 		if (ctx.exec !== undefined) {
 			// Build: js-exec -c CODE [extra-args…]
-			const code = args[1];
+			// args.length >= 2 is guaranteed by the `args.length < 2` guard above.
+			const code = args[1]!;
 			const extraArgs = args.slice(2);
 			const cmd = ["js-exec", "-c", shellQuote(code), ...extraArgs.map(shellQuote)].join(" ");
 			return ctx.exec(cmd, { cwd: ctx.cwd });
