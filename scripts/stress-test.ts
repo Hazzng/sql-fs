@@ -21,6 +21,7 @@ import { PostgresDialect } from "../src/fs/sql-fs/dialects/postgres.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../src/fs/sql-fs/index.js";
 import { runMigrations } from "../src/api/migrations.js";
 import { RuntimeBackpressureError, SessionManager } from "../src/api/session-manager.js";
+import { executeBatch } from "../src/api/lib/batch-exec.js";
 
 const PG_URL = process.env.STRESS_PG_URL;
 const REDIS_URL = process.env.STRESS_REDIS_URL;
@@ -676,6 +677,102 @@ async function scenarioCrossReplicaRw(durationMs: number): Promise<ScenarioResul
 	};
 }
 
+// ── Scenario 6: parallel readOnly batch execution ─────────────────────────────
+
+/**
+ * Fires a readOnly batch of 10 scripts each sleeping 0.5s in-process via
+ * SessionManager + executeBatch. If the parallel fan-out is working, wall-clock
+ * should be ~0.5s, not ~5s (serial sum).
+ */
+async function scenarioParallelReadOnlyBatch(): Promise<ScenarioResult> {
+	const name = "Parallel readOnly batch execution";
+	log(`▶ ${name}`);
+	const errors: string[] = [];
+	const notes: string[] = [];
+	const before = await snapshot();
+	const t0 = Date.now();
+
+	const redis = new Redis(REDIS_URL!, { lazyConnect: false, maxRetriesPerRequest: 1 });
+	await new Promise<void>((resolve, reject) => {
+		redis.once("ready", resolve);
+		redis.once("error", reject);
+		setTimeout(() => reject(new Error("redis connect timeout")), 10_000);
+	});
+
+	const sandboxId = `stress-parallel-batch-${Date.now()}`;
+	const sm = new SessionManager({
+		createFs: async (_t, sid) => {
+			const { fs } = await createPostgresSandboxFs({ connectionString: PG_URL!, tenantId: "stress", redis }, sid);
+			return fs;
+		},
+		destroySandboxFn: async (_t, sid) => destroyPostgresSandbox(PG_URL!, sid),
+		idleMs: 120_000,
+		redis,
+	});
+
+	try {
+		// Seed the sandbox so it's in the pool before the readOnly entry.
+		await sm.withSession("stress", sandboxId, async (s) => {
+			await s.fs.writeFile("/seed.txt", "ready");
+		});
+
+		const scripts = Array.from({ length: 10 }, (_, i) => ({
+			id: `s${i}`,
+			script: "sleep 0.5; echo ok",
+		}));
+
+		const batchStart = Date.now();
+		const results = await sm.withSessionRead("stress", sandboxId, (session) =>
+			executeBatch(sm, session, scripts, 5_000),
+		);
+		const elapsed = Date.now() - batchStart;
+
+		// 10 scripts × 0.5s serial = 5s; parallel with cap=16 should be ~0.5s.
+		if (elapsed >= 2000) {
+			errors.push(`expected < 2000ms wall-clock for parallel batch, got ${elapsed}ms`);
+		} else {
+			notes.push(`10 × sleep 0.5s completed in ${elapsed}ms (serial would be ≥ 5000ms)`);
+		}
+
+		if (results.length !== 10) {
+			errors.push(`expected 10 results, got ${results.length}`);
+		} else {
+			const allOk = results.every((r) => r.exitCode === 0 && r.stdout.trim() === "ok");
+			if (!allOk) {
+				errors.push(`some scripts failed or had unexpected output: ${JSON.stringify(results.filter((r) => r.exitCode !== 0))}`);
+			} else {
+				notes.push("all 10 scripts exited 0, stdout='ok'");
+			}
+
+			const orderOk = results.every((r, i) => r.id === `s${i}`);
+			if (!orderOk) {
+				errors.push(`result order not preserved: ${results.map((r) => r.id).join(",")}`);
+			} else {
+				notes.push("result order preserved");
+			}
+		}
+	} finally {
+		try {
+			await sm.destroy("stress", sandboxId);
+		} catch {
+			/* ignore */
+		}
+		await sm.shutdown({ drainTimeoutMs: 10_000 });
+		await redis.quit().catch(() => {});
+	}
+
+	const after = await snapshot();
+	return {
+		name,
+		durationMs: Date.now() - t0,
+		before,
+		after,
+		notes,
+		errors,
+		pass: errors.length === 0,
+	};
+}
+
 // ── Migration bootstrap ───────────────────────────────────────────────────────
 
 /**
@@ -762,6 +859,7 @@ async function main(): Promise<void> {
 		{ key: "redis-flakiness", fn: scenarioRedisFlakiness },
 		{ key: "in-proc", fn: scenarioInProc },
 		{ key: "cross-replica-rw", fn: () => scenarioCrossReplicaRw(cli.durationMs) },
+		{ key: "parallel-readonly-batch", fn: scenarioParallelReadOnlyBatch },
 	];
 	const selected = cli.scenario
 		? scenarioRegistry.filter((s) => s.key === cli.scenario)

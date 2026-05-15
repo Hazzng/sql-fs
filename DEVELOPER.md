@@ -221,6 +221,8 @@ Route handlers (`/exec-sync`, `/exec` SSE, `/exec-sync-batch`, MCP `bash_exec` /
 
 **The `scriptTx` is intentionally bypassed in the read path** (`execWithRuntimeThrottle` inspects `readOnlyContext.getStore()`). The script transaction is a per-script DB transaction shared via `SessionScopedFs` — concurrent readers would race on its `beginScope`/`endScope`. Since no writes can occur, there is nothing for it to commit.
 
+**Parallel batch execution (`exec-sync-batch` / `bash_exec_batch` with `readOnly:true`):** When a batch is invoked with `readOnly:true`, its scripts execute in parallel under a single shared-lock grant. The lock-hold duration is unchanged relative to a sequential batch — only wall-clock time decreases. Result order is preserved by indexed assignment into a pre-sized array. The fan-out is bounded by `MAX_BATCH_PARALLELISM = 16` (defined in `src/api/lib/batch-exec.ts`). The branching is controlled by `readOnlyContext.getStore()` inside `executeBatch` — if the ALS store is populated (i.e., the caller is inside a `withSessionReadEntry` scope), the parallel path runs; otherwise the sequential path runs.
+
 ---
 
 ## Cache Layers
