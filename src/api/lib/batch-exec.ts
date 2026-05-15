@@ -1,3 +1,4 @@
+import { readOnlyContext } from "../read-only-context.js";
 import type { SessionManager } from "../session-manager.js";
 import type { Session } from "../session-manager.js";
 
@@ -14,7 +15,9 @@ export interface BatchScriptResult {
 	readonly error?: string;
 }
 
-export async function executeBatch(
+const MAX_BATCH_PARALLELISM = 16;
+
+async function runSequential(
 	sessionManager: SessionManager,
 	session: Session,
 	scripts: readonly BatchScriptEntry[],
@@ -75,4 +78,95 @@ export async function executeBatch(
 	}
 
 	return results;
+}
+
+async function runParallel(
+	sessionManager: SessionManager,
+	session: Session,
+	scripts: readonly BatchScriptEntry[],
+	totalTimeoutMs: number,
+	outerSignal?: AbortSignal,
+): Promise<BatchScriptResult[]> {
+	const results = new Array<BatchScriptResult>(scripts.length) as BatchScriptResult[];
+
+	const sharedController = new AbortController();
+	let timedOut = false;
+
+	const deadlineTimer = setTimeout(() => {
+		timedOut = true;
+		sharedController.abort();
+	}, totalTimeoutMs);
+
+	const onOuterAbort = () => sharedController.abort();
+	outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+
+	try {
+		const cap = Math.min(scripts.length, MAX_BATCH_PARALLELISM);
+		let cursor = 0;
+
+		const runWorker = async (): Promise<void> => {
+			while (true) {
+				const idx = cursor++;
+				if (idx >= scripts.length) break;
+
+				const entry = scripts[idx]!;
+
+				if (sharedController.signal.aborted) {
+					results[idx] = {
+						id: entry.id,
+						stdout: "",
+						stderr: "",
+						exitCode: -1,
+						error: timedOut ? "timeout" : "aborted",
+					};
+					continue;
+				}
+
+				try {
+					const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
+						signal: sharedController.signal,
+					});
+					results[idx] = {
+						id: entry.id,
+						stdout: execResult.stdout,
+						stderr: execResult.stderr,
+						exitCode: execResult.exitCode,
+					};
+				} catch {
+					results[idx] = {
+						id: entry.id,
+						stdout: "",
+						stderr: "",
+						exitCode: -1,
+						error: timedOut ? "timeout" : "aborted",
+					};
+				}
+			}
+		};
+
+		const workers: Promise<void>[] = [];
+		for (let i = 0; i < cap; i++) {
+			workers.push(runWorker());
+		}
+		await Promise.all(workers);
+	} finally {
+		clearTimeout(deadlineTimer);
+		outerSignal?.removeEventListener("abort", onOuterAbort);
+	}
+
+	return results;
+}
+
+export async function executeBatch(
+	sessionManager: SessionManager,
+	session: Session,
+	scripts: readonly BatchScriptEntry[],
+	totalTimeoutMs: number,
+	outerSignal?: AbortSignal,
+): Promise<BatchScriptResult[]> {
+	const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
+	if (inReadOnlyScope) {
+		return runParallel(sessionManager, session, scripts, totalTimeoutMs, outerSignal);
+	}
+	return runSequential(sessionManager, session, scripts, totalTimeoutMs, outerSignal);
 }
