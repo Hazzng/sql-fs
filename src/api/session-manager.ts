@@ -115,6 +115,28 @@ export interface Session {
 	destroyPromise?: Promise<void>;
 	lastSeenVersion: number;
 	/**
+	 * Tracked working directory for this session.
+	 *
+	 * just-bash's `bash.exec()` runs each call against a **copy** of the
+	 * interpreter state (env + cwd). Any `cd` executed inside a script
+	 * modifies only that copy and is discarded once the call returns —
+	 * `bash.getCwd()` never changes. We therefore mirror the cwd ourselves:
+	 *
+	 * - Initialised from `bash.getCwd()` at session creation (typically `/home/user`).
+	 * - After every **non-readOnly** exec we read `result.env.PWD`, which
+	 *   just-bash always populates with the final working directory, and store
+	 *   it here.
+	 * - Before each exec we pass this value as `opts.cwd` (unless the caller
+	 *   already supplied an explicit `cwd` in the request body).
+	 *
+	 * Semantics: cwd is **session-scoped** and **per-sandbox** — two sandboxes
+	 * are completely independent, and the cwd resets to `/home/user` only when
+	 * the session is evicted (idle timeout or explicit destroy).
+	 * readOnly execs use the current `session.cwd` as their starting directory
+	 * but do not update it, consistent with the read-only contract.
+	 */
+	cwd: string;
+	/**
 	 * Single-flight guard for `ensureFreshCache`. While set, parallel readers
 	 * (and any concurrent writer entry) await the same probe + reload rather
 	 * than each issuing their own Redis GET / coherent.reload(). Cleared on
@@ -434,6 +456,7 @@ export class SessionManager {
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
 					publishPending: false,
+					cwd: bash.getCwd(),
 				};
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
@@ -1109,6 +1132,17 @@ export class SessionManager {
 		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
+		// Apply the session-tracked cwd as the starting directory for this exec,
+		// unless the caller has already supplied an explicit cwd in the request.
+		// just-bash runs each exec against a copy of the interpreter state, so
+		// any `cd` executed inside a script does not survive the call. We bridge
+		// that gap by reading result.env.PWD (always populated by just-bash) and
+		// storing it back on the session after every non-readOnly exec.
+		const resolvedOpts: ExecOptions = {
+			...opts,
+			cwd: opts?.cwd ?? session.cwd,
+		};
+
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
 		// EREADONLY before any DB call, so the per-script transaction has
 		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
@@ -1118,7 +1152,7 @@ export class SessionManager {
 			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
-					const result = await session.bash.exec(script, opts);
+					const result = await session.bash.exec(script, resolvedOpts);
 					await session.scriptTx.endScope();
 					return result;
 				} catch (err) {
@@ -1126,11 +1160,23 @@ export class SessionManager {
 					throw err;
 				}
 			}
-			return session.bash.exec(script, opts);
+			return session.bash.exec(script, resolvedOpts);
+		};
+
+		const updateCwd = (result: BashExecResult): BashExecResult => {
+			// readOnly execs must not mutate session state — they run in shared
+			// lock mode and may execute concurrently with other readers.
+			if (!inReadOnlyScope) {
+				const finalCwd = result.env?.PWD;
+				if (typeof finalCwd === "string" && finalCwd.length > 0) {
+					session.cwd = finalCwd;
+				}
+			}
+			return result;
 		};
 
 		if (!usesPython && !usesJs) {
-			return execFn();
+			return updateCwd(await execFn());
 		}
 
 		const signal = opts?.signal;
@@ -1145,7 +1191,7 @@ export class SessionManager {
 		}
 
 		try {
-			return await execFn();
+			return updateCwd(await execFn());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);
