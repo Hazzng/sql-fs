@@ -61,6 +61,45 @@ describe("POST /v1/sandboxes", () => {
 		expect(typeof body.createdAt).toBe("string");
 	});
 
+	it("create sandbox with network=true returns network:true in response and sets runtime flag", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-net");
+
+		const res = await app.request("/v1/sandboxes", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ javascript: true, network: true }),
+		});
+
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { id: string; javascript: boolean; network: boolean };
+		expect(body.javascript).toBe(true);
+		expect(body.network).toBe(true);
+
+		// Verify the session was created with network=true in runtimeOptions
+		const session = sessionManager.getSession("default", body.id);
+		expect(session?.runtimeOptions.network).toBe(true);
+	});
+
+	it("create sandbox without network flag returns network:false by default", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-no-net");
+
+		const res = await app.request("/v1/sandboxes", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { network: boolean };
+		expect(body.network).toBe(false);
+	});
+
 	it("create sandbox with initial files writes files to fs", async () => {
 		const { sessionManager, fs } = makeTestEnv();
 		const app = makeTestApp(sessionManager);

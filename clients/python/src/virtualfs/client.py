@@ -96,8 +96,22 @@ class SandboxesResource:
         files: Optional[Mapping[str, str]] = None,
         python: bool = False,
         javascript: bool = False,
+        network: bool = False,
     ) -> Sandbox:
         """`POST /v1/sandboxes` — create a new sandbox.
+
+        Args:
+            name: Optional human-readable label for the sandbox.
+            env: Environment variables exposed to processes inside the sandbox.
+            files: Initial files to seed the sandbox filesystem with, keyed by path.
+            python: Enable the CPython WASM runtime.
+            javascript: Enable the QuickJS / `js-exec` runtime.
+            network: Opt-in to outbound network access. When enabled, `fetch()`
+                inside `js-exec` can reach external HTTP endpoints (timeout
+                extends to 60 s). Bash itself remains air-gapped — no `curl`,
+                `wget`, DNS, or raw sockets — so `fetch()` is the only egress
+                path. Defaults to `False` (secure-by-default). Requires
+                `javascript=True` to have any effect.
 
         Returns a bound `Sandbox` handle ready for exec / file operations.
         """
@@ -112,6 +126,8 @@ class SandboxesResource:
             body["python"] = True
         if javascript:
             body["javascript"] = True
+        if network:
+            body["network"] = True
 
         resp = self._t.request("POST", "/sandboxes", json_body=body or None)
         record = SandboxRecord.from_api(resp.json())

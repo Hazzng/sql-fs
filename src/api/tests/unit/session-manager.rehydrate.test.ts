@@ -114,11 +114,11 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	it("restores runtime options from PG metadata on rehydration", async () => {
 		pgSandboxes.set("sb-py", { owner: null, name: null, python: true, javascript: false });
 
-		let capturedRuntime = { python: false, javascript: false };
+		let capturedRuntime = { python: false, javascript: false, network: false };
 		await sm.withSessionOrRehydrate("default", "sb-py", async (session) => {
 			capturedRuntime = session.runtimeOptions;
 		});
-		expect(capturedRuntime).toEqual({ python: true, javascript: false });
+		expect(capturedRuntime).toEqual({ python: true, javascript: false, network: false });
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
@@ -139,12 +139,12 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 		});
 
 		let owner = "";
-		let runtime = { python: false, javascript: false };
+		let runtime = { python: false, javascript: false, network: false };
 		await sm2.withSessionOrRehydrate("default", "sb-meta", async (session) => {
 			owner = session.owner;
 			runtime = session.runtimeOptions;
 		});
 		expect(owner).toBe("creator");
-		expect(runtime).toEqual({ python: true, javascript: false });
+		expect(runtime).toEqual({ python: true, javascript: false, network: false });
 	});
 });
