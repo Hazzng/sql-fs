@@ -209,13 +209,17 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
   Write broad greps and filter in Python — never anchor for performance reasons:
 
   ```python
+  import re
+
   # SLOW (24×): anchored for precision
   sb.exec("grep -rn '^def \\|^async def ' /project --include='*.py'")
 
   # FAST (1×): broad grep, filter in Python
+  # Note: the filter intentionally matches all def sites (including methods);
+  # narrow further with your own logic if you only want top-level definitions.
   r = sb.exec("grep -rn 'def ' /project --include='*.py'")
   lines = [l for l in r.stdout.splitlines()
-           if re.search(r':\s*(async\s+)?def ', l)]
+           if re.search(r'\bdef ', l)]
   ```
 
   The same advice applies inside `exec_batch` scripts.

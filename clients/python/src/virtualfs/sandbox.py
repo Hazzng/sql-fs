@@ -193,16 +193,18 @@ class Sandbox:
         combined with alternation (``\\|``) -- force grep into a slow line-by-line
         NFA/DFA evaluation mode and can be **10-24x slower** than unanchored
         equivalents on large file sets. Prefer a broad unanchored pattern and
-        filter results in Python:
+        filter results in Python (``import re`` required in your script):
 
             # SLOW (anchored, ~24x slower):
             sb.exec("grep -rn '^def \\\\|^async def ' /project --include='*.py'")
 
             # FAST (broad grep + Python filter):
+            # Note: broad pattern intentionally matches more than the anchored
+            # grep above (includes methods/nested defs); narrow as needed.
             r = sb.exec("grep -rn 'def ' /project --include='*.py'")
             lines = [
                 l for l in r.stdout.splitlines()
-                if re.search(r':\\s*(async\\s+)?def ', l)
+                if re.search(r'\\bdef ', l)
             ]
         """
         body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}

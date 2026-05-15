@@ -133,7 +133,8 @@ tax — the broad grep + post-filter is dramatically faster end-to-end.
 grep -rn '^def \|^async def ' /project --include='*.py'
 
 # FAST (1×): broad grep, post-filter
-grep -rn 'def ' /project --include='*.py' | awk -F: '$3 ~ /^[[:space:]]*(async[[:space:]]+)?def /'
+# sub() strips "file:line:" prefix (handles filenames with colons) before matching
+grep -rn 'def ' /project --include='*.py' | awk '{ line=$0; sub(/^[^:]+:[^:]+:/, "", line); if (line ~ /[[:space:]]*(async[[:space:]]+)?def /) print $0 }'
 ```
 
 ---
