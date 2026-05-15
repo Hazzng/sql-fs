@@ -10,7 +10,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
-import { type BatchScriptResult, executeBatch } from "../lib/batch-exec.js";
+import { type BatchScriptResult, type ExecuteBatchOptions, executeBatch } from "../lib/batch-exec.js";
 import {
 	forbiddenResponse,
 	isForbiddenError,
@@ -45,6 +45,7 @@ const batchExecBodySchema = z.object({
 		.min(1)
 		.max(MAX_BATCH_SCRIPTS),
 	timeoutMs: z.number().int().positive().optional(),
+	perScriptTimeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 	readOnly: z.boolean().optional(),
 });
 
@@ -360,6 +361,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		const totalTimeoutMs = Math.min(body.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+		const batchOptions: ExecuteBatchOptions | undefined =
+			body.perScriptTimeoutMs !== undefined ? { perScriptTimeoutMs: body.perScriptTimeoutMs } : undefined;
 
 		const disconnectController = new AbortController();
 		if (c.req.raw.signal.aborted) {
@@ -372,7 +375,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 			results = await runner<BatchScriptResult[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) =>
-				executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal),
+				executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal, batchOptions),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
