@@ -99,6 +99,7 @@ async function runParallel(
 
 	const onOuterAbort = () => sharedController.abort();
 	outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+	if (outerSignal?.aborted) sharedController.abort();
 
 	try {
 		const cap = Math.min(scripts.length, MAX_BATCH_PARALLELISM);
