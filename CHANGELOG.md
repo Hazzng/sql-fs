@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7
+
+### Patch Changes
+
+- [#69](https://github.com/Hazzng/virtualFS/pull/69) Thanks [@Hazzng](https://github.com/Hazzng)! - Parallel readOnly batch execution. POST /exec-sync-batch and MCP bash_exec_batch now run scripts in parallel when readOnly: true, bounded at 16 concurrent workers. Result order is preserved. Write-path batches are unchanged (sequential, exclusive lock). MCP client disconnects now propagate into in-flight scripts via extra.signal forwarding.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
