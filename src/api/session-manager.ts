@@ -14,7 +14,14 @@
 
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
-import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import type {
+	BashExecResult,
+	DefenseInDepthConfig,
+	ExecOptions,
+	IFileSystem,
+	JavaScriptConfig,
+	SecurityViolation,
+} from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
@@ -27,6 +34,155 @@ import { logAudit } from "./lib/audit.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
+
+/**
+ * Bootstrap code injected into every js-exec (QuickJS) session to patch the
+ * broken Buffer encoding shim.  The built-in shim ignores the `encoding`
+ * argument on both `Buffer.from(str, enc)` and `buf.toString(enc)`, making
+ * base64 / hex / latin1 round-trips silent no-ops.  This patch replaces those
+ * two methods with correct implementations while leaving all other Buffer
+ * behaviour untouched.
+ *
+ * Encodings patched:
+ *   • base64 / base64url — encode & decode
+ *   • hex               — encode & decode
+ *   • latin1 / binary   — encode & decode (byte-per-char pass-through)
+ *   • utf8 / utf-8 / ascii / ucs2 / utf16le — delegated to the original shim
+ *
+ * The code runs inside QuickJS where `btoa`/`atob` are not available, so
+ * base64 is implemented with a compact pure-JS lookup table.
+ */
+const JS_EXEC_BUFFER_ENCODING_BOOTSTRAP = /* js */ `
+(function () {
+  var _Buf = globalThis.Buffer;
+  if (!_Buf) return; // safety guard — should never be falsy
+
+  // ─── base64 alphabet ───────────────────────────────────────────────────────
+  var _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var _B64U = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+  // Reverse lookup: charCode → 6-bit value (works for both standard and url-safe)
+  var _REV = new Uint8Array(128);
+  for (var _i = 0; _i < 64; _i++) {
+    _REV[_B64.charCodeAt(_i)] = _i;
+    _REV[_B64U.charCodeAt(_i)] = _i; // url-safe aliases overlap, that's fine
+  }
+
+  function _b64Encode(bytes, urlSafe) {
+    var alpha = urlSafe ? _B64U : _B64;
+    var out = '';
+    var len = bytes.length;
+    var i = 0;
+    while (i < len) {
+      var b0 = bytes[i++];
+      var b1 = i < len ? bytes[i++] : 0;
+      var b2 = i < len ? bytes[i++] : 0;  // may be padding
+      out += alpha[b0 >> 2];
+      out += alpha[((b0 & 3) << 4) | (b1 >> 4)];
+      out += alpha[((b1 & 0x0f) << 2) | (b2 >> 6)];
+      out += alpha[b2 & 0x3f];
+    }
+    // Add standard padding (base64url strips it; standard keeps it)
+    var pad = (3 - (len % 3)) % 3;
+    if (!urlSafe && pad > 0) {
+      out = out.slice(0, out.length - pad) + (pad === 1 ? '=' : '==');
+    } else if (urlSafe && pad > 0) {
+      out = out.slice(0, out.length - pad); // no padding for base64url
+    }
+    return out;
+  }
+
+  function _b64Decode(str) {
+    // Strip padding and whitespace
+    str = str.replace(/[\\r\\n\\t ]/g, '').replace(/=+$/, '');
+    var len = str.length;
+    var outLen = (len * 3 / 4) | 0;
+    var out = new Uint8Array(outLen);
+    var j = 0;
+    for (var i = 0; i < len; i += 4) {
+      var c0 = _REV[str.charCodeAt(i)     & 0x7f] || 0;
+      var c1 = _REV[str.charCodeAt(i + 1) & 0x7f] || 0;
+      var c2 = _REV[str.charCodeAt(i + 2) & 0x7f] || 0;
+      var c3 = _REV[str.charCodeAt(i + 3) & 0x7f] || 0;
+      if (j < outLen) out[j++] = (c0 << 2) | (c1 >> 4);
+      if (j < outLen) out[j++] = ((c1 & 0x0f) << 4) | (c2 >> 2);
+      if (j < outLen) out[j++] = ((c2 & 0x03) << 6) | c3;
+    }
+    return out.subarray(0, j);
+  }
+
+  // ─── hex ──────────────────────────────────────────────────────────────────
+  var _HEX = '0123456789abcdef';
+
+  function _hexEncode(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) {
+      out += _HEX[(bytes[i] >> 4) & 0xf] + _HEX[bytes[i] & 0xf];
+    }
+    return out;
+  }
+
+  function _hexDecode(str) {
+    var len = (str.length >> 1);
+    var out = new Uint8Array(len);
+    for (var i = 0; i < len; i++) {
+      out[i] = parseInt(str.substr(i * 2, 2), 16);
+    }
+    return out;
+  }
+
+  // ─── latin1 / binary ──────────────────────────────────────────────────────
+  function _latin1Encode(bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] & 0xff);
+    return out;
+  }
+
+  function _latin1Decode(str) {
+    var out = new Uint8Array(str.length);
+    for (var i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
+    return out;
+  }
+
+  // ─── Patch Buffer.from ────────────────────────────────────────────────────
+  var _origFrom = _Buf.from.bind(_Buf);
+  _Buf.from = function (data, encoding) {
+    if (typeof data === 'string' && typeof encoding === 'string') {
+      var enc = encoding.toLowerCase().replace('-', '');
+      if (enc === 'base64')    return new _Buf(_b64Decode(data));
+      if (enc === 'base64url') return new _Buf(_b64Decode(data)); // _REV handles url-safe chars
+      if (enc === 'hex')       return new _Buf(_hexDecode(data));
+      if (enc === 'latin1' || enc === 'binary') return new _Buf(_latin1Decode(data));
+      // utf8 / ascii / ucs2 / utf16le — fall through to original (utf-8 only shim)
+    }
+    return _origFrom(data, encoding);
+  };
+  // Preserve static methods that just-bash copies onto Buffer.from
+  Object.keys(_origFrom).forEach(function (k) {
+    if (!_Buf.from[k]) _Buf.from[k] = _origFrom[k];
+  });
+
+  // ─── Patch Buffer.prototype.toString ─────────────────────────────────────
+  var _origToString = _Buf.prototype.toString;
+  _Buf.prototype.toString = function (encoding, start, end) {
+    var bytes = (start !== undefined || end !== undefined)
+      ? this._data.subarray(start, end)
+      : this._data;
+    if (typeof encoding === 'string') {
+      var enc = encoding.toLowerCase().replace('-', '');
+      if (enc === 'base64')    return _b64Encode(bytes, false);
+      if (enc === 'base64url') return _b64Encode(bytes, true);
+      if (enc === 'hex')       return _hexEncode(bytes);
+      if (enc === 'latin1' || enc === 'binary') return _latin1Encode(bytes);
+      // utf8 / ascii / ucs2 / utf16le — fall through to original
+    }
+    return _origToString.call(this._data === bytes ? this : { _data: bytes }, encoding);
+  };
+
+  // Keep globalThis.Buffer and the jb:buffer symbol in sync
+  globalThis[Symbol.for('jb:buffer')].Buffer = _Buf;
+})();
+`;
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
@@ -391,10 +547,13 @@ export class SessionManager {
 							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
 						}
 					: false;
+				const javascriptConfig: JavaScriptConfig | undefined = resolvedRuntime.javascript
+					? { bootstrap: JS_EXEC_BUFFER_ENCODING_BOOTSTRAP }
+					: undefined;
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
-					javascript: resolvedRuntime.javascript || undefined,
+					javascript: javascriptConfig,
 					defenseInDepth: defenseInDepthConfig,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
