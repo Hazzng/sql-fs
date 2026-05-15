@@ -100,6 +100,12 @@ export class WarmPythonProcess {
 	private pendingResolve: ((result: WarmPythonExecResult) => void) | undefined;
 	private pendingReject: ((err: Error) => void) | undefined;
 	private currentSentinel: string | undefined;
+	/**
+	 * Sentinels belonging to aborted exec() calls.  When the Python process
+	 * eventually emits one of these, trySettle() drains it from stdoutBuf so
+	 * that future calls don't see stale output.
+	 */
+	private drainSentinels = new Set<string>();
 	private dead = false;
 
 	/**
@@ -188,7 +194,16 @@ export class WarmPythonProcess {
 				return;
 			}
 			const onAbort = (): void => {
-				this.kill();
+				// Cancel only this exec() call — do NOT kill the whole warm process.
+				// Register the sentinel in drainSentinels so that when the Python
+				// side eventually emits it, trySettle() scrubs it from stdoutBuf
+				// (along with any stdout produced by the aborted code) before the
+				// next exec() call picks them up as its own output.
+				this.drainSentinels.add(sentinel);
+				this.pendingResolve = undefined;
+				this.pendingReject = undefined;
+				this.currentSentinel = undefined;
+				clearTimeout(timer);
 				reject(Object.assign(new Error("ABORTED"), { code: "ABORTED", name: "AbortError" }));
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
@@ -243,6 +258,24 @@ export class WarmPythonProcess {
 	// ── private ──────────────────────────────────────────────────────────────
 
 	private trySettle(): void {
+		// First, drain any sentinels belonging to aborted exec() calls so their
+		// output does not bleed into the next exec's stdout capture.
+		if (this.drainSentinels.size > 0) {
+			let lines = this.stdoutBuf.split("\n");
+			for (const drainSentinel of this.drainSentinels) {
+				const idx = lines.findIndex((l) => {
+					const m = SENTINEL_SUFFIX_RE.exec(l);
+					return m !== null && m[1] === drainSentinel;
+				});
+				if (idx !== -1) {
+					// Discard everything up to and including this sentinel line.
+					lines = lines.slice(idx + 1);
+					this.drainSentinels.delete(drainSentinel);
+				}
+			}
+			this.stdoutBuf = lines.join("\n");
+		}
+
 		if (this.pendingResolve === undefined || this.currentSentinel === undefined) return;
 
 		// The bootstrap writes `<sentinel>:<exitCode>\n` to stdout.
@@ -255,6 +288,12 @@ export class WarmPythonProcess {
 		if (sentinelIdx === -1) return;
 
 		// User stdout is everything before the sentinel line.
+		// Reconstruct stdout as it was written by the Python process:
+		//   - sentinelIdx === 0  →  no output at all  →  ""
+		//   - sentinelIdx  > 0  →  userLines joined by "\n" plus the terminating
+		//     "\n" that Python (print/sys.stdout.write) wrote before the sentinel.
+		// Do NOT use trimEnd() — programs may intentionally produce trailing
+		// spaces (print("hi   ")) or trailing blank lines (print("")).
 		const userLines = lines.slice(0, sentinelIdx);
 		const remainingLines = lines.slice(sentinelIdx + 1);
 		const sentinelLine = lines[sentinelIdx]!;
@@ -264,20 +303,30 @@ export class WarmPythonProcess {
 		// Carry over any data that arrived after the sentinel.
 		this.stdoutBuf = remainingLines.join("\n");
 
-		// Drain accumulated stderr for this turn.
-		const stderrOut = this.stderrBuf.trimEnd();
-		this.stderrBuf = "";
+		const stdoutOut = sentinelIdx > 0 ? `${userLines.join("\n")}\n` : "";
 
+		// Clear pending fields so concurrent checks don't re-settle.
 		const resolve = this.pendingResolve;
 		this.pendingResolve = undefined;
 		this.pendingReject = undefined;
 		this.currentSentinel = undefined;
 
-		const stdoutOut = userLines.join("\n").trimEnd();
-		resolve({
-			stdout: stdoutOut.length > 0 ? `${stdoutOut}\n` : "",
-			stderr: stderrOut.length > 0 ? `${stderrOut}\n` : "",
-			exitCode,
+		// Defer stderr drain by one event-loop tick so that any stderr `data`
+		// events already queued in libuv (but not yet delivered) can fire before
+		// we snapshot stderrBuf.  This closes a pipe-ordering race where the
+		// stdout sentinel arrives on one epoll cycle and the matching stderr bytes
+		// arrive on the very next one.
+		setImmediate(() => {
+			// Use stderr exactly as accumulated — do NOT trimEnd() so that
+			// intentional trailing whitespace or blank lines are preserved.
+			const stderrOut = this.stderrBuf;
+			this.stderrBuf = "";
+
+			resolve({
+				stdout: stdoutOut,
+				stderr: stderrOut,
+				exitCode,
+			});
 		});
 	}
 
@@ -304,6 +353,15 @@ export class WarmPythonProcess {
  *   -c <code>   Inline Python code string (like `python3 -c`).
  *
  * Exit codes mirror the Python script's exit code.
+ *
+ * ## Abort / cancellation behaviour
+ *
+ * When `ctx.signal` is aborted (e.g. a client disconnect), the current
+ * `exec()` call rejects with `{ code: "ABORTED" }` but the warm interpreter
+ * process is kept alive.  The in-flight Python code continues running until
+ * it naturally completes; its result is silently discarded, and the process
+ * becomes available for the next `exec()` call.  Callers must serialise
+ * requests (no concurrent `exec()` calls) — see `EPYEXEC_BUSY`.
  */
 export function createPyExecCommand(warm: WarmPythonProcess): import("just-bash").Command {
 	return {

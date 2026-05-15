@@ -126,6 +126,42 @@ describe("WarmPythonProcess", () => {
 		controller.abort();
 		await expect(warm.exec("print(1)", { signal: controller.signal })).rejects.toMatchObject({ code: "ABORTED" });
 	});
+
+	it("abort during exec rejects with ABORTED but keeps the process alive for subsequent calls", async () => {
+		if (!pythonAvailable) return;
+		warm.warmUp();
+		await new Promise((r) => setTimeout(r, 100));
+
+		const controller = new AbortController();
+		// Abort immediately after submitting so the in-flight exec is cancelled.
+		const execPromise = warm.exec("import time; time.sleep(0.05); print('done')", {
+			signal: controller.signal,
+		});
+		controller.abort();
+		await expect(execPromise).rejects.toMatchObject({ code: "ABORTED" });
+
+		// Give the in-flight Python a moment to finish and its sentinel to be drained.
+		await new Promise((r) => setTimeout(r, 200));
+
+		// The warm process must still be alive and usable.
+		expect(warm.isAlive).toBe(true);
+		const result = await warm.exec("print('still warm')");
+		expect(result.stdout).toBe("still warm\n");
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("preserves trailing whitespace and trailing blank lines in stdout", async () => {
+		if (!pythonAvailable) return;
+		const result = await warm.exec("print('hello   ')");
+		expect(result.stdout).toBe("hello   \n");
+	});
+
+	it("preserves trailing blank line from print('')", async () => {
+		if (!pythonAvailable) return;
+		const result = await warm.exec("print('')");
+		// print('') outputs '\n', so stdout should be '\n' (one blank line).
+		expect(result.stdout).toBe("\n");
+	});
 });
 
 // ── createPyExecCommand ──────────────────────────────────────────────────────
