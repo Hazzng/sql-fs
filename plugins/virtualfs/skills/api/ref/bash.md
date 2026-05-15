@@ -111,6 +111,31 @@ After session eviction (10 min idle) or on a cold replica:
 | `python3 -c "..."` (first call, WASM init) | ~2–5 s |
 | `python3 -c "..."` (subsequent calls) | ~500 ms–1 s |
 
+### Grep: anchored patterns are a trap
+
+Anchored regex patterns (`^`, `$`) — and especially anchored alternation like
+`^foo\|^bar` — force `grep` out of its Boyer-Moore fast path into line-by-line
+NFA/DFA evaluation. On large file sets this is **10–24× slower** than the
+unanchored equivalent.
+
+| Pattern (951-file Python repo) | Hits | Time |
+|---|---|---|
+| `grep -rn 'def ' …` (unanchored, broad) | 2081 | **82 ms** |
+| `grep -rn '^def \|^async def ' …` (anchored, precise) | 675 | **1963 ms** (24×) |
+
+**Rule of thumb:** prefer broad unanchored patterns and post-filter the result
+set client-side (Python `re`, `awk`, `grep` pipeline) rather than anchoring for
+precision. The anchored version returns 3× fewer hits but pays a 24× latency
+tax — the broad grep + post-filter is dramatically faster end-to-end.
+
+```bash
+# SLOW (24×): anchored for precision
+grep -rn '^def \|^async def ' /project --include='*.py'
+
+# FAST (1×): broad grep, post-filter
+grep -rn 'def ' /project --include='*.py' | awk -F: '$3 ~ /^[[:space:]]*(async[[:space:]]+)?def /'
+```
+
 ---
 
 ## Writing robust scripts

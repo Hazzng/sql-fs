@@ -194,3 +194,28 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
 - **`sb.exec` is reusable**, not per-call. The session manager keeps the just-bash
   worker warm for 10 min idle. Repeated `sb.exec(...)` calls reuse the same Bash
   process — cwd, env vars, and shell functions persist within that window.
+
+- **Anchored grep patterns are a trap.** `^pattern` (and especially anchored
+  alternation like `^foo \| ^bar`) forces grep out of its Boyer-Moore fast path
+  into line-by-line NFA/DFA evaluation and can be **10–24× slower** than the
+  unanchored equivalent on the same file set. Benchmarked on a 951-file Python
+  monorepo:
+
+  | Pattern | Hits | Time |
+  |---|---|---|
+  | `grep -rn 'def ' …` (unanchored, broad) | 2081 | **82 ms** |
+  | `grep -rn '^def \|^async def ' …` (anchored, precise) | 675 | **1963 ms** (24×) |
+
+  Write broad greps and filter in Python — never anchor for performance reasons:
+
+  ```python
+  # SLOW (24×): anchored for precision
+  sb.exec("grep -rn '^def \\|^async def ' /project --include='*.py'")
+
+  # FAST (1×): broad grep, filter in Python
+  r = sb.exec("grep -rn 'def ' /project --include='*.py'")
+  lines = [l for l in r.stdout.splitlines()
+           if re.search(r':\s*(async\s+)?def ', l)]
+  ```
+
+  The same advice applies inside `exec_batch` scripts.

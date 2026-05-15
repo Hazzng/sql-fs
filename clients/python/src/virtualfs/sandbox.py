@@ -188,6 +188,22 @@ class Sandbox:
 
             # CORRECT — lock held for the whole operation
             sb.exec("balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt")
+
+        Grep performance tip: anchored regex patterns (``^``, ``$``) -- especially
+        combined with alternation (``\\|``) -- force grep into a slow line-by-line
+        NFA/DFA evaluation mode and can be **10-24x slower** than unanchored
+        equivalents on large file sets. Prefer a broad unanchored pattern and
+        filter results in Python:
+
+            # SLOW (anchored, ~24x slower):
+            sb.exec("grep -rn '^def \\\\|^async def ' /project --include='*.py'")
+
+            # FAST (broad grep + Python filter):
+            r = sb.exec("grep -rn 'def ' /project --include='*.py'")
+            lines = [
+                l for l in r.stdout.splitlines()
+                if re.search(r':\\s*(async\\s+)?def ', l)
+            ]
         """
         body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
         if cwd is not None:
