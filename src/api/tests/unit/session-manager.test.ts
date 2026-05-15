@@ -335,15 +335,15 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("warm session ignores subsequent runtimeOptions (cache-hit path)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs() });
-		const first = await sm.getOrCreate(T, "sandbox-warm", { python: true, javascript: false });
-		const second = await sm.getOrCreate(T, "sandbox-warm", { python: false, javascript: true });
+		const first = await sm.getOrCreate(T, "sandbox-warm", { python: true, javascript: false, network: false });
+		const second = await sm.getOrCreate(T, "sandbox-warm", { python: false, javascript: true, network: false });
 		expect(second).toBe(first);
-		expect(second.runtimeOptions).toEqual({ python: true, javascript: false });
+		expect(second.runtimeOptions).toEqual({ python: true, javascript: false, network: false });
 	});
 
 	it("non-Python script bypasses semaphore entirely", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-no-py", { python: true, javascript: false });
+		const session = await sm.getOrCreate(T, "sandbox-no-py", { python: true, javascript: false, network: false });
 		stubBashExec(session, async () => ({ stdout: "hi", stderr: "", exitCode: 0, env: {} }));
 
 		await sm.execWithRuntimeThrottle(session, "echo hi");
@@ -376,7 +376,7 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("regex does not match mypython_script or python-config (word boundary)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-regex", { python: true, javascript: false });
+		const session = await sm.getOrCreate(T, "sandbox-regex", { python: true, javascript: false, network: false });
 
 		let running = 0;
 		let peak = 0;
@@ -400,7 +400,7 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 2 });
-		const session = await sm.getOrCreate(T, "sandbox-sem", { python: true, javascript: false });
+		const session = await sm.getOrCreate(T, "sandbox-sem", { python: true, javascript: false, network: false });
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -433,7 +433,7 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("slot is released even when bash.exec throws", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-throw", { python: true, javascript: false });
+		const session = await sm.getOrCreate(T, "sandbox-throw", { python: true, javascript: false, network: false });
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -481,7 +481,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("JS regex does not match mynode/nodejs_tool/js-exec-helper etc (word boundary)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-js-regex", { python: false, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-js-regex", { python: false, javascript: true, network: false });
 
 		let running = 0;
 		let peak = 0;
@@ -503,7 +503,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("12 parallel js-exec scripts with cap=4 run in 3 batches of 4", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 4 });
-		const session = await sm.getOrCreate(T, "sandbox-js-12", { python: false, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-js-12", { python: false, javascript: true, network: false });
 
 		let running = 0;
 		let peak = 0;
@@ -528,7 +528,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("semaphore allows up to N concurrent JS executions, queues the (N+1)th until a slot frees", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 2 });
-		const session = await sm.getOrCreate(T, "sandbox-js-sem", { python: false, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-js-sem", { python: false, javascript: true, network: false });
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -558,7 +558,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("JS slot is released even when bash.exec throws", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-js-throw", { python: false, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-js-throw", { python: false, javascript: true, network: false });
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -591,7 +591,7 @@ describe("SessionManager combined python + js semaphores", () => {
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate(T, "sandbox-both", { python: true, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-both", { python: true, javascript: true, network: false });
 
 		const releasers: Array<() => void> = [];
 		stubBashExec(session, async () => {
@@ -630,7 +630,7 @@ describe("SessionManager combined python + js semaphores", () => {
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate(T, "sandbox-deadlock", { python: true, javascript: true });
+		const session = await sm.getOrCreate(T, "sandbox-deadlock", { python: true, javascript: true, network: false });
 
 		let peak = 0;
 		let running = 0;

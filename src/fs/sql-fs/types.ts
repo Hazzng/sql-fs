@@ -64,7 +64,7 @@ export interface SandboxMeta {
 	readonly python: boolean;
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
-	readonly network?: boolean;
+	readonly network: boolean;
 }
 
 /** A single entry returned by the list-sandboxes query. */
@@ -76,7 +76,7 @@ export interface SandboxListEntry {
 	readonly python: boolean;
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
-	readonly network?: boolean;
+	readonly network: boolean;
 }
 
 /** Options for creating a new inode row */

@@ -148,7 +148,7 @@ describe("execWithRuntimeThrottle script-tx wrapping", () => {
 		const abortScope = vi.fn(async () => {});
 
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "wrap-py", { python: true, javascript: false });
+		const session = await sm.getOrCreate(T, "wrap-py", { python: true, javascript: false, network: false });
 		stubBashExec(session, async () => ({ stdout: "py", stderr: "", exitCode: 0, env: {} }));
 
 		const mockScriptTx = {
@@ -176,7 +176,7 @@ describe("execWithRuntimeThrottle script-tx wrapping", () => {
 		const abortScope = vi.fn(async () => {});
 
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate(T, "wrap-js", { python: false, javascript: true });
+		const session = await sm.getOrCreate(T, "wrap-js", { python: false, javascript: true, network: false });
 		stubBashExec(session, async () => ({ stdout: "js", stderr: "", exitCode: 0, env: {} }));
 
 		const mockScriptTx = {

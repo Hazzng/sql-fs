@@ -579,6 +579,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 				name: null,
 				python: false,
 				javascript: false,
+				network: false,
 			});
 		});
 

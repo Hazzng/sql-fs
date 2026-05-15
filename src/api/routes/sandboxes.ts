@@ -88,6 +88,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					createdAt: s.createdAt.toISOString(),
 					python: s.python,
 					javascript: s.javascript,
+					network: s.network,
 				})),
 			});
 		} catch (err) {

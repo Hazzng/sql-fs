@@ -89,7 +89,7 @@ export interface RuntimeOptions {
 	 * flag — the Bash layer itself remains air-gapped (no `curl`, `wget`, DNS, or
 	 * raw sockets). Defaults to false (secure-by-default).
 	 */
-	readonly network?: boolean;
+	readonly network: boolean;
 }
 
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
@@ -405,9 +405,7 @@ export class SessionManager {
 					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
 					// Bash itself remains air-gapped — no curl/wget/DNS — because
 					// just-bash only gates fetch() through this NetworkConfig path.
-					network: resolvedRuntime.network
-						? { dangerouslyAllowFullInternetAccess: true }
-						: undefined,
+					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
 					defenseInDepth: defenseInDepthConfig,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
@@ -796,7 +794,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network ?? false }
+			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
@@ -842,7 +840,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network ?? false }
+			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) {

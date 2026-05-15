@@ -35,6 +35,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const runtimeOptions = {
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
+				network: false,
 			};
 			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
 			session.name = name;
@@ -43,6 +44,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				name,
 				python: runtimeOptions.python,
 				javascript: runtimeOptions.javascript,
+				network: runtimeOptions.network,
 			});
 			return {
 				content: [
