@@ -266,13 +266,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 	server.tool(
 		"bash_exec_batch",
 		[
-			"Execute multiple bash scripts in a sandbox sequentially within a single request.",
+			"Execute multiple bash scripts in a sandbox within a single request.",
 			"Collapses N round-trips into 1 — ideal for exploration (find, grep, cat).",
-			"Scripts share shell state and run in order. Each result includes stdout, stderr, exitCode.",
-			"A single timeout (ms) budget covers all scripts; set `timeout` to override the default. Remaining scripts get error: 'timeout' if the budget is exceeded.",
+			"",
+			"When readOnly:true → scripts run IN PARALLEL (bounded fan-out, ordered results).",
+			"When readOnly:false or omitted → scripts run SEQUENTIALLY and share shell state.",
+			"",
+			"Each result includes stdout, stderr, exitCode. A single timeout (ms) budget covers all scripts;",
+			"set `timeout` to override the default. Remaining scripts get error: 'timeout' if the budget is exceeded.",
 			"Max 50 scripts per batch.",
 			"",
-			"ATOMICITY: the lock is acquired once for the entire batch — all scripts are atomic",
+			"ATOMICITY (write path): the lock is acquired once for the entire batch — all scripts are atomic",
 			"relative to other callers. If your logic requires reading state in one script and",
 			"writing based on it in another, that is safe within a single batch call.",
 			"It is NOT safe across two separate bash_exec or bash_exec_batch calls.",
@@ -291,13 +295,18 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"When true, runs all scripts in the batch in read-only mode: parallel reads are unblocked across calls and any mutating filesystem op is rejected with EREADONLY at the offending command.",
 				),
 		},
-		async (args) => {
+		async (args, extra) => {
 			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 
+			const disconnectController = new AbortController();
+			const onDisconnect = () => disconnectController.abort();
+			extra.signal.addEventListener("abort", onDisconnect, { once: true });
+			if (extra.signal.aborted) disconnectController.abort();
+
 			try {
 				const results = await runner(sessionManager, tenant, args.id, owner, async (session) =>
-					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs),
+					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs, disconnectController.signal),
 				);
 
 				return {
@@ -340,6 +349,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
 				};
+			} finally {
+				extra.signal.removeEventListener("abort", onDisconnect);
 			}
 		},
 	);

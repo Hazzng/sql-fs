@@ -400,6 +400,8 @@ In `src/api/session-manager.ts`:
 
 4. **`exec-sync-batch` in read-only mode** — A batch of scripts with `readOnly: true` would hold the shared lock for the duration of the entire batch, blocking writers for longer. Is this the desired behavior? The alternative is to acquire/release shared mode per script in the batch, but that introduces version-staleness gaps between scripts.
 
+   **Resolved (2026-05-14):** The single shared-lock grant for the entire batch is the correct design. Scripts inside a readOnly batch run in parallel (bounded fan-out, `MAX_BATCH_PARALLELISM = 16`) under that grant; wall-clock time decreases while lock-hold duration stays the same as a sequential batch. Version-staleness gaps between per-script lock acquisitions are avoided. See plan `thoughts/shared/plans/2026-05-14_20-50-44_parallel-batch-readonly-exec.md` for implementation details.
+
 5. **openapi-spec.ts** — The `readOnly` field needs to be added to the OpenAPI spec at `src/api/openapi-spec.ts` for documentation completeness.
 
 ---
