@@ -24,6 +24,7 @@ import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { WarmPythonProcess, createPyExecCommand } from "./lib/warm-python.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -98,6 +99,12 @@ export interface Session {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
+	/**
+	 * Warm Python interpreter shared across all `py-exec` calls in this
+	 * session. Undefined when the sandbox was created without `python: true`.
+	 * Kill it when the session is destroyed so the child process does not leak.
+	 */
+	readonly warmPython: WarmPythonProcess | undefined;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -391,11 +398,18 @@ export class SessionManager {
 							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
 						}
 					: false;
+
+				// Build the warm Python process (if python runtime is enabled) and
+				// register py-exec as a custom command so agents can call it without
+				// paying the 1.4 s WASM cold-boot cost on every invocation.
+				const warmPython = resolvedRuntime.python ? new WarmPythonProcess() : undefined;
+
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
 					defenseInDepth: defenseInDepthConfig,
+					customCommands: warmPython !== undefined ? [createPyExecCommand(warmPython)] : undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
@@ -423,6 +437,7 @@ export class SessionManager {
 					runtimeOptions: resolvedRuntime,
 					tenantId,
 					scriptTx,
+					warmPython,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					lock: new RWLock(),
@@ -909,7 +924,7 @@ export class SessionManager {
 						}
 					}
 				} finally {
-					await this.disconnectFs(session.fs);
+					await this.disconnectFs(session.fs, session.warmPython);
 				}
 				if (cleanupError !== undefined) throw cleanupError;
 			});
@@ -983,7 +998,7 @@ export class SessionManager {
 				}
 				this.sessions.delete(key);
 				try {
-					await this.disconnectFs(session.fs);
+					await this.disconnectFs(session.fs, session.warmPython);
 				} catch {
 					// best-effort
 				}
@@ -1022,13 +1037,20 @@ export class SessionManager {
 					})
 					.catch(() => {})
 					.finally(() => {
-						void this.disconnectFs(session.fs);
+						void this.disconnectFs(session.fs, session.warmPython);
 					});
 			}
 		}
 	}
 
-	private async disconnectFs(fs: IFileSystem): Promise<void> {
+	private async disconnectFs(fs: IFileSystem, warmPython?: WarmPythonProcess): Promise<void> {
+		if (warmPython !== undefined) {
+			try {
+				warmPython.kill();
+			} catch {
+				// best-effort
+			}
+		}
 		const disconnectable = fs as { disconnect?: () => Promise<void> };
 		if (typeof disconnectable.disconnect === "function") {
 			try {
