@@ -15,6 +15,7 @@
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import { nodeCommand } from "./commands/node-command.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
 import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
@@ -396,6 +397,12 @@ export class SessionManager {
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
 					defenseInDepth: defenseInDepthConfig,
+					// Override just-bash's built-in nodeStubCommand with a smarter
+					// version that translates `node -e CODE` → `js-exec -c CODE` and
+					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
+					// Only registered when the javascript runtime is enabled so that
+					// non-JS sandboxes keep the default "command not found" behaviour.
+					customCommands: resolvedRuntime.javascript ? [nodeCommand] : undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
