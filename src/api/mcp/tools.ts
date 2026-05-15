@@ -302,6 +302,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			const disconnectController = new AbortController();
 			const onDisconnect = () => disconnectController.abort();
 			extra.signal.addEventListener("abort", onDisconnect, { once: true });
+			if (extra.signal.aborted) disconnectController.abort();
 
 			try {
 				const results = await runner(sessionManager, tenant, args.id, owner, async (session) =>

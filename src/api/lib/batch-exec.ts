@@ -139,7 +139,7 @@ async function runParallel(
 						stdout: "",
 						stderr: "",
 						exitCode: -1,
-						error: timedOut ? "timeout" : "aborted",
+						error: timedOut ? "timeout" : sharedController.signal.aborted ? "aborted" : "internal error",
 					};
 				}
 			}
