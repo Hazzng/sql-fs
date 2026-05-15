@@ -40,11 +40,7 @@ describe("js-exec Buffer encoding fix (issue #74)", () => {
 
 	it("Buffer.from([0xff,0xfe,0x00]).toString('base64') encodes binary bytes", async () => {
 		const sm = await makeJsSession("buf-b64-bytes");
-		const out = await jsExec(
-			sm,
-			"buf-b64-bytes",
-			`console.log(Buffer.from([0xff,0xfe,0x00]).toString("base64"))`,
-		);
+		const out = await jsExec(sm, "buf-b64-bytes", `console.log(Buffer.from([0xff,0xfe,0x00]).toString("base64"))`);
 		expect(out).toBe("//4A");
 	});
 
@@ -52,11 +48,7 @@ describe("js-exec Buffer encoding fix (issue #74)", () => {
 
 	it("Buffer.from(b64str, 'base64').toString() decodes correctly", async () => {
 		const sm = await makeJsSession("buf-b64-decode");
-		const out = await jsExec(
-			sm,
-			"buf-b64-decode",
-			`console.log(Buffer.from("aGVsbG8=", "base64").toString())`,
-		);
+		const out = await jsExec(sm, "buf-b64-decode", `console.log(Buffer.from("aGVsbG8=", "base64").toString())`);
 		expect(out).toBe("hello");
 	});
 
@@ -77,11 +69,7 @@ describe("js-exec Buffer encoding fix (issue #74)", () => {
 	it("Buffer.from(str).toString('base64url') produces url-safe no-padding encoding", async () => {
 		const sm = await makeJsSession("buf-b64url-enc");
 		// 0xfb=11111011, 0xff=11111111 → base64: '//' → base64url: '--' (idx 62) and '_' (idx 63)
-		const out = await jsExec(
-			sm,
-			"buf-b64url-enc",
-			`console.log(Buffer.from([0xfb, 0xff]).toString("base64url"))`,
-		);
+		const out = await jsExec(sm, "buf-b64url-enc", `console.log(Buffer.from([0xfb, 0xff]).toString("base64url"))`);
 		// Verify no '+', '/', or '=' characters (url-safe, no padding)
 		expect(out).not.toMatch(/[+/=]/);
 		// Verify it decodes back correctly
@@ -117,11 +105,7 @@ describe("js-exec Buffer encoding fix (issue #74)", () => {
 
 	it("Buffer.from([0x00,0xff]).toString('hex') encodes boundary bytes", async () => {
 		const sm = await makeJsSession("buf-hex-bytes");
-		const out = await jsExec(
-			sm,
-			"buf-hex-bytes",
-			`console.log(Buffer.from([0x00,0xff]).toString("hex"))`,
-		);
+		const out = await jsExec(sm, "buf-hex-bytes", `console.log(Buffer.from([0x00,0xff]).toString("hex"))`);
 		expect(out).toBe("00ff");
 	});
 
@@ -129,11 +113,7 @@ describe("js-exec Buffer encoding fix (issue #74)", () => {
 
 	it("Buffer.from('616263', 'hex').toString() decodes from hex", async () => {
 		const sm = await makeJsSession("buf-hex-decode");
-		const out = await jsExec(
-			sm,
-			"buf-hex-decode",
-			`console.log(Buffer.from("616263", "hex").toString())`,
-		);
+		const out = await jsExec(sm, "buf-hex-decode", `console.log(Buffer.from("616263", "hex").toString())`);
 		expect(out).toBe("abc");
 	});
 

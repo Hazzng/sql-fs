@@ -165,6 +165,18 @@ const JS_EXEC_BUFFER_ENCODING_BOOTSTRAP = /* js */ `
   // ─── Patch Buffer.prototype.toString ─────────────────────────────────────
   var _origToString = _Buf.prototype.toString;
   _Buf.prototype.toString = function (encoding, start, end) {
+    // ASSUMPTION: just-bash's Buffer shim stores the backing Uint8Array in
+    // this._data.  We read it directly to support start/end slicing without
+    // copying.  When forwarding utf8/ascii/ucs2 calls back to the original
+    // toString we synthesise a minimal shim object { _data: bytes } so the
+    // original method sees the sliced view instead of the full buffer.
+    //
+    // MAINTENANCE NOTE: if just-bash is upgraded and _data is renamed,
+    // removed, or a required second property is added (e.g. an internal
+    // offset), the utf8/ascii/ucs2 fall-through path will either throw or
+    // silently return wrong data.  Verify after every just-bash upgrade by
+    // running the buffer-encoding unit tests
+    // (src/api/tests/unit/session-manager.js-exec-buffer.test.ts).
     var bytes = (start !== undefined || end !== undefined)
       ? this._data.subarray(start, end)
       : this._data;
