@@ -207,9 +207,7 @@ describe("executeBatch — readOnly:true parallel vs sequential", () => {
 			//   innocent scripts never start (remaining <= 0) → bash.exec called 1 time.
 			// Parallel: all 3 start → innocent scripts finish instantly → bash.exec called 3 times.
 			const ctx = { violated: false };
-			const batchPromise = readOnlyContext.run(ctx, () =>
-				executeBatch(sessionManager, session, scripts, 100),
-			);
+			const batchPromise = readOnlyContext.run(ctx, () => executeBatch(sessionManager, session, scripts, 100));
 
 			await vi.advanceTimersByTimeAsync(200);
 			await batchPromise;
