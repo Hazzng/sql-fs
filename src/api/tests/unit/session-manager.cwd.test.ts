@@ -10,29 +10,32 @@
 
 import { Bash, InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../session-manager.js";
 
 const T = "default";
 const HOME = "/home/user";
 
-async function makeEnv(): Promise<{ sm: SessionManager; sandboxId: string }> {
-	const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
-	const sandboxId = `sb-cwd-${Math.random().toString(36).slice(2)}`;
-	await sm.getOrCreate(T, sandboxId);
-	return { sm, sandboxId };
-}
-
 describe("session cwd persistence across exec calls (regression — issue #73)", () => {
+	let sm: SessionManager;
+	let sandboxId: string;
+
+	beforeEach(async () => {
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		sandboxId = `sb-cwd-${Math.random().toString(36).slice(2)}`;
+		await sm.getOrCreate(T, sandboxId);
+	});
+
+	afterEach(async () => {
+		await sm.shutdown();
+	});
+
 	it("session.cwd is initialised to the bash home directory", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 		expect(session.cwd).toBe(HOME);
 	});
 
 	it("cd in one exec persists to the next exec via session.cwd", async () => {
-		const { sm, sandboxId } = await makeEnv();
-
 		// Call 1: cd to a subdirectory
 		await sm.withSession(T, sandboxId, async (session) => {
 			await session.bash.exec("mkdir -p /home/user/project");
@@ -48,7 +51,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("session.cwd is updated after cd", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 
 		await session.bash.exec("mkdir -p /home/user/deep/sub");
@@ -61,7 +63,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("session.cwd is not updated when cd fails (stays at current dir)", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 
 		await sm.withSession(T, sandboxId, async (s) => {
@@ -74,7 +75,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("relative cd is resolved correctly across calls", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 
 		await session.bash.exec("mkdir -p /home/user/a/b/c");
@@ -99,8 +99,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("explicit cwd in opts overrides session.cwd for that call", async () => {
-		const { sm, sandboxId } = await makeEnv();
-
 		await sm.withSession(T, sandboxId, async (s) => {
 			await sm.execWithRuntimeThrottle(s, "mkdir -p /tmp/override");
 		});
@@ -113,7 +111,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("explicit cwd in opts also updates session.cwd after the call", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 
 		await sm.withSession(T, sandboxId, async (s) => {
@@ -129,7 +126,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("readOnly exec does not update session.cwd", async () => {
-		const { sm, sandboxId } = await makeEnv();
 		const session = sm.getSession(T, sandboxId)!;
 
 		// Create directory so cd can succeed within the readOnly exec context
@@ -147,8 +143,6 @@ describe("session cwd persistence across exec calls (regression — issue #73)",
 	});
 
 	it("cwd persists across multiple sequential cd calls — exact issue #73 reproduction", async () => {
-		const { sm, sandboxId } = await makeEnv();
-
 		// Set up the directory structure
 		await sm.withSession(T, sandboxId, async (s) => {
 			await sm.execWithRuntimeThrottle(s, "mkdir -p /home/user/project/apps/langgraph");
@@ -175,6 +169,12 @@ describe("session.cwd — stub-based unit coverage", () => {
 	 */
 	type StubResult = BashExecResult;
 
+	let sm: SessionManager;
+
+	afterEach(async () => {
+		await sm.shutdown();
+	});
+
 	function stubBashExec(
 		session: { bash: unknown },
 		impl: (script: string, opts?: unknown) => Promise<StubResult>,
@@ -184,7 +184,7 @@ describe("session.cwd — stub-based unit coverage", () => {
 	}
 
 	it("passes session.cwd as opts.cwd to bash.exec when no explicit cwd provided", async () => {
-		const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const session = await sm.getOrCreate(T, "sb-stub-cwd");
 
 		// Manually override session.cwd so we can verify it is forwarded
@@ -202,7 +202,7 @@ describe("session.cwd — stub-based unit coverage", () => {
 	});
 
 	it("uses caller-supplied cwd over session.cwd when both are set", async () => {
-		const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const session = await sm.getOrCreate(T, "sb-stub-override");
 
 		session.cwd = "/session/dir";
@@ -222,7 +222,7 @@ describe("session.cwd — stub-based unit coverage", () => {
 	});
 
 	it("updates session.cwd from result.env.PWD after exec", async () => {
-		const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const session = await sm.getOrCreate(T, "sb-stub-update");
 
 		stubBashExec(session, async () => {
@@ -235,7 +235,7 @@ describe("session.cwd — stub-based unit coverage", () => {
 	});
 
 	it("does not update session.cwd when result.env.PWD is missing", async () => {
-		const sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const session = await sm.getOrCreate(T, "sb-stub-no-pwd");
 		session.cwd = "/original/dir";
 
@@ -250,9 +250,27 @@ describe("session.cwd — stub-based unit coverage", () => {
 		expect(session.cwd).toBe("/original/dir");
 	});
 
+	it("does not update session.cwd when result.env.PWD contains a null byte", async () => {
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const session = await sm.getOrCreate(T, "sb-stub-null-byte");
+		session.cwd = "/safe/dir";
+
+		stubBashExec(session, async () => {
+			// A malicious script could do: export PWD=/evil\0path
+			return { stdout: "", stderr: "", exitCode: 0, env: { PWD: "/evil\0path" } };
+		});
+
+		await sm.execWithRuntimeThrottle(session, "export PWD=/evil$'\\0'path");
+
+		// cwd must not be updated when PWD contains a null byte (security guard)
+		expect(session.cwd).toBe("/safe/dir");
+	});
+
 	it("bash instance state — getCwd() always returns HOME (confirms just-bash design)", async () => {
 		// This test documents that just-bash.getCwd() never changes on its own;
 		// our session.cwd layer is what provides cross-call persistence.
+		// No SessionManager is created here — create a dummy one for afterEach safety.
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const bash = new Bash({ fs: new InMemoryFs() });
 		await bash.exec("cd /tmp");
 		expect(bash.getCwd()).toBe(HOME);

@@ -28,6 +28,24 @@ import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
+/**
+ * Lightweight POSIX path normalization for session.cwd storage.
+ * Resolves `.` and `..` segments and collapses consecutive slashes.
+ * Does NOT require the path to exist on disk — pure string transformation.
+ * Mirrors the logic in sql-fs/sql-fs.ts `normalizeFsPath`.
+ */
+function posixNormalizePath(p: string): string {
+	if (!p || p === "/") return "/";
+	const s = p.startsWith("/") ? p : `/${p}`;
+	const parts = s.split("/").filter((seg) => seg !== "" && seg !== ".");
+	const stack: string[] = [];
+	for (const part of parts) {
+		if (part === "..") stack.pop();
+		else stack.push(part);
+	}
+	return `/${stack.join("/")}`;
+}
+
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
 function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
@@ -1168,8 +1186,14 @@ export class SessionManager {
 			// lock mode and may execute concurrently with other readers.
 			if (!inReadOnlyScope) {
 				const finalCwd = result.env?.PWD;
-				if (typeof finalCwd === "string" && finalCwd.length > 0) {
-					session.cwd = finalCwd;
+				// Validate before storing: reject null bytes (security) and
+				// normalize via posix.resolve so scripts that do `export PWD=…`
+				// with relative or un-normalized paths cannot corrupt session.cwd.
+				if (typeof finalCwd === "string" && finalCwd.length > 0 && !finalCwd.includes("\0")) {
+					const normalized = posixNormalizePath(finalCwd);
+					if (normalized.startsWith("/")) {
+						session.cwd = normalized;
+					}
 				}
 			}
 			return result;
