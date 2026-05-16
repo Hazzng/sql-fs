@@ -21,9 +21,7 @@ Then call:
     sb.fs.mkdir(...)
     sb.fs.tree(prefix=..., depth=...)
 
-    sb.ingest_archive(open("p.tar.gz", "rb"), base_path="/home/user/p")
     sb.ingest_files({"a.txt": b"..."}, base_path="/home/user/p")
-    bytes_ = sb.export(base_path="/home/user")
     sb.delete()
 """
 
@@ -32,9 +30,10 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Iterator, Mapping
-from typing import Any, BinaryIO, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from ._http import Transport, encode_path, iter_sse_events
+from .errors import ValidationError
 from .models import (
     BatchExecResult,
     ExecResult,
@@ -174,6 +173,7 @@ class Sandbox:
         env: Optional[Mapping[str, str]] = None,
         timeout_ms: int = 30_000,
         debug: bool = False,
+        read_only: bool = False,
     ) -> ExecResult:
         """`POST /exec-sync` — run a bash script and return the buffered result.
 
@@ -196,6 +196,8 @@ class Sandbox:
             body["env"] = dict(env)
         if debug:
             body["debug"] = True
+        if read_only:
+            body["readOnly"] = True
 
         # Wall-clock httpx timeout slightly above server-side budget so a
         # legitimate timeout surfaces as 408 rather than a transport error.
@@ -276,6 +278,7 @@ class Sandbox:
         env: Optional[Mapping[str, str]] = None,
         timeout_ms: int = 30_000,
         debug: bool = False,
+        read_only: bool = False,
     ) -> Iterator[StreamEvent]:
         """`POST /exec` — stream stdout/stderr/exit events as `StreamEvent`s.
 
@@ -289,6 +292,8 @@ class Sandbox:
             body["env"] = dict(env)
         if debug:
             body["debug"] = True
+        if read_only:
+            body["readOnly"] = True
 
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
         resp = self._t.stream(
@@ -300,6 +305,14 @@ class Sandbox:
         )
         try:
             for event_name, payload in iter_sse_events(resp):
+                if event_name == "error":
+                    msg = (
+                        payload.get("error", "unknown error")
+                        if isinstance(payload, dict)
+                        else str(payload)
+                    )
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    raise ValidationError(msg, code=code, status=422)
                 if event_name not in ("stdout", "stderr", "exit"):
                     continue
                 yield StreamEvent.from_sse(event_name, payload)
@@ -308,26 +321,7 @@ class Sandbox:
         finally:
             resp.close()
 
-    # ── ingest / export ─────────────────────────────────────────────────────
-    def ingest_archive(
-        self,
-        archive: Union[bytes, BinaryIO],
-        *,
-        base_path: str = "/home/user/project",
-    ) -> Dict[str, Any]:
-        """`POST /ingest` — extract a `.tar.gz` archive into the sandbox."""
-        files: Dict[str, Any] = {
-            "archive": ("archive.tar.gz", archive, "application/gzip"),
-            "basePath": (None, base_path),
-        }
-        resp = self._t.request(
-            "POST",
-            f"/sandboxes/{self._id}/ingest",
-            files=files,
-        )
-        body = resp.json()
-        return body if isinstance(body, dict) else {}
-
+    # ── ingest ──────────────────────────────────────────────────────────────
     def ingest_files(
         self,
         files: Mapping[str, Union[str, bytes]],
@@ -350,37 +344,6 @@ class Sandbox:
         )
         body = resp.json()
         return body if isinstance(body, dict) else {}
-
-    def export(self, *, base_path: str = "/home/user") -> bytes:
-        """`GET /export` — download `base_path` as a `.tar.gz` blob.
-
-        For very large exports, use `export_stream()` to avoid buffering the
-        whole archive in memory.
-        """
-        resp = self._t.request(
-            "GET",
-            f"/sandboxes/{self._id}/export",
-            params={"basePath": base_path},
-            expect_json=False,
-        )
-        return resp.content
-
-    def export_stream(
-        self,
-        *,
-        base_path: str = "/home/user",
-        chunk_size: int = 64 * 1024,
-    ) -> Iterator[bytes]:
-        """Streaming variant of `export()` — yields chunks of the tar.gz body."""
-        resp = self._t.stream(
-            "GET",
-            f"/sandboxes/{self._id}/export",
-            params={"basePath": base_path},
-        )
-        try:
-            yield from resp.iter_bytes(chunk_size)
-        finally:
-            resp.close()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def delete(self) -> None:

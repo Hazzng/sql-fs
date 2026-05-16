@@ -11,7 +11,6 @@ Exercises every hot path users actually care about:
   6. exec       — echo overhead distribution (p50/p95) + batch speedup curve
   7. cache      — pathCache vs contentCache: `find` vs `grep -r NOMATCH`
                     cold/warm/repeat — quantifies the "first content scan" tax
-  8. export     — tar.gz download time + size
 
 Usage:
     BASE_URL=...  AUTH_SECRET=...  python perf_benchmark.py
@@ -340,21 +339,6 @@ def bench_cache(rows: list[Row], sb: Sandbox) -> None:
     )
 
 
-def bench_export(rows: list[Row], sb: Sandbox) -> None:
-    print("[8/8] export — tar.gz download ...")
-    ms, blob = time_call(lambda: sb.export(base_path=SANDBOX_BASE))
-    kbs = (len(blob) / 1024) / (ms / 1000) if ms > 0 else None
-    rows.append(
-        Row(
-            "export",
-            "sb.export() — full tree as .tar.gz",
-            ms=ms,
-            throughput_kbs=kbs,
-            note=f"{len(blob):,} B archive",
-        )
-    )
-
-
 # ── output ───────────────────────────────────────────────────────────────────
 SECTION_TITLES = {
     "auth": "1. Auth",
@@ -364,7 +348,6 @@ SECTION_TITLES = {
     "tree": "5. Tree listing",
     "exec": "6. Exec overhead + batch speedup",
     "cache": "7. Cache behaviour (pathCache vs contentCache)",
-    "export": "8. Export (tar.gz)",
 }
 
 
@@ -416,8 +399,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--skip",
         type=str,
         default="",
-        help="comma-separated section ids to skip: "
-        "auth,lifecycle,single,ingest,tree,exec,cache,export",
+        help="comma-separated section ids to skip: auth,lifecycle,single,ingest,tree,exec,cache",
     )
     parser.add_argument(
         "--sub", type=str, default="bench-runner", help="JWT subject (default: bench-runner)"
@@ -487,7 +469,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if sb_id:
                 sb = client.sandboxes.attach(sb_id)
         else:
-            # Need a populated sandbox for tree/exec/cache/export sections.
+            # Need a populated sandbox for tree/exec/cache sections.
             sb = client.sandboxes.create(name="bench-fallback")
             sb.ingest_files(files, base_path=SANDBOX_BASE)
             sb_id = sb.id
@@ -500,8 +482,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                     bench_exec(rows, sb)
                 if "cache" not in skip:
                     bench_cache(rows, sb)
-                if "export" not in skip:
-                    bench_export(rows, sb)
             finally:
                 if sb_id:
                     try:

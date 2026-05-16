@@ -1,7 +1,6 @@
 /**
- * Ingest/Export routes.
+ * Ingest routes.
  * US-072: POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
- * US-073: GET /v1/sandboxes/:id/export — tar.gz download
  */
 
 import { Hono } from "hono";
@@ -113,81 +112,6 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		}
 
 		return c.json({ status: "ok", fileCount });
-	});
-
-	// GET /v1/sandboxes/:id/export — download sandbox contents as tar.gz
-	router.get("/:id/export", async (c) => {
-		const sandboxId = c.req.param("id");
-		const tenant = c.get("tenant");
-		const basePath = c.req.query("basePath") ?? "/home/user";
-
-		if (!isValidBasePath(basePath)) {
-			return c.json(
-				{ error: "validation_error", code: "INVALID_INPUT", details: ["basePath must be a safe absolute path"] },
-				400 as ContentfulStatusCode,
-			);
-		}
-
-		let archiveBytes: Uint8Array;
-		try {
-			archiveBytes = await withOwnedSessionOrRehydrate(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
-					// Check basePath exists
-					const exists = await session.fs.exists(basePath);
-					if (!exists) {
-						throw Object.assign(new Error(`ENOENT: basePath does not exist: ${basePath}`), { code: "ENOENT" });
-					}
-
-					// Ensure /tmp exists
-					try {
-						await session.fs.mkdir("/tmp", { recursive: true });
-					} catch (e) {
-						const code = (e as Error & { code?: string }).code;
-						if (code !== "EEXIST") throw e;
-					}
-
-					// Create archive
-					const tarResult = await sessionManager.execWithRuntimeThrottle(
-						session,
-						`tar -czf /tmp/_export.tar.gz -C '${basePath}' .`,
-					);
-					if (tarResult.exitCode !== 0) {
-						throw Object.assign(new Error(`tar creation failed: ${tarResult.stderr || "unknown error"}`), {
-							code: "EINVAL",
-						});
-					}
-
-					// Read archive bytes
-					const bytes = await session.fs.readFileBuffer("/tmp/_export.tar.gz");
-
-					// Delete temp file (best effort — don't fail if cleanup fails)
-					await sessionManager.execWithRuntimeThrottle(session, "rm /tmp/_export.tar.gz");
-
-					return bytes;
-				},
-			);
-		} catch (e) {
-			const code = (e as Error & { code?: string }).code;
-			if (isForbiddenError(e)) {
-				return forbiddenResponse();
-			}
-			if (code === "ENOENT") {
-				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
-			}
-			throw e;
-		}
-
-		return new Response(archiveBytes, {
-			status: 200,
-			headers: {
-				"Content-Type": "application/gzip",
-				"Content-Disposition": "attachment; filename=export.tar.gz",
-			},
-		});
 	});
 
 	return router;

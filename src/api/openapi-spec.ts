@@ -838,61 +838,7 @@ export const openapiSpec = {
 			},
 		},
 
-		// ── Ingest / Export ───────────────────────────────────────────────────────
-		"/sandboxes/{id}/ingest": {
-			post: {
-				tags: ["Ingest"],
-				summary: "Ingest tar.gz archive",
-				description: "Upload a `.tar.gz` file and extract it into the sandbox at `basePath`.",
-				parameters: [sandboxIdParam],
-				requestBody: {
-					required: true,
-					content: {
-						"multipart/form-data": {
-							schema: {
-								type: "object",
-								properties: {
-									archive: { type: "string", format: "binary", description: "The .tar.gz file" },
-									basePath: {
-										type: "string",
-										default: "/home/user/project",
-										description: "Extraction target directory",
-									},
-								},
-								required: ["archive"],
-							},
-						},
-					},
-				},
-				responses: {
-					"200": {
-						description: "Extracted",
-						content: {
-							"application/json": {
-								schema: {
-									type: "object",
-									properties: { status: { type: "string" }, basePath: { type: "string" } },
-									required: ["status", "basePath"],
-								},
-							},
-						},
-					},
-					"400": {
-						description: "Validation error or extraction failure",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-					"403": {
-						description: "Forbidden",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-					"404": {
-						description: "Sandbox not found",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-				},
-			},
-		},
-
+		// ── Ingest ────────────────────────────────────────────────────────────────
 		"/sandboxes/{id}/ingest-files": {
 			post: {
 				tags: ["Ingest"],
@@ -941,45 +887,6 @@ export const openapiSpec = {
 					},
 					"404": {
 						description: "Sandbox not found",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-				},
-			},
-		},
-
-		"/sandboxes/{id}/export": {
-			get: {
-				tags: ["Ingest"],
-				summary: "Export as tar.gz",
-				description: "Download sandbox contents under `basePath` as a `.tar.gz` file.",
-				parameters: [
-					sandboxIdParam,
-					{
-						name: "basePath",
-						in: "query",
-						required: false,
-						description: "Directory to export (default `/home/user`)",
-						schema: { type: "string", default: "/home/user" },
-					},
-				],
-				responses: {
-					"200": {
-						description: "Archive download",
-						headers: {
-							"Content-Disposition": { schema: { type: "string" }, description: "attachment; filename=export.tar.gz" },
-						},
-						content: { "application/gzip": { schema: { type: "string", format: "binary" } } },
-					},
-					"400": {
-						description: "Invalid basePath",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-					"403": {
-						description: "Forbidden",
-						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
-					},
-					"404": {
-						description: "Sandbox or basePath not found",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
 				},
