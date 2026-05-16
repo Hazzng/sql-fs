@@ -213,23 +213,50 @@ class Sandbox:
         scripts: List[Mapping[str, str]],
         *,
         timeout_ms: int = 30_000,
+        read_only: bool = False,
     ) -> List[BatchExecResult]:
-        """`POST /exec-sync-batch` — run up to 50 scripts sequentially in one request.
+        """`POST /exec-sync-batch` — run up to 50 scripts in one HTTP request.
 
         `scripts` is a list of `{"id": "...", "script": "..."}` dicts. The
         single `timeout_ms` budget covers all scripts; if it is exhausted,
         the remaining results carry `exit_code=-1` and `error="timeout"`.
 
-        The lock is acquired once for the entire batch — all scripts in the
-        batch are atomic relative to other callers. Use this for exploration
-        (find, grep, cat) to collapse N round-trips into 1.
+        Execution mode (important — agents please read):
 
-        Atomicity caveat: the same read-modify-write rule applies. If your
-        batch reads state in script 1 and writes in script 50, that is safe
-        (same lock acquisition). If you need to do Python computation between
-        a read and a write, that logic must live inside a single script string.
+        * `read_only=False` (default): scripts run **SEQUENTIALLY** inside a
+          single write-lock acquisition. They share shell state and are
+          atomic relative to other callers. This collapses N HTTP round-trips
+          into 1 but does **not** parallelise CPU-bound work — each script
+          waits for the previous to finish.
+        * `read_only=True`: scripts run **IN PARALLEL** (bounded fan-out)
+          under a shared read-lock. Any mutating filesystem op is rejected
+          with `EREADONLY_VIOLATION`. Use this for independent reads
+          (find / grep / cat) when you want parallel execution.
+
+        Performance patterns:
+
+        * For multi-pattern grep over the same file set, prefer a single
+          `sb.exec("grep -E 'pat1|pat2|pat3' ...")` over batching separate
+          greps — one filesystem traversal beats N. See the SDK README for
+          benchmark numbers.
+        * For many cheap independent scripts (echo / stat / small cat),
+          `exec_batch` with up to 50 scripts has flat ~42ms overhead and is
+          the fastest path.
+        * The sandbox container is typically single-core; bash `& + wait`
+          parallelism degrades past ~2 jobs on CPU-bound work.
+
+        Atomicity caveat (write batches): the same read-modify-write rule as
+        `exec` applies. If your batch reads state in script 1 and writes in
+        script 50, that is safe (same lock). If you need Python computation
+        between a read and a write, that logic must live inside a single
+        script string.
         """
-        body = {"scripts": [dict(s) for s in scripts], "timeoutMs": timeout_ms}
+        body: Dict[str, Any] = {
+            "scripts": [dict(s) for s in scripts],
+            "timeoutMs": timeout_ms,
+        }
+        if read_only:
+            body["readOnly"] = True
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
         resp = self._t.request(
             "POST",

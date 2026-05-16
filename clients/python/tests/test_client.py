@@ -285,6 +285,30 @@ def test_exec_batch():
 
 
 @respx.mock
+def test_exec_batch_read_only_forwards_flag():
+    captured: dict = {}
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={"results": [{"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0}]},
+        )
+
+    respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(side_effect=_record)
+
+    sb = make_client().sandboxes.attach("sb")
+    sb.exec_batch([{"id": "a", "script": "ls"}], read_only=True)
+    assert captured["body"].get("readOnly") is True
+
+    # Default (read_only=False) must not send the flag, preserving the
+    # existing sequential-atomic write semantics.
+    captured.clear()
+    sb.exec_batch([{"id": "a", "script": "ls"}])
+    assert "readOnly" not in captured["body"]
+
+
+@respx.mock
 def test_exec_stream_yields_events_until_exit():
     sse_body = (
         'event: stdout\ndata: {"t":0.1,"data":"hello\\n"}\n\n'
