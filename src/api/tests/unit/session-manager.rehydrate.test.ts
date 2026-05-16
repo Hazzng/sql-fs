@@ -33,7 +33,7 @@ function makeSessionManager(): SessionManager {
 	});
 }
 
-const DEFAULT_META: SandboxMeta = { owner: null, name: null, python: false, javascript: false };
+const DEFAULT_META: SandboxMeta = { owner: null, name: null, python: false, javascript: false, network: false };
 
 describe("SessionManager.withSessionOrRehydrate()", () => {
 	let sm: SessionManager;
@@ -102,7 +102,7 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("restores owner from PG metadata on rehydration", async () => {
-		pgSandboxes.set("sb-owned", { owner: "user-a", name: null, python: false, javascript: false });
+		pgSandboxes.set("sb-owned", { owner: "user-a", name: null, python: false, javascript: false, network: false });
 
 		let capturedOwner = "";
 		await sm.withSessionOrRehydrate("default", "sb-owned", async (session) => {
@@ -112,13 +112,13 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("restores runtime options from PG metadata on rehydration", async () => {
-		pgSandboxes.set("sb-py", { owner: null, name: null, python: true, javascript: false });
+		pgSandboxes.set("sb-py", { owner: null, name: null, python: true, javascript: false, network: false });
 
-		let capturedRuntime = { python: false, javascript: false };
+		let capturedRuntime = { python: false, javascript: false, network: false };
 		await sm.withSessionOrRehydrate("default", "sb-py", async (session) => {
 			capturedRuntime = session.runtimeOptions;
 		});
-		expect(capturedRuntime).toEqual({ python: true, javascript: false });
+		expect(capturedRuntime).toEqual({ python: true, javascript: false, network: false });
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
@@ -129,6 +129,7 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 				name: null,
 				python: true,
 				javascript: false,
+				network: false,
 			});
 		});
 
@@ -139,12 +140,12 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 		});
 
 		let owner = "";
-		let runtime = { python: false, javascript: false };
+		let runtime = { python: false, javascript: false, network: false };
 		await sm2.withSessionOrRehydrate("default", "sb-meta", async (session) => {
 			owner = session.owner;
 			runtime = session.runtimeOptions;
 		});
 		expect(owner).toBe("creator");
-		expect(runtime).toEqual({ python: true, javascript: false });
+		expect(runtime).toEqual({ python: true, javascript: false, network: false });
 	});
 });

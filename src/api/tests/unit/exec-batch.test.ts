@@ -237,6 +237,7 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 				name: null,
 				python: false,
 				javascript: false,
+				network: false,
 			});
 		});
 

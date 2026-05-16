@@ -18,6 +18,8 @@ const createBodySchema = z.object({
 	files: z.record(z.string()).optional(),
 	python: z.boolean().optional(),
 	javascript: z.boolean().optional(),
+	/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */
+	network: z.boolean().optional(),
 });
 
 export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
@@ -28,6 +30,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		let files: Record<string, string> | undefined;
 		let python = false;
 		let javascript = false;
+		let network = false;
 
 		// Body is optional — parse if present, ignore if missing/empty
 		try {
@@ -41,6 +44,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			files = result.data.files;
 			python = result.data.python ?? false;
 			javascript = result.data.javascript ?? false;
+			network = result.data.network ?? false;
 		} catch {
 			// No body provided — that's fine
 		}
@@ -57,18 +61,18 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				if (!session.owner) session.owner = owner;
 				session.name = name;
 				session.createdAt = createdAt;
-				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, name, python, javascript });
+				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, name, python, javascript, network });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);
 					}
 				}
 			},
-			{ python, javascript },
+			{ python, javascript, network },
 			owner,
 		);
 
-		return c.json({ id: sandboxId, name, owner, createdAt, python, javascript }, 201 as ContentfulStatusCode);
+		return c.json({ id: sandboxId, name, owner, createdAt, python, javascript, network }, 201 as ContentfulStatusCode);
 	});
 
 	router.get("/", async (c) => {
@@ -84,6 +88,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					createdAt: s.createdAt.toISOString(),
 					python: s.python,
 					javascript: s.javascript,
+					network: s.network,
 				})),
 			});
 		} catch (err) {

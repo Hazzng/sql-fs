@@ -191,6 +191,7 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 				name: null,
 				python: false,
 				javascript: false,
+				network: false,
 			});
 		});
 

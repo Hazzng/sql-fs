@@ -103,9 +103,16 @@ function asScriptTxFs(fs: IFileSystem): IScriptTxFs | undefined {
 export interface RuntimeOptions {
 	readonly python: boolean;
 	readonly javascript: boolean;
+	/**
+	 * When true, the `js-exec` runtime is given a permissive `NetworkConfig` that
+	 * allows all outbound HTTPS. Only `fetch()` inside `js-exec` benefits from this
+	 * flag — the Bash layer itself remains air-gapped (no `curl`, `wget`, DNS, or
+	 * raw sockets). Defaults to false (secure-by-default).
+	 */
+	readonly network: boolean;
 }
 
-const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false };
+const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
 
 /** Matches `python3` or `python` as a standalone word (avoids false positives like `mypython`). */
 const PYTHON_INVOCATION_REGEX = /\bpython3?\b/;
@@ -459,6 +466,10 @@ export class SessionManager {
 					fs,
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
+					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
+					// Bash itself remains air-gapped — no curl/wget/DNS — because
+					// just-bash only gates fetch() through this NetworkConfig path.
+					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
 					defenseInDepth: defenseInDepthConfig,
 					customCommands: customCommands.length > 0 ? customCommands : undefined,
 				});
@@ -850,7 +861,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript }
+			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
@@ -896,7 +907,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript }
+			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) {

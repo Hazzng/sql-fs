@@ -5,6 +5,14 @@ All notable changes to the VirtualFS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-05-16
+
+### Added
+
+- `network` parameter on `Sandbox.create()` — enables outbound internet access for the sandbox.
+
+---
+
 ## [0.2.1] - 2026-05-16
 
 ### Added

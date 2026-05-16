@@ -271,6 +271,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 				name: null,
 				python: false,
 				javascript: false,
+				network: false,
 			});
 		});
 

@@ -113,6 +113,54 @@ def test_create_sandbox_returns_handle():
 
 
 @respx.mock
+def test_create_sandbox_with_network_passes_flag():
+    """`network=True` is forwarded to the create payload so js-exec `fetch()` can be enabled."""
+    route = respx.post(f"{BASE_URL}/v1/sandboxes").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "id": "sb-net",
+                "name": None,
+                "owner": "alice",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "python": False,
+                "javascript": True,
+            },
+        )
+    )
+    make_client().sandboxes.create(javascript=True, network=True)
+    assert route.called
+    sent = json.loads(route.calls.last.request.content)
+    assert sent.get("network") is True
+    assert sent.get("javascript") is True
+
+
+@respx.mock
+def test_create_sandbox_network_default_omitted():
+    """When `network` is not requested, the flag must not leak into the body (default secure)."""
+    route = respx.post(f"{BASE_URL}/v1/sandboxes").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "id": "sb-x",
+                "name": None,
+                "owner": "alice",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "python": False,
+                "javascript": False,
+            },
+        )
+    )
+    make_client().sandboxes.create()
+    assert route.called
+    body = route.calls.last.request.content
+    # Empty body is also fine — what matters is that `network` is not asserted as True
+    if body:
+        sent = json.loads(body)
+        assert "network" not in sent or sent["network"] is False
+
+
+@respx.mock
 def test_get_sandbox_404_raises_notfound():
     respx.get(f"{BASE_URL}/v1/sandboxes/missing").mock(
         return_value=httpx.Response(404, json={"error": "not_found", "code": "ENOENT"})

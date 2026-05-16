@@ -93,11 +93,35 @@ sb = fs.sandboxes.create(
     files={"/home/user/seed.txt": "..."},   # text-only seed (use ingest_files for many/binary)
     python=False,                           # enable CPython WASM runtime
     javascript=False,                       # enable QuickJS runtime
+    network=False,                          # enable outbound fetch() from js-exec (opt-in)
 )
 ```
 
 All keyword args are optional — `fs.sandboxes.create()` is valid and creates
 an anonymous sandbox.
+
+**`network=True` — enabling outbound fetch()**
+
+Pass `network=True` together with `javascript=True` to allow `fetch()` calls
+inside `js-exec` scripts to reach external HTTP endpoints:
+
+```python
+sb = fs.sandboxes.create(javascript=True, network=True)
+r = sb.exec("""js-exec -c '
+    fetch("https://httpbin.org/get")
+        .then(r => r.json())
+        .then(d => console.log("origin:", d.origin))
+'""")
+print(r.stdout)   # origin: <your-ip>
+```
+
+- **Bash remains air-gapped.** Even with `network=True`, the Bash shell has
+  no `curl`, `wget`, DNS, or raw socket access. Only `fetch()` inside `js-exec`
+  gains outbound HTTP.
+- **Opt-in, default `False`.** Omitting `network` (or passing `network=False`)
+  produces a fully isolated sandbox.
+- **js-exec timeout extends to 60 s** when network is enabled (documented in
+  the `node` alias help text).
 
 ### `client.sandboxes.get(sandbox_id) -> SandboxInfo`
 

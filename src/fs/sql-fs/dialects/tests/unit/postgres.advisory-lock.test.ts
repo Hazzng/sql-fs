@@ -142,7 +142,13 @@ describe("PostgresDialect metadata helpers — SQL error translation", () => {
 		const { tx } = makeFakeTx();
 
 		await expect(
-			dialect.updateSandboxMeta(tx, "sandbox-missing", { owner: null, name: null, python: false, javascript: false }),
+			dialect.updateSandboxMeta(tx, "sandbox-missing", {
+				owner: null,
+				name: null,
+				python: false,
+				javascript: false,
+				network: false,
+			}),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
@@ -151,7 +157,13 @@ describe("PostgresDialect metadata helpers — SQL error translation", () => {
 		const tx = makeRejectingTx(new Error("permission denied on /var/lib/postgresql/data/base"));
 
 		await expect(
-			dialect.updateSandboxMeta(tx, "sandbox-meta", { owner: null, name: null, python: false, javascript: false }),
+			dialect.updateSandboxMeta(tx, "sandbox-meta", {
+				owner: null,
+				name: null,
+				python: false,
+				javascript: false,
+				network: false,
+			}),
 		).rejects.toMatchObject({
 			message: expect.stringContaining("[redacted]"),
 		});
