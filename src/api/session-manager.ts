@@ -21,6 +21,7 @@ import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snap
 import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
+import { nodeCommand } from "./commands/node-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
@@ -396,6 +397,12 @@ export class SessionManager {
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
 					defenseInDepth: defenseInDepthConfig,
+					// Override just-bash's built-in nodeStubCommand with a smarter
+					// version that translates `node -e CODE` → `js-exec -c CODE` and
+					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
+					// Only registered when the javascript runtime is enabled so that
+					// non-JS sandboxes keep the default "command not found" behaviour.
+					customCommands: resolvedRuntime.javascript ? [nodeCommand] : undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
