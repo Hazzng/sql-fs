@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8
+
+### Patch Changes
+
+- [#79](https://github.com/Hazzng/virtualFS/pull/79) Thanks [@Hazzng](https://github.com/Hazzng)! - Python SDK: expose `read_only` parameter on `Sandbox.exec_batch()`. When `read_only=True`, the request forwards `readOnly: true` to the server, activating parallel script execution under a shared read-lock. Defaults to `False` (sequential, write-lock) for full backward compatibility.
+
 ## 0.3.7
 
 ### Patch Changes
