@@ -127,7 +127,7 @@ All body fields are **optional**:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `python` | boolean | false | Enable CPython WASM (`python3`/`python`) |
+| `python` | boolean | false | Enable CPython WASM — registers `py-exec` (warm, fast) and `python3` (cold per call) |
 | `javascript` | boolean | false | Enable QuickJS WASM (`js-exec`/`node`) |
 | `network` | boolean | false | Enable outbound `fetch()` from `js-exec` (see note below) |
 | `files` | `Record<absPath, string>` | — | Seed files (absolute path → plain text) |
@@ -312,6 +312,10 @@ Request body:
 | `cwd` | string | no | session cwd | — |
 | `env` | `Record<string, string>` | no | — | — |
 | `timeoutMs` | integer | no | 30 000 | 300 000 |
+| `debug` | boolean | no | false | — |
+| `readOnly` | boolean | no | false | — |
+
+`readOnly`: when `true`, the script runs without acquiring the exclusive sandbox write-lock, allowing concurrent reads from multiple callers. Any mutating filesystem op in the script is rejected by the server with HTTP 422 `EREADONLY_VIOLATION` after the script returns. Use for pure read operations (grep, cat, find, wc, stat).
 
 Response `200`:
 ```json
@@ -319,10 +323,51 @@ Response `200`:
 ```
 
 On timeout → `408 { "error": "timeout", "code": "EXEC_TIMEOUT" }`.
+On read-only violation → `422 { "error": "read_only_violation", "code": "EREADONLY_VIOLATION", "details": [...] }`.
 
 **Shell state persists** across exec-sync calls on the same sandbox (same warm Bash instance):
 env vars set with `export`, cwd changes with `cd`, shell functions — all survive between calls.
 State resets only after the session is evicted (10 min idle).
+
+### POST /v1/sandboxes/:id/exec-sync-batch — Buffered batch execution
+
+Run up to **50 scripts in one HTTP request**. Scripts run sequentially (write mode) or in parallel (read-only mode). Returns results for all scripts even if some time out.
+
+```bash
+curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync-batch" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scripts": [
+      {"id": "tree", "script": "find /home/user -type f | head -20"},
+      {"id": "uname", "script": "uname -srm"}
+    ],
+    "timeoutMs": 30000,
+    "readOnly": true
+  }' | jq
+```
+
+Request body:
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `scripts` | `Array<{id: string, script: string}>` | yes | — |
+| `timeoutMs` | integer | no | 30 000 |
+| `readOnly` | boolean | no | false |
+
+`readOnly`: same semantics as exec-sync — scripts run in parallel under a shared read-lock. Any mutating op returns `422 EREADONLY_VIOLATION`.
+
+Response `200`:
+```json
+{
+  "results": [
+    {"id": "tree", "stdout": "...", "stderr": "", "exitCode": 0},
+    {"id": "uname", "stdout": "Linux ...", "stderr": "", "exitCode": 0}
+  ]
+}
+```
+
+Scripts that time out carry `exitCode: -1` and `error: "timeout"`. The budget `timeoutMs` covers all scripts combined.
 
 ### POST /v1/sandboxes/:id/exec — SSE streaming execution
 
@@ -330,8 +375,10 @@ State resets only after the session is evicted (10 min idle).
 curl -N -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"script": "for i in 1 2 3; do echo $i; done"}'
+  -d '{"script": "for i in 1 2 3; do echo $i; done", "readOnly": false}'
 ```
+
+Request body fields: `script` (required), `cwd`, `env`, `timeoutMs`, `debug`, `readOnly` — same semantics as exec-sync.
 
 SSE events emitted:
 
@@ -341,12 +388,13 @@ SSE events emitted:
 | `stderr` | `{"t":"stderr","data":"..."}` | Per chunk of stderr |
 | `exit` | `{"t":"exit","exitCode":0,"durationMs":42}` | Script finished |
 | `exit` (timeout) | `{"t":"exit","exitCode":-1,"error":"timeout","durationMs":...}` | Timed out |
+| `error` | `{"error":"read_only_violation","code":"EREADONLY_VIOLATION","details":[...]}` | Read-only violation or server error |
 
 Client disconnect cancels the script via `AbortController`.
 
 ---
 
-## Ingest / Export
+## Ingest
 
 ### POST /v1/sandboxes/:id/ingest-files — JSON manifest upload
 
@@ -395,30 +443,6 @@ Request body:
 **Performance:** ~150 files / ~1 MB JSON typically completes in <100 ms server-side.
 The previous "≤25 files per batch" rule no longer applies — the dialect now uses a
 single bulk INSERT. Practical caps are HTTP body size and the 240 s ACA gateway window.
-
-### GET /v1/sandboxes/:id/export — Download as tar.gz
-
-> ⛔ **Banned for agent use.** Use the exec equivalent: stream a tar archive via stdout
-> and decode it client-side.
->
-> ```bash
-> curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync" \
->   -H "Authorization: Bearer $TOKEN" \
->   -H "Content-Type: application/json" \
->   -d '{"script": "tar -czf - /home/user/project | base64"}' \
->   | jq -r '.stdout' | base64 -d > export.tar.gz
-> ```
-
-```bash
-curl -s "$BASE_URL/v1/sandboxes/$SB/export?basePath=/home/user/project" \
-  -H "Authorization: Bearer $TOKEN" \
-  -o export.tar.gz
-
-tar tzf export.tar.gz   # list contents
-tar xzf export.tar.gz   # extract
-```
-
-`basePath` query param defaults to `/home/user`.
 
 ---
 

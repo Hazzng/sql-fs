@@ -24,13 +24,23 @@ from virtualfs import Client
 with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001") as fs:
     sb = fs.sandboxes.create(name="demo", python=True)
 
-    # Execute a script
+    # Bash execution
     result = sb.exec("echo hello && ls /home/user")
     print(result.stdout)        # "hello\n..."
     print(result.error)         # alias for stderr
     print(result.exit_code)     # 0
     print(result.ok)            # True
     print(result.duration_ms)
+
+    # Python execution — use py-exec, not python3.
+    # py-exec keeps the interpreter warm: ~1.4 s first call, < 5 ms after.
+    # python3 cold-boots every call (~1.4 s each).
+    sb.exec("py-exec -c 'print(1 + 1)'")          # first call warms interpreter
+    sb.exec("py-exec -c 'print(\"still warm\")'")  # < 5 ms
+
+    # For multi-step Python work, write a script and run it once:
+    sb.fs.write("/home/user/script.py", "for i in range(5):\n    print(i)\n")
+    result = sb.exec("py-exec /home/user/script.py")
 
     # File operations
     sb.fs.write("/home/user/main.py", "print('hi')\n")
@@ -77,7 +87,7 @@ fs = Client(base_url="...", token="eyJhbGciOi...")
 | Method | HTTP |
 |---|---|
 | `sb.exec(script, cwd=, env=, timeout_ms=, debug=) -> ExecResult` | `POST /exec-sync` |
-| `sb.exec_batch([{id, script}, ...], timeout_ms=) -> list[BatchExecResult]` | `POST /exec-sync-batch` |
+| `sb.exec_batch([{id, script}, ...], timeout_ms=, read_only=) -> list[BatchExecResult]` | `POST /exec-sync-batch` |
 | `for ev in sb.exec_stream(script, ...)` | `POST /exec` (SSE) |
 
 #### Ingest / Export
@@ -106,6 +116,30 @@ All exceptions derive from `VirtualFSError`. HTTP status codes map to:
 | network | `TransportError` |
 
 Each error exposes `.code` (server error code, e.g. `ENOENT`), `.status`, and `.details`.
+
+## Performance patterns
+
+`exec_batch` is for collapsing many round-trips, not for parallelising
+CPU-bound work. The lock model determines what runs in parallel:
+
+| Goal | Recommended call | Notes |
+|---|---|---|
+| Many cheap independent reads (find/grep/cat/stat) | `sb.exec_batch([...], read_only=True)` | Parallel under shared read-lock, ordered results. |
+| Atomic multi-step write | `sb.exec_batch([...])` (default) | Sequential inside one write-lock. Scripts share shell state. |
+| Multi-pattern grep over the same file set | `sb.exec("grep -E 'pat1\|pat2\|pat3' ...")` | One filesystem traversal beats N. |
+| One-shot read or write | `sb.exec("...")` | Holds the lock for the whole script — bundle logic into one script. |
+
+Benchmark snapshot (951-file repo, 8 grep patterns):
+
+| Approach | Wall-clock |
+|---|---|
+| `exec_batch` of 8 scripts (default, sequential) | ~1100ms |
+| `exec_batch` of 8 scripts, `read_only=True` (parallel) | faster, varies with vCPU count |
+| Single `grep -E 'pat1\|pat2\|...'` (alternation) | ~420ms |
+
+The sandbox container is typically single-core; bash `&`/`wait`
+parallelism beyond ~2 jobs is usually slower than sequential on CPU-bound
+work.
 
 ## Streaming exec
 

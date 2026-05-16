@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.3.7-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/version-0.3.10-blue" alt="Version" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen?logo=node.js&logoColor=white" alt="Node.js" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white" alt="TypeScript" />
   <img src="https://img.shields.io/badge/MCP-2025--03--26-8b5cf6" alt="MCP" />
@@ -95,7 +95,7 @@ Mounted at `/mcp`. Streamable HTTP transport per MCP 2025-03-26 spec. Tool names
 | `sandbox_list` | List all sandboxes owned by the current user |
 | `sandbox_delete` | Delete a sandbox and all its files |
 | `bash_exec` | Execute a bash script, return buffered output |
-| `bash_exec_batch` | Execute multiple scripts sequentially — collapses N round-trips into 1 |
+| `bash_exec_batch` | Execute multiple scripts in one round-trip; `readOnly:false` → sequential under one write-lock, `readOnly:true` → parallel under a shared read-lock |
 | `fs_ingest` | Bulk-upload files into a sandbox |
 | `fs_export` | Download sandbox files as a JSON map |
 

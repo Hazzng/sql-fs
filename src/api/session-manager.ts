@@ -21,12 +21,32 @@ import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snap
 import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
+import { nodeCommand } from "./commands/node-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { WarmPythonProcess, createPyExecCommand } from "./lib/warm-python.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
+
+/**
+ * Lightweight POSIX path normalization for session.cwd storage.
+ * Resolves `.` and `..` segments and collapses consecutive slashes.
+ * Does NOT require the path to exist on disk — pure string transformation.
+ * Mirrors the logic in sql-fs/sql-fs.ts `normalizeFsPath`.
+ */
+function posixNormalizePath(p: string): string {
+	if (!p || p === "/") return "/";
+	const s = p.startsWith("/") ? p : `/${p}`;
+	const parts = s.split("/").filter((seg) => seg !== "" && seg !== ".");
+	const stack: string[] = [];
+	for (const part of parts) {
+		if (part === "..") stack.pop();
+		else stack.push(part);
+	}
+	return `/${stack.join("/")}`;
+}
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
@@ -105,6 +125,12 @@ export interface Session {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
+	/**
+	 * Warm Python interpreter shared across all `py-exec` calls in this
+	 * session. Undefined when the sandbox was created without `python: true`.
+	 * Kill it when the session is destroyed so the child process does not leak.
+	 */
+	readonly warmPython: WarmPythonProcess | undefined;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -121,6 +147,28 @@ export interface Session {
 	overBudget: boolean;
 	destroyPromise?: Promise<void>;
 	lastSeenVersion: number;
+	/**
+	 * Tracked working directory for this session.
+	 *
+	 * just-bash's `bash.exec()` runs each call against a **copy** of the
+	 * interpreter state (env + cwd). Any `cd` executed inside a script
+	 * modifies only that copy and is discarded once the call returns —
+	 * `bash.getCwd()` never changes. We therefore mirror the cwd ourselves:
+	 *
+	 * - Initialised from `bash.getCwd()` at session creation (typically `/home/user`).
+	 * - After every **non-readOnly** exec we read `result.env.PWD`, which
+	 *   just-bash always populates with the final working directory, and store
+	 *   it here.
+	 * - Before each exec we pass this value as `opts.cwd` (unless the caller
+	 *   already supplied an explicit `cwd` in the request body).
+	 *
+	 * Semantics: cwd is **session-scoped** and **per-sandbox** — two sandboxes
+	 * are completely independent, and the cwd resets to `/home/user` only when
+	 * the session is evicted (idle timeout or explicit destroy).
+	 * readOnly execs use the current `session.cwd` as their starting directory
+	 * but do not update it, consistent with the read-only contract.
+	 */
+	cwd: string;
 	/**
 	 * Single-flight guard for `ensureFreshCache`. While set, parallel readers
 	 * (and any concurrent writer entry) await the same probe + reload rather
@@ -398,6 +446,22 @@ export class SessionManager {
 							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
 						}
 					: false;
+
+				// Build the warm Python process (if python runtime is enabled) and
+				// register py-exec as a custom command so agents can call it without
+				// paying the 1.4 s WASM cold-boot cost on every invocation.
+				const warmPython = resolvedRuntime.python ? new WarmPythonProcess() : undefined;
+
+				const customCommands = [
+					...(warmPython !== undefined ? [createPyExecCommand(warmPython)] : []),
+					// Override just-bash's built-in nodeStubCommand with a smarter
+					// version that translates `node -e CODE` → `js-exec -c CODE` and
+					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
+					// Only registered when the javascript runtime is enabled so that
+					// non-JS sandboxes keep the default "command not found" behaviour.
+					...(resolvedRuntime.javascript ? [nodeCommand] : []),
+				];
+
 				const bash = new Bash({
 					fs,
 					python: resolvedRuntime.python || undefined,
@@ -407,6 +471,7 @@ export class SessionManager {
 					// just-bash only gates fetch() through this NetworkConfig path.
 					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
 					defenseInDepth: defenseInDepthConfig,
+					customCommands: customCommands.length > 0 ? customCommands : undefined,
 				});
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
@@ -434,6 +499,7 @@ export class SessionManager {
 					runtimeOptions: resolvedRuntime,
 					tenantId,
 					scriptTx,
+					warmPython,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					lock: new RWLock(),
@@ -445,6 +511,7 @@ export class SessionManager {
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
 					publishPending: false,
+					cwd: bash.getCwd(),
 				};
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
@@ -920,7 +987,7 @@ export class SessionManager {
 						}
 					}
 				} finally {
-					await this.disconnectFs(session.fs);
+					await this.disconnectFs(session.fs, session.warmPython);
 				}
 				if (cleanupError !== undefined) throw cleanupError;
 			});
@@ -994,7 +1061,7 @@ export class SessionManager {
 				}
 				this.sessions.delete(key);
 				try {
-					await this.disconnectFs(session.fs);
+					await this.disconnectFs(session.fs, session.warmPython);
 				} catch {
 					// best-effort
 				}
@@ -1033,13 +1100,20 @@ export class SessionManager {
 					})
 					.catch(() => {})
 					.finally(() => {
-						void this.disconnectFs(session.fs);
+						void this.disconnectFs(session.fs, session.warmPython);
 					});
 			}
 		}
 	}
 
-	private async disconnectFs(fs: IFileSystem): Promise<void> {
+	private async disconnectFs(fs: IFileSystem, warmPython?: WarmPythonProcess): Promise<void> {
+		if (warmPython !== undefined) {
+			try {
+				warmPython.kill();
+			} catch {
+				// best-effort
+			}
+		}
 		const disconnectable = fs as { disconnect?: () => Promise<void> };
 		if (typeof disconnectable.disconnect === "function") {
 			try {
@@ -1120,6 +1194,17 @@ export class SessionManager {
 		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
+		// Apply the session-tracked cwd as the starting directory for this exec,
+		// unless the caller has already supplied an explicit cwd in the request.
+		// just-bash runs each exec against a copy of the interpreter state, so
+		// any `cd` executed inside a script does not survive the call. We bridge
+		// that gap by reading result.env.PWD (always populated by just-bash) and
+		// storing it back on the session after every non-readOnly exec.
+		const resolvedOpts: ExecOptions = {
+			...opts,
+			cwd: opts?.cwd ?? session.cwd,
+		};
+
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
 		// EREADONLY before any DB call, so the per-script transaction has
 		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
@@ -1129,7 +1214,7 @@ export class SessionManager {
 			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
-					const result = await session.bash.exec(script, opts);
+					const result = await session.bash.exec(script, resolvedOpts);
 					await session.scriptTx.endScope();
 					return result;
 				} catch (err) {
@@ -1137,11 +1222,29 @@ export class SessionManager {
 					throw err;
 				}
 			}
-			return session.bash.exec(script, opts);
+			return session.bash.exec(script, resolvedOpts);
+		};
+
+		const updateCwd = (result: BashExecResult): BashExecResult => {
+			// readOnly execs must not mutate session state — they run in shared
+			// lock mode and may execute concurrently with other readers.
+			if (!inReadOnlyScope) {
+				const finalCwd = result.env?.PWD;
+				// Validate before storing: reject null bytes (security) and
+				// normalize via posix.resolve so scripts that do `export PWD=…`
+				// with relative or un-normalized paths cannot corrupt session.cwd.
+				if (typeof finalCwd === "string" && finalCwd.length > 0 && !finalCwd.includes("\0")) {
+					const normalized = posixNormalizePath(finalCwd);
+					if (normalized.startsWith("/")) {
+						session.cwd = normalized;
+					}
+				}
+			}
+			return result;
 		};
 
 		if (!usesPython && !usesJs) {
-			return execFn();
+			return updateCwd(await execFn());
 		}
 
 		const signal = opts?.signal;
@@ -1156,7 +1259,7 @@ export class SessionManager {
 		}
 
 		try {
-			return await execFn();
+			return updateCwd(await execFn());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);

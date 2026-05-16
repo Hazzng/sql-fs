@@ -37,7 +37,7 @@ sb.record      # SandboxRecord | None — full record at creation; None if attac
 
 ## Exec
 
-### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False) -> ExecResult`
+### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False) -> ExecResult`
 
 Buffered bash execution. Maps to `POST /v1/sandboxes/{id}/exec-sync`. Blocks
 until the script exits and returns a flat `ExecResult` with
@@ -50,6 +50,7 @@ result = sb.exec(
     env={"FOO": "bar"},          # added on top of sandbox-level env
     timeout_ms=15_000,            # 1 ≤ ms ≤ 300_000
     debug=False,                  # True = prepend `set -x` for tracing
+    read_only=False,              # True = skip exclusive lock; raises ValidationError on any write
 )
 print(result.stdout)              # str
 print(result.error)               # alias for .stderr
@@ -63,10 +64,11 @@ client-side network timeout.
 **Idempotency:** `exec` is **not** retried automatically (the server cannot
 safely re-execute a script). Wrap your own retry logic if needed.
 
-### `sb.exec_batch(scripts, *, timeout_ms=30_000) -> list[BatchExecResult]`
+### `sb.exec_batch(scripts, *, timeout_ms=30_000, read_only=False) -> list[BatchExecResult]`
 
 Maps to `POST /v1/sandboxes/{id}/exec-sync-batch`. Run up to **50 scripts
-sequentially** in one HTTP round-trip. Each entry is `{"id": "...", "script": "..."}`.
+sequentially** (or in parallel when `read_only=True`) in one HTTP round-trip.
+Each entry is `{"id": "...", "script": "..."}`.
 
 ```python
 results = sb.exec_batch(
@@ -76,6 +78,7 @@ results = sb.exec_batch(
         {"id": "uname", "script": "uname -srm"},
     ],
     timeout_ms=60_000,   # single budget covering ALL scripts
+    read_only=True,      # parallel execution; raises ValidationError on any write
 )
 for r in results:
     print(r.id, r.exit_code, r.ok)
@@ -91,7 +94,7 @@ costs ~700 ms steady-state regardless of script complexity (HTTP round-trip
 dominates). Bundling 20 trivial probes into one `exec_batch` runs in ~700 ms
 total, ~35 ms/probe. Always batch independent exploration probes.
 
-### `sb.exec_stream(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False) -> Iterator[StreamEvent]`
+### `sb.exec_stream(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False) -> Iterator[StreamEvent]`
 
 Maps to `POST /v1/sandboxes/{id}/exec` (Server-Sent Events). Yields
 `StreamEvent` instances of three types until the server emits `exit`:
@@ -157,19 +160,7 @@ Returns the server's response dict, e.g. `{"status": "ok", "fileCount": 125}`.
 **Hard limits to keep in mind:**
 - All file bytes are buffered into one HTTP request body. Practical ceiling
   before things get slow: ~10 MB total, ~500 files. For larger payloads, split
-  into multiple `ingest_files` calls or use `sb.ingest_archive(open(p, 'rb'))`
-  with a `.tar.gz` (multipart upload, streamed server-side).
-
-### `sb.ingest_archive(archive, *, base_path="/home/user/project") -> dict`
-
-Maps to `POST /v1/sandboxes/{id}/ingest`. Upload a `.tar.gz` via multipart and
-extract on the server. Use this for large codebases (>10 MB) where
-`ingest_files` would balloon the JSON body.
-
-```python
-with open("project.tar.gz", "rb") as fh:
-    sb.ingest_archive(fh, base_path="/home/user/project")
-```
+  into multiple `ingest_files` calls.
 
 ---
 
@@ -189,7 +180,7 @@ finally:
 
 ---
 
-## ⚠️ `sb.fs.*` and `sb.export*` — banned for agent use
+## ⚠️ `sb.fs.*` — banned for agent use
 
 Listed for completeness only. Translate to `exec` per the SKILL.md policy.
 
@@ -202,8 +193,6 @@ Listed for completeness only. Translate to `exec` per the SKILL.md policy.
 | `sb.fs.delete(path, recursive=...)` | `DELETE /files/{path}` | `sb.exec(f"rm -rf {shlex.quote(path)}")` |
 | `sb.fs.mkdir(path, recursive=...)` | `POST /mkdir` | `sb.exec(f"mkdir -p {shlex.quote(path)}")` |
 | `sb.fs.tree(prefix=..., depth=...)` | `GET /tree` | `sb.exec(f"find {root} -printf '%y %s %p\\n'")` |
-| `sb.export(base_path=...) -> bytes` | `GET /export` | `sb.exec(f"tar -czf - {root} \| base64").stdout` then `base64.b64decode(...)` |
-| `sb.export_stream(...)` | `GET /export` (chunked) | streaming exec with `tar -czf -` and pipe to local `tee`/file |
 
 ---
 

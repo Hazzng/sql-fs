@@ -170,7 +170,7 @@ The `Client` retries up to `max_retries` times on **transient** failures only:
 
 After `max_retries` exhaustion the SDK raises `ServerError` (for 5xx) or
 `TransportError` (for network failures). Streaming endpoints
-(`exec_stream`, `export_stream`) are **not** retried — they have at-most-once
+(`exec_stream`) are **not** retried — they have at-most-once
 semantics because the server can't safely re-execute a script.
 
 See `plugins/virtualfs/skills/py-sdk/ref/errors.md` for the full exception

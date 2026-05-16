@@ -90,8 +90,9 @@ response shapes, and known gotchas from the live API.
 | `DELETE /v1/sandboxes/:id` | `DELETE /v1/sandboxes/:id/files/*path` |
 | `POST /v1/sandboxes/:id/exec-sync` | `POST /v1/sandboxes/:id/mkdir` |
 | `POST /v1/sandboxes/:id/exec` (SSE) | `POST /v1/sandboxes/:id/writeFiles` |
-| `POST /v1/sandboxes/:id/ingest-files` (bulk bootstrap only — see note) | `GET /v1/sandboxes/:id/tree` |
-| `POST /v1/auth/bootstrap` (get first token — no Bearer needed) | `GET /v1/sandboxes/:id/export` |
+| `POST /v1/sandboxes/:id/exec-sync-batch` | `GET /v1/sandboxes/:id/tree` |
+| `POST /v1/sandboxes/:id/ingest-files` (bulk bootstrap only — see note) | |
+| `POST /v1/auth/bootstrap` (get first token — no Bearer needed) | |
 | `POST /v1/auth/admin`, `POST /v1/admin/gc (not yet implemented)` | |
 
 **Translate Files-endpoint patterns to exec scripts:**
@@ -106,7 +107,7 @@ response shapes, and known gotchas from the live API.
 | Make a directory | `POST /mkdir` | `exec-sync` with `mkdir -p <path>` |
 | Delete a file/dir | `DELETE /files/*path` | `exec-sync` with `rm -f` or `rm -rf` |
 | List the tree | `GET /tree` | `exec-sync` with `find <root> -printf '%y %s %p\n'` (or `ls -laR`, `stat`) |
-| Download as archive | `GET /export` | `exec-sync` with `tar -czf - <root> \| base64` and decode client-side |
+| Download as archive | (removed) | `exec-sync` with `tar -czf - <root> \| base64` and decode client-side |
 
 **Ingest exception:** `POST /ingest-files` is allowed for one-time bulk bootstrapping a
 local folder into a fresh sandbox (~5 DB round-trips regardless of file count, no practical
@@ -139,3 +140,5 @@ curl -s ... /exec-sync -d '{
 ```
 
 **Rule:** if you read state and then write based on it, the read, compute, and write must all be inside a single `"script"` string. Any client-side logic between two exec calls is outside the lock.
+
+5. Pass `"readOnly": true` on exec-sync, exec-sync-batch, and exec whenever the script only reads data (grep, cat, find, wc, stat, etc.) and does not mutate the filesystem. This skips the exclusive sandbox lock, allowing parallel reads from multiple callers against the same sandbox. Any mutating filesystem op in a read-only script is rejected by the server with HTTP 422 `EREADONLY_VIOLATION`.
