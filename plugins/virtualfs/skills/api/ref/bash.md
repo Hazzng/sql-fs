@@ -46,14 +46,42 @@ It is NOT a real Linux shell. The following is the authoritative list of what wo
 ## Optional runtimes (must be enabled at sandbox creation)
 
 ### Python — `python: true`
+
+Two commands are available. **Use `py-exec` by default** — it keeps the interpreter warm so the ~1.4 s WASM cold-boot cost is paid at most once per session. Only fall back to `python3` when you explicitly need per-call state isolation (fresh globals, clean `sys.modules`).
+
 ```bash
+# Fast — warm interpreter, paid once per session (~1.4 s first call, <5 ms after)
+py-exec -c "print(1 + 1)"
+py-exec script.py          # reads the file from the sandbox VirtualFS
+
+# Slow — fresh WASM process every call (~1.4 s every time)
 python3 -c "print(1 + 1)"
 python3 script.py
 ```
-- CPython WASM, full standard library
+
+**`py-exec` vs `python3`:**
+| | `py-exec` | `python3` |
+|---|---|---|
+| First call | ~1.4 s (interpreter boot) | ~1.4 s |
+| Subsequent calls | < 5 ms | ~1.4 s |
+| Interpreter state | **Shared** — variables persist across calls | Fresh per call |
+| Use when | Running multiple Python steps in one session | Truly stateless one-offs |
+
+**`py-exec` state is shared within a session.** Variables defined in one call are visible in the next, like a Python REPL. If you need isolation, use `python3`.
+
+**Write multi-step Python logic to a file and run it once** rather than calling `py-exec -c` in a loop — one script with a loop is always faster than N separate exec calls:
+
+```bash
+# FAST — one exec, one interpreter boot
+py-exec script.py
+
+# SLOW — 20 × 1.4 s cold boots (python3) or 20 HTTP round-trips (py-exec -c in loop)
+for m in json re hashlib datetime; do python3 -c "import $m; print('ok')"; done
+```
+
 - No `pip`, no network, no `os.system`, no `subprocess`
-- Server-wide concurrency cap: **5 concurrent python3 calls** (queue FIFO beyond that)
-- Each invocation costs ~80 MB RAM; processes exit cleanly (EXIT_RUNTIME)
+- Server-wide concurrency cap: **5 concurrent `python3` calls** (queue FIFO beyond that; `py-exec` is exempt — it reuses an existing process)
+- Each `python3` invocation costs ~80 MB RAM; processes exit cleanly (EXIT_RUNTIME)
 
 ### JavaScript — `javascript: true`
 ```bash
@@ -108,8 +136,9 @@ After session eviction (10 min idle) or on a cold replica:
 | `cat large_file.txt` (contentCache warm) | < 10 ms |
 | `cat large_file.txt` (cold, 1 MB blob from Neon) | ~300 ms |
 | `tar -xzf archive.tar.gz` (10 files via just-bash) | ~3 s |
-| `python3 -c "..."` (first call, WASM init) | ~2–5 s |
-| `python3 -c "..."` (subsequent calls) | ~500 ms–1 s |
+| `py-exec -c "..."` (first call, WASM init) | ~1.4 s |
+| `py-exec -c "..."` (subsequent warm calls) | < 5 ms |
+| `python3 -c "..."` (every call, fresh WASM) | ~1.4 s |
 
 ---
 

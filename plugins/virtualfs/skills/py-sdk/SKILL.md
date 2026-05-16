@@ -194,3 +194,11 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
 - **`sb.exec` is reusable**, not per-call. The session manager keeps the just-bash
   worker warm for 10 min idle. Repeated `sb.exec(...)` calls reuse the same Bash
   process — cwd, env vars, and shell functions persist within that window.
+
+- **Use `py-exec` not `python3` for multi-step Python work.** On `python=True`
+  sandboxes, `py-exec -c '...'` keeps the interpreter warm — the ~1.4 s WASM
+  cold-boot is paid once per session, then subsequent calls run in < 5 ms.
+  `python3 -c '...'` cold-boots every call (~1.4 s each). Write multi-step logic
+  to a file and call `py-exec script.py` rather than looping `py-exec -c` calls.
+  Note: `py-exec` state is shared across calls (variables persist like a REPL);
+  use `python3` only when per-call isolation is required.

@@ -127,7 +127,7 @@ All body fields are **optional**:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `python` | boolean | false | Enable CPython WASM (`python3`/`python`) |
+| `python` | boolean | false | Enable CPython WASM — registers `py-exec` (warm, fast) and `python3` (cold per call) |
 | `javascript` | boolean | false | Enable QuickJS WASM (`js-exec`/`node`) |
 | `files` | `Record<absPath, string>` | — | Seed files (absolute path → plain text) |
 | `env` | `Record<string, string>` | — | Default env vars for all exec calls |

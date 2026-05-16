@@ -24,13 +24,23 @@ from virtualfs import Client
 with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001") as fs:
     sb = fs.sandboxes.create(name="demo", python=True)
 
-    # Execute a script
+    # Bash execution
     result = sb.exec("echo hello && ls /home/user")
     print(result.stdout)        # "hello\n..."
     print(result.error)         # alias for stderr
     print(result.exit_code)     # 0
     print(result.ok)            # True
     print(result.duration_ms)
+
+    # Python execution — use py-exec, not python3.
+    # py-exec keeps the interpreter warm: ~1.4 s first call, < 5 ms after.
+    # python3 cold-boots every call (~1.4 s each).
+    sb.exec("py-exec -c 'print(1 + 1)'")          # first call warms interpreter
+    sb.exec("py-exec -c 'print(\"still warm\")'")  # < 5 ms
+
+    # For multi-step Python work, write a script and run it once:
+    sb.fs.write("/home/user/script.py", "for i in range(5):\n    print(i)\n")
+    result = sb.exec("py-exec /home/user/script.py")
 
     # File operations
     sb.fs.write("/home/user/main.py", "print('hi')\n")
