@@ -74,7 +74,7 @@ All reference material lives under `plugins/virtualfs/skills/py-sdk/` in this pr
   `Client(...)` constructor + `client.sandboxes.{list,create,get,attach,delete}`. Read this for sandbox lifecycle.
 
 - **Sandbox reference** → `plugins/virtualfs/skills/py-sdk/ref/sandbox.md`
-  `sb.exec / exec_batch / exec_stream`, `sb.ingest_files`, `sb.export`, `sb.delete`. Read this for everything an agent does inside a sandbox.
+  `sb.exec / exec_batch / exec_stream`, `sb.ingest_files`, `sb.delete`. Read this for everything an agent does inside a sandbox.
 
 - **Models reference** → `plugins/virtualfs/skills/py-sdk/ref/models.md`
   Field-by-field shape of `ExecResult`, `BatchExecResult`, `StreamEvent`, `SandboxRecord`, etc. Read this when shaping return-value handling.
@@ -123,7 +123,7 @@ methods are banned for agent use.
 | `sb.exec(script, ...)` | `sb.fs.delete(path, ...)` |
 | `sb.exec_batch([...])` | `sb.fs.mkdir(path, ...)` |
 | `sb.exec_stream(script, ...)` | `sb.fs.tree(...)` |
-| `sb.ingest_files({...})` (one-time bootstrap only — see note) | `sb.export(...)` / `sb.export_stream(...)` |
+| `sb.ingest_files({...})` (one-time bootstrap only — see note) | |
 
 **Translate `fs.*` patterns to exec scripts:**
 
@@ -137,7 +137,7 @@ methods are banned for agent use.
 | Make a directory | `sb.fs.mkdir(path, recursive=True)` | `sb.exec(f"mkdir -p {shlex.quote(path)}")` |
 | Delete a file/dir | `sb.fs.delete(path, recursive=True)` | `sb.exec(f"rm -rf {shlex.quote(path)}")` |
 | List the tree | `sb.fs.tree(prefix=...)` | `sb.exec(f"find {root} -printf '%y %s %p\\n'")` (or `ls -laR`, `stat`) |
-| Download as archive | `sb.export(base_path=...)` | `sb.exec(f"tar -czf - {root} \| base64").stdout` then decode client-side |
+| Download as archive | (removed) | `sb.exec(f"tar -czf - {root} \| base64").stdout` then decode client-side |
 
 **Ingest exception:** `sb.ingest_files({...})` is allowed for one-time bulk bootstrapping
 a local folder into a fresh sandbox (single HTTP round-trip, base64-safe for binary).
@@ -202,3 +202,5 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
   to a file and call `py-exec script.py` rather than looping `py-exec -c` calls.
   Note: `py-exec` state is shared across calls (variables persist like a REPL);
   use `python3` only when per-call isolation is required.
+
+6. Pass `read_only=True` on `sb.exec`, `sb.exec_batch`, and `sb.exec_stream` whenever the script only reads data (grep, cat, find, wc, stat, etc.). This skips the exclusive sandbox write-lock, allowing concurrent reads from multiple callers. Any mutating filesystem op in a read-only script raises `ValidationError(code="EREADONLY_VIOLATION")`.

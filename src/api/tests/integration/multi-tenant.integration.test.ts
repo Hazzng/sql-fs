@@ -1,18 +1,14 @@
-import { execSync } from "node:child_process";
 /**
  * Phase 5 — multi-tenant Postgres routing integration tests.
  *
  * Uses two fresh Postgres databases plus one Redis instance to verify:
  * - same sandbox ids in different tenants do not serialize
- * - tenant-scoped API requests stay isolated across create/exec/ingest/export/destroy
+ * - tenant-scoped API requests stay isolated across create/exec/ingest/destroy
  * - legacy single-tenant mode still accepts tokens without a tenant claim
  *
  * Skipped unless both DATABASE_URL and REDIS_URL are set.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { Redis } from "ioredis";
@@ -218,22 +214,13 @@ describe.skipIf(SKIP)("Phase 5 — multi-tenant Postgres routing", () => {
 		});
 		expect(ingest.status).toBe(200);
 
-		const exportRes = await app.request(`/v1/sandboxes/${sandboxB}/export?basePath=/home/user`, {
-			headers: authB,
+		const readLogRes = await app.request(`/v1/sandboxes/${sandboxB}/exec-sync`, {
+			method: "POST",
+			headers: { ...authB, ...createHeaders },
+			body: JSON.stringify({ script: "cat /home/user/log.txt" }),
 		});
-		expect(exportRes.status).toBe(200);
-		const archiveBytes = new Uint8Array(await exportRes.arrayBuffer());
-		expect(archiveBytes[0]).toBe(0x1f);
-		expect(archiveBytes[1]).toBe(0x8b);
-		const tmpDir = mkdtempSync(path.join(os.tmpdir(), "phase5-export-"));
-		try {
-			const archivePath = path.join(tmpDir, "export.tar.gz");
-			writeFileSync(archivePath, Buffer.from(archiveBytes));
-			execSync(`tar -xzf "${archivePath}" -C "${tmpDir}"`);
-			expect(readFileSync(path.join(tmpDir, "log.txt"), "utf8")).toContain("b-1");
-		} finally {
-			rmSync(tmpDir, { recursive: true, force: true });
-		}
+		expect(readLogRes.status).toBe(200);
+		expect(((await readLogRes.json()) as { stdout: string; exitCode: number }).stdout).toContain("b-1");
 
 		const crossTenantRead = await app.request(`/v1/sandboxes/${sandboxB}/files/home/user/log.txt`, { headers: authA });
 		expect(crossTenantRead.status).toBe(404);

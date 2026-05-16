@@ -15,6 +15,19 @@ export interface BatchScriptResult {
 	readonly error?: string;
 }
 
+export interface ExecuteBatchOptions {
+	/**
+	 * Optional per-script timeout (ms). When set, each script gets its own
+	 * independent budget instead of sharing `totalTimeoutMs` across the batch.
+	 * `totalTimeoutMs` still acts as an outer ceiling.
+	 *
+	 * This is the recommended mode for capability probes (e.g. `python3 -c 'import foo'`
+	 * × N) where a slow first script would otherwise silently exhaust the shared
+	 * budget and turn later scripts into false negatives (issue #77).
+	 */
+	readonly perScriptTimeoutMs?: number;
+}
+
 const MAX_BATCH_PARALLELISM = 16;
 
 async function runSequential(
@@ -23,26 +36,32 @@ async function runSequential(
 	scripts: readonly BatchScriptEntry[],
 	totalTimeoutMs: number,
 	outerSignal?: AbortSignal,
+	options?: ExecuteBatchOptions,
 ): Promise<BatchScriptResult[]> {
 	const results: BatchScriptResult[] = [];
 	const batchStart = Date.now();
+	const perScript = options?.perScriptTimeoutMs;
 
 	for (const entry of scripts) {
 		if (outerSignal?.aborted) break;
 
-		const remaining = totalTimeoutMs - (Date.now() - batchStart);
+		const totalRemaining = totalTimeoutMs - (Date.now() - batchStart);
 
-		if (remaining <= 0) {
+		if (totalRemaining <= 0) {
 			results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
 			continue;
 		}
+
+		// Per-script budget: each script gets its own timeout, capped by the
+		// outer total budget so callers can't escape the total ceiling.
+		const effectiveTimeout = perScript !== undefined ? Math.min(perScript, totalRemaining) : totalRemaining;
 
 		const controller = new AbortController();
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
 			controller.abort();
-		}, remaining);
+		}, effectiveTimeout);
 
 		const abortFromOuter = () => controller.abort();
 		outerSignal?.addEventListener("abort", abortFromOuter, { once: true });
@@ -86,8 +105,10 @@ async function runParallel(
 	scripts: readonly BatchScriptEntry[],
 	totalTimeoutMs: number,
 	outerSignal?: AbortSignal,
+	options?: ExecuteBatchOptions,
 ): Promise<BatchScriptResult[]> {
 	const results = new Array<BatchScriptResult>(scripts.length) as BatchScriptResult[];
+	const perScript = options?.perScriptTimeoutMs;
 
 	const sharedController = new AbortController();
 	let timedOut = false;
@@ -123,9 +144,28 @@ async function runParallel(
 					continue;
 				}
 
+				// Per-script timeout: combine with the shared controller so either
+				// the batch deadline OR the per-script deadline can abort.
+				let perScriptController: AbortController | undefined;
+				let perScriptTimer: ReturnType<typeof setTimeout> | undefined;
+				let perScriptTimedOut = false;
+				let signalToUse: AbortSignal = sharedController.signal;
+				let unlinkShared: (() => void) | undefined;
+				if (perScript !== undefined) {
+					perScriptController = new AbortController();
+					perScriptTimer = setTimeout(() => {
+						perScriptTimedOut = true;
+						perScriptController?.abort();
+					}, perScript);
+					const onShared = () => perScriptController?.abort();
+					sharedController.signal.addEventListener("abort", onShared, { once: true });
+					unlinkShared = () => sharedController.signal.removeEventListener("abort", onShared);
+					signalToUse = perScriptController.signal;
+				}
+
 				try {
 					const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
-						signal: sharedController.signal,
+						signal: signalToUse,
 					});
 					results[idx] = {
 						id: entry.id,
@@ -139,8 +179,16 @@ async function runParallel(
 						stdout: "",
 						stderr: "",
 						exitCode: -1,
-						error: timedOut ? "timeout" : sharedController.signal.aborted ? "aborted" : "internal error",
+						error:
+							timedOut || perScriptTimedOut
+								? "timeout"
+								: sharedController.signal.aborted
+									? "aborted"
+									: "internal error",
 					};
+				} finally {
+					if (perScriptTimer !== undefined) clearTimeout(perScriptTimer);
+					unlinkShared?.();
 				}
 			}
 		};
@@ -164,10 +212,11 @@ export async function executeBatch(
 	scripts: readonly BatchScriptEntry[],
 	totalTimeoutMs: number,
 	outerSignal?: AbortSignal,
+	options?: ExecuteBatchOptions,
 ): Promise<BatchScriptResult[]> {
 	const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
 	if (inReadOnlyScope) {
-		return runParallel(sessionManager, session, scripts, totalTimeoutMs, outerSignal);
+		return runParallel(sessionManager, session, scripts, totalTimeoutMs, outerSignal, options);
 	}
-	return runSequential(sessionManager, session, scripts, totalTimeoutMs, outerSignal);
+	return runSequential(sessionManager, session, scripts, totalTimeoutMs, outerSignal, options);
 }

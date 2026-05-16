@@ -261,7 +261,7 @@ class Transport:
             )
         if status == 409:
             raise ConflictError(message, code=code, status=status, details=details)
-        if status == 400:
+        if status in (400, 422):
             raise ValidationError(message, code=code, status=status, details=details)
         if status == 429:
             raise RateLimitError(

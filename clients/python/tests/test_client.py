@@ -285,6 +285,30 @@ def test_exec_batch():
 
 
 @respx.mock
+def test_exec_batch_read_only_forwards_flag():
+    captured: dict = {}
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={"results": [{"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0}]},
+        )
+
+    respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(side_effect=_record)
+
+    sb = make_client().sandboxes.attach("sb")
+    sb.exec_batch([{"id": "a", "script": "ls"}], read_only=True)
+    assert captured["body"].get("readOnly") is True
+
+    # Default (read_only=False) must not send the flag, preserving the
+    # existing sequential-atomic write semantics.
+    captured.clear()
+    sb.exec_batch([{"id": "a", "script": "ls"}])
+    assert "readOnly" not in captured["body"]
+
+
+@respx.mock
 def test_exec_stream_yields_events_until_exit():
     sse_body = (
         'event: stdout\ndata: {"t":0.1,"data":"hello\\n"}\n\n'
@@ -304,7 +328,58 @@ def test_exec_stream_yields_events_until_exit():
     assert events[2].duration_ms == 42
 
 
-# ── Ingest / Export ──────────────────────────────────────────────────────────
+@respx.mock
+def test_exec_read_only_sends_flag():
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "stdout": "hi\n",
+                "stderr": "",
+                "exitCode": 0,
+                "timedOut": False,
+                "durationMs": 5,
+            },
+        )
+    )
+    sb = make_client().sandboxes.attach("sb")
+    sb.exec("echo hi", read_only=True)
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert sent["readOnly"] is True
+
+
+@respx.mock
+def test_exec_read_only_violation_raises_validation_error():
+    respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        return_value=httpx.Response(
+            422,
+            json={
+                "error": "read_only_violation",
+                "code": "EREADONLY_VIOLATION",
+                "details": ["readOnly script attempted to mutate the filesystem"],
+            },
+        )
+    )
+    sb = make_client().sandboxes.attach("sb")
+    with pytest.raises(ValidationError) as exc:
+        sb.exec("echo hi > /home/user/f.txt", read_only=True)
+    assert exc.value.code == "EREADONLY_VIOLATION"
+
+
+@respx.mock
+def test_exec_batch_read_only_sends_flag():
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(
+        return_value=httpx.Response(
+            200, json={"results": [{"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0}]}
+        )
+    )
+    sb = make_client().sandboxes.attach("sb")
+    sb.exec_batch([{"id": "a", "script": "echo ok"}], read_only=True)
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert sent["readOnly"] is True
+
+
+# ── Ingest ───────────────────────────────────────────────────────────────────
 @respx.mock
 def test_ingest_files_base64_encodes():
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/ingest-files").mock(
@@ -316,16 +391,6 @@ def test_ingest_files_base64_encodes():
     assert sent["basePath"] == "/home/user/p"
     assert sent["files"]["a.txt"] == base64.b64encode(b"hello").decode()
     assert sent["files"]["b.bin"] == base64.b64encode(b"\x00\x01").decode()
-
-
-@respx.mock
-def test_export_returns_bytes():
-    blob = b"\x1f\x8b\x08\x00fake.tar.gz"
-    respx.get(f"{BASE_URL}/v1/sandboxes/sb/export").mock(
-        return_value=httpx.Response(200, content=blob)
-    )
-    sb = make_client().sandboxes.attach("sb")
-    assert sb.export(base_path="/home/user") == blob
 
 
 # ── Error mapping ────────────────────────────────────────────────────────────
