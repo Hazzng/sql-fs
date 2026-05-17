@@ -65,6 +65,11 @@ const execBodySchema = {
 			description:
 				"When true, runs the script in read-only mode: parallel reads against the same sandbox are unblocked (no exclusive lock), and any mutating filesystem op is rejected with EREADONLY at the offending command. If the script attempts a write, the request fails with HTTP 422 EREADONLY_VIOLATION after the script returns. Single-replica only: cross-replica writers are still serialized via the distributed exec lock.",
 		},
+		retryOn5xx: {
+			type: "boolean",
+			description:
+				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs (the write committed; only the cache invalidation publish failed).",
+		},
 	},
 	required: ["script"],
 } as const;
@@ -730,6 +735,11 @@ export const openapiSpec = {
 										type: "boolean",
 										description:
 											"When true, runs all scripts in the batch in read-only mode: parallel reads are unblocked across calls and any mutating filesystem op is rejected with EREADONLY at the offending command. Returns HTTP 422 EREADONLY_VIOLATION if any script attempts a write.",
+									},
+									retryOn5xx: {
+										type: "boolean",
+										description:
+											"Caller hint that every script in the batch is idempotent and safe to retry. Currently accepted and ignored server-side; client SDKs use it to enable client-side retry of the whole batch.",
 									},
 								},
 								required: ["scripts"],
