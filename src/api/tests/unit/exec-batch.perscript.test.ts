@@ -63,6 +63,7 @@ interface BatchResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
+	durationMs: number;
 	error?: string;
 }
 

@@ -364,8 +364,8 @@ Response `200`:
 ```json
 {
   "results": [
-    {"id": "tree", "stdout": "...", "stderr": "", "exitCode": 0},
-    {"id": "uname", "stdout": "Linux ...", "stderr": "", "exitCode": 0}
+    {"id": "tree", "stdout": "...", "stderr": "", "exitCode": 0, "durationMs": 42},
+    {"id": "uname", "stdout": "Linux ...", "stderr": "", "exitCode": 0, "durationMs": 8}
   ]
 }
 ```
