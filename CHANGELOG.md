@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1
+
+### Patch Changes
+
+- [#95](https://github.com/Hazzng/virtualFS/pull/95) Thanks [@Hazzng](https://github.com/Hazzng)! - Add `durationMs` to `BatchScriptResult` so agents can profile individual script latencies inside a batch execution.
+
+- [#96](https://github.com/Hazzng/virtualFS/pull/96) Thanks [@Hazzng](https://github.com/Hazzng)! - Fix GET /v1/sandboxes/:id returning stale createdAt and transient 404 after session eviction. The route now falls back to the database when the session is not in the in-memory pool, and createdAt is sourced from the DB RETURNING clause on creation and restored from DB meta on rehydration so all three endpoints (POST, GET, LIST) agree on the same timestamp.
+
 ## 0.4.0
 
 ### Minor Changes
