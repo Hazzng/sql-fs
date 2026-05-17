@@ -32,6 +32,11 @@ const execBodySchema = z.object({
 	timeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 	debug: z.boolean().optional(),
 	readOnly: z.boolean().optional(),
+	// Forward-compat hint that the caller has declared the script idempotent
+	// and is willing to retry transient 5xx. Currently accepted-and-ignored
+	// server-side — client SDKs use it to enable client-side retry. Reserved
+	// for future server-side retry of worker-crash exceptions.
+	retryOn5xx: z.boolean().optional(),
 });
 
 const batchExecBodySchema = z.object({
@@ -47,6 +52,7 @@ const batchExecBodySchema = z.object({
 	timeoutMs: z.number().int().positive().optional(),
 	perScriptTimeoutMs: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
 	readOnly: z.boolean().optional(),
+	retryOn5xx: z.boolean().optional(),
 });
 
 type ExecBody = z.infer<typeof execBodySchema>;

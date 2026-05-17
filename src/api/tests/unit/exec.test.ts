@@ -345,6 +345,23 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("retryOn5xx flag is accepted and ignored server-side (forward-compat)", async () => {
+		const { sessionManager } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/exec-sync`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ script: "echo hi", retryOn5xx: true }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { stdout: string; exitCode: number };
+		expect(body.exitCode).toBe(0);
+		expect(body.stdout).toBe("hi\n");
+	});
+
 	it("EREADONLY_VIOLATION from a lying readOnly script returns HTTP 422", async () => {
 		const { sessionManager } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);

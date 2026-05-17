@@ -174,6 +174,7 @@ class Sandbox:
         timeout_ms: int = 30_000,
         debug: bool = False,
         read_only: bool = False,
+        retry_on_5xx: bool = False,
     ) -> ExecResult:
         """`POST /exec-sync` — run a bash script and return the buffered result.
 
@@ -188,6 +189,17 @@ class Sandbox:
 
             # CORRECT — lock held for the whole operation
             sb.exec("balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt")
+
+        Retry semantics:
+          - `read_only=True` execs are always safe to retry; the SDK retries
+            transient 5xx automatically regardless of `retry_on_5xx`.
+          - For write execs, the SDK does NOT retry 5xx by default — retrying
+            a write that may have committed could double-apply side effects.
+            Set `retry_on_5xx=True` to opt in only when the script is
+            idempotent (e.g. `mkdir -p`, deterministic `echo > file`).
+          - 503 `ECOHERENCE` is never retried on write execs even when
+            `retry_on_5xx=True`: the write committed to Postgres and only
+            the Redis publish failed.
         """
         body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
         if cwd is not None:
@@ -198,6 +210,8 @@ class Sandbox:
             body["debug"] = True
         if read_only:
             body["readOnly"] = True
+        if retry_on_5xx:
+            body["retryOn5xx"] = True
 
         # Wall-clock httpx timeout slightly above server-side budget so a
         # legitimate timeout surfaces as 408 rather than a transport error.
@@ -207,6 +221,8 @@ class Sandbox:
             f"/sandboxes/{self._id}/exec-sync",
             json_body=body,
             timeout=client_timeout,
+            idempotent=read_only or retry_on_5xx,
+            read_only=read_only,
         )
         return ExecResult.from_api(resp.json())
 
@@ -217,6 +233,7 @@ class Sandbox:
         timeout_ms: int = 30_000,
         per_script_timeout_ms: Optional[int] = None,
         read_only: bool = False,
+        retry_on_5xx: bool = False,
     ) -> List[BatchExecResult]:
         """`POST /exec-sync-batch` — run up to 50 scripts in one HTTP request.
 
@@ -260,6 +277,12 @@ class Sandbox:
         script 50, that is safe (same lock). If you need Python computation
         between a read and a write, that logic must live inside a single
         script string.
+
+        Retry semantics: identical to `exec()`. `read_only=True` batches are
+        retried on transient 5xx automatically. Write batches retry only when
+        `retry_on_5xx=True` is set — and only when EVERY script in the batch
+        is safe to re-run from the start (the whole batch is replayed; there
+        is no partial retry).
         """
         body: Dict[str, Any] = {
             "scripts": [dict(s) for s in scripts],
@@ -269,12 +292,16 @@ class Sandbox:
             body["perScriptTimeoutMs"] = per_script_timeout_ms
         if read_only:
             body["readOnly"] = True
+        if retry_on_5xx:
+            body["retryOn5xx"] = True
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
         resp = self._t.request(
             "POST",
             f"/sandboxes/{self._id}/exec-sync-batch",
             json_body=body,
             timeout=client_timeout,
+            idempotent=read_only or retry_on_5xx,
+            read_only=read_only,
         )
         payload = resp.json()
         items = payload.get("results", []) if isinstance(payload, dict) else []

@@ -424,6 +424,190 @@ def test_exec_batch_read_only_sends_flag():
     assert sent["readOnly"] is True
 
 
+# ── Retry policy: idempotency-aware ─────────────────────────────────────────
+@respx.mock
+def test_exec_default_does_not_retry_5xx():
+    """Regression guard: a bare 503 on a write exec must NOT silently re-run.
+
+    Before this fix, Transport.request() retried unconditionally on any 5xx,
+    which would re-execute write scripts whose Postgres mutation already
+    committed. Default `read_only=False, retry_on_5xx=False` must surface
+    the 503 to the caller after a single attempt.
+    """
+    ok_body = {
+        "stdout": "ok\n",
+        "stderr": "",
+        "exitCode": 0,
+        "exitSignal": None,
+        "timedOut": False,
+        "durationMs": 1,
+    }
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(200, json=ok_body),
+        ]
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    from virtualfs import ServerError
+
+    with pytest.raises(ServerError):
+        sb.exec("echo hi > /tmp/x")
+    # Exactly one attempt — no retry on write exec by default.
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_exec_ecoherence_never_retries_even_with_retry_on_5xx():
+    """ECOHERENCE means the write committed; retrying would double-apply."""
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        return_value=httpx.Response(503, json={"error": "coherence", "code": "ECOHERENCE"})
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    from virtualfs import ServerError
+
+    with pytest.raises(ServerError) as exc:
+        sb.exec("echo hi > /tmp/x", retry_on_5xx=True)
+    assert exc.value.code == "ECOHERENCE"
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_exec_read_only_retries_5xx_automatically():
+    """`read_only=True` execs are always safe to retry — no opt-in needed."""
+    ok_body = {
+        "stdout": "ok\n",
+        "stderr": "",
+        "exitCode": 0,
+        "exitSignal": None,
+        "timedOut": False,
+        "durationMs": 1,
+    }
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(200, json=ok_body),
+        ]
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    r = sb.exec("ls /home/user", read_only=True)
+    assert r.ok is True
+    assert route.call_count == 2
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert sent["readOnly"] is True
+
+
+@respx.mock
+def test_exec_read_only_retries_ecoherence():
+    """ECOHERENCE on a read can be safely retried — no mutation to double-apply."""
+    ok_body = {
+        "stdout": "ok\n",
+        "stderr": "",
+        "exitCode": 0,
+        "exitSignal": None,
+        "timedOut": False,
+        "durationMs": 1,
+    }
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "coherence", "code": "ECOHERENCE"}),
+            httpx.Response(200, json=ok_body),
+        ]
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    r = sb.exec("ls /home/user", read_only=True)
+    assert r.ok is True
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_exec_retry_on_5xx_opt_in_retries_runtime_busy():
+    """Idempotent write scripts can opt in to retry on transient 5xx."""
+    ok_body = {
+        "stdout": "ok\n",
+        "stderr": "",
+        "exitCode": 0,
+        "exitSignal": None,
+        "timedOut": False,
+        "durationMs": 1,
+    }
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(200, json=ok_body),
+        ]
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    r = sb.exec("mkdir -p /home/user/x", retry_on_5xx=True)
+    assert r.ok is True
+    assert route.call_count == 3
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert sent["retryOn5xx"] is True
+
+
+@respx.mock
+def test_exec_retry_on_5xx_default_false_does_not_send_flag():
+    """When the caller does not opt in, retryOn5xx must not appear in the body."""
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "stdout": "",
+                "stderr": "",
+                "exitCode": 0,
+                "exitSignal": None,
+                "timedOut": False,
+                "durationMs": 0,
+            },
+        )
+    )
+    sb = make_client().sandboxes.attach("sb")
+    sb.exec("echo x")
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert "retryOn5xx" not in sent
+
+
+@respx.mock
+def test_exec_batch_retry_on_5xx_replays_whole_batch():
+    """A 5xx between scripts replays the whole batch when opted-in."""
+    ok = {
+        "results": [
+            {"id": "a", "stdout": "1", "stderr": "", "exitCode": 0, "durationMs": 0},
+            {"id": "b", "stdout": "2", "stderr": "", "exitCode": 0, "durationMs": 0},
+        ]
+    }
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(200, json=ok),
+        ]
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    results = sb.exec_batch(
+        [{"id": "a", "script": "mkdir -p /a"}, {"id": "b", "script": "mkdir -p /b"}],
+        retry_on_5xx=True,
+    )
+    assert [r.id for r in results] == ["a", "b"]
+    assert route.call_count == 2
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert sent["retryOn5xx"] is True
+
+
+@respx.mock
+def test_exec_batch_default_does_not_retry_5xx():
+    """Default batch behavior matches `exec`: no silent retry on writes."""
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(
+        return_value=httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"})
+    )
+    sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
+    from virtualfs import ServerError
+
+    with pytest.raises(ServerError):
+        sb.exec_batch([{"id": "a", "script": "mkdir -p /a"}])
+    assert route.call_count == 1
+
+
 # ── Ingest ───────────────────────────────────────────────────────────────────
 @respx.mock
 def test_ingest_files_base64_encodes():

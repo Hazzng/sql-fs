@@ -157,12 +157,22 @@ class Transport:
         files: Optional[Mapping[str, Any]] = None,
         timeout: Optional[float] = None,
         expect_json: bool = True,
+        idempotent: bool = True,
+        read_only: bool = False,
     ) -> httpx.Response:
         """Send a request with retry + error mapping.
 
         `path` is appended to `base_url + /v1`. Pass either `json_body` (sets
         Content-Type to application/json) or `content` (raw bytes — caller
         supplies Content-Type via `headers`).
+
+        Retry policy:
+          - Network errors retry up to `max_retries` regardless of idempotency
+            (no HTTP request was completed → no server-side side effect).
+          - 5xx / 429 responses retry only when `idempotent=True`.
+          - 503 with `code: ECOHERENCE` is never retried unless `read_only=True`,
+            because the write committed to the database and only the Redis
+            publish failed — retrying would double-apply the write.
         """
         url = f"{self._base_url}/v1{path}"
         merged_headers: Dict[str, str] = self._auth_headers()
@@ -189,7 +199,11 @@ class Transport:
                 self._sleep_backoff(attempt)
                 continue
 
-            if resp.status_code in RETRY_STATUS and attempt < self._max_retries:
+            if (
+                resp.status_code in RETRY_STATUS
+                and attempt < self._max_retries
+                and _should_retry_response(resp, idempotent=idempotent, read_only=read_only)
+            ):
                 # Honour Retry-After when present, else exponential jitter.
                 retry_after = _parse_retry_after(resp)
                 if retry_after is not None:
@@ -296,6 +310,29 @@ def _parse_error_body(resp: httpx.Response) -> tuple[Dict[str, Any], Any, str, A
     message = body.get("error") or f"HTTP {resp.status_code}"
     details = body.get("details")
     return body, code, message, details
+
+
+def _should_retry_response(
+    resp: httpx.Response,
+    *,
+    idempotent: bool,
+    read_only: bool,
+) -> bool:
+    """Decide whether a retriable status code should actually be retried.
+
+    `ECOHERENCE` (503) means the write committed to Postgres but the Redis
+    publish failed. Retrying re-executes the script against already-mutated
+    state, double-applying side effects. Only retry it when the caller has
+    declared the request idempotent (`read_only=True` for execs, or any
+    other inherently safe GET/HEAD).
+    """
+    if resp.status_code == 503 and not read_only:
+        _body, code, _msg, _details = _parse_error_body(resp)
+        if code == "ECOHERENCE":
+            return False
+    if not idempotent and not read_only:
+        return False
+    return True
 
 
 def _parse_retry_after(resp: httpx.Response) -> Optional[int]:
