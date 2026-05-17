@@ -384,9 +384,13 @@ export class SessionManager {
 		tenantId: string,
 		sandboxId: string,
 		owner = "",
-	): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
+	): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
 		if (this.createFsOverride !== undefined) {
-			return { fs: await this.createFsOverride(tenantId, sandboxId), resolvedOwner: owner };
+			return {
+				fs: await this.createFsOverride(tenantId, sandboxId),
+				resolvedOwner: owner,
+				createdAt: new Date().toISOString(),
+			};
 		}
 		const backend = this.getOrInitBackend(tenantId);
 		return createPostgresSandboxFs(
@@ -437,7 +441,7 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			let createdFs: IFileSystem | undefined;
 			try {
-				const { fs, resolvedOwner } = await this.buildFs(tenantId, sandboxId, owner);
+				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
 				createdFs = fs;
 				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
 					? {
@@ -506,7 +510,7 @@ export class SessionManager {
 					state: "active",
 					owner: resolvedOwner,
 					name: null,
-					createdAt: new Date().toISOString(),
+					createdAt: fsCreatedAt,
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
@@ -866,6 +870,7 @@ export class SessionManager {
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
 		if (meta?.name !== undefined) session.name = meta.name;
+		if (meta?.createdAt !== undefined) session.createdAt = meta.createdAt;
 		return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
 	}
 
@@ -916,6 +921,9 @@ export class SessionManager {
 		if (meta?.name !== undefined) {
 			session.name = meta.name;
 		}
+		if (meta?.createdAt !== undefined) {
+			session.createdAt = meta.createdAt;
+		}
 		return this.withSessionEntry(tenantId, sandboxId, session, fn);
 	}
 
@@ -923,6 +931,15 @@ export class SessionManager {
 		if (this.persistSandboxMetaFn !== undefined) {
 			await this.persistSandboxMetaFn(tenantId, sandboxId, meta);
 		}
+	}
+
+	/**
+	 * Returns persisted metadata for the given sandbox from the DB, or null if
+	 * the sandbox does not exist or no DB is configured.
+	 */
+	async getSandboxMeta(tenantId: string, sandboxId: string): Promise<SandboxMeta | null> {
+		if (this.getSandboxMetaFn === undefined) return null;
+		return this.getSandboxMetaFn(tenantId, sandboxId);
 	}
 
 	async listSandboxes(tenantId: string, owner?: string): Promise<SandboxListEntry[]> {

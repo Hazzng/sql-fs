@@ -51,7 +51,7 @@ export async function createPostgresSandboxFs(
 	opts: PostgresBackendOptions,
 	sandboxId: string,
 	owner = "",
-): Promise<{ fs: IFileSystem; resolvedOwner: string }> {
+): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
 	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
 	await dialect.connect();
 	// All post-connect work runs inside try/catch so a failure (sandbox bootstrap,
@@ -59,15 +59,18 @@ export async function createPostgresSandboxFs(
 	// connection pool. The pg pool stays alive until disconnect() is awaited.
 	try {
 		let resolvedOwner = owner;
+		let createdAt = new Date().toISOString();
 		try {
 			await dialect.transaction(async (tx) => {
-				await dialect.createSandbox(tx, sandboxId, owner);
+				const result = await dialect.createSandbox(tx, sandboxId, owner);
+				createdAt = result.createdAt;
 			});
 		} catch (e) {
 			const sqlErr = e as { code?: string };
 			if (sqlErr.code !== "23505") throw e;
 			const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
 			resolvedOwner = meta?.owner ?? "";
+			createdAt = meta?.createdAt ?? createdAt;
 		}
 		const fs = new SqlFs({
 			dialect,
@@ -78,7 +81,7 @@ export async function createPostgresSandboxFs(
 			blobCache: opts.blobCache,
 		});
 		await fs.ready();
-		return { fs, resolvedOwner };
+		return { fs, resolvedOwner, createdAt };
 	} catch (err) {
 		try {
 			await dialect.disconnect();

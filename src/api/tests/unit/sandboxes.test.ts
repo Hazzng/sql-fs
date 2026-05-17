@@ -257,4 +257,60 @@ describe("GET /v1/sandboxes/:id", () => {
 		expect(body.error).toBe("not_found");
 		expect(body.code).toBe("SANDBOX_NOT_FOUND");
 	});
+
+	it("returns 200 with correct createdAt after session eviction (DB fallback, no 404)", async () => {
+		// Simulate a cold replica: getSandboxMetaFn is wired up but the session
+		// pool starts empty (the sandbox was created on a different replica).
+		const knownCreatedAt = "2026-05-15T10:00:00.000Z";
+		const meta = new Map<string, SandboxMeta>();
+		const sandboxId = crypto.randomUUID();
+		meta.set(sandboxId, {
+			owner: "owner-evict",
+			name: null,
+			python: false,
+			javascript: false,
+			network: false,
+			createdAt: knownCreatedAt,
+		});
+
+		const coldReplica = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			getSandboxMetaFn: async (_tenantId, id) => meta.get(id) ?? null,
+		});
+		const app = makeTestApp(coldReplica);
+		const ownerToken = await makeToken("owner-evict");
+
+		// GET on a sandbox that exists in meta but not in the in-memory pool must
+		// return 200 (not 404) and supply the correct createdAt from DB.
+		const getRes = await app.request(`/v1/sandboxes/${sandboxId}`, {
+			headers: { Authorization: `Bearer ${ownerToken}` },
+		});
+
+		expect(getRes.status).toBe(200);
+		const body = (await getRes.json()) as { id: string; createdAt: string };
+		expect(body.id).toBe(sandboxId);
+		expect(body.createdAt).toBe(knownCreatedAt);
+	});
+
+	it("createdAt from GET matches createdAt from POST (no rehydration drift)", async () => {
+		const { sessionManager } = makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken("owner-drift");
+
+		const postRes = await app.request("/v1/sandboxes", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(postRes.status).toBe(201);
+		const { id, createdAt: postCreatedAt } = (await postRes.json()) as { id: string; createdAt: string };
+
+		const getRes = await app.request(`/v1/sandboxes/${id}`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(getRes.status).toBe(200);
+		const { createdAt: getCreatedAt } = (await getRes.json()) as { createdAt: string };
+
+		// The timestamps must agree — no clock-based drift between POST and GET
+		expect(getCreatedAt).toBe(postCreatedAt);
+	});
 });
