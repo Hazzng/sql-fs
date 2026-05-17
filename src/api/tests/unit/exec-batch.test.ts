@@ -45,6 +45,7 @@ interface BatchResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
+	durationMs: number;
 	error?: string;
 }
 
@@ -77,8 +78,20 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { results: BatchResult[] };
 		expect(body.results).toHaveLength(2);
-		expect(body.results[0]).toEqual({ id: "hello", stdout: "hello\n", stderr: "", exitCode: 0 });
-		expect(body.results[1]).toEqual({ id: "world", stdout: "world\n", stderr: "", exitCode: 0 });
+		expect(body.results[0]).toEqual({
+			id: "hello",
+			stdout: "hello\n",
+			stderr: "",
+			exitCode: 0,
+			durationMs: expect.any(Number),
+		});
+		expect(body.results[1]).toEqual({
+			id: "world",
+			stdout: "world\n",
+			stderr: "",
+			exitCode: 0,
+			durationMs: expect.any(Number),
+		});
 	});
 
 	it("continues executing after a script fails with non-zero exit", async () => {
@@ -184,6 +197,10 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 			expect(body.results[0]!.exitCode).toBe(-1);
 			expect(body.results[1]!.error).toBe("timeout");
 			expect(body.results[1]!.exitCode).toBe(-1);
+			// The "never" script was skipped because totalRemaining <= 0 on the
+			// second iteration, so it should report durationMs === 0 (the script
+			// never ran). This covers the pre-exhausted budget branch in runSequential.
+			expect(body.results[1]!.durationMs).toBe(0);
 		} finally {
 			vi.useRealTimers();
 		}

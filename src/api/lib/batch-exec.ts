@@ -12,6 +12,7 @@ export interface BatchScriptResult {
 	readonly stdout: string;
 	readonly stderr: string;
 	readonly exitCode: number;
+	readonly durationMs: number;
 	readonly error?: string;
 }
 
@@ -48,7 +49,7 @@ async function runSequential(
 		const totalRemaining = totalTimeoutMs - (Date.now() - batchStart);
 
 		if (totalRemaining <= 0) {
-			results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+			results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, durationMs: 0, error: "timeout" });
 			continue;
 		}
 
@@ -66,6 +67,7 @@ async function runSequential(
 		const abortFromOuter = () => controller.abort();
 		outerSignal?.addEventListener("abort", abortFromOuter, { once: true });
 
+		const scriptStart = Date.now();
 		try {
 			const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
 				signal: controller.signal,
@@ -74,24 +76,45 @@ async function runSequential(
 			outerSignal?.removeEventListener("abort", abortFromOuter);
 
 			if (timedOut) {
-				results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+				results.push({
+					id: entry.id,
+					stdout: "",
+					stderr: "",
+					exitCode: -1,
+					durationMs: Date.now() - scriptStart,
+					error: "timeout",
+				});
 			} else {
 				results.push({
 					id: entry.id,
 					stdout: execResult.stdout,
 					stderr: execResult.stderr,
 					exitCode: execResult.exitCode,
+					durationMs: Date.now() - scriptStart,
 				});
 			}
 		} catch {
 			clearTimeout(timer);
 			outerSignal?.removeEventListener("abort", abortFromOuter);
 			if (timedOut) {
-				results.push({ id: entry.id, stdout: "", stderr: "", exitCode: -1, error: "timeout" });
+				results.push({
+					id: entry.id,
+					stdout: "",
+					stderr: "",
+					exitCode: -1,
+					durationMs: Date.now() - scriptStart,
+					error: "timeout",
+				});
 			} else if (outerSignal?.aborted) {
 				break;
 			} else {
-				results.push({ id: entry.id, stdout: "", stderr: "internal error", exitCode: -1 });
+				results.push({
+					id: entry.id,
+					stdout: "",
+					stderr: "internal error",
+					exitCode: -1,
+					durationMs: Date.now() - scriptStart,
+				});
 			}
 		}
 	}
@@ -139,6 +162,7 @@ async function runParallel(
 						stdout: "",
 						stderr: "",
 						exitCode: -1,
+						durationMs: 0,
 						error: timedOut ? "timeout" : "aborted",
 					};
 					continue;
@@ -163,6 +187,7 @@ async function runParallel(
 					signalToUse = perScriptController.signal;
 				}
 
+				const scriptStart = Date.now();
 				try {
 					const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
 						signal: signalToUse,
@@ -172,6 +197,7 @@ async function runParallel(
 						stdout: execResult.stdout,
 						stderr: execResult.stderr,
 						exitCode: execResult.exitCode,
+						durationMs: Date.now() - scriptStart,
 					};
 				} catch {
 					results[idx] = {
@@ -179,6 +205,7 @@ async function runParallel(
 						stdout: "",
 						stderr: "",
 						exitCode: -1,
+						durationMs: Date.now() - scriptStart,
 						error:
 							timedOut || perScriptTimedOut
 								? "timeout"

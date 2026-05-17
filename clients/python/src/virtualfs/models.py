@@ -112,6 +112,7 @@ class BatchExecResult:
     stdout: str
     stderr: str
     exit_code: int
+    duration_ms: int
     error: Optional[str] = None
 
     @property
@@ -125,6 +126,7 @@ class BatchExecResult:
             stdout=payload.get("stdout", ""),
             stderr=payload.get("stderr", ""),
             exit_code=int(payload["exitCode"]),
+            duration_ms=int(payload.get("durationMs", 0)),
             error=payload.get("error"),
         )
 

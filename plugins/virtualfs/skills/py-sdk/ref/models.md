@@ -84,6 +84,7 @@ content on stderr will still have `r.ok == True` and a non-empty `r.error`.
 | `stdout` | `str` | |
 | `stderr` | `str` | |
 | `exit_code` | `int` | `-1` if the batch budget was exhausted before this script ran |
+| `duration_ms` | `int` | Wall-clock duration of the script in ms; `0` if the script never ran (budget pre-exhausted or batch aborted) |
 | `error` | `str \| None` | Set when the server itself errored on this entry (e.g. `"timeout"`) |
 | `ok` | `bool` (property) | `exit_code == 0` |
 

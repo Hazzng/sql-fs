@@ -319,8 +319,8 @@ def test_exec_batch():
             200,
             json={
                 "results": [
-                    {"id": "a", "stdout": "1", "stderr": "", "exitCode": 0},
-                    {"id": "b", "stdout": "", "stderr": "boom", "exitCode": 2},
+                    {"id": "a", "stdout": "1", "stderr": "", "exitCode": 0, "durationMs": 0},
+                    {"id": "b", "stdout": "", "stderr": "boom", "exitCode": 2, "durationMs": 0},
                 ]
             },
         )
@@ -338,10 +338,8 @@ def test_exec_batch_read_only_forwards_flag():
 
     def _record(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content.decode())
-        return httpx.Response(
-            200,
-            json={"results": [{"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0}]},
-        )
+        item = {"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0, "durationMs": 0}
+        return httpx.Response(200, json={"results": [item]})
 
     respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(side_effect=_record)
 
@@ -416,10 +414,9 @@ def test_exec_read_only_violation_raises_validation_error():
 
 @respx.mock
 def test_exec_batch_read_only_sends_flag():
+    result_item = {"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0, "durationMs": 0}
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(
-        return_value=httpx.Response(
-            200, json={"results": [{"id": "a", "stdout": "ok", "stderr": "", "exitCode": 0}]}
-        )
+        return_value=httpx.Response(200, json={"results": [result_item]})
     )
     sb = make_client().sandboxes.attach("sb")
     sb.exec_batch([{"id": "a", "script": "echo ok"}], read_only=True)
