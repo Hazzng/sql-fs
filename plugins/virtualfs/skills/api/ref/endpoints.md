@@ -349,11 +349,14 @@ curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync-batch" \
 
 Request body:
 
-| Field | Type | Required | Default |
-|---|---|---|---|
-| `scripts` | `Array<{id: string, script: string}>` | yes | — |
-| `timeoutMs` | integer | no | 30 000 |
-| `readOnly` | boolean | no | false |
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `scripts` | `Array<{id: string, script: string}>` | yes | — | |
+| `timeoutMs` | integer | no | 30 000 | Outer ceiling for the whole batch |
+| `perScriptTimeoutMs` | integer | no | — | Per-script independent budget; `timeoutMs` still caps the total |
+| `readOnly` | boolean | no | false | |
+
+**`perScriptTimeoutMs`**: when set, each script gets its own timeout instead of sharing `timeoutMs`. A slow script that hits its per-script limit returns `exitCode: -1, error: "timeout"` and the batch continues with the next script. `timeoutMs` still acts as the absolute outer ceiling. Useful for capability probes (`python3 -c 'import foo'` × N) where one slow import would otherwise exhaust the shared budget.
 
 `readOnly`: same semantics as exec-sync — scripts run in parallel under a shared read-lock. Any mutating op returns `422 EREADONLY_VIOLATION`.
 
@@ -367,7 +370,7 @@ Response `200`:
 }
 ```
 
-Scripts that time out carry `exitCode: -1` and `error: "timeout"`. The budget `timeoutMs` covers all scripts combined.
+Scripts that time out carry `exitCode: -1` and `error: "timeout"`. Without `perScriptTimeoutMs`, the `timeoutMs` budget is shared across all scripts combined.
 
 ### POST /v1/sandboxes/:id/exec — SSE streaming execution
 

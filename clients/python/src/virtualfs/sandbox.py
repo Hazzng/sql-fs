@@ -215,6 +215,7 @@ class Sandbox:
         scripts: List[Mapping[str, str]],
         *,
         timeout_ms: int = 30_000,
+        per_script_timeout_ms: Optional[int] = None,
         read_only: bool = False,
     ) -> List[BatchExecResult]:
         """`POST /exec-sync-batch` — run up to 50 scripts in one HTTP request.
@@ -222,6 +223,13 @@ class Sandbox:
         `scripts` is a list of `{"id": "...", "script": "..."}` dicts. The
         single `timeout_ms` budget covers all scripts; if it is exhausted,
         the remaining results carry `exit_code=-1` and `error="timeout"`.
+
+        `per_script_timeout_ms`: optional per-script budget (ms). When set,
+        each script gets its own independent timeout instead of sharing
+        `timeout_ms`. The outer `timeout_ms` still acts as an absolute ceiling.
+        Recommended for capability probes (`python3 -c 'import foo'` x N)
+        where a slow first script would otherwise silently exhaust the shared
+        budget and turn later scripts into false negatives.
 
         Execution mode (important — agents please read):
 
@@ -257,6 +265,8 @@ class Sandbox:
             "scripts": [dict(s) for s in scripts],
             "timeoutMs": timeout_ms,
         }
+        if per_script_timeout_ms is not None:
+            body["perScriptTimeoutMs"] = per_script_timeout_ms
         if read_only:
             body["readOnly"] = True
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)

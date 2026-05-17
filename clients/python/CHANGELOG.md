@@ -5,6 +5,14 @@ All notable changes to the VirtualFS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-05-17
+
+### Added
+
+- `per_script_timeout_ms` parameter on `exec_batch()` — optional per-script timeout budget (ms). When set, each script gets its own independent deadline instead of sharing the global `timeout_ms`. The outer `timeout_ms` still acts as an absolute ceiling. Recommended for capability probes where a slow first script would otherwise exhaust the shared budget and silently turn later scripts into false negatives.
+
+---
+
 ## [0.2.2] - 2026-05-16
 
 ### Added

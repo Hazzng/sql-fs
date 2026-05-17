@@ -1,6 +1,6 @@
 {
 	"name": "virtualfs",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"description": "Operator skill for the VirtualFS API — persistent bash sandbox service with SQL-backed filesystem",
 	"author": {
 		"name": "Harry Nguyen",

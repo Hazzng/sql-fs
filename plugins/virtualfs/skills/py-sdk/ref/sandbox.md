@@ -64,7 +64,7 @@ client-side network timeout.
 **Idempotency:** `exec` is **not** retried automatically (the server cannot
 safely re-execute a script). Wrap your own retry logic if needed.
 
-### `sb.exec_batch(scripts, *, timeout_ms=30_000, read_only=False) -> list[BatchExecResult]`
+### `sb.exec_batch(scripts, *, timeout_ms=30_000, per_script_timeout_ms=None, read_only=False) -> list[BatchExecResult]`
 
 Maps to `POST /v1/sandboxes/{id}/exec-sync-batch`. Run up to **50 scripts
 sequentially** (or in parallel when `read_only=True`) in one HTTP round-trip.
@@ -77,13 +77,21 @@ results = sb.exec_batch(
         {"id": "imports", "script": "grep -rn '^from langgraph' /home/user | head -10"},
         {"id": "uname", "script": "uname -srm"},
     ],
-    timeout_ms=60_000,   # single budget covering ALL scripts
-    read_only=True,      # parallel execution; raises ValidationError on any write
+    timeout_ms=60_000,            # outer ceiling covering the whole batch
+    per_script_timeout_ms=5_000,  # each script independently limited to 5 s
+    read_only=True,               # parallel execution; raises ValidationError on any write
 )
 for r in results:
     print(r.id, r.exit_code, r.ok)
     print(r.stdout)
 ```
+
+**`per_script_timeout_ms`** — optional per-script budget (ms). When set, each
+script gets its own independent timeout rather than sharing `timeout_ms`.
+`timeout_ms` still acts as the outer wall-clock ceiling for the whole batch.
+Recommended for capability probes (`python3 -c 'import foo'` × N) where a slow
+first script would otherwise silently exhaust the shared budget and produce false
+negatives for later scripts (issue #77).
 
 If the shared `timeout_ms` budget is exhausted, remaining results carry
 `exit_code = -1` and `error = "timeout"` — you still get a result row for every
