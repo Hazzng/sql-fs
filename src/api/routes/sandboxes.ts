@@ -65,7 +65,17 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				session.name = name;
 				// session.createdAt is set by getOrCreate from the DB RETURNING clause.
 				createdAt = session.createdAt;
-				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, name, python, javascript, network });
+				// Forward createdAt so KV/Redis-backed metadata stores (whose getSandboxMetaFn
+				// reads only what persistSandboxMetaFn wrote) can also serve the DB timestamp
+				// without falling back to a fabricated clock reading on the GET fallback path.
+				await sessionManager.persistSandboxMeta(tenant, sandboxId, {
+					owner,
+					name,
+					python,
+					javascript,
+					network,
+					createdAt,
+				});
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
 						await session.fs.writeFile(path, content);
@@ -118,11 +128,14 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			if (meta.owner && meta.owner !== caller) {
 				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 			}
+			// If a future dialect/metadata store doesn't populate createdAt, return null
+			// rather than fabricating a fresh timestamp — that would re-introduce the
+			// clock-drift bug this PR fixes. The Postgres path always supplies a value.
 			return c.json({
 				id,
 				name: meta.name,
 				owner: meta.owner,
-				createdAt: meta.createdAt ?? new Date().toISOString(),
+				createdAt: meta.createdAt ?? null,
 				lastUsedAt: null,
 			});
 		}
