@@ -5,6 +5,20 @@ All notable changes to the VirtualFS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-05-17
+
+### Fixed
+
+- `exec()` and `exec_batch()` no longer silently retry write scripts on 5xx responses. Before this fix, `Transport.request()` retried `{429, 500, 502, 503, 504}` unconditionally, which could re-execute a write whose Postgres mutation had already committed (`ECOHERENCE` → 503), double-applying side effects.
+
+### Added
+
+- `retry_on_5xx: bool = False` parameter on `exec()` and `exec_batch()`. Opt in only when every script in the call is idempotent (e.g. `mkdir -p`, deterministic `echo > file`).
+- `read_only=True` execs continue to be retried automatically — no opt-in needed (reads cannot commit state).
+- `503 ECOHERENCE` is never retried on write execs even when `retry_on_5xx=True`: the write committed; only the Redis cache-invalidation publish failed.
+
+---
+
 ## [0.2.3] - 2026-05-17
 
 ### Added
