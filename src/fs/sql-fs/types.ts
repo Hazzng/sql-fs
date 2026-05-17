@@ -65,6 +65,8 @@ export interface SandboxMeta {
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;
+	/** ISO-8601 timestamp of when the sandbox was originally created (from DB created_at). */
+	readonly createdAt?: string;
 }
 
 /** A single entry returned by the list-sandboxes query. */
@@ -158,9 +160,9 @@ export interface SqlDialect<Tx = unknown> {
 	 * Creates a new sandbox: inserts a root inode (kind=2, mode=0o755),
 	 * inserts the sandboxes row, and creates default directories
 	 * (/home, /home/user, /tmp, /bin).
-	 * Returns the root inode ID.
+	 * Returns the root inode ID and the DB-generated creation timestamp (ISO-8601).
 	 */
-	createSandbox(tx: Tx, sandboxId: string, owner?: string): Promise<{ rootInodeId: bigint }>;
+	createSandbox(tx: Tx, sandboxId: string, owner?: string): Promise<{ rootInodeId: bigint; createdAt: string }>;
 
 	/**
 	 * Deletes a sandbox and all associated inodes, dirents, and blobs

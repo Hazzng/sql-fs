@@ -255,9 +255,16 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Stubs — implemented in subsequent user stories ────────────────────────────
 
 	// US-005
-	async createSandbox(tx: PgTx, sandboxId: string, owner = ""): Promise<{ rootInodeId: bigint }> {
-		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK
-		await tx`INSERT INTO sandboxes (id, root_inode, owner) VALUES (${sandboxId}, NULL, ${owner})`;
+	async createSandbox(tx: PgTx, sandboxId: string, owner = ""): Promise<{ rootInodeId: bigint; createdAt: string }> {
+		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK.
+		//    RETURNING created_at gives us the DB-generated timestamp for byte-for-byte
+		//    agreement between POST response, GET, and LIST.
+		const sandboxRows = await tx<{ created_at: Date }[]>`
+			INSERT INTO sandboxes (id, root_inode, owner) VALUES (${sandboxId}, NULL, ${owner}) RETURNING created_at
+		`;
+		const sandboxRow = sandboxRows[0];
+		if (!sandboxRow) throw new Error("createSandbox: failed to insert sandbox row");
+		const createdAt = sandboxRow.created_at.toISOString();
 
 		// 2. Insert root directory inode (kind=2, mode=0o755)
 		const rootRows = await tx<{ id: string }[]>`
@@ -272,15 +279,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// 3. Update sandbox with root_inode reference
 		await tx`UPDATE sandboxes SET root_inode = ${String(rootInodeId)} WHERE id = ${sandboxId}`;
 
-		// 3. Create default directories under root: /home, /tmp, /bin
+		// 4. Create default directories under root: /home, /tmp, /bin
 		const homeInodeId = await this.#createDirInode(tx, sandboxId, rootInodeId, "home");
 		await this.#createDirInode(tx, sandboxId, rootInodeId, "tmp");
 		await this.#createDirInode(tx, sandboxId, rootInodeId, "bin");
 
-		// 4. Create /home/user under /home
+		// 5. Create /home/user under /home
 		await this.#createDirInode(tx, sandboxId, homeInodeId, "user");
 
-		return { rootInodeId };
+		return { rootInodeId, createdAt };
 	}
 
 	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<void> {
@@ -310,9 +317,10 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 					python: boolean;
 					javascript: boolean;
 					network: boolean;
+					created_at: Date;
 				}[]
 			>`
-				SELECT owner, name, python, javascript, network FROM sandboxes WHERE id = ${sandboxId}
+				SELECT owner, name, python, javascript, network, created_at FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
@@ -322,6 +330,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				python: r.python,
 				javascript: r.javascript,
 				network: r.network,
+				createdAt: r.created_at.toISOString(),
 			};
 		} catch (err) {
 			throw translateSqlError(err, sandboxId);

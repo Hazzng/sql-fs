@@ -52,7 +52,10 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		const owner = c.get("owner");
 		const tenant = c.get("tenant");
 		const sandboxId = crypto.randomUUID();
-		const createdAt = new Date().toISOString();
+
+		// createdAt is captured from the session after buildFs runs, so it reflects
+		// the DB-generated created_at timestamp rather than a JS clock reading.
+		let createdAt = new Date().toISOString();
 
 		await sessionManager.withSession(
 			tenant,
@@ -60,7 +63,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			async (session) => {
 				if (!session.owner) session.owner = owner;
 				session.name = name;
-				session.createdAt = createdAt;
+				// session.createdAt is set by getOrCreate from the DB RETURNING clause.
+				createdAt = session.createdAt;
 				await sessionManager.persistSandboxMeta(tenant, sandboxId, { owner, name, python, javascript, network });
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
@@ -100,14 +104,28 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		}
 	});
 
-	router.get("/:id", (c) => {
+	router.get("/:id", async (c) => {
 		const id = c.req.param("id");
 		const tenant = c.get("tenant");
+		const caller = c.get("owner");
 		const session = sessionManager.getSession(tenant, id);
 		if (session === undefined) {
-			return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+			// Session evicted or on a cold replica — fall back to DB.
+			const meta = await sessionManager.getSandboxMeta(tenant, id);
+			if (meta === null) {
+				return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+			}
+			if (meta.owner && meta.owner !== caller) {
+				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
+			}
+			return c.json({
+				id,
+				name: meta.name,
+				owner: meta.owner,
+				createdAt: meta.createdAt ?? new Date().toISOString(),
+				lastUsedAt: null,
+			});
 		}
-		const caller = c.get("owner");
 		if (session.owner && session.owner !== caller) {
 			return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 		}
