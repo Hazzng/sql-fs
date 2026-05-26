@@ -3,7 +3,7 @@ date: 2026-05-14T20:50:44+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: dd7e7fd84c7256457ca28225d8118072ff9b8e0a
 branch: main
-repository: virtualFS
+repository: sql-fs
 task: "Parallelize reads + serialize writes in exec-sync-batch (Issue #64)"
 tags: [implementation-plan, batch-exec, parallelism, rw-lock, read-only, async-local-storage]
 status: draft
@@ -495,7 +495,7 @@ None. No data migration, no schema change, no API surface change. Existing clien
 - RW lock implementation review: `thoughts/shared/research/2026-05-12_19-23-33_rw-lock-deep-dive.md`
 - Issue #60 originating design (the one that shipped cross-request parallel-readOnly): `thoughts/shared/research/2026-05-10_13-03-37_parallel-readonly-bash-exec.md`
 - Latency motivation: `thoughts/shared/research/2026-05-02_11-24-37_remote-bash-latency-scaling.md`
-- GitHub issue: https://github.com/Hazzng/virtualFS/issues/64
+- GitHub issue: https://github.com/Hazzng/sql-fs/issues/64
 - Key files (current commit `dd7e7fd`):
   - `src/api/lib/batch-exec.ts:17-78` — the loop that becomes the parallel branch
   - `src/api/routes/exec.ts:37-49, 343-393` — schema + handler (unchanged)

@@ -6,7 +6,7 @@ This document covers the internal architecture — how a request flows end-to-en
 
 ## Mental Model
 
-virtualFS is a **stateless HTTP server** backed by Postgres, with warm in-process state per active sandbox. The key invariant:
+sql-fs is a **stateless HTTP server** backed by Postgres, with warm in-process state per active sandbox. The key invariant:
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
@@ -509,13 +509,13 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 
 ## Consensus Algorithm Discussion
 
-virtualFS does not implement a consensus algorithm (Raft, Paxos, or similar). This is a deliberate design choice, not an oversight.
+sql-fs does not implement a consensus algorithm (Raft, Paxos, or similar). This is a deliberate design choice, not an oversight.
 
-Consensus algorithms are needed when multiple nodes must agree on a sequence of writes with no single authoritative source. virtualFS avoids that requirement entirely by keeping Postgres as the single authoritative source and serializing all writes to a sandbox through a single exec lock at any given time.
+Consensus algorithms are needed when multiple nodes must agree on a sequence of writes with no single authoritative source. sql-fs avoids that requirement entirely by keeping Postgres as the single authoritative source and serializing all writes to a sandbox through a single exec lock at any given time.
 
 Each concern that consensus typically solves is handled more simply here:
 
-| Concern | Consensus approach | virtualFS approach |
+| Concern | Consensus approach | sql-fs approach |
 |---|---|---|
 | Leader election | Raft leader vote, quorum | Redis `SET NX` — whoever wins the atomic SET owns the exec |
 | Distributed state agreement | Log replication across nodes | Version counter (`INCR ver`) + reload from Postgres on mismatch |

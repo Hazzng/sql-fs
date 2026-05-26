@@ -12,7 +12,7 @@ depends_on: tasks/arch-redis-caching-and-locking.md
 
 ## Overview
 
-Implements the architecture described in `tasks/arch-redis-caching-and-locking.md`. Scales virtualfs-api from single-replica to N replicas on Azure Container Apps without sandbox affinity. Adds a Redis-backed L2 cache (blobs + optional path snapshot), three layered locks (existing `session.mutex` + new Redis exec lock + new PG advisory lock), and a version-counter coherence protocol that replaces pub/sub.
+Implements the architecture described in `tasks/arch-redis-caching-and-locking.md`. Scales sql-fs-api from single-replica to N replicas on Azure Container Apps without sandbox affinity. Adds a Redis-backed L2 cache (blobs + optional path snapshot), three layered locks (existing `session.mutex` + new Redis exec lock + new PG advisory lock), and a version-counter coherence protocol that replaces pub/sub.
 
 Five phases, each independently shippable:
 
@@ -60,7 +60,7 @@ Recommended order: A → B → C → D. Defer E until measurement justifies it.
 
 After all phases (A–D) are implemented:
 
-- virtualfs-api runs correctly on N replicas behind an ACA load balancer with no sandbox affinity.
+- sql-fs-api runs correctly on N replicas behind an ACA load balancer with no sandbox affinity.
 - Cross-replica script atomicity is guaranteed under normal operation (Redis exec lock).
 - DB data integrity is guaranteed even under lock-lost scenarios (PG advisory lock).
 - Caches on any replica are always fresh at exec entry (version counter + reload).
@@ -1716,7 +1716,7 @@ Alert thresholds:
 ## References
 
 - Architecture document: `tasks/arch-redis-caching-and-locking.md`
-- Original PRD: `tasks/prd-virtual-fs-api.md` (US-088 and below — prerequisites)
+- Original PRD: `tasks/prd-sql-fs-api.md` (US-088 and below — prerequisites)
 - Existing implementation plan: `tasks/IMPLEMENT.md` (Phase 6 — Deployment, which this work sits alongside)
 - Key source files:
   - `src/fs/sql-fs/sql-fs.ts` — `SqlFs` class (Phase D dirty tracking + reload)

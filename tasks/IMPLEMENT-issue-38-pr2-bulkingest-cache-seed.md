@@ -10,7 +10,7 @@
 
 ## 1. Background — what is this and why
 
-`virtualfs-api` exposes a sandboxed `Bash` to AI agents over HTTP. A common usage pattern is:
+`sql-fs-api` exposes a sandboxed `Bash` to AI agents over HTTP. A common usage pattern is:
 
 1. Agent creates a sandbox (`POST /v1/sandboxes`).
 2. Agent uploads a code tree (`POST /v1/sandboxes/{id}/ingest-files` with a JSON manifest of base64 file contents — see `src/api/routes/ingest.ts:26`).

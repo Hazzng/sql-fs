@@ -3,7 +3,7 @@ date: 2026-05-10T13:03:37+09:30
 researcher: Harry Nguyen
 git_commit: c149f89b4ce04b88fce1d68f8b624d4dfbc036a6
 branch: feature/RW-exec
-repository: virtualFS
+repository: sql-fs
 topic: "Parallel readOnly bash exec — Multiple Reader Single Writer pattern (Issue #60)"
 tags: [research, codebase, session-manager, exec, concurrency, rw-lock, sql-fs]
 status: complete
@@ -17,7 +17,7 @@ last_updated_by: Harry Nguyen
 **Researcher**: Harry Nguyen  
 **Git Commit**: `c149f89b4ce04b88fce1d68f8b624d4dfbc036a6`  
 **Branch**: `feature/RW-exec`  
-**Repository**: virtualFS
+**Repository**: sql-fs
 
 ---
 

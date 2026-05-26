@@ -1,4 +1,4 @@
-"""Unit tests for the VirtualFS SDK.
+"""Unit tests for the SQL-FS SDK.
 
 Mocks httpx with respx — no network required.
 """
@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from virtualfs import (
+from sqlfs import (
     AuthError,
     Client,
     ConflictError,
@@ -449,7 +449,7 @@ def test_exec_default_does_not_retry_5xx():
         ]
     )
     sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
-    from virtualfs import ServerError
+    from sqlfs import ServerError
 
     with pytest.raises(ServerError):
         sb.exec("echo hi > /tmp/x")
@@ -464,7 +464,7 @@ def test_exec_ecoherence_never_retries_even_with_retry_on_5xx():
         return_value=httpx.Response(503, json={"error": "coherence", "code": "ECOHERENCE"})
     )
     sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
-    from virtualfs import ServerError
+    from sqlfs import ServerError
 
     with pytest.raises(ServerError) as exc:
         sb.exec("echo hi > /tmp/x", retry_on_5xx=True)
@@ -601,7 +601,7 @@ def test_exec_batch_default_does_not_retry_5xx():
         return_value=httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"})
     )
     sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
-    from virtualfs import ServerError
+    from sqlfs import ServerError
 
     with pytest.raises(ServerError):
         sb.exec_batch([{"id": "a", "script": "mkdir -p /a"}])

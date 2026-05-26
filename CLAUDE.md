@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-virtualfs-api is a persistent filesystem backend + HTTP/MCP API for [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes. It lets AI agents create isolated bash environments over the network, backed by SQL databases (Postgres, MySQL, Azure SQL) or Azure FileShare. `just-bash` is consumed as an npm dependency — we do NOT modify its source.
+sql-fs-api is a persistent filesystem backend + HTTP/MCP API for [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes. It lets AI agents create isolated bash environments over the network, backed by SQL databases (Postgres, MySQL, Azure SQL) or Azure FileShare. `just-bash` is consumed as an npm dependency — we do NOT modify its source.
 
 **Architecture:**
 ```
@@ -36,8 +36,8 @@ pnpm db:migrate             # Apply migrations to database
 pnpm db:gc                  # Run blob garbage collection
 
 # Docker
-docker build -t virtualfs-api .
-docker run -p 8080:8080 -e FS_BACKEND=postgres -e DATABASE_URL=... virtualfs-api
+docker build -t sql-fs-api .
+docker run -p 8080:8080 -e FS_BACKEND=postgres -e DATABASE_URL=... sql-fs-api
 ```
 
 ## Architecture
@@ -257,7 +257,7 @@ src/
       gc.ts                      ← Blob GC CLI
     tests/                       ← API unit + e2e tests (integration/ inside)
 tasks/
-  prd-virtual-fs-api.md          ← 105 user stories (23 epics)
+  prd-sql-fs-api.md          ← 105 user stories (23 epics)
   IMPLEMENT.md                   ← 6-phase implementation plan
 ```
 
@@ -306,7 +306,7 @@ After the release PR merges to `main`, the release pipeline cuts a GitHub Releas
 ## Implementation Guidance
 
 - Read `tasks/IMPLEMENT.md` for the phased implementation plan with verification steps.
-- Read `tasks/prd-virtual-fs-api.md` for full user story details and acceptance criteria.
+- Read `tasks/prd-sql-fs-api.md` for full user story details and acceptance criteria.
 - Phase 1 (SqlFs + Postgres) must be completed first — everything else depends on it.
 - When implementing a user story, check its acceptance criteria and write tests that verify each criterion.
 - After completing a set of stories, run `pnpm typecheck && pnpm lint:fix && pnpm test:unit` before moving on.

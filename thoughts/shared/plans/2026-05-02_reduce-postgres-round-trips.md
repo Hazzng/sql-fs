@@ -3,7 +3,7 @@ date: 2026-05-02T11:34:41+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: 7a7395bb9158cd6c39dbd498af9604769e7350cd
 branch: perf/reduce-postgres-round-trips
-repository: virtualFS
+repository: sql-fs
 task: "Reduce per-transaction Postgres round-trips in SqlFs write operations"
 tags: [implementation-plan, sql-fs, postgres, performance, latency]
 status: draft

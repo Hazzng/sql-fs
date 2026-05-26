@@ -3,7 +3,7 @@
 Remote Bash latency benchmark.
 
 Supports two providers:
-  virtualfs  — VirtualFS HTTP API (default)
+  sqlfs  — SQL-FS HTTP API (default)
   daytona    — Daytona sandbox API
 
 Measures:
@@ -11,10 +11,10 @@ Measures:
              sandboxes so every measurement includes a real round-trip.
   Phase 2 — Exec latency: grep / find / write / delete / mv commands on a
              warm sandbox. Reports wall-clock ms (always) and server-reported
-             duration_ms (VirtualFS only — Daytona does not expose this).
+             duration_ms (SQL-FS only — Daytona does not expose this).
 
 Usage:
-  # VirtualFS (env-var defaults)
+  # SQL-FS (env-var defaults)
   API_URL=http://localhost:8080 AUTH_SECRET=dev \\
     python3 scripts/benchmark_remote_bash.py
 
@@ -25,7 +25,7 @@ Usage:
     --daytona-api-url https://app.daytona.io/api
 
   # Side-by-side (run twice, compare output)
-  python3 scripts/benchmark_remote_bash.py --provider virtualfs ...
+  python3 scripts/benchmark_remote_bash.py --provider sqlfs ...
   python3 scripts/benchmark_remote_bash.py --provider daytona   ...
 """
 
@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ── VirtualFS SDK (optional — only needed for virtualfs provider) ─────────────
+# ── SQL-FS SDK (optional — only needed for sqlfs provider) ─────────────
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "clients" / "python" / "src"))
 
@@ -50,17 +50,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Remote Bash latency benchmark")
     p.add_argument(
         "--provider",
-        choices=["virtualfs", "daytona"],
-        default="virtualfs",
-        help="Sandbox provider to benchmark (default: virtualfs)",
+        choices=["sql-fs", "daytona"],
+        default="sql-fs",
+        help="Sandbox provider to benchmark (default: sqlfs)",
     )
 
-    # VirtualFS args
-    vfs = p.add_argument_group("VirtualFS provider")
+    # SQL-FS args
+    vfs = p.add_argument_group("SQL-FS provider")
     vfs.add_argument(
         "--api-url",
         default=os.environ.get("API_URL", "http://localhost:8080"),
-        help="VirtualFS API base URL (default: $API_URL or http://localhost:8080)",
+        help="SQL-FS API base URL (default: $API_URL or http://localhost:8080)",
     )
     vfs.add_argument(
         "--auth-secret",
@@ -277,17 +277,17 @@ class Provider:
         raise NotImplementedError
 
 
-# ── VirtualFS provider ────────────────────────────────────────────────────────
+# ── SQL-FS provider ────────────────────────────────────────────────────────
 
-class VirtualFSProvider(Provider):
-    name = "VirtualFS"
+class SQLFSProvider(Provider):
+    name = "SQL-FS"
     has_server_ms = True
 
     def __init__(self, api_url: str, auth_secret: str, sub: str) -> None:
         try:
-            from virtualfs import Client
+            from sqlfs import Client
         except ImportError as exc:
-            print(f"ERROR: Cannot import virtualfs SDK: {exc}", file=sys.stderr)
+            print(f"ERROR: Cannot import sqlfs SDK: {exc}", file=sys.stderr)
             print(f"Install it with: pip install {_REPO_ROOT / 'clients' / 'python'}", file=sys.stderr)
             sys.exit(1)
         self._client = Client(base_url=api_url, auth_secret=auth_secret, sub=sub).__enter__()
@@ -539,11 +539,11 @@ def main() -> None:
     requested_base = args.base_path.rstrip("/")
 
     # Build provider
-    if args.provider == "virtualfs":
+    if args.provider == "sql-fs":
         if not args.auth_secret:
-            print("ERROR: --auth-secret or AUTH_SECRET is required for virtualfs provider", file=sys.stderr)
+            print("ERROR: --auth-secret or AUTH_SECRET is required for sqlfs provider", file=sys.stderr)
             sys.exit(1)
-        provider: Provider = VirtualFSProvider(args.api_url, args.auth_secret, args.sub)
+        provider: Provider = SQLFSProvider(args.api_url, args.auth_secret, args.sub)
     else:
         if not args.daytona_api_key:
             print("ERROR: --daytona-api-key or DAYTONA_API_KEY is required for daytona provider", file=sys.stderr)
@@ -606,7 +606,7 @@ def main() -> None:
     print("Remote Bash Latency Benchmark")
     print("==============================")
     print(f"Provider: {provider.name}")
-    if args.provider == "virtualfs":
+    if args.provider == "sql-fs":
         print(f"API:      {args.api_url}")
     else:
         print(f"API:      {args.daytona_api_url}")

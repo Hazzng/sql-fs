@@ -47,7 +47,7 @@ Started: Sun Apr 19 23:23:07 ACST 2026
 ---
 
 ## 2026-04-20 - US-077
-- What was implemented: MCP server setup in src/api/mcp/server.ts; creates McpServer with name 'virtualfs'/version '1.0.0'; uses WebStandardStreamableHTTPServerTransport (web-standard, not Node.js-specific) for Hono compatibility; session management via Map<sessionId, transport>; each new session gets a fresh McpServer+transport pair; mounted at /mcp in server.ts via `app.all("/mcp", (c) => handleMcpRequest(c.req.raw))`
+- What was implemented: MCP server setup in src/api/mcp/server.ts; creates McpServer with name 'sqlfs'/version '1.0.0'; uses WebStandardStreamableHTTPServerTransport (web-standard, not Node.js-specific) for Hono compatibility; session management via Map<sessionId, transport>; each new session gets a fresh McpServer+transport pair; mounted at /mcp in server.ts via `app.all("/mcp", (c) => handleMcpRequest(c.req.raw))`
 - Files changed: src/api/mcp/server.ts (new), src/api/__tests__/mcp.test.ts (new), src/api/server.ts (added /mcp mount)
 - **Learnings for future iterations:**
   - Use `WebStandardStreamableHTTPServerTransport` (not `StreamableHTTPServerTransport`) for Hono — it uses Web Standard Request/Response APIs directly: `transport.handleRequest(c.req.raw)`

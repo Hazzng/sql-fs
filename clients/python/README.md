@@ -1,13 +1,13 @@
-# virtualfs (Python SDK)
+# sqlfs (Python SDK)
 
-Official Python client for the [VirtualFS API](https://github.com/Hazzng/virtualFS) — persistent bash sandboxes for AI agents.
+Official Python client for the [SQL-FS API](https://github.com/Hazzng/sql-fs) — persistent bash sandboxes for AI agents.
 
-Handles JWT minting, JSON serialization, retries, and streaming so callers don't rebuild `exec_sync` boilerplate every session (see issue [#29](https://github.com/Hazzng/virtualFS/issues/29)).
+Handles JWT minting, JSON serialization, retries, and streaming so callers don't rebuild `exec_sync` boilerplate every session (see issue [#29](https://github.com/Hazzng/sql-fs/issues/29)).
 
 ## Install
 
 ```bash
-pip install virtualfs-sdk
+pip install sql-fs-sdk
 ```
 
 Local (from this repo):
@@ -19,7 +19,7 @@ pip install -e clients/python
 ## Quick start
 
 ```python
-from virtualfs import Client
+from sqlfs import Client
 
 with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001") as fs:
     sb = fs.sandboxes.create(name="demo", python=True)
@@ -102,7 +102,7 @@ fs = Client(base_url="...", token="eyJhbGciOi...")
 
 ## Errors
 
-All exceptions derive from `VirtualFSError`. HTTP status codes map to:
+All exceptions derive from `SQLFSError`. HTTP status codes map to:
 
 | Status | Exception |
 |---|---|

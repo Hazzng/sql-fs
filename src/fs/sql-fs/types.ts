@@ -1,5 +1,5 @@
 /**
- * SqlDialect interface and shared types for virtualfs-api.
+ * SqlDialect interface and shared types for sql-fs-api.
  * US-001: SqlDialect interface definition
  * US-002: Shared types for inode, dirent, cache entry
  */

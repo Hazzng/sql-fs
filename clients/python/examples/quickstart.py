@@ -1,4 +1,4 @@
-"""End-to-end demo of the VirtualFS Python SDK.
+"""End-to-end demo of the SQL-FS Python SDK.
 
 Run with:
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import sys
 
-from virtualfs import Client
+from sqlfs import Client
 
 
 def main() -> int:

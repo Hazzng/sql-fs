@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="virtualFS" width="720" />
+  <img src="assets/banner.svg" alt="sql-fs" width="720" />
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 ---
 
-Most sandbox runtimes lose state when the process dies. virtualFS gives [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes a durable, Postgres-backed filesystem — so an AI agent can create an environment, run commands, come back hours later, and pick up exactly where it left off.
+Most sandbox runtimes lose state when the process dies. sql-fs gives [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes a durable, Postgres-backed filesystem — so an AI agent can create an environment, run commands, come back hours later, and pick up exactly where it left off.
 
 ## Why
 
@@ -54,11 +54,11 @@ docker-compose -f docker-compose.local.yml up
 ## Typical Agent Workflow
 
 ```bash
-pip install virtualfs-sdk
+pip install sql-fs-sdk
 ```
 
 ```python
-from virtualfs import Client
+from sqlfs import Client
 import pathlib
 
 client = Client(
@@ -220,12 +220,12 @@ Key design choices:
 ## Deployment
 
 ```bash
-docker build -t virtualfs-api .
+docker build -t sql-fs-api .
 docker run -p 8080:8080 \
   -e FS_BACKEND=postgres \
   -e DATABASE_URL=postgres://... \
   -e AUTH_SECRET=... \
-  virtualfs-api
+  sql-fs-api
 ```
 
 For multi-replica deployments, add `REDIS_URL`. All replicas share the same Postgres database and Redis instance; the exec lock ensures only one replica processes a given sandbox at a time.
@@ -246,7 +246,7 @@ pnpm db:gc                  # garbage-collect orphan blobs
 
 ## Benchmarking
 
-`scripts/benchmark_remote_bash.py` measures end-to-end latency through the API — sandbox lifecycle and exec operations — against either virtualFS or [Daytona](https://daytona.io).
+`scripts/benchmark_remote_bash.py` measures end-to-end latency through the API — sandbox lifecycle and exec operations — against either sql-fs or [Daytona](https://daytona.io).
 
 ```bash
 # Against local dev server

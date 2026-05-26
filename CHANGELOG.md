@@ -4,15 +4,15 @@
 
 ### Patch Changes
 
-- [#95](https://github.com/Hazzng/virtualFS/pull/95) Thanks [@Hazzng](https://github.com/Hazzng)! - Add `durationMs` to `BatchScriptResult` so agents can profile individual script latencies inside a batch execution.
+- [#95](https://github.com/Hazzng/sql-fs/pull/95) Thanks [@Hazzng](https://github.com/Hazzng)! - Add `durationMs` to `BatchScriptResult` so agents can profile individual script latencies inside a batch execution.
 
-- [#96](https://github.com/Hazzng/virtualFS/pull/96) Thanks [@Hazzng](https://github.com/Hazzng)! - Fix GET /v1/sandboxes/:id returning stale createdAt and transient 404 after session eviction. The route now falls back to the database when the session is not in the in-memory pool, and createdAt is sourced from the DB RETURNING clause on creation and restored from DB meta on rehydration so all three endpoints (POST, GET, LIST) agree on the same timestamp.
+- [#96](https://github.com/Hazzng/sql-fs/pull/96) Thanks [@Hazzng](https://github.com/Hazzng)! - Fix GET /v1/sandboxes/:id returning stale createdAt and transient 404 after session eviction. The route now falls back to the database when the session is not in the in-memory pool, and createdAt is sourced from the DB RETURNING clause on creation and restored from DB meta on rehydration so all three endpoints (POST, GET, LIST) agree on the same timestamp.
 
 ## 0.4.0
 
 ### Minor Changes
 
-- [#86](https://github.com/Hazzng/virtualFS/pull/86) Thanks [@Hazzng](https://github.com/Hazzng)! - feat(py-exec): add warm Python interpreter to eliminate 1.4s startup cost per invocation
+- [#86](https://github.com/Hazzng/sql-fs/pull/86) Thanks [@Hazzng](https://github.com/Hazzng)! - feat(py-exec): add warm Python interpreter to eliminate 1.4s startup cost per invocation
 
   Introduces `py-exec`, a new bash command available in `python=true` sandboxes that routes Python execution through a persistent `python3` process instead of spawning a fresh CPython/WASM worker on every call.
 
@@ -27,7 +27,7 @@
 
 ### Patch Changes
 
-- [#85](https://github.com/Hazzng/virtualFS/pull/85) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(session-manager): persist cwd across exec calls
+- [#85](https://github.com/Hazzng/sql-fs/pull/85) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(session-manager): persist cwd across exec calls
 
   `cd` executed inside a `bash.exec()` call was silently discarded because
   just-bash runs each call against a **copy** of the interpreter state;
@@ -53,25 +53,25 @@
   correct just-bash design. The issue report's claim that env persists was
   incorrect; only cwd needed fixing.
 
-  Closes [#73](https://github.com/Hazzng/virtualFS/issues/73).
+  Closes [#73](https://github.com/Hazzng/sql-fs/issues/73).
 
 ## 0.3.9
 
 ### Patch Changes
 
-- [#81](https://github.com/Hazzng/virtualFS/pull/81) Thanks [@Hazzng](https://github.com/Hazzng)! - just-bash's built-in nodeStubCommand (registered alongside js-exec when javascript=true) ignores all arguments and unconditionally prints the full 60-line js-exec --help page to stderr before exiting 1. Added src/api/commands/node-command.ts — a custom Command that replaces the built-in stub via BashOptions.customCommands (which takes precedence over built-ins with the same name). Custom commands are only injected when javascript: true; non-JS sandboxes are unaffected.
+- [#81](https://github.com/Hazzng/sql-fs/pull/81) Thanks [@Hazzng](https://github.com/Hazzng)! - just-bash's built-in nodeStubCommand (registered alongside js-exec when javascript=true) ignores all arguments and unconditionally prints the full 60-line js-exec --help page to stderr before exiting 1. Added src/api/commands/node-command.ts — a custom Command that replaces the built-in stub via BashOptions.customCommands (which takes precedence over built-ins with the same name). Custom commands are only injected when javascript: true; non-JS sandboxes are unaffected.
 
 ## 0.3.8
 
 ### Patch Changes
 
-- [#79](https://github.com/Hazzng/virtualFS/pull/79) Thanks [@Hazzng](https://github.com/Hazzng)! - Python SDK: expose `read_only` parameter on `Sandbox.exec_batch()`. When `read_only=True`, the request forwards `readOnly: true` to the server, activating parallel script execution under a shared read-lock. Defaults to `False` (sequential, write-lock) for full backward compatibility.
+- [#79](https://github.com/Hazzng/sql-fs/pull/79) Thanks [@Hazzng](https://github.com/Hazzng)! - Python SDK: expose `read_only` parameter on `Sandbox.exec_batch()`. When `read_only=True`, the request forwards `readOnly: true` to the server, activating parallel script execution under a shared read-lock. Defaults to `False` (sequential, write-lock) for full backward compatibility.
 
 ## 0.3.7
 
 ### Patch Changes
 
-- [#69](https://github.com/Hazzng/virtualFS/pull/69) Thanks [@Hazzng](https://github.com/Hazzng)! - Parallel readOnly batch execution. POST /exec-sync-batch and MCP bash_exec_batch now run scripts in parallel when readOnly: true, bounded at 16 concurrent workers. Result order is preserved. Write-path batches are unchanged (sequential, exclusive lock). MCP client disconnects now propagate into in-flight scripts via extra.signal forwarding.
+- [#69](https://github.com/Hazzng/sql-fs/pull/69) Thanks [@Hazzng](https://github.com/Hazzng)! - Parallel readOnly batch execution. POST /exec-sync-batch and MCP bash_exec_batch now run scripts in parallel when readOnly: true, bounded at 16 concurrent workers. Result order is preserved. Write-path batches are unchanged (sequential, exclusive lock). MCP client disconnects now propagate into in-flight scripts via extra.signal forwarding.
 
 All notable changes to this project will be documented in this file.
 
@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `portless` dev dependency, `portless.json` (`virtualfs-api`), and `pnpm dev:portless` to run the dev server behind stable `https://…localhost` URLs (including per-branch subdomains in git worktrees).
+- `portless` dev dependency, `portless.json` (`sql-fs-api`), and `pnpm dev:portless` to run the dev server behind stable `https://…localhost` URLs (including per-branch subdomains in git worktrees).
 
 ## [0.3.1] - 2026-05-11
 
@@ -205,7 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `scripts/benchmark_remote_bash.py`: end-to-end Remote Bash latency benchmark hitting the live HTTP API via the Python SDK. Runs in two phases — sandbox lifecycle (create / ingest / delete over N fresh sandboxes) and exec latency (find / grep / rg / write / delete / mkdir / mv cases on a warm sandbox). Reports wall-clock ms and server-side `duration_ms` (avg / p50 / p95 / max) as markdown tables. Supports both `virtualfs` and `daytona` providers via `--provider`, auto-detects writable home dir on Daytona, and sweeps leftover `bench-*` sandboxes on exit. Run with `pnpm bench:remote-bash`. See README for full instructions.
+- `scripts/benchmark_remote_bash.py`: end-to-end Remote Bash latency benchmark hitting the live HTTP API via the Python SDK. Runs in two phases — sandbox lifecycle (create / ingest / delete over N fresh sandboxes) and exec latency (find / grep / rg / write / delete / mkdir / mv cases on a warm sandbox). Reports wall-clock ms and server-side `duration_ms` (avg / p50 / p95 / max) as markdown tables. Supports both `sqlfs` and `daytona` providers via `--provider`, auto-detects writable home dir on Daytona, and sweeps leftover `bench-*` sandboxes on exit. Run with `pnpm bench:remote-bash`. See README for full instructions.
 
 ### Removed
 
@@ -245,8 +245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `bulkIngest` now populates the in-memory content cache with the bytes it just received, eliminating a database round-trip on the very next read of an ingested file. No API surface change.
-- Python SDK PyPI distribution name renamed from `virtualfs` to `virtualfs-sdk`.
-- Fixed pre-existing mypy strict errors in `clients/python/src/virtualfs/_http.py` and `models.py`: typed `list`/`tuple` type arguments, cast `Literal` for `StreamEvent.type`.
+- Python SDK PyPI distribution name renamed from `sqlfs` to `sql-fs-sdk`.
+- Fixed pre-existing mypy strict errors in `clients/python/src/sqlfs/_http.py` and `models.py`: typed `list`/`tuple` type arguments, cast `Literal` for `StreamEvent.type`.
 - Fixed pre-existing ruff lint/format issues in `clients/python/examples/perf_benchmark.py` and `tests/test_client.py`.
 
 ## [0.2.8] - 2026-04-28
@@ -265,7 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `constantTimeEqual()` in `src/api/routes/auth.ts` now compares SHA-256 digests of the inputs, removing the early-return length oracle. Used by both `POST /v1/auth/bootstrap` and `POST /v1/auth/admin`.
 - `POST /v1/auth/admin` is now structured as pre-middleware → `validateBody` → handler so the `X-Admin-Secret` check runs before body parsing. Wrong/missing secrets now return 403 even for malformed bodies (previously returned 400 from Zod). The handler also hard-fails with 500 `AUTH_NOT_CONFIGURED` when `AUTH_SECRET` is unset.
-- Rate-limit `clientIp()` no longer reads `X-Forwarded-For` / `X-Real-IP` by default — those headers are spoofable. Operators behind a trusted ingress that strips inbound forwarding headers must opt in via `TRUST_PROXY_HEADERS=true`. Otherwise the connecting socket's `remoteAddress` is used. See `plugins/virtualfs/skills/api/SETUP.md` for the full trust-proxy note.
+- Rate-limit `clientIp()` no longer reads `X-Forwarded-For` / `X-Real-IP` by default — those headers are spoofable. Operators behind a trusted ingress that strips inbound forwarding headers must opt in via `TRUST_PROXY_HEADERS=true`. Otherwise the connecting socket's `remoteAddress` is used. See `plugins/sqlfs/skills/api/SETUP.md` for the full trust-proxy note.
 
 ## [0.2.7] - 2026-04-28
 
@@ -345,13 +345,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Migrated Claude Code skills from `commands/virtualfs-api.md` + `skills/virtualfs-api/` into the plugin layout under `.claude-plugin/` and `plugins/virtualfs/`.
+- Migrated Claude Code skills from `commands/sql-fs-api.md` + `skills/sql-fs-api/` into the plugin layout under `.claude-plugin/` and `plugins/sqlfs/`.
 
 ## [0.1.0] - 2026-04-26
 
 ### Added
 
-- Initial release of `virtualfs-api`: persistent filesystem backend + HTTP/MCP API for `just-bash` sandboxes.
+- Initial release of `sql-fs-api`: persistent filesystem backend + HTTP/MCP API for `just-bash` sandboxes.
 - SQL-backed `IFileSystem` implementation (`SqlFs`) with Postgres, MySQL, and Azure SQL dialects.
 - Adjacency-list directory model with content-addressable blob storage and global dedup.
 - Path cache (eager) and content cache (lazy LRU, 50 MB/session) for low-latency reads.

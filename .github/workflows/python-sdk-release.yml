@@ -85,7 +85,7 @@ jobs:
             exit 1
           fi
 
-          VERSION_PY_VER=$(awk -F'"' '/^__version__/{print $2; exit}' src/virtualfs/_version.py)
+          VERSION_PY_VER=$(awk -F'"' '/^__version__/{print $2; exit}' src/sqlfs/_version.py)
           if [ "$CHANGELOG_VER" != "$VERSION_PY_VER" ]; then
             echo "::error::Version mismatch: CHANGELOG=$CHANGELOG_VER, _version.py=$VERSION_PY_VER"
             exit 1
@@ -146,7 +146,7 @@ jobs:
 
       # ── 5. Publish to PyPI via OIDC trusted publisher ─────────────────────
       # Set up trusted publisher on PyPI first:
-      #   Owner: <github-org>, Repo: virtualFS, Workflow: python-sdk-release.yml
+      #   Owner: <github-org>, Repo: sql-fs, Workflow: python-sdk-release.yml
       # To use an API token instead, remove id-token permission above and add:
       #   password: ${{ secrets.PYPI_TOKEN }}
       - name: Publish to PyPI
@@ -180,7 +180,7 @@ jobs:
 
             Install via pip:
             ```
-            pip install virtualfs-sdk==${{ steps.detect.outputs.VERSION }}
+            pip install sql-fs-sdk==${{ steps.detect.outputs.VERSION }}
             ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

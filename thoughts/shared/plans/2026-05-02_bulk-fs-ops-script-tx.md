@@ -3,7 +3,7 @@ date: 2026-05-02T12:54:26+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: 7a7395bb9158cd6c39dbd498af9604769e7350cd
 branch: feat/bulk-fs-ops-script-tx
-repository: virtualFS
+repository: sql-fs
 task: "Lazy script-scoped transaction + bulk FS operations (mvBulk/rmBulk/cpBulk)"
 tags: [implementation-plan, sql-fs, session-manager, performance, latency]
 status: draft

@@ -586,7 +586,7 @@ wheels = [
 ]
 
 [[package]]
-name = "virtualfs-sdk"
+name = "sql-fs-sdk"
 version = "0.2.3"
 source = { editable = "." }
 dependencies = [

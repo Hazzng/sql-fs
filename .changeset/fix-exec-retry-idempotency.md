@@ -1,5 +1,5 @@
 ---
-"virtualfs-api": patch
+"sql-fs-api": patch
 ---
 
 fix(exec): never silently retry write execs on 5xx; add opt-in `retryOn5xx`

@@ -6,7 +6,7 @@
 
 ## 1. Background — what is this and why
 
-`virtualfs-api` mints HS256 JWTs that callers attach as `Authorization: Bearer <jwt>` to every `/v1/*` request. Tokens are produced by two endpoints:
+`sql-fs-api` mints HS256 JWTs that callers attach as `Authorization: Bearer <jwt>` to every `/v1/*` request. Tokens are produced by two endpoints:
 
 | Endpoint | Auth required | Purpose |
 |---|---|---|
@@ -41,8 +41,8 @@ You will edit / read these files:
 | `src/api/lib/jwt.ts:8-14` | `SignTokenOptions`. Add optional `jti?: string`. |
 | `src/api/server.ts:155-160` | Where Bearer middleware mounts and `authRoutes()` mounts. Rate-limit middleware mounts here too. |
 | `src/api/__tests__/admin.test.ts` | Existing tests. Will gain ~10 new cases. |
-| `plugins/virtualfs/skills/api/SETUP.md` | Operator-facing docs. Must mention new env vars. **Note:** there is no top-level `SETUP.md`; this is the only one. |
-| `plugins/virtualfs/skills/api/ref/endpoints.md` | Endpoint reference. Add audit log shapes + 429. |
+| `plugins/sqlfs/skills/api/SETUP.md` | Operator-facing docs. Must mention new env vars. **Note:** there is no top-level `SETUP.md`; this is the only one. |
+| `plugins/sqlfs/skills/api/ref/endpoints.md` | Endpoint reference. Add audit log shapes + 429. |
 | `README.md:22` | Stale `POST /v1/admin/tokens` reference — fix it. |
 | `CHANGELOG.md`, `package.json`, `pnpm-lock.yaml`, `src/api/openapi-spec.ts` | Per CLAUDE.md, all four version fields must be bumped together. |
 
@@ -322,11 +322,11 @@ router.use("/bootstrap", bootstrapLimiter);
 
 **Touch (in this exact set, per CLAUDE.md):**
 
-1. `plugins/virtualfs/skills/api/SETUP.md`:
+1. `plugins/sqlfs/skills/api/SETUP.md`:
    - Document new env vars: `ADMIN_RATE_LIMIT_WINDOW_MS` (default 60000), `ADMIN_RATE_LIMIT_MAX` (default 5), `BOOTSTRAP_RATE_LIMIT_WINDOW_MS`, `BOOTSTRAP_RATE_LIMIT_MAX`.
    - Document audit log events: `admin_token_issued`, `admin_token_denied`, `admin_token_misconfigured`, `auth_rate_limited`.
    - Document `429 RATE_LIMITED` with `Retry-After`.
-2. `plugins/virtualfs/skills/api/ref/endpoints.md`:
+2. `plugins/sqlfs/skills/api/ref/endpoints.md`:
    - Add 429 row to `POST /v1/auth/admin` and `POST /v1/auth/bootstrap`.
    - Add audit-log shape examples.
 3. `README.md:22`: replace `POST /v1/admin/tokens` → `POST /v1/auth/admin`.
@@ -357,8 +357,8 @@ cp .env.example .env   # if not already present
 Edit `.env` to set:
 ```bash
 FS_BACKEND=postgres
-DATABASE_URL=postgres://postgres:test@localhost:5432/virtualfs
-DATABASE_DIRECT_URL=postgres://postgres:test@localhost:5432/virtualfs
+DATABASE_URL=postgres://postgres:test@localhost:5432/sqlfs
+DATABASE_DIRECT_URL=postgres://postgres:test@localhost:5432/sqlfs
 PORT=8080
 AUTH_SECRET=local-auth-secret-please-change
 ADMIN_SECRET=local-admin-secret-please-change
@@ -381,7 +381,7 @@ docker compose -f docker-compose.local.yml ps     # both healthy
 
 Confirm:
 ```bash
-psql "postgres://postgres:test@localhost:5432/virtualfs" -c '\dt'   # tables list (post-migration)
+psql "postgres://postgres:test@localhost:5432/sqlfs" -c '\dt'   # tables list (post-migration)
 redis-cli -u redis://localhost:6379 PING                            # PONG
 ```
 
@@ -578,8 +578,8 @@ Copy this into the PR description and tick off:
 | `src/api/__tests__/admin.test.ts` | ~7 new cases (Phase 3). `beforeEach` resets store + log spy. |
 | `src/api/__tests__/bootstrap.test.ts` (new or existing) | Rate-limit cases. |
 | `src/api/__tests__/rate-limit.test.ts` (new) | Store + middleware unit tests with fake clock. |
-| `plugins/virtualfs/skills/api/SETUP.md` | Env vars, audit events, 429. |
-| `plugins/virtualfs/skills/api/ref/endpoints.md` | 429 row, audit shapes. |
+| `plugins/sqlfs/skills/api/SETUP.md` | Env vars, audit events, 429. |
+| `plugins/sqlfs/skills/api/ref/endpoints.md` | 429 row, audit shapes. |
 | `README.md` | `POST /v1/admin/tokens` → `POST /v1/auth/admin` (line 22). |
 | `.env.example` | Add `ADMIN_SECRET=` and rate-limit env stubs. |
 | `CHANGELOG.md` | New `## [0.2.8] - 2026-04-28` section. |

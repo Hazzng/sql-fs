@@ -6,7 +6,7 @@
 
 ## Summary
 
-virtualfs-api today runs correctly on a single replica. This document specifies the architecture required to scale to N replicas behind an autoscaling load balancer (Azure Container Apps) **without sandbox affinity**. Two orthogonal problems are solved:
+sql-fs-api today runs correctly on a single replica. This document specifies the architecture required to scale to N replicas behind an autoscaling load balancer (Azure Container Apps) **without sandbox affinity**. Two orthogonal problems are solved:
 
 1. **Zero cold-start cost** across replicas — blob content and path trees persist in Redis so new replicas don't re-fetch from Postgres.
 2. **Correctness under concurrent access** — no stale caches, no interleaved bash scripts, no DB-level data corruption.

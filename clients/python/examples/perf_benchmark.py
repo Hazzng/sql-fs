@@ -1,4 +1,4 @@
-"""Comprehensive performance benchmark for the VirtualFS API + Python SDK.
+"""Comprehensive performance benchmark for the SQL-FS API + Python SDK.
 
 Exercises every hot path users actually care about:
 
@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from virtualfs import (
+from sqlfs import (
     Client,
     NotFoundError,
     Sandbox,
@@ -414,7 +414,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
-    print(f"virtualfs-sdk {__version__}  →  {base_url}")
+    print(f"sql-fs-sdk {__version__}  →  {base_url}")
     print(f"skip={sorted(skip) or 'none'}")
 
     if args.folder:

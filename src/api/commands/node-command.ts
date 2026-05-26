@@ -18,7 +18,7 @@
  * own flag parsing, runtime throttling, and error reporting — we never
  * duplicate that logic here.
  *
- * Fixes: https://github.com/Hazzng/virtualFS/issues/76
+ * Fixes: https://github.com/Hazzng/sql-fs/issues/76
  */
 
 import { defineCommand } from "just-bash";

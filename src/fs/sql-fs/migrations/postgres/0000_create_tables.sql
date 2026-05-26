@@ -1,4 +1,4 @@
--- Migration 0000: Initial schema for virtualfs-api (Postgres/Neon)
+-- Migration 0000: Initial schema for sql-fs-api (Postgres/Neon)
 -- Tables: sandboxes, inodes, dirents, blobs
 
 -- Sandboxes: one row per isolated filesystem environment.

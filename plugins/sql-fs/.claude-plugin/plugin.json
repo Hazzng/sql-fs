@@ -1,0 +1,11 @@
+{
+	"name": "sql-fs",
+	"version": "1.1.0",
+	"description": "Operator skill for the SQL-FS API — persistent bash sandbox service with SQL-backed filesystem",
+	"author": {
+		"name": "Harry Nguyen",
+		"email": "Harry.Nguyen@insightfactory.ai"
+	},
+	"skills": "./skills/",
+	"keywords": ["sql-fs", "sandbox", "bash", "filesystem", "sql", "api"]
+}

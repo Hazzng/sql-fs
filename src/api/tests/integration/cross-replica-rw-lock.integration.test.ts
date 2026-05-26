@@ -2,7 +2,7 @@
  * Phase 3 — cross-replica distributed RW lock integration tests.
  *
  * Two SessionManager instances against one real Postgres + one real Redis
- * exercise the invariants from issue Hazzng/virtualFS#61:
+ * exercise the invariants from issue Hazzng/sql-fs#61:
  *   1. Readers from different replicas overlap (peak >= 2).
  *   2. An exclusive writer on A blocks new shared readers on B.
  *   3. A live reader on A blocks an exclusive writer on B (writer waits for drain).

@@ -83,11 +83,11 @@ export async function shutdownMcp(): Promise<void> {
 }
 
 /**
- * Creates a new MCP server instance with virtualfs server info.
+ * Creates a new MCP server instance with sqlfs server info.
  */
 export function createMcpServer(): McpServer {
 	return new McpServer({
-		name: "virtualfs",
+		name: "sql-fs",
 		version: "1.0.0",
 	});
 }

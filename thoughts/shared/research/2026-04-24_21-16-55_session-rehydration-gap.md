@@ -3,7 +3,7 @@ date: 2026-04-24T21:16:55+09:30
 researcher: QuangNguyen2609
 git_commit: 571a99d9897e858797bf80ed52969503f9c16378
 branch: feat/multi-replica-redis
-repository: virtualFS
+repository: sql-fs
 topic: "GitHub Issue #10: Multi-replica session rehydration gap — cold replicas return ENOENT for existing sandboxes"
 tags: [research, codebase, session-manager, multi-replica, redis, rehydration, withExistingSession]
 status: complete
@@ -17,7 +17,7 @@ last_updated_by: QuangNguyen2609
 **Researcher**: QuangNguyen2609
 **Git Commit**: 571a99d9897e858797bf80ed52969503f9c16378
 **Branch**: feat/multi-replica-redis
-**Repository**: virtualFS
+**Repository**: sql-fs
 
 ## Research Question
 
@@ -25,7 +25,7 @@ Fully comprehend the context, code patterns, and architecture surrounding GitHub
 
 ## Summary
 
-Issue #10 identifies a **pre-existing architectural limitation** in the virtualFS API where non-create HTTP routes throw ENOENT for sandboxes that exist in Postgres but aren't in the local in-memory session pool. This manifests in multi-replica deployments (LB routes request to a replica that never saw the sandbox) and after server restarts (pool is empty). The fix requires a new `withSessionOrRehydrate` wrapper on `SessionManager` that checks Postgres before throwing ENOENT, plus a `sandboxExists` method on `SqlDialect`. Phase E's Redis path snapshot makes rehydration cheap (~5ms for 1k paths).
+Issue #10 identifies a **pre-existing architectural limitation** in the sql-fs API where non-create HTTP routes throw ENOENT for sandboxes that exist in Postgres but aren't in the local in-memory session pool. This manifests in multi-replica deployments (LB routes request to a replica that never saw the sandbox) and after server restarts (pool is empty). The fix requires a new `withSessionOrRehydrate` wrapper on `SessionManager` that checks Postgres before throwing ENOENT, plus a `sandboxExists` method on `SqlDialect`. Phase E's Redis path snapshot makes rehydration cheap (~5ms for 1k paths).
 
 ---
 

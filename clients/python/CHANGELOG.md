@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the VirtualFS Python SDK are documented here.
+All notable changes to the SQL-FS Python SDK are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- HTTP 422 responses now correctly raise `ValidationError` (was falling through to base `VirtualFSError`).
+- HTTP 422 responses now correctly raise `ValidationError` (was falling through to base `SQLFSError`).
 
 ### Removed
 
@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `Client` — synchronous HTTP client wrapping all VirtualFS API endpoints; supports
+- `Client` — synchronous HTTP client wrapping all SQL-FS API endpoints; supports
   token-based auth, `auth_secret`/`sub` bootstrap, and `admin_secret` bootstrap.
 - `SandboxHandle` — fluent handle returned by `client.sandboxes.create()` / `.attach()` / `.get()`;
   exposes `.fs`, `.exec()`, `.exec_batch()`, `.exec_stream()`, `.ingest_files()`, `.export()`.

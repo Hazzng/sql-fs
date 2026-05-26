@@ -3,7 +3,7 @@ date: 2026-04-24T21:34:03+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: 571a99d9897e858797bf80ed52969503f9c16378
 branch: feat/multi-replica-redis
-repository: virtualFS
+repository: sql-fs
 task: "GitHub Issue #10: Fix multi-replica session rehydration gap (TDD)"
 tags: [implementation-plan, session-manager, multi-replica, redis, rehydration, tdd]
 status: draft

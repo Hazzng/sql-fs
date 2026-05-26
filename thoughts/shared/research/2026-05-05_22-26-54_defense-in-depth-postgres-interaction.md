@@ -3,7 +3,7 @@ date: 2026-05-05T22:26:54+09:30
 researcher: Harry Nguyen
 git_commit: effe298e8b608097b637c8dac82c7db1bc637e33
 branch: main
-repository: virtualFS
+repository: sql-fs
 topic: "How just-bash defenseInDepth interacts with SqlFs/Postgres calls"
 tags: [research, codebase, just-bash, defense-in-depth, sql-fs, postgres, security]
 status: complete
@@ -17,7 +17,7 @@ last_updated_by: Harry Nguyen
 **Researcher**: Harry Nguyen
 **Git Commit**: effe298e8b608097b637c8dac82c7db1bc637e33
 **Branch**: main
-**Repository**: virtualFS
+**Repository**: sql-fs
 
 ## Research Question
 
@@ -30,7 +30,7 @@ A user reports that when testing `SqlFs` plugged into `just-bash`, they had to d
 
 ## Summary
 
-**The bug is real, but it does not manifest in the `virtualfs-api` service today** because `defenseInDepth` is never enabled at the only `new Bash(...)` call site (`src/api/session-manager.ts:299`). It manifests only for downstream consumers (or local tests) that compose `just-bash` with `defenseInDepth: true` and pass our `SqlFs` as the filesystem.
+**The bug is real, but it does not manifest in the `sql-fs-api` service today** because `defenseInDepth` is never enabled at the only `new Bash(...)` call site (`src/api/session-manager.ts:299`). It manifests only for downstream consumers (or local tests) that compose `just-bash` with `defenseInDepth: true` and pass our `SqlFs` as the filesystem.
 
 The hypothesis is correct. `defenseInDepth` monkey-patches `setTimeout`, `setImmediate`, `Function`, `eval`, `process`, and dynamic `import` during script execution (just-bash `Bash.d.ts:121–146`). The `postgres` driver (porsager/postgres v3) uses `setTimeout`/`clearTimeout` for connect / idle / lifetime timers and `setImmediate`/`clearImmediate` for batched writes (see `node_modules/postgres/src/connection.js:1042–1062`, `node_modules/postgres/src/index.js:372`, `node_modules/postgres/src/connection.js:250, 256, 427, 440`). Because there is **no worker / thread boundary between the bash script execution context and the SqlFs → postgres call** — the `IFileSystem` runs in the same JS event loop as the interpreter — postgres timer calls happen while the globals are patched, and `defenseInDepth` raises `WorkerSecurityViolationError`.
 
@@ -78,7 +78,7 @@ just-bash itself acknowledges this: commands that legitimately need real timers 
 
 Scenarios:
 
-- **Production virtualfs-api today:** Not affected. `session-manager.ts:299` passes no `defenseInDepth`, so the patches never run, and the `postgres` driver uses unpatched timers happily.
+- **Production sql-fs-api today:** Not affected. `session-manager.ts:299` passes no `defenseInDepth`, so the patches never run, and the `postgres` driver uses unpatched timers happily.
 - **Downstream consumer enables it:** If anyone instantiates `new Bash({ fs: sqlFs, defenseInDepth: true })` (the JSDoc example at `Bash.d.ts:135`), the first SqlFs operation that triggers postgres I/O — typically the first `cat`/`ls` after sandbox boot, or our own `loadAllPaths` path-snapshot warmup — throws `WorkerSecurityViolationError` complaining about `setTimeout` (or `setImmediate` for write batching). The user reports exactly this.
 - **Wrapping with `Sandbox` instead of `Bash`:** `SandboxOptions.defenseInDepth` defaults to `true` (`Sandbox.d.ts:32–35`). A consumer who picks the higher-level wrapper gets the bug by default and has to opt out explicitly.
 - **Tests that mimic that setup:** Same as above. The user's repro path.

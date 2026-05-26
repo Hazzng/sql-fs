@@ -1,5 +1,5 @@
 {
-  "project": "VirtualFS API",
+  "project": "SQL-FS API",
   "branchName": "ralph/phase3-ingest-mcp",
   "description": "Phase 3: Ingest/Export + MCP Server. Full agent workflow: upload a project, run commands, download results. MCP tools work in MCP Inspector. 9 stories across 2 epics.",
   "userStories": [
@@ -71,7 +71,7 @@
       "acceptanceCriteria": [
         "src/api/mcp/server.ts creates MCP server via @modelcontextprotocol/sdk",
         "Uses StreamableHTTPServerTransport (SSE) per MCP 2025-03-26 spec",
-        "Server info includes name ('virtualfs') and version (from package.json or hardcoded)",
+        "Server info includes name ('sqlfs') and version (from package.json or hardcoded)",
         "MCP endpoint mounted on Hono app at /mcp path in server.ts",
         "Handles POST /mcp for client requests and GET /mcp for SSE stream",
         "Install @modelcontextprotocol/sdk as dependency if not already present",

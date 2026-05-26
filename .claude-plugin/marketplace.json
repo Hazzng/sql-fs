@@ -1,14 +1,14 @@
 {
-	"name": "virtualfs-plugins",
+	"name": "sql-fs-plugins",
 	"owner": {
 		"name": "Harry Nguyen",
 		"email": "Harry.Nguyen@insightfactory.ai"
 	},
 	"plugins": [
 		{
-			"name": "virtualfs-api",
-			"source": "./plugins/virtualfs",
-			"description": "Operator skill for the VirtualFS API — persistent bash sandbox service with SQL-backed filesystem"
+			"name": "sql-fs-api",
+			"source": "./plugins/sql-fs",
+			"description": "Operator skill for the SQL-FS API — persistent bash sandbox service with SQL-backed filesystem"
 		}
 	]
 }

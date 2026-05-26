@@ -10,7 +10,7 @@
 
 ## 1. Background — what is this and why
 
-`virtualfs-api` exposes a `Bash` sandbox to AI agents over HTTP. Agents run real `grep`, `cat`, `awk` against real files; the filesystem itself is `SqlFs`, an `IFileSystem` implementation backed by Postgres. File contents live in a global, content-addressable `blobs` table keyed by `sha256`. Inodes carry a `content_sha256` pointing into that table. Reads go through an in-memory LRU `#contentCache` (50 MB cap, keyed by `inodeId`); on miss, the read falls through to a SQL fetch.
+`sql-fs-api` exposes a `Bash` sandbox to AI agents over HTTP. Agents run real `grep`, `cat`, `awk` against real files; the filesystem itself is `SqlFs`, an `IFileSystem` implementation backed by Postgres. File contents live in a global, content-addressable `blobs` table keyed by `sha256`. Inodes carry a `content_sha256` pointing into that table. Reads go through an in-memory LRU `#contentCache` (50 MB cap, keyed by `inodeId`); on miss, the read falls through to a SQL fetch.
 
 **The cold-grep measurement that motivated issue #38** (AU-East Postgres, 12 ms RTT, 125-file / 1.18 MB Python tree):
 

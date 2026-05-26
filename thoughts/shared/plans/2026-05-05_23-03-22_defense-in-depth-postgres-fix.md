@@ -3,7 +3,7 @@ date: 2026-05-05T23:03:22+09:30
 researcher: Harry Nguyen
 git_commit: effe298e8b608097b637c8dac82c7db1bc637e33
 branch: main
-repository: virtualFS
+repository: sql-fs
 task: "Enable just-bash defenseInDepth without breaking Postgres calls"
 tags: [implementation-plan, just-bash, defense-in-depth, sql-fs, postgres, security]
 status: draft
@@ -15,7 +15,7 @@ last_updated_by: Harry Nguyen
 
 ## Overview
 
-Make virtualfs-api compatible with just-bash's `defenseInDepth` security layer by routing every Postgres call through `DefenseInDepthBox.runTrustedAsync(...)`, then wire an opt-in env flag (`JUST_BASH_DEFENSE_IN_DEPTH`) into our `Bash` constructor with `auditMode` enabled by default for safe rollout.
+Make sql-fs-api compatible with just-bash's `defenseInDepth` security layer by routing every Postgres call through `DefenseInDepthBox.runTrustedAsync(...)`, then wire an opt-in env flag (`JUST_BASH_DEFENSE_IN_DEPTH`) into our `Bash` constructor with `auditMode` enabled by default for safe rollout.
 
 ## Current State Analysis
 

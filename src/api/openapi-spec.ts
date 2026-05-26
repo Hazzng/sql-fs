@@ -1,5 +1,5 @@
 /**
- * OpenAPI 3.0 specification for the VirtualFS API.
+ * OpenAPI 3.0 specification for the SQL-FS API.
  * Served at GET /openapi.json; Swagger UI at GET /docs.
  */
 
@@ -87,7 +87,7 @@ const bearerAuth = { bearerAuth: [] };
 export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
-		title: "VirtualFS API",
+		title: "SQL-FS API",
 		version: "0.4.1",
 		description: "Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres.",
 	},

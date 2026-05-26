@@ -1,4 +1,4 @@
-# Contributing to virtualFS
+# Contributing to sql-fs
 
 Thank you for your interest. This guide covers everything you need to go from zero to a merged PR.
 
@@ -11,8 +11,8 @@ Thank you for your interest. This guide covers everything you need to go from ze
 ## Setup
 
 ```bash
-git clone https://github.com/your-org/virtualfs-api.git
-cd virtualfs-api
+git clone https://github.com/your-org/sql-fs-api.git
+cd sql-fs-api
 pnpm install
 cp .env.example .env        # fill in DATABASE_URL and AUTH_SECRET at minimum
 pnpm dev                    # dev server at http://localhost:8080
@@ -92,7 +92,7 @@ Commit the result and push — the CI pipeline cuts a GitHub Release from the ne
 ## Reporting issues
 
 Open a GitHub issue with:
-- The virtualFS version (`pnpm list virtualfs-api` or the `/readyz` response)
+- The sql-fs version (`pnpm list sql-fs-api` or the `/readyz` response)
 - Steps to reproduce
 - Expected vs actual behaviour
 - Relevant logs (redact connection strings)

@@ -3,7 +3,7 @@ date: 2026-05-14T20:27:13+09:30
 researcher: Harry Nguyen
 git_commit: dd7e7fd84c7256457ca28225d8118072ff9b8e0a
 branch: main
-repository: virtualFS
+repository: sql-fs
 topic: "Issue #64 — Why `exec-sync-batch` / `bash_exec_batch` does not parallelize even on the readOnly path"
 tags: [research, codebase, batch-exec, parallelism, rw-lock, read-only, async-local-storage, session-manager]
 status: complete
@@ -17,13 +17,13 @@ last_updated_by: Harry Nguyen
 **Researcher**: Harry Nguyen
 **Git Commit**: `dd7e7fd84c7256457ca28225d8118072ff9b8e0a`
 **Branch**: `main`
-**Repository**: virtualFS
+**Repository**: sql-fs
 
 ---
 
 ## Research Question
 
-[Issue #64](https://github.com/Hazzng/virtualFS/issues/64) asks: why does `POST /v1/sandboxes/:id/exec-sync-batch` (and MCP `bash_exec_batch`) still execute scripts **sequentially** even when the call enters via `readOnly: true`, despite the parallel-readOnly bash-exec feature already shipping (Issue #60, commits 34228c1 → 0.3.1)?
+[Issue #64](https://github.com/Hazzng/sql-fs/issues/64) asks: why does `POST /v1/sandboxes/:id/exec-sync-batch` (and MCP `bash_exec_batch`) still execute scripts **sequentially** even when the call enters via `readOnly: true`, despite the parallel-readOnly bash-exec feature already shipping (Issue #60, commits 34228c1 → 0.3.1)?
 
 We need to:
 

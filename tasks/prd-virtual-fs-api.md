@@ -1,4 +1,4 @@
-# PRD: VirtualFS — Persistent Filesystem Backends + HTTP/MCP API for just-bash
+# PRD: SQL-FS — Persistent Filesystem Backends + HTTP/MCP API for just-bash
 
 ## Introduction
 

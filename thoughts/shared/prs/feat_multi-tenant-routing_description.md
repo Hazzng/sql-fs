@@ -2,7 +2,7 @@
 
 ## Summary
 
-Enables a single `virtualfs-api` process to serve N independent tenants, each mapped to a dedicated Postgres database, with full Redis key isolation and per-tenant startup migrations. Backward-compatible: existing `DATABASE_URL` deployments continue working as a single implicit `default` tenant with no config changes.
+Enables a single `sql-fs-api` process to serve N independent tenants, each mapped to a dedicated Postgres database, with full Redis key isolation and per-tenant startup migrations. Backward-compatible: existing `DATABASE_URL` deployments continue working as a single implicit `default` tenant with no config changes.
 
 This PR also consolidates the multi-replica Redis hardening work (hardened version-counter publishing, fire-and-forget blob writes, advisory-lock splitting, distributed-lock option validation, env-var validation at startup) that formed the foundation for the multi-tenant layer.
 

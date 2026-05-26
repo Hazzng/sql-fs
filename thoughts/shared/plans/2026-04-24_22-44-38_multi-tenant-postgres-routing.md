@@ -3,7 +3,7 @@ date: 2026-04-24T22:44:38+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: 6aed558064353fc2ff60489fdf65d9d3e7692fa9
 branch: feat/multi-replica-redis
-repository: virtualFS
+repository: sql-fs
 task: "Multi-tenant Postgres routing (one container, N databases)"
 tags: [implementation-plan, multi-tenant, session-manager, auth, redis, postgres]
 status: draft
@@ -15,7 +15,7 @@ last_updated_by: quangnguyentechno@gmail.com
 
 ## Overview
 
-Allow a single virtualFS API process to serve N tenants, each mapped to a dedicated Postgres database (all using the default `public` schema). Tenant is resolved from a JWT claim; Postgres dialects are cached per-tenant and lazily constructed on first use. All Redis keys gain a tenant prefix. A startup migration runner applies DDL to every configured tenant database. Backward-compatible with the current single-`DATABASE_URL` deployment.
+Allow a single sql-fs API process to serve N tenants, each mapped to a dedicated Postgres database (all using the default `public` schema). Tenant is resolved from a JWT claim; Postgres dialects are cached per-tenant and lazily constructed on first use. All Redis keys gain a tenant prefix. A startup migration runner applies DDL to every configured tenant database. Backward-compatible with the current single-`DATABASE_URL` deployment.
 
 ## Current State Analysis
 

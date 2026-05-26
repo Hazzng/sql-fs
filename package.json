@@ -1,5 +1,5 @@
 {
-	"name": "virtualfs-api",
+	"name": "sql-fs-api",
 	"version": "0.4.1",
 	"description": "Persistent filesystem backend (Postgres) + HTTP/MCP API for just-bash sandboxes",
 	"type": "module",

@@ -1,6 +1,6 @@
-# Implementation Plan: VirtualFS — Persistent Filesystem Backends + HTTP/MCP API
+# Implementation Plan: SQL-FS — Persistent Filesystem Backends + HTTP/MCP API
 
-> PRD: [tasks/prd-virtual-fs-api.md](./prd-virtual-fs-api.md)
+> PRD: [tasks/prd-sql-fs-api.md](./prd-sql-fs-api.md)
 > V1 = 97 stories across Phases 1, 2, 3, 5, 6. Phase 4 is documented future roadmap (11 stories, not in V1).
 > Each phase ends with a concrete verification step.
 

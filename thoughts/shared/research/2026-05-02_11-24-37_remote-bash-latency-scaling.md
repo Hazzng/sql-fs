@@ -3,7 +3,7 @@ date: 2026-05-02T11:24:37+09:30
 researcher: quangnguyentechno@gmail.com
 git_commit: 7a7395bb9158cd6c39dbd498af9604769e7350cd
 branch: feature/network-trip
-repository: virtualFS
+repository: sql-fs
 topic: "Why repeated bash ops (mv/mkdir/rm) scale linearly in remote-bash benchmark"
 tags: [research, codebase, sql-fs, just-bash, postgres, latency, benchmark]
 status: complete
@@ -17,7 +17,7 @@ last_updated_by: quangnguyentechno@gmail.com
 **Researcher**: quangnguyentechno@gmail.com
 **Git Commit**: 7a7395bb9158cd6c39dbd498af9604769e7350cd
 **Branch**: feature/network-trip
-**Repository**: virtualFS
+**Repository**: sql-fs
 
 ## Research Question
 
