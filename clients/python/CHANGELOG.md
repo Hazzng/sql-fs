@@ -5,6 +5,16 @@ All notable changes to the SQL-FS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-05-27
+
+### Changed
+
+- Package renamed from `virtualfs-sdk` to `sql-fs-sdk` following project rebrand.
+- Top-level import module renamed from `virtualfs` to `sqlfs` (`from sqlfs import Client, Sandbox`).
+- `VirtualFSError` base exception class renamed to `SQLFSError`.
+
+---
+
 ## [0.2.4] - 2026-05-17
 
 ### Fixed
