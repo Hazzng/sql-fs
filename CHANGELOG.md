@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+### Patch Changes
+
+- Thanks [@Hazzng](https://github.com/Hazzng)! - Rebranding the repo as sql-fs
+
 ## 0.4.1
 
 ### Patch Changes
