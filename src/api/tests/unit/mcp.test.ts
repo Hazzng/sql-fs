@@ -8,6 +8,9 @@
  * US-087: MCP tool — fs_export
  */
 
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -47,6 +50,41 @@ function withBulkIngest(fs: IFileSystem): IFileSystem & Pick<ICoherentFs, "bulkI
 }
 
 const b64 = (s: string): string => Buffer.from(s, "utf-8").toString("base64");
+
+/**
+ * Boots an in-memory MCP server + client, registers tools, and creates a
+ * sandbox. Returns `{ client, sandboxId }` plus a `close()` shortcut.
+ *
+ * Used by the fs_ingest tests below — every one of them needs the same
+ * ~10 lines of bootstrap; centralizing here keeps the per-test bodies
+ * focused on the behavior under test.
+ */
+async function bootIngestHarness(
+	opts: { withBulk?: boolean } = {},
+): Promise<{ client: Client; sandboxId: string; close: () => Promise<void> }> {
+	const withBulk = opts.withBulk ?? true;
+	const sessionManager = new SessionManager({
+		createFs: async () => (withBulk ? withBulkIngest(new InMemoryFs()) : new InMemoryFs()),
+	});
+	const server = createMcpServer();
+	registerTools(server, sessionManager, "test-owner", "default");
+	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+	const client = new Client({ name: "test-client", version: "1.0.0" });
+	await server.connect(serverTransport);
+	await client.connect(clientTransport);
+
+	const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+	const { id: sandboxId } = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+		id: string;
+	};
+
+	return { client, sandboxId, close: () => client.close() };
+}
+
+function parseToolJson<T>(res: unknown): T {
+	const content = (res as { content: Array<{ text?: string }> }).content;
+	return JSON.parse(content[0]?.text ?? "") as T;
+}
 
 describe("MCP server", () => {
 	it("initializes without error", () => {
@@ -567,6 +605,139 @@ describe("MCP tool — fs_ingest", () => {
 		expect(parsed).toEqual({ ok: false, error: "basePath must be a safe absolute path" });
 
 		await client.close();
+	});
+
+	it("ingests via paths — server reads host files without model generating base64 tokens", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-test-"));
+		try {
+			await writeFile(join(tmpDir, "a.txt"), "hello from a", "utf-8");
+			await writeFile(join(tmpDir, "b.txt"), "hello from b", "utf-8");
+
+			const { client, sandboxId, close } = await bootIngestHarness();
+
+			const ingestResult = await client.callTool({
+				name: "fs_ingest",
+				arguments: {
+					id: sandboxId,
+					basePath: "/home/user/project",
+					paths: {
+						"a.txt": join(tmpDir, "a.txt"),
+						"b.txt": join(tmpDir, "b.txt"),
+					},
+				},
+			});
+			expect(parseToolJson<{ ok: boolean; count: number }>(ingestResult)).toEqual({ ok: true, count: 2 });
+
+			for (const [rel, expected] of [
+				["a.txt", "hello from a"],
+				["b.txt", "hello from b"],
+			] as Array<[string, string]>) {
+				const execResult = await client.callTool({
+					name: "bash_exec",
+					arguments: { id: sandboxId, script: `cat /home/user/project/${rel}` },
+				});
+				const exec = parseToolJson<{ stdout: string; exitCode: number }>(execResult);
+				expect(exec.exitCode).toBe(0);
+				expect(exec.stdout).toBe(expected);
+			}
+
+			await close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("merges files and paths in one call", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-test-"));
+		try {
+			await writeFile(join(tmpDir, "from-disk.txt"), "disk content", "utf-8");
+
+			const { client, sandboxId, close } = await bootIngestHarness();
+
+			const ingestResult = await client.callTool({
+				name: "fs_ingest",
+				arguments: {
+					id: sandboxId,
+					basePath: "/home/user/project",
+					files: { "generated.txt": b64("generated content") },
+					paths: { "from-disk.txt": join(tmpDir, "from-disk.txt") },
+				},
+			});
+			expect(parseToolJson<{ ok: boolean; count: number }>(ingestResult)).toEqual({ ok: true, count: 2 });
+
+			await close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects relative host path values before any I/O", async () => {
+		const { client, sandboxId, close } = await bootIngestHarness();
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: sandboxId,
+				basePath: "/home/user/proj",
+				paths: { "a.txt": "relative/path/not/absolute" },
+			},
+		});
+		expect(parseToolJson<{ ok: boolean; error: string }>(res)).toEqual({
+			ok: false,
+			error: "invalid host paths: a.txt",
+		});
+		await close();
+	});
+
+	it("returns unreadable error when a host path does not exist", async () => {
+		const { client, sandboxId, close } = await bootIngestHarness();
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: sandboxId,
+				basePath: "/home/user/proj",
+				paths: { "missing.txt": "/tmp/does-not-exist-sqlfs-test-12345.txt" },
+			},
+		});
+		const parsed = parseToolJson<{ ok: boolean; error: string }>(res);
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toContain("unreadable host paths");
+		expect(parsed.error).toContain("missing.txt");
+		await close();
+	});
+
+	it("rejects when both files and paths are absent", async () => {
+		const { client, sandboxId, close } = await bootIngestHarness();
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: { id: sandboxId, basePath: "/home/user/proj" },
+		});
+		const parsed = parseToolJson<{ ok: boolean; error: string }>(res);
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toContain("at least one");
+		await close();
+	});
+
+	it("rejects duplicate keys between files and paths", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-test-"));
+		try {
+			await writeFile(join(tmpDir, "dup.txt"), "from disk", "utf-8");
+			const { client, sandboxId, close } = await bootIngestHarness();
+			const res = await client.callTool({
+				name: "fs_ingest",
+				arguments: {
+					id: sandboxId,
+					basePath: "/home/user/proj",
+					files: { "dup.txt": b64("from inline") },
+					paths: { "dup.txt": join(tmpDir, "dup.txt") },
+				},
+			});
+			const parsed = parseToolJson<{ ok: boolean; error: string }>(res);
+			expect(parsed.ok).toBe(false);
+			expect(parsed.error).toContain("duplicate keys in files and paths: dup.txt");
+			await close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
 	});
 
 	it("returns a sanitized internal error (no backend wiring) when the FS lacks bulkIngest", async () => {

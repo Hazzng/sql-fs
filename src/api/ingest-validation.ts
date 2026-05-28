@@ -1,10 +1,15 @@
 /**
- * Shared input validators for the manifest-based ingest paths
+ * Shared input validators for the ingest entry points
  * (HTTP `POST /v1/sandboxes/:id/ingest-files` and MCP `fs_ingest`).
  *
- * Both surfaces accept the same `{ basePath, files: { relPath: base64 } }`
- * shape and need the same checks. Keeping them here avoids drift between
- * the two entry points.
+ * Ingest accepts two payload modes that can be combined in one call:
+ *   - `files`: { relPath: base64 }   — inline bytes (both surfaces)
+ *   - `paths`: { relPath: hostPath } — server reads the host filesystem (MCP only)
+ *
+ * Both modes share basePath/relative-path rules; only the `paths` mode
+ * needs `isValidHostPath`. Keeping every check here avoids drift between
+ * the surfaces. The actual orchestration (read host files, dedup keys,
+ * shape errors) lives in `ingest-manifest.ts`.
  */
 
 /**
@@ -59,4 +64,24 @@ export function isValidBasePath(p: string): boolean {
 	if (!/^\/[a-zA-Z0-9_\-./]*$/.test(p)) return false;
 	if (p.includes("..")) return false;
 	return true;
+}
+
+/**
+ * Validates an absolute host-filesystem path supplied to `fs_ingest`'s `paths`
+ * param. The server reads the file directly, so we only require the path to be
+ * absolute and free of null bytes — the OS enforces access control.
+ *
+ * NOTE on `..`: unlike `isValidBasePath`, we do NOT reject `..` segments here.
+ * The server resolves these at read time and the OS gates whether the
+ * process can read the resulting target; rejecting them in the validator
+ * would block legitimate uses (e.g. paths produced by tools that don't
+ * canonicalize). The asymmetry is intentional — basePath is a path inside
+ * the sandbox where `..` would escape isolation; hostPath is outside the
+ * sandbox entirely.
+ */
+export function isValidHostPath(p: string): boolean {
+	if (p.length === 0) return false;
+	if (p.includes("\0")) return false;
+	// Accept Unix absolute paths (/…) and Windows absolute paths (C:\…, \\…)
+	return p.startsWith("/") || /^[a-zA-Z]:[/\\]/.test(p) || p.startsWith("\\\\");
 }
