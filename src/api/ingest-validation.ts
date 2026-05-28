@@ -60,3 +60,15 @@ export function isValidBasePath(p: string): boolean {
 	if (p.includes("..")) return false;
 	return true;
 }
+
+/**
+ * Validates an absolute host-filesystem path supplied to `fs_ingest`'s `paths`
+ * param. The server reads the file directly, so we only require the path to be
+ * absolute and free of null bytes — the OS enforces access control.
+ */
+export function isValidHostPath(p: string): boolean {
+	if (p.length === 0) return false;
+	if (p.includes("\0")) return false;
+	// Accept Unix absolute paths (/…) and Windows absolute paths (C:\…, \\…)
+	return p.startsWith("/") || /^[a-zA-Z]:[/\\]/.test(p) || p.startsWith("\\\\");
+}

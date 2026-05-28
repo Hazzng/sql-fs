@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { isValidBase64, isValidBasePath, isValidRelativePath } from "../../ingest-validation.js";
+import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "../../ingest-validation.js";
 
 describe("isValidRelativePath", () => {
 	it.each([
@@ -55,6 +55,29 @@ describe("isValidBase64", () => {
 		["YQ=", "wrong padding length for 1-byte payload"],
 	])("rejects malformed base64 %p — %s", (s) => {
 		expect(isValidBase64(s)).toBe(false);
+	});
+});
+
+describe("isValidHostPath", () => {
+	it.each([
+		["/home/user/project/src/app.ts", "Unix absolute path"],
+		["/tmp/upload.bin", "Unix tmp path"],
+		["/", "root"],
+		["C:\\Users\\me\\project\\file.ts", "Windows drive-letter path"],
+		["C:/Users/me/project/file.ts", "Windows drive-letter with forward slashes"],
+		["\\\\server\\share\\file.txt", "Windows UNC path"],
+	])("accepts valid host path %p — %s", (p) => {
+		expect(isValidHostPath(p)).toBe(true);
+	});
+
+	it.each([
+		["", "empty string"],
+		["relative/path.ts", "relative path — not absolute"],
+		["./local.ts", "dot-relative path"],
+		["../escape.ts", "parent traversal"],
+		["/home/user\0evil", "null byte injection"],
+	])("rejects invalid host path %p — %s", (p) => {
+		expect(isValidHostPath(p)).toBe(false);
 	});
 });
 

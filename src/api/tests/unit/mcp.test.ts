@@ -8,6 +8,9 @@
  * US-087: MCP tool — fs_export
  */
 
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -565,6 +568,197 @@ describe("MCP tool — fs_ingest", () => {
 		const content = res.content as Array<{ type: string; text?: string }>;
 		const parsed = JSON.parse(content[0]?.text ?? "") as { ok: boolean; error: string };
 		expect(parsed).toEqual({ ok: false, error: "basePath must be a safe absolute path" });
+
+		await client.close();
+	});
+
+	it("ingests via paths — server reads host files without model generating base64 tokens", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-test-"));
+		try {
+			await writeFile(join(tmpDir, "a.txt"), "hello from a", "utf-8");
+			await writeFile(join(tmpDir, "b.txt"), "hello from b", "utf-8");
+
+			const sessionManager = new SessionManager({
+				createFs: async () => withBulkIngest(new InMemoryFs()),
+			});
+			const server = createMcpServer();
+			registerTools(server, sessionManager, "test-owner", "default");
+			const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+			const client = new Client({ name: "test-client", version: "1.0.0" });
+			await server.connect(serverTransport);
+			await client.connect(clientTransport);
+
+			const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+			const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+			const ingestResult = await client.callTool({
+				name: "fs_ingest",
+				arguments: {
+					id: created.id,
+					basePath: "/home/user/project",
+					paths: {
+						"a.txt": join(tmpDir, "a.txt"),
+						"b.txt": join(tmpDir, "b.txt"),
+					},
+				},
+			});
+
+			const parsed = JSON.parse((ingestResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+				ok: boolean;
+				count: number;
+			};
+			expect(parsed).toEqual({ ok: true, count: 2 });
+
+			for (const [rel, expected] of [
+				["a.txt", "hello from a"],
+				["b.txt", "hello from b"],
+			] as Array<[string, string]>) {
+				const execResult = await client.callTool({
+					name: "bash_exec",
+					arguments: { id: created.id, script: `cat /home/user/project/${rel}` },
+				});
+				const exec = JSON.parse((execResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+					stdout: string;
+					exitCode: number;
+				};
+				expect(exec.exitCode).toBe(0);
+				expect(exec.stdout).toBe(expected);
+			}
+
+			await client.close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("merges files and paths in one call", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-test-"));
+		try {
+			await writeFile(join(tmpDir, "from-disk.txt"), "disk content", "utf-8");
+
+			const sessionManager = new SessionManager({
+				createFs: async () => withBulkIngest(new InMemoryFs()),
+			});
+			const server = createMcpServer();
+			registerTools(server, sessionManager, "test-owner", "default");
+			const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+			const client = new Client({ name: "test-client", version: "1.0.0" });
+			await server.connect(serverTransport);
+			await client.connect(clientTransport);
+
+			const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+			const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+			const ingestResult = await client.callTool({
+				name: "fs_ingest",
+				arguments: {
+					id: created.id,
+					basePath: "/home/user/project",
+					files: { "generated.txt": b64("generated content") },
+					paths: { "from-disk.txt": join(tmpDir, "from-disk.txt") },
+				},
+			});
+
+			const parsed = JSON.parse((ingestResult.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+				ok: boolean;
+				count: number;
+			};
+			expect(parsed).toEqual({ ok: true, count: 2 });
+
+			await client.close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects relative host path values before any I/O", async () => {
+		const sessionManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/proj",
+				paths: { "a.txt": "relative/path/not/absolute" },
+			},
+		});
+		const parsed = JSON.parse((res.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+			ok: boolean;
+			error: string;
+		};
+		expect(parsed).toEqual({ ok: false, error: "invalid host paths: a.txt" });
+
+		await client.close();
+	});
+
+	it("returns unreadable error when a host path does not exist", async () => {
+		const sessionManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: {
+				id: created.id,
+				basePath: "/home/user/proj",
+				paths: { "missing.txt": "/tmp/does-not-exist-sqlfs-test-12345.txt" },
+			},
+		});
+		const parsed = JSON.parse((res.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+			ok: boolean;
+			error: string;
+		};
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toContain("unreadable host paths");
+		expect(parsed.error).toContain("missing.txt");
+
+		await client.close();
+	});
+
+	it("rejects when both files and paths are absent", async () => {
+		const sessionManager = new SessionManager({
+			createFs: async () => withBulkIngest(new InMemoryFs()),
+		});
+		const server = createMcpServer();
+		registerTools(server, sessionManager, "test-owner", "default");
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const createResult = await client.callTool({ name: "sandbox_create", arguments: {} });
+		const created = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+
+		const res = await client.callTool({
+			name: "fs_ingest",
+			arguments: { id: created.id, basePath: "/home/user/proj" },
+		});
+		const parsed = JSON.parse((res.content as Array<{ text?: string }>)[0]?.text ?? "") as {
+			ok: boolean;
+			error: string;
+		};
+		expect(parsed.ok).toBe(false);
+		expect(parsed.error).toContain("at least one");
 
 		await client.close();
 	});
