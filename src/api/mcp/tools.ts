@@ -8,12 +8,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
-import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
-import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "../ingest-validation.js";
+import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
@@ -410,114 +408,17 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				),
 		},
 		async (args) => {
-			const basePath = args.basePath ?? "/home/user";
-
-			if (!isValidBasePath(basePath)) {
+			const built = await buildBulkIngestPayload({
+				basePath: args.basePath ?? "/home/user",
+				files: args.files,
+				paths: args.paths,
+			});
+			if (!built.ok) {
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: "basePath must be a safe absolute path" }),
-						},
-					],
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: built.errors.join("; ") }) }],
 				};
 			}
-
-			const filesEntries = Object.entries(args.files ?? {});
-			const pathsEntries = Object.entries(args.paths ?? {});
-			if (filesEntries.length === 0 && pathsEntries.length === 0) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: "at least one of `files` or `paths` must be non-empty" }),
-						},
-					],
-				};
-			}
-
-			const bulkFiles: BulkIngestFile[] = [];
-			const invalidPaths: string[] = [];
-			const invalidBase64: string[] = [];
-
-			// ── inline base64 ────────────────────────────────────────────────
-			for (const [rel, b64] of filesEntries) {
-				if (!isValidRelativePath(rel)) {
-					invalidPaths.push(rel);
-					continue;
-				}
-				if (!isValidBase64(b64)) {
-					invalidBase64.push(rel);
-					continue;
-				}
-				bulkFiles.push({
-					path: `${basePath}/${rel}`,
-					content: new Uint8Array(Buffer.from(b64, "base64")),
-					mode: 0o644,
-				});
-			}
-
-			if (invalidPaths.length > 0 || invalidBase64.length > 0) {
-				const parts: string[] = [];
-				if (invalidPaths.length > 0) parts.push(`invalid paths: ${invalidPaths.join(", ")}`);
-				if (invalidBase64.length > 0) parts.push(`invalid base64: ${invalidBase64.join(", ")}`);
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: parts.join("; ") }) }],
-				};
-			}
-
-			// ── host-filesystem paths ────────────────────────────────────────
-			// Validate all keys/values before doing any I/O so we surface a
-			// single consolidated error rather than failing mid-batch.
-			const invalidRelPaths: string[] = [];
-			const invalidHostPaths: string[] = [];
-			for (const [rel, hostPath] of pathsEntries) {
-				if (!isValidRelativePath(rel)) invalidRelPaths.push(rel);
-				else if (!isValidHostPath(hostPath)) invalidHostPaths.push(rel);
-			}
-			if (invalidRelPaths.length > 0 || invalidHostPaths.length > 0) {
-				const parts: string[] = [];
-				if (invalidRelPaths.length > 0) parts.push(`invalid paths: ${invalidRelPaths.join(", ")}`);
-				if (invalidHostPaths.length > 0) parts.push(`invalid host paths: ${invalidHostPaths.join(", ")}`);
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: parts.join("; ") }) }],
-				};
-			}
-
-			// Read all host files in parallel — same pattern as py-sdk ingest_files().
-			const readResults = await Promise.allSettled(
-				pathsEntries.map(async ([rel, hostPath]) => {
-					const bytes = await readFile(hostPath);
-					return { rel, bytes };
-				}),
-			);
-
-			const unreadable: string[] = [];
-			for (const result of readResults) {
-				if (result.status === "rejected") {
-					// The rejected value is an fs error; extract the rel path from
-					// the corresponding pathsEntries position via index.
-					const idx = readResults.indexOf(result);
-					const entry = pathsEntries[idx];
-					if (entry !== undefined) unreadable.push(entry[0]);
-				} else {
-					bulkFiles.push({
-						path: `${basePath}/${result.value.rel}`,
-						content: new Uint8Array(result.value.bytes),
-						mode: 0o644,
-					});
-				}
-			}
-			if (unreadable.length > 0) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: `unreadable host paths: ${unreadable.join(", ")}` }),
-						},
-					],
-				};
-			}
+			const { bulkFiles } = built;
 
 			try {
 				await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {

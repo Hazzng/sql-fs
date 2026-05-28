@@ -7,9 +7,8 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
-import type { BulkIngestFile } from "../../fs/sql-fs/types.js";
 import type { AuthVariables } from "../auth.js";
-import { isValidBase64, isValidBasePath, isValidRelativePath } from "../ingest-validation.js";
+import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -43,38 +42,16 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 
 		const { basePath, files } = parsed.data;
 
-		if (!isValidBasePath(basePath)) {
+		// HTTP intentionally does NOT expose the `paths` (host-filesystem) ingest
+		// mode — that's a local-trust capability and lives only on the MCP surface.
+		const built = await buildBulkIngestPayload({ basePath, files, allowEmpty: true });
+		if (!built.ok) {
 			return c.json(
-				{ error: "validation_error", code: "INVALID_INPUT", details: ["basePath must be a safe absolute path"] },
+				{ error: "validation_error", code: "INVALID_INPUT", details: built.errors },
 				400 as ContentfulStatusCode,
 			);
 		}
-
-		const bulkFiles: BulkIngestFile[] = [];
-		const invalidPaths: string[] = [];
-		const invalidBase64: string[] = [];
-		for (const [rel, b64] of Object.entries(files)) {
-			if (!isValidRelativePath(rel)) {
-				invalidPaths.push(rel);
-				continue;
-			}
-			if (!isValidBase64(b64)) {
-				invalidBase64.push(rel);
-				continue;
-			}
-			bulkFiles.push({
-				path: `${basePath}/${rel}`,
-				content: Buffer.from(b64, "base64"),
-				mode: 0o644,
-			});
-		}
-		if (invalidPaths.length > 0 || invalidBase64.length > 0) {
-			const details: string[] = [];
-			if (invalidPaths.length > 0) details.push(`invalid paths: ${invalidPaths.join(", ")}`);
-			if (invalidBase64.length > 0) details.push(`invalid base64: ${invalidBase64.join(", ")}`);
-			return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
-		}
-
+		const { bulkFiles } = built;
 		const fileCount = bulkFiles.length;
 
 		try {
