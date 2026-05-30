@@ -5,8 +5,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { DefenseInDepthBox } from "just-bash";
 import postgres from "postgres";
+import { runTrustedDbAsync } from "../defense.js";
 import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
 import {
@@ -58,7 +58,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		const idleTimeout = envInt("PG_POOL_IDLE_TIMEOUT_S", 30);
 		const connectTimeout = envInt("PG_POOL_CONNECT_TIMEOUT_S", 30);
 		const maxLifetime = envInt("PG_POOL_MAX_LIFETIME_S", 60 * 30);
-		this.pool = await DefenseInDepthBox.runTrustedAsync(() =>
+		this.pool = await runTrustedDbAsync(() =>
 			Promise.resolve(
 				postgres(this.connectionString, {
 					prepare: false,
@@ -72,7 +72,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async disconnect(): Promise<void> {
-		await DefenseInDepthBox.runTrustedAsync(() => this.pool?.end() ?? Promise.resolve());
+		await runTrustedDbAsync(() => this.pool?.end() ?? Promise.resolve());
 		this.pool = null;
 	}
 
