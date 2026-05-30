@@ -130,31 +130,56 @@ export async function withDistributedLock<T>(
 	let lost = false;
 	let stopped = false;
 	let renewTimer: ReturnType<typeof setTimeout> | undefined;
-	const scheduleRenew = (): void => {
+	// The lock is safely held until this instant. Updated on every SUCCESSFUL
+	// renewal; a transient renew failure does NOT move it. Audit H4: a single
+	// transient renew timeout/error must NOT abandon a still-valid lease — we
+	// only relinquish on a definitive ownership loss (token mismatch) or once the
+	// lease has actually expired.
+	let leaseExpiresAt = Date.now() + leaseMs;
+	// After a transient failure, retry promptly (well before lease expiry) rather
+	// than waiting another full renewMs.
+	const renewRetryMs = Math.max(50, Math.floor(renewMs / 4));
+	const scheduleRenew = (delayMs: number): void => {
 		if (stopped) return;
 		renewTimer = setTimeout(async () => {
 			if (stopped) return;
 			// Cap renewal command wait so a stalled Redis can't block release.
-			// We use a generous bound (renewMs) — any longer and the lease has
-			// already expired anyway.
+			let outcome: "renewed" | "ownership_lost" | "transient";
+			// L1: track and clear the race timeout so a won race doesn't leave a
+			// dangling timer pending until it self-fires.
+			let raceTimeout: ReturnType<typeof setTimeout> | undefined;
 			try {
 				const renewPromise = redis.eval(RENEW_SCRIPT, 1, key, token, String(leaseMs));
-				const timeoutPromise = new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("renew_timeout")), renewMs),
-				);
+				const timeoutPromise = new Promise<never>((_, reject) => {
+					raceTimeout = setTimeout(() => reject(new Error("renew_timeout")), renewMs);
+				});
 				const res = await Promise.race([renewPromise, timeoutPromise]);
-				if (res !== 1) lost = true;
+				// RENEW_SCRIPT returns 1 when our token still owns the key, 0 when it
+				// does not (someone else acquired it) → that 0 is a definitive loss.
+				outcome = res === 1 ? "renewed" : "ownership_lost";
 			} catch {
-				lost = true;
+				// Redis error or renew_timeout: transient, the lease may still hold.
+				outcome = "transient";
+			} finally {
+				if (raceTimeout !== undefined) clearTimeout(raceTimeout);
 			}
-			// Once the lock is lost (or a renew has timed out), stop scheduling
-			// further renewals. Otherwise on a hung Redis we'd keep enqueuing
-			// EVAL commands every renewMs that pile up in the ioredis send queue
-			// while their predecessors are still in-flight.
-			if (!stopped && !lost) scheduleRenew();
-		}, renewMs);
+			if (stopped) return;
+			if (outcome === "renewed") {
+				leaseExpiresAt = Date.now() + leaseMs;
+				scheduleRenew(renewMs);
+			} else if (outcome === "ownership_lost") {
+				lost = true;
+			} else if (Date.now() >= leaseExpiresAt) {
+				// Transient failures persisted past the lease — we can no longer be
+				// sure we hold the lock. Relinquish.
+				lost = true;
+			} else {
+				// Transient blip with lease still valid — retry soon, do not give up.
+				scheduleRenew(renewRetryMs);
+			}
+		}, delayMs);
 	};
-	scheduleRenew();
+	scheduleRenew(renewMs);
 
 	// ── Critical section ──
 	try {

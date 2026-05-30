@@ -212,7 +212,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		newParentId: bigint,
 		newName: string,
 	): Promise<void> {
-		const rows = await tx<{ inode_id: string }[]>`
+		// Audit M10: a single wCTE that both DELETEs the destination dirent and
+		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
+		// raises a spurious unique_violation (→ EEXIST) — Postgres checks the PK
+		// for the UPDATE against a snapshot where the to-be-deleted row still
+		// exists. Split into two statements within the SAME transaction: statement
+		// 1 frees the destination slot (and cleans its inode), statement 2 renames
+		// the source into it. Statement 1's effects are visible to statement 2, so
+		// the rename can no longer collide. Atomicity is preserved by the tx.
+		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
@@ -229,18 +237,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				FROM old_dest
 				WHERE inodes.id = old_dest.inode_id
 				RETURNING inodes.id, inodes.nlink
-			),
-			cleaned AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
-			),
-			moved AS (
-				UPDATE dirents
-				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-				RETURNING inode_id
 			)
-			SELECT inode_id FROM moved
+			DELETE FROM inodes
+			WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+		`;
+		const rows = await tx<{ inode_id: string }[]>`
+			UPDATE dirents
+			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			RETURNING inode_id
 		`;
 		if (rows.length === 0) throw createEnoent(oldName);
 	}

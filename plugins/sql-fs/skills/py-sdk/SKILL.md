@@ -195,12 +195,11 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
   worker warm for 10 min idle. Repeated `sb.exec(...)` calls reuse the same Bash
   process — cwd, env vars, and shell functions persist within that window.
 
-- **Use `py-exec` not `python3` for multi-step Python work.** On `python=True`
-  sandboxes, `py-exec -c '...'` keeps the interpreter warm — the ~1.4 s WASM
-  cold-boot is paid once per session, then subsequent calls run in < 5 ms.
-  `python3 -c '...'` cold-boots every call (~1.4 s each). Write multi-step logic
-  to a file and call `py-exec script.py` rather than looping `py-exec -c` calls.
-  Note: `py-exec` state is shared across calls (variables persist like a REPL);
-  use `python3` only when per-call isolation is required.
+- **Batch multi-step Python into one `python3` script, not many `python3 -c` calls.**
+  On `python=True` sandboxes, `python3` is CPython-on-WASM, stdlib only, and each
+  call cold-boots a fresh isolated interpreter (~1.4 s, no shared state). Write
+  your logic to a file and run `python3 script.py` once rather than looping
+  `python3 -c '...'` — one script with a loop avoids paying the cold-boot N times.
+  Persist data across calls via the sandbox filesystem, not interpreter state.
 
 6. Pass `read_only=True` on `sb.exec`, `sb.exec_batch`, and `sb.exec_stream` whenever the script only reads data (grep, cat, find, wc, stat, etc.). This skips the exclusive sandbox write-lock, allowing concurrent reads from multiple callers. Any mutating filesystem op in a read-only script raises `ValidationError(code="EREADONLY_VIOLATION")`.

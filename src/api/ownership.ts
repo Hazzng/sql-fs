@@ -12,8 +12,22 @@ export function forbiddenResponse(): Response {
 	return Response.json({ error: "forbidden", code: "FORBIDDEN" }, { status: 403 });
 }
 
+/**
+ * Fail-CLOSED ownership predicate. Returns `true` only when the caller is
+ * positively identified AND matches the recorded owner.
+ *
+ * Audit M1: the previous check (`owner && owner !== caller`) was fail-OPEN — an
+ * empty/NULL `owner` skipped the comparison entirely, so every authenticated
+ * caller could reach an ownerless sandbox. Auth always populates a non-empty
+ * `sub` (see auth.ts), and both create paths persist `owner = caller`, so an
+ * empty owner only ever indicates legacy/corrupt data and must NOT grant access.
+ */
+export function isOwnedBy(owner: string | null | undefined, caller: string): boolean {
+	return caller.length > 0 && !!owner && owner === caller;
+}
+
 export function assertSessionOwner(session: Pick<Session, "owner">, caller: string): void {
-	if (session.owner && session.owner !== caller) {
+	if (!isOwnedBy(session.owner, caller)) {
 		throw createForbiddenError();
 	}
 }

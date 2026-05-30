@@ -10,6 +10,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { clientSafeErrorMessage } from "../errors.js";
 import { type BatchScriptResult, type ExecuteBatchOptions, executeBatch } from "../lib/batch-exec.js";
 import {
 	forbiddenResponse,
@@ -180,10 +181,11 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					});
 					clearTimeout(timer);
 
-					if (timedOut) {
-						return { kind: "timeout", durationMs: Date.now() - startMs };
-					}
-
+					// Audit L7: a RESOLVED exec means the script ran to completion and any
+					// write committed — return the real result even if the timeout timer
+					// happened to fire in the same tick. Reporting a false 408 here would
+					// make the client retry a write that actually succeeded. The timeout
+					// path applies only when the exec was genuinely aborted (catch below).
 					return {
 						kind: "ok",
 						stdout: result.stdout,
@@ -271,11 +273,13 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				controller.abort();
 			}, timeoutMs);
 
-			const runner = readOnly
-				? sessionManager.withSessionRead.bind(sessionManager)
-				: sessionManager.withExistingSession.bind(sessionManager);
+			// Audit L2: run the streamed exec through the rehydrating, owner-checking
+			// entry point (not withExistingSession). This avoids a spurious ENOENT if
+			// the session is evicted between the pre-check above and here, and re-runs
+			// the ownership check under lock rather than skipping it in this phase.
+			const ownerRunner = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 			try {
-				await runner(tenant, sandboxId, async (session) => {
+				await ownerRunner(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 					try {
 						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 							signal: controller.signal,
@@ -342,7 +346,26 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					});
 					return;
 				}
-				throw err;
+				// Audit M12: never let the stream close without a terminal event —
+				// otherwise the client cannot distinguish a failed exec from a
+				// truncated success. Emit a sanitized error + exit event. Writing may
+				// itself fail if the client already disconnected; ignore that.
+				const errCode = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
+				console.error(
+					JSON.stringify({ event: "exec_sse_error", sandboxId, code: errCode, error: (err as Error).message }),
+				);
+				try {
+					await stream.writeSSE({
+						event: "error",
+						data: JSON.stringify({ t: "error", code: errCode, error: clientSafeErrorMessage(err, "internal error") }),
+					});
+					await stream.writeSSE({
+						event: "exit",
+						data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "error" }),
+					});
+				} catch {
+					// stream already closed (client disconnect) — nothing to surface.
+				}
 			}
 		});
 	});

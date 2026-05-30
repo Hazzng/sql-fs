@@ -15,6 +15,14 @@ import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import type { TenantConfig } from "./tenants.js";
 
+/**
+ * Fixed Postgres advisory-lock key for the migration runner (audit M4). Any
+ * constant works as long as it is stable across replicas; this is an arbitrary
+ * 64-bit value unlikely to collide with application advisory locks (which are
+ * derived from sandbox-id hashes).
+ */
+const MIGRATION_LOCK_KEY = 7_263_001_954_120_388n;
+
 function migrationFiles(): readonly string[] {
 	const dir = fileURLToPath(new URL("../fs/sql-fs/migrations/postgres/", import.meta.url));
 	return readdirSync(dir)
@@ -33,8 +41,19 @@ export async function runMigrations(tenantConfig: TenantConfig): Promise<void> {
 	const files = migrationFiles();
 	for (const tenantId of tenantConfig.tenantIds) {
 		const url = tenantConfig.getConnectionString(tenantId);
+		// max:1 so the session-level advisory lock below is held on the one
+		// connection that runs every migration.
 		const sql = postgres(url, { prepare: false, max: 1 });
+		let lockHeld = false;
 		try {
+			// Audit M4: serialize concurrent multi-replica boots. Without this, two
+			// replicas can run the same DDL at once and crash-loop / race. The
+			// advisory lock makes the second booter wait for the first to finish
+			// (the migrations are idempotent, so it then re-applies cleanly).
+			// Inlined constant (not user input) — pg_advisory_lock takes a bigint
+			// literal; the tagged-template param path binds bigints as text.
+			await sql.unsafe(`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
+			lockHeld = true;
 			for (const path of files) {
 				const body = readFileSync(path, "utf8");
 				const file = path.split(/[/\\]/).pop() ?? path;
@@ -47,8 +66,22 @@ export async function runMigrations(tenantConfig: TenantConfig): Promise<void> {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			console.error(JSON.stringify({ event: "migration_failed", tenantId, error: message }));
+			if (lockHeld) {
+				try {
+					await sql.unsafe(`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);
+				} catch {
+					// best-effort; the lock also releases when the session ends below
+				}
+			}
 			await sql.end({ timeout: 5 });
 			throw new Error(`Migration failed for tenant "${tenantId}": ${message}`);
+		}
+		if (lockHeld) {
+			try {
+				await sql.unsafe(`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);
+			} catch {
+				// best-effort
+			}
 		}
 		await sql.end({ timeout: 5 });
 	}

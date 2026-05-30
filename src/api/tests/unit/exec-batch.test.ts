@@ -22,7 +22,7 @@ async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFil
 	const sessionManager = new SessionManager({
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate("default", SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 	return { sessionManager, fs };
 }
 
@@ -147,7 +147,7 @@ describe("POST /v1/sandboxes/:id/exec-sync-batch", () => {
 			const token = await makeToken();
 
 			const batchSandboxId = `${SANDBOX_ID}-timeout`;
-			const session = await sessionManager.getOrCreate("default", batchSandboxId);
+			const session = await sessionManager.getOrCreate("default", batchSandboxId, undefined, "agent-1");
 
 			// Latch resolves the moment the first exec call begins blocking, which is
 			// AFTER batch-exec.ts has registered its budget setTimeout. Advancing the

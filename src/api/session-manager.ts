@@ -25,7 +25,10 @@ import { nodeCommand } from "./commands/node-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
-import { WarmPythonProcess, createPyExecCommand } from "./lib/warm-python.js";
+// NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
+// It spawned the HOST python3 with full `process.env`, which is a sandbox
+// escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
+// command from just-bash (enabled via `python: true` below) is the safe path.
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -55,9 +58,13 @@ function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
 }
 
 /**
- * Stale-key TTL for `vfs:{tenantId}:ver:*`. Seven days matches the longest realistic
- * idle window; after a full rollback the counter ages out automatically and
- * the next fresh create starts at version 0.
+ * TTL for `vfs:{tenantId}:ver:*`, REFRESHED on every read (GETEX) and write
+ * (INCR+EXPIRE). Because it is renewed on every access and far exceeds the
+ * session idle-eviction window, an actively-used sandbox's counter never
+ * expires; the key only ages out after a sandbox has been completely idle for
+ * this long (by which point no replica holds a `lastSeenVersion` for it), which
+ * is what makes the reset-to-1 safe (audit H6). It is also deleted eagerly on
+ * `destroy`.
  */
 const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
 
@@ -114,6 +121,25 @@ export interface RuntimeOptions {
 
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
 
+/**
+ * Syntactically valid sandbox id: UUIDs and dashed/underscored slugs, 1–128
+ * chars. Audit M2: an unvalidated sandbox id flows straight into Redis lock /
+ * version keys (`vfs:{tenant}:lock:{id}`, `…:ver:{id}`). Bounding the charset
+ * and length here — before any key is built — prevents control-character /
+ * unbounded-length keys and keeps a hostile id from ever reaching Redis.
+ */
+const SANDBOX_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function isValidSandboxId(id: string): boolean {
+	return SANDBOX_ID_RE.test(id);
+}
+
+function assertValidSandboxId(sandboxId: string): void {
+	if (!isValidSandboxId(sandboxId)) {
+		throw Object.assign(new Error("EINVAL: invalid sandbox id"), { code: "EINVAL" });
+	}
+}
+
 /** Matches `python3` or `python` as a standalone word (avoids false positives like `mypython`). */
 const PYTHON_INVOCATION_REGEX = /\bpython3?\b/;
 /** Matches `js-exec` or `node` as a standalone command word (avoids `mynode`, `nodejs-config`, etc). */
@@ -125,12 +151,6 @@ export interface Session {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
-	/**
-	 * Warm Python interpreter shared across all `py-exec` calls in this
-	 * session. Undefined when the sandbox was created without `python: true`.
-	 * Kill it when the session is destroyed so the child process does not leak.
-	 */
-	readonly warmPython: WarmPythonProcess | undefined;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -421,6 +441,7 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
 	): Promise<Session> {
+		assertValidSandboxId(sandboxId);
 		if (this.shuttingDown) {
 			throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
 		}
@@ -451,13 +472,10 @@ export class SessionManager {
 						}
 					: false;
 
-				// Build the warm Python process (if python runtime is enabled) and
-				// register py-exec as a custom command so agents can call it without
-				// paying the 1.4 s WASM cold-boot cost on every invocation.
-				const warmPython = resolvedRuntime.python ? new WarmPythonProcess() : undefined;
-
+				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
+				// not registered (audit C1 — host sandbox escape). Python sandboxes
+				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
 				const customCommands = [
-					...(warmPython !== undefined ? [createPyExecCommand(warmPython)] : []),
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
@@ -484,7 +502,8 @@ export class SessionManager {
 				let initialVersion = 0;
 				if (this.redis !== undefined) {
 					try {
-						const raw = await this.redis.get(versionKey(tenantId, sandboxId));
+						// GETEX so rehydrating a session refreshes the counter's TTL (audit H6).
+						const raw = await this.redis.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
 						initialVersion = raw === null ? 0 : Number(raw) || 0;
 					} catch {
 						initialVersion = 0;
@@ -503,7 +522,6 @@ export class SessionManager {
 					runtimeOptions: resolvedRuntime,
 					tenantId,
 					scriptTx,
-					warmPython,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					lock: new RWLock(),
@@ -546,6 +564,7 @@ export class SessionManager {
 	}
 
 	private async withExecLockExclusive<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
 		if (!this.rwlockEnabled) {
 			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
@@ -554,6 +573,7 @@ export class SessionManager {
 	}
 
 	private async withExecLockShared<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
 		if (!this.rwlockEnabled) return fn();
 		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
@@ -685,6 +705,12 @@ export class SessionManager {
 				}
 				if (ctx.violated) {
 					logAudit("read_only_violation", { tenantId, sandboxId });
+					// Audit M11: a readOnly batch shares one violation context, so a
+					// single mutating script fails the WHOLE batch (and its sibling
+					// reads are discarded). This is intentional fail-CLOSED behaviour —
+					// the read-only safety net must reject the request as a unit and
+					// guarantee nothing persisted; surfacing partial results from a
+					// batch that contained a rejected mutation would be a footgun.
 					throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
 						code: "EREADONLY_VIOLATION",
 					});
@@ -730,7 +756,12 @@ export class SessionManager {
 		const probe = (async (): Promise<void> => {
 			let current: number;
 			try {
-				const raw = await this.redis!.get(versionKey(tenantId, sandboxId));
+				// GETEX refreshes the key's TTL on every read so an actively-used
+				// sandbox's version counter never ages out. Combined with session
+				// idle-eviction (≪ TTL), this guarantees no warm session can ever
+				// be holding a `lastSeenVersion` when the key expires and the counter
+				// resets to 1 — closing the stale-read / lost-update wrap (audit H6).
+				const raw = await this.redis!.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
 				current = raw === null ? 0 : Number(raw) || 0;
 			} catch (err) {
 				// Redis unavailable — can't determine whether the cache is fresh.
@@ -938,6 +969,7 @@ export class SessionManager {
 	 * the sandbox does not exist or no DB is configured.
 	 */
 	async getSandboxMeta(tenantId: string, sandboxId: string): Promise<SandboxMeta | null> {
+		if (!isValidSandboxId(sandboxId)) return null;
 		if (this.getSandboxMetaFn === undefined) return null;
 		return this.getSandboxMetaFn(tenantId, sandboxId);
 	}
@@ -1004,7 +1036,7 @@ export class SessionManager {
 						}
 					}
 				} finally {
-					await this.disconnectFs(session.fs, session.warmPython);
+					await this.disconnectFs(session.fs);
 				}
 				if (cleanupError !== undefined) throw cleanupError;
 			});
@@ -1078,7 +1110,7 @@ export class SessionManager {
 				}
 				this.sessions.delete(key);
 				try {
-					await this.disconnectFs(session.fs, session.warmPython);
+					await this.disconnectFs(session.fs);
 				} catch {
 					// best-effort
 				}
@@ -1117,20 +1149,13 @@ export class SessionManager {
 					})
 					.catch(() => {})
 					.finally(() => {
-						void this.disconnectFs(session.fs, session.warmPython);
+						void this.disconnectFs(session.fs);
 					});
 			}
 		}
 	}
 
-	private async disconnectFs(fs: IFileSystem, warmPython?: WarmPythonProcess): Promise<void> {
-		if (warmPython !== undefined) {
-			try {
-				warmPython.kill();
-			} catch {
-				// best-effort
-			}
-		}
+	private async disconnectFs(fs: IFileSystem): Promise<void> {
 		const disconnectable = fs as { disconnect?: () => Promise<void> };
 		if (typeof disconnectable.disconnect === "function") {
 			try {

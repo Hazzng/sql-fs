@@ -40,7 +40,7 @@ async function makeTestEnv(): Promise<{
 }> {
 	const fs = new InMemoryFs();
 	const sessionManager = new SessionManager({ createFs: async () => fs });
-	const session = await sessionManager.getOrCreate("default", SANDBOX_ID);
+	const session = await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 	return { sessionManager, fs, session };
 }
 
@@ -90,7 +90,7 @@ describe("perScriptTimeoutMs — sequential (write) path via HTTP", () => {
 			const token = await makeToken();
 
 			const batchSandboxId = `${SANDBOX_ID}-per-script`;
-			const session = await sessionManager.getOrCreate("default", batchSandboxId);
+			const session = await sessionManager.getOrCreate("default", batchSandboxId, undefined, "agent-1");
 
 			// Latch fires once the first blocking exec is registered so we can advance
 			// the fake clock after its per-script timer has been created.
@@ -170,7 +170,7 @@ describe("perScriptTimeoutMs — sequential (write) path via HTTP", () => {
 			const token = await makeToken();
 
 			const batchSandboxId = `${SANDBOX_ID}-ceiling`;
-			const session = await sessionManager.getOrCreate("default", batchSandboxId);
+			const session = await sessionManager.getOrCreate("default", batchSandboxId, undefined, "agent-1");
 
 			let latchResolve!: () => void;
 			const execBlocking = new Promise<void>((r) => {
@@ -234,7 +234,7 @@ describe("perScriptTimeoutMs — parallel (readOnly) path via executeBatch", () 
 		vi.useFakeTimers();
 		try {
 			const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
-			const session = await sessionManager.getOrCreate("default", `${SANDBOX_ID}-parallel`);
+			const session = await sessionManager.getOrCreate("default", `${SANDBOX_ID}-parallel`, undefined, "agent-1");
 
 			let latchResolve!: () => void;
 			const execBlocking = new Promise<void>((r) => {

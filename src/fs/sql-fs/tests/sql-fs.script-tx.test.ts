@@ -278,3 +278,45 @@ describe("SqlFs script-tx — error handling", () => {
 		expect(fs.wasDirty()).toBe(false);
 	});
 });
+
+// Audit H7: when the script-tx COMMIT fails, Postgres rolls the transaction
+// back. endScriptScope must discard the in-memory mutations (reload + clearDirty)
+// and rethrow, so the session never publishes a version/snapshot of state that
+// is not actually in Postgres.
+describe("SqlFs script-tx — COMMIT failure recovery (H7)", () => {
+	function makeFailableDialect(): { dialect: SqlDialect<unknown>; state: { failNextCommit: boolean } } {
+		const dialect = makeDialect();
+		const state = { failNextCommit: false };
+		dialect.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+			const result = await fn({});
+			if (state.failNextCommit) {
+				state.failNextCommit = false;
+				throw new Error("COMMIT failed");
+			}
+			return result;
+		}) as unknown as SqlDialect<unknown>["transaction"];
+		return { dialect, state };
+	}
+
+	it("COMMIT failure reloads committed state, clears dirty, and rethrows", async () => {
+		const { dialect, state } = makeFailableDialect();
+		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+		await fs.ready();
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/phantom.txt", "ghost");
+		expect(fs.wasDirty()).toBe(true);
+		expect(fs.getAllPaths()).toContain("/home/user/phantom.txt");
+
+		state.failNextCommit = true;
+		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
+
+		// The uncommitted mutation is discarded; dirty is cleared so no version/
+		// snapshot of the rolled-back state is published.
+		expect(fs.wasDirty()).toBe(false);
+		expect(fs.getAllPaths()).not.toContain("/home/user/phantom.txt");
+		expect(fs.getAllPaths()).toContain("/home/user/file.txt");
+		expect(fs.scriptScopeActive).toBe(false);
+		expect(fs.scriptTxOpen).toBe(false);
+	});
+});

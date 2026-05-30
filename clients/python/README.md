@@ -32,15 +32,15 @@ with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub
     print(result.ok)            # True
     print(result.duration_ms)
 
-    # Python execution — use py-exec, not python3.
-    # py-exec keeps the interpreter warm: ~1.4 s first call, < 5 ms after.
-    # python3 cold-boots every call (~1.4 s each).
-    sb.exec("py-exec -c 'print(1 + 1)'")          # first call warms interpreter
-    sb.exec("py-exec -c 'print(\"still warm\")'")  # < 5 ms
+    # Python execution — CPython on WASM, stdlib only, isolated per call.
+    # Each python3 call cold-boots a fresh interpreter (~1.4 s); state is not
+    # shared across calls, so persist data via the filesystem.
+    sb.exec("python3 -c 'print(1 + 1)'")
 
-    # For multi-step Python work, write a script and run it once:
+    # For multi-step Python work, write a script and run it once (avoids paying
+    # the cold-boot per step):
     sb.fs.write("/home/user/script.py", "for i in range(5):\n    print(i)\n")
-    result = sb.exec("py-exec /home/user/script.py")
+    result = sb.exec("python3 /home/user/script.py")
 
     # File operations
     sb.fs.write("/home/user/main.py", "print('hi')\n")

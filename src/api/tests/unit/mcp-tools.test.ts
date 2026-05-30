@@ -52,7 +52,9 @@ describe("MCP tool — bash_exec_batch disconnect signal", () => {
 		vi.useFakeTimers();
 		try {
 			const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
-			await sessionManager.getOrCreate("default", SANDBOX_ID);
+			// Owner must match the caller registered with registerTools ("test-owner"),
+			// otherwise the fail-closed ownership check (audit M1) rejects the batch.
+			await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "test-owner");
 
 			// Track the fake-clock timestamp when each script's abort signal fires.
 			const start = Date.now();

@@ -80,6 +80,8 @@ function parentDir(filePath: string): string {
 const MAX_RAW_FILE_WRITE_BYTES = Number(process.env.MAX_FILE_WRITE_BYTES ?? `${64 * 1024 * 1024}`);
 const MAX_BULK_WRITE_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
 const MAX_BULK_WRITE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
+// Audit H11 (#27): cap the number of entries a single /tree response materializes.
+const MAX_TREE_ENTRIES = Number(process.env.MAX_TREE_ENTRIES ?? "50000");
 
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -153,6 +155,14 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		return new Response(result.body, {
 			headers: {
 				"Content-Type": inferContentType(filePath),
+				// Audit M3: file bytes are attacker-controlled. Prevent a browser from
+				// MIME-sniffing or rendering them as active content (stored XSS via
+				// text/html, image/svg+xml, JS, …). nosniff + forced download +
+				// a locked-down CSP neutralize inline execution; programmatic clients
+				// read the body regardless of Content-Disposition.
+				"X-Content-Type-Options": "nosniff",
+				"Content-Disposition": "attachment",
+				"Content-Security-Policy": "default-src 'none'; sandbox",
 				"X-FS-Stat": JSON.stringify(result.statHeader),
 			},
 		});
@@ -286,6 +296,15 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		const { files } = body;
 		const fileEntries = Object.entries(files);
+		// Audit M5: reject blank keys up-front with a clear error. (Defense in depth:
+		// even without this, an empty/degenerate key normalizes to "/" and is
+		// rejected with EISDIR by the write guard, so no corrupt inode is created.)
+		if (fileEntries.some(([key]) => key.trim() === "")) {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["file keys must be non-empty paths"] },
+				400 as ContentfulStatusCode,
+			);
+		}
 		if (fileEntries.length > MAX_BULK_WRITE_FILES) {
 			return c.json(
 				{
@@ -313,17 +332,37 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				for (const [filePath, content] of fileEntries) {
-					const parent = parentDir(filePath);
-					if (parent !== "/") {
-						try {
-							await session.fs.mkdir(parent, { recursive: true });
-						} catch (e) {
-							const code = extractErrCode(e);
-							if (code !== "EEXIST") throw e;
+				const writeAll = async (): Promise<void> => {
+					for (const [filePath, content] of fileEntries) {
+						const parent = parentDir(filePath);
+						if (parent !== "/") {
+							try {
+								await session.fs.mkdir(parent, { recursive: true });
+							} catch (e) {
+								const code = extractErrCode(e);
+								if (code !== "EEXIST") throw e;
+							}
 						}
+						await session.fs.writeFile(filePath, content);
 					}
-					await session.fs.writeFile(filePath, content);
+				};
+
+				// Audit H10: make the bulk write atomic. Wrap the whole batch in a
+				// single script-tx scope so a mid-batch failure rolls back ALL files
+				// instead of leaving earlier writes committed. Backends without
+				// script-tx support (e.g. in-memory) fall back to the per-entry loop.
+				const scriptTx = session.scriptTx;
+				if (scriptTx !== undefined) {
+					scriptTx.beginScope();
+					try {
+						await writeAll();
+						await scriptTx.endScope();
+					} catch (err) {
+						await scriptTx.abortScope();
+						throw err;
+					}
+				} else {
+					await writeAll();
 				}
 			});
 		} catch (err) {
@@ -449,8 +488,12 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 								size: stat.size,
 								mtime: stat.mtime.toISOString(),
 							});
-						} catch {
-							// Skip paths that can't be stat'd
+							if (result.length > MAX_TREE_ENTRIES) {
+								throw Object.assign(new Error("tree too large"), { code: "PAYLOAD_TOO_LARGE" });
+							}
+						} catch (e) {
+							// Surface the size guard; otherwise skip paths that can't be stat'd.
+							if ((e as { code?: string }).code === "PAYLOAD_TOO_LARGE") throw e;
 						}
 					}
 
@@ -459,6 +502,16 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
+			if ((err as { code?: string }).code === "PAYLOAD_TOO_LARGE") {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`Tree exceeds ${MAX_TREE_ENTRIES} entries; narrow with prefix/depth`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
 			throw err;
 		}
 

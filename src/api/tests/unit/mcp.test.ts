@@ -168,8 +168,8 @@ describe("MCP tool — sandbox_delete", () => {
 		const sessions = new Map<string, Session>();
 
 		const mockSessionManager = {
-			getOrCreate: async (_tenantId: string, id: string): Promise<Session> => {
-				const session = { owner: "" } as unknown as Session;
+			getOrCreate: async (_tenantId: string, id: string, _runtime?: unknown, owner = ""): Promise<Session> => {
+				const session = { owner } as unknown as Session;
 				sessions.set(id, session);
 				return session;
 			},
@@ -642,6 +642,68 @@ describe("MCP tool — fs_ingest", () => {
 			}
 
 			await close();
+		} finally {
+			await rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	// Audit H3: host files in `paths` mode must be read ONLY after the ownership
+	// check passes. A non-owner must get an identical `forbidden` response whether
+	// the host path exists or not — otherwise the pre-authz read becomes a
+	// cross-principal host-file existence/readability oracle.
+	it("does not read host files for a non-owner (forbidden, no readability oracle)", async () => {
+		const tmpDir = await mkdtemp(join(tmpdir(), "sqlfs-h3-"));
+		try {
+			const existing = join(tmpDir, "exists.txt");
+			const missing = join(tmpDir, "nope.txt");
+			await writeFile(existing, "secret host bytes", "utf-8");
+
+			// user-a creates + owns the sandbox; meta persisted to a shared store.
+			const meta = new Map<string, SandboxMeta>();
+			const ownerManager = new SessionManager({
+				createFs: async () => withBulkIngest(new InMemoryFs()),
+				getSandboxMetaFn: async (_t, id) => meta.get(id) ?? null,
+				persistSandboxMetaFn: async (_t, id, m) => {
+					meta.set(id, m);
+				},
+			});
+			const serverA = createMcpServer();
+			registerTools(serverA, ownerManager, "user-a", "default");
+			const [ctA, stA] = InMemoryTransport.createLinkedPair();
+			const clientA = new Client({ name: "a", version: "1.0.0" });
+			await serverA.connect(stA);
+			await clientA.connect(ctA);
+			const createResult = await clientA.callTool({ name: "sandbox_create", arguments: {} });
+			const { id } = JSON.parse((createResult.content as Array<{ text?: string }>)[0]?.text ?? "") as { id: string };
+			await clientA.close();
+
+			// user-b (non-owner) on a cold replica attempts to ingest by host path.
+			const coldReplica = new SessionManager({
+				createFs: async () => withBulkIngest(new InMemoryFs()),
+				getSandboxMetaFn: async (_t, sid) => meta.get(sid) ?? null,
+			});
+			const serverB = createMcpServer();
+			registerTools(serverB, coldReplica, "user-b", "default");
+			const [ctB, stB] = InMemoryTransport.createLinkedPair();
+			const clientB = new Client({ name: "b", version: "1.0.0" });
+			await serverB.connect(stB);
+			await clientB.connect(ctB);
+
+			const ingest = (hostPath: string) =>
+				clientB
+					.callTool({
+						name: "fs_ingest",
+						arguments: { id, basePath: "/home/user/p", paths: { "x.txt": hostPath } },
+					})
+					.then((r) => parseToolJson<{ ok: boolean; error: string }>(r));
+
+			// Both an existing and a missing host path must yield the SAME forbidden
+			// response. A divergent "unreadable host paths" error would prove the read
+			// happened before authorization (the bug H3 fixes).
+			expect(await ingest(existing)).toEqual({ ok: false, error: "forbidden" });
+			expect(await ingest(missing)).toEqual({ ok: false, error: "forbidden" });
+
+			await clientB.close();
 		} finally {
 			await rm(tmpDir, { recursive: true, force: true });
 		}

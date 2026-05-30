@@ -30,7 +30,7 @@ async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFil
 	const sessionManager = new SessionManager({
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate("default", SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 	return { sessionManager, fs };
 }
 

@@ -37,14 +37,14 @@ function makeNoJsBash(): Bash {
 
 describe("nodeCommand — direct execution (no shell context)", () => {
 	/** Minimal stub CommandContext without exec (simulates missing ctx.exec). */
-	function stubCtx() {
+	function stubCtx(): import("just-bash").CommandContext {
 		const fs = new InMemoryFs();
 		return {
 			fs,
 			cwd: "/",
 			env: new Map<string, string>(),
 			stdin: "",
-		};
+		} as unknown as import("just-bash").CommandContext;
 	}
 
 	it("bare node (no args) returns exit 127 with hint on stderr", async () => {
