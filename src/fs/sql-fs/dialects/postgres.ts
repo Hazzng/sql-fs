@@ -37,6 +37,42 @@ function envInt(name: string, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/**
+ * Re-arm `Error.stackTraceLimit` as writable before issuing a query.
+ *
+ * just-bash 3.0.x's `DefenseInDepthBox.applyPatches()` freezes
+ * `Error.stackTraceLimit` (`writable: false, configurable: true`) on the host
+ * realm for the duration of every `bash.exec()` (in 2.14.x this hardening was
+ * scoped to worker threads and never took effect on the host). The `postgres`
+ * driver assigns to `Error.stackTraceLimit` inside its `cachedError()` on every
+ * query construction, so any Postgres I/O issued from inside an exec throws
+ * `TypeError: Cannot assign to read only property 'stackTraceLimit'`.
+ *
+ * Because the box only (re-)applies patches on the refCount `0 → 1` transition
+ * and our own exec keeps refCount ≥ 1 for its whole duration, restoring
+ * writability here — synchronously, immediately before each query — is stable
+ * for the rest of the exec; just-bash restores the original descriptor on
+ * deactivation. The freeze keeps `configurable: true`, so this redefinition
+ * always succeeds. Best-effort: never throw from this guard.
+ */
+function ensureWritableStackTraceLimit(): void {
+	try {
+		const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+		// Only act on a frozen data property we can redefine. Leaves accessor
+		// descriptors and an already-writable property untouched.
+		if (desc && "writable" in desc && desc.writable === false && desc.configurable === true) {
+			Object.defineProperty(Error, "stackTraceLimit", {
+				value: desc.value,
+				writable: true,
+				enumerable: desc.enumerable ?? false,
+				configurable: true,
+			});
+		}
+	} catch {
+		/* best-effort — fall through and let the driver surface any real error */
+	}
+}
+
 export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
@@ -212,7 +248,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		newParentId: bigint,
 		newName: string,
 	): Promise<void> {
-		const rows = await tx<{ inode_id: string }[]>`
+		// Audit M10: a single wCTE that both DELETEs the destination dirent and
+		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
+		// raises a spurious unique_violation (→ EEXIST) — Postgres checks the PK
+		// for the UPDATE against a snapshot where the to-be-deleted row still
+		// exists. Split into two statements within the SAME transaction: statement
+		// 1 frees the destination slot (and cleans its inode), statement 2 renames
+		// the source into it. Statement 1's effects are visible to statement 2, so
+		// the rename can no longer collide. Atomicity is preserved by the tx.
+		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
@@ -229,18 +273,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				FROM old_dest
 				WHERE inodes.id = old_dest.inode_id
 				RETURNING inodes.id, inodes.nlink
-			),
-			cleaned AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
-			),
-			moved AS (
-				UPDATE dirents
-				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-				RETURNING inode_id
 			)
-			SELECT inode_id FROM moved
+			DELETE FROM inodes
+			WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+		`;
+		const rows = await tx<{ inode_id: string }[]>`
+			UPDATE dirents
+			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			RETURNING inode_id
 		`;
 		if (rows.length === 0) throw createEnoent(oldName);
 	}
@@ -249,6 +290,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	private db(): postgres.Sql {
 		if (!this.pool) throw new Error("PostgresDialect: not connected");
+		// Re-arm Error.stackTraceLimit writability immediately before every query
+		// construction (see ensureWritableStackTraceLimit). db() is the single
+		// accessor used by both transaction() and direct queries, and runs
+		// synchronously right before the `postgres` driver builds the Query, so
+		// this covers all Postgres I/O on just-bash 3.0.x.
+		ensureWritableStackTraceLimit();
 		return this.pool;
 	}
 

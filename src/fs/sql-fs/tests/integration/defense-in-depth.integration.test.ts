@@ -5,6 +5,14 @@
  * WorkerSecurityViolationError for common filesystem operations when
  * defenseInDepth is enabled and auditMode is false.
  *
+ * Also guards the just-bash 3.0.x regression where DefenseInDepthBox freezes
+ * `Error.stackTraceLimit` (writable: false) on the host realm for the duration
+ * of every `bash.exec()`. The `postgres` driver assigns to that property on
+ * every query, so without PostgresDialect's writability guard any Postgres I/O
+ * during an exec throws `TypeError: Cannot assign to read only property
+ * 'stackTraceLimit'`. (On 2.14.x this hardening was scoped to worker threads
+ * and never took effect on the host.)
+ *
  * Skipped when DATABASE_URL is not set so CI without a DB still passes.
  */
 
@@ -93,5 +101,51 @@ describe.skipIf(SKIP)("defenseInDepth + Postgres SqlFs", () => {
 
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout.trim()).toBe("persisted");
+	});
+});
+
+describe.skipIf(SKIP)("just-bash Error.stackTraceLimit freeze + Postgres SqlFs", () => {
+	const url = process.env.DATABASE_URL!;
+	const createdSandboxIds: string[] = [];
+
+	function makeSandboxId(): string {
+		return `test-stl-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	}
+
+	afterEach(async () => {
+		for (const id of createdSandboxIds.splice(0)) {
+			await destroyPostgresSandbox(url, id).catch(() => {});
+		}
+	});
+
+	// Default Bash config — no `defenseInDepth` option. This is the exact shape
+	// the API uses for sessions without defense-in-depth, and the one that broke
+	// on just-bash 3.0.1: `defenseInDepth` defaults to `true`, so the host-realm
+	// `Error.stackTraceLimit` freeze is active during exec.
+	it("default Bash (defenseInDepth unset) survives the host stackTraceLimit freeze", async () => {
+		const sandboxId = makeSandboxId();
+		createdSandboxIds.push(sandboxId);
+
+		const { fs } = await createPostgresSandboxFs({ connectionString: url }, sandboxId);
+		const bash = new Bash({ fs });
+		const result = await bash.exec("echo hi > /tmp/x && cat /tmp/x");
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.trim()).toBe("hi");
+	});
+
+	// The writability guard must not permanently weaken the host global: once the
+	// exec ends, just-bash restores the original descriptor and the property is
+	// writable again (this is also what test frameworks rely on).
+	it("Error.stackTraceLimit is writable again after exec completes", async () => {
+		const sandboxId = makeSandboxId();
+		createdSandboxIds.push(sandboxId);
+
+		const { fs } = await createPostgresSandboxFs({ connectionString: url }, sandboxId);
+		const bash = new Bash({ fs });
+		await bash.exec("echo hi > /tmp/x");
+
+		const desc = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+		expect(desc?.writable).toBe(true);
 	});
 });
