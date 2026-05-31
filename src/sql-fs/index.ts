@@ -15,8 +15,8 @@
 import type { Redis } from "ioredis";
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
-import { getRedisClient } from "../../redis/client.js";
-import { parseNonNegativeInt } from "../../redis/config.js";
+import { getRedisClient } from "../redis/client.js";
+import { parseNonNegativeInt } from "../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
 import { RedisPathSnapshot } from "./redis-path-snapshot.js";

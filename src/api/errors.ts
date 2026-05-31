@@ -3,7 +3,7 @@
  * US-056: Hono server bootstrap
  */
 
-import { sanitizeFsError } from "../fs/sql-fs/errors.js";
+import { sanitizeFsError } from "../sql-fs/errors.js";
 
 /**
  * FS error codes whose `.message` is safe to surface to API/MCP clients. These

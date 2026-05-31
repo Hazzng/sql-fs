@@ -15,7 +15,7 @@
 
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { destroySandbox } from "../../../fs/sql-fs/index.js";
+import { destroySandbox } from "../../../sql-fs/index.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";

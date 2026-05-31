@@ -14,7 +14,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { Redis } from "ioredis";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { RedisPathSnapshot } from "../../../fs/sql-fs/redis-path-snapshot.js";
+import { RedisPathSnapshot } from "../../../sql-fs/redis-path-snapshot.js";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
 import { mapFsErrorToStatus } from "../../errors.js";
 import { signToken } from "../../lib/jwt.js";

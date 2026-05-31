@@ -15,8 +15,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { Bash, getCommandNames } from "just-bash";
-import { PostgresDialect } from "./src/fs/sql-fs/dialects/postgres.js";
-import { SqlFs } from "./src/fs/sql-fs/sql-fs.js";
+import { PostgresDialect } from "./src/sql-fs/dialects/postgres.js";
+import { SqlFs } from "./src/sql-fs/sql-fs.js";
 
 const execAsync: (
 	command: string,

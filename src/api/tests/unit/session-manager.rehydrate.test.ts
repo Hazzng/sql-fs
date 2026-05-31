@@ -9,7 +9,7 @@
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { SandboxMeta } from "../../../fs/sql-fs/types.js";
+import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { SessionManager } from "../../session-manager.js";
 
 let pgSandboxes: Map<string, SandboxMeta>;

@@ -10,7 +10,7 @@ import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SandboxMeta } from "../../../fs/sql-fs/types.js";
+import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { execRoutes } from "../../routes/exec.js";
 import { SessionManager } from "../../session-manager.js";

@@ -6,7 +6,7 @@
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
-import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import type { AuthVariables } from "../auth.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
