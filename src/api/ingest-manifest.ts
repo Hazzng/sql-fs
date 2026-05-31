@@ -20,6 +20,7 @@
 import { readFile } from "node:fs/promises";
 import type { BulkIngestFile } from "../fs/sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "./ingest-validation.js";
+import { positiveIntEnv } from "./lib/env.js";
 
 // Audit H11 (#5, #6, #10, #43): bound ingest manifests so a single call cannot
 // exhaust memory or host file descriptors.
@@ -27,8 +28,9 @@ import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } 
 const MAX_INGEST_FILES = Number(process.env.MAX_INGEST_FILES ?? "10000");
 /** Max total decoded/read bytes across one ingest manifest. */
 const MAX_INGEST_BYTES = Number(process.env.MAX_INGEST_BYTES ?? `${512 * 1024 * 1024}`);
-/** Max concurrent host-file reads for `paths` mode (FD / memory bound). */
-const MAX_INGEST_PATHS_CONCURRENCY = Number(process.env.MAX_INGEST_PATHS_CONCURRENCY ?? "16");
+/** Max concurrent host-file reads for `paths` mode (FD / memory bound). Steps the
+ * read loop, so it must be a positive integer (0/NaN would hang or no-op). */
+const MAX_INGEST_PATHS_CONCURRENCY = positiveIntEnv(process.env.MAX_INGEST_PATHS_CONCURRENCY, 16);
 
 export interface BuildIngestPayloadArgs {
 	readonly basePath: string;

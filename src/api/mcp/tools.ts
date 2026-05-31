@@ -14,6 +14,7 @@ import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
 import { clientSafeErrorMessage } from "../errors.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
+import { positiveIntEnv } from "../lib/env.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -24,7 +25,8 @@ const MAX_TIMEOUT_MS = 300_000;
 // unboundedly into one in-memory JSON map / opened all at once.
 const MAX_EXPORT_FILES = Number(process.env.MAX_EXPORT_FILES ?? "10000");
 const MAX_EXPORT_BYTES = Number(process.env.MAX_EXPORT_BYTES ?? `${256 * 1024 * 1024}`);
-const MAX_EXPORT_CONCURRENCY = Number(process.env.MAX_EXPORT_CONCURRENCY ?? "16");
+/** Steps the export read loop, so it must be a positive integer (0/NaN would hang or no-op). */
+const MAX_EXPORT_CONCURRENCY = positiveIntEnv(process.env.MAX_EXPORT_CONCURRENCY, 16);
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
