@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+### Patch Changes
+
+- [#111](https://github.com/Hazzng/sql-fs/pull/111) Thanks [@Hazzng](https://github.com/Hazzng)! - Flatten `src/fs/sql-fs/` to `src/sql-fs/`. The intermediate `fs/` directory had no purpose — `sql-fs` was its only child. No behaviour change.
+
 ## 0.6.1
 
 ### Patch Changes
