@@ -59,6 +59,14 @@ class FakeRedis {
 		return this.store.get(key)?.value ?? null;
 	}
 
+	async getex(key: string, _ex: "EX", seconds: number): Promise<string | null> {
+		this.gc();
+		const e = this.store.get(key);
+		if (e === undefined) return null;
+		e.expiresAt = Date.now() + seconds * 1000;
+		return e.value;
+	}
+
 	async incr(key: string): Promise<number> {
 		this.gc();
 		const current = Number(this.store.get(key)?.value ?? "0") || 0;
@@ -429,10 +437,11 @@ describe("SessionManager version counter (Phase D)", () => {
 		// Warm the session.
 		await sm.withSession("default", "sbx", async () => {});
 
-		// First GET fails — ensureFreshCache falls back to reload from PG
+		// First version read fails — ensureFreshCache falls back to reload from PG
 		// so we don't serve stale data. The subsequent INCR for the mutation
-		// should still succeed and advance the counter.
-		const getSpy = vi.spyOn(redis, "get").mockRejectedValueOnce(new Error("ECONNRESET"));
+		// should still succeed and advance the counter. (The read uses GETEX so the
+		// counter's TTL is refreshed on every access — audit H6.)
+		const getSpy = vi.spyOn(redis, "getex").mockRejectedValueOnce(new Error("ECONNRESET"));
 
 		await expect(
 			sm.withSession("default", "sbx", async () => {

@@ -188,31 +188,44 @@ function startSharedHeartbeat(
 	const { renewMs, readerLeaseMs } = opts;
 	let stopped = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	// Audit H4: a single transient renew timeout/error must NOT drop the reader's
+	// ZSET entry (which would let a writer enter mid-read). Track expiry; only
+	// call onLost on a definitive loss or once the reader lease has expired.
+	let leaseExpiresAt = Date.now() + readerLeaseMs;
+	const renewRetryMs = Math.max(50, Math.floor(renewMs / 4));
 
-	const schedule = (): void => {
+	const schedule = (delayMs: number): void => {
 		if (stopped) return;
 		timer = setTimeout(async () => {
 			if (stopped) return;
+			let outcome: "renewed" | "ownership_lost" | "transient";
+			let raceTimeout: ReturnType<typeof setTimeout> | undefined; // L1: clear on settle
 			try {
 				const expireAt = Date.now() + readerLeaseMs;
 				const renewPromise = redis.eval(RENEW_SHARED_SCRIPT, 1, keys.readers, token, String(expireAt));
-				const timeoutPromise = new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("renew_timeout")), renewMs),
-				);
+				const timeoutPromise = new Promise<never>((_, reject) => {
+					raceTimeout = setTimeout(() => reject(new Error("renew_timeout")), renewMs);
+				});
 				const res = await Promise.race([renewPromise, timeoutPromise]);
-				if (res !== 1) {
-					onLost();
-					return;
-				}
+				outcome = res === 1 ? "renewed" : "ownership_lost";
 			} catch {
-				onLost();
-				return;
+				outcome = "transient";
+			} finally {
+				if (raceTimeout !== undefined) clearTimeout(raceTimeout);
 			}
-			if (!stopped) schedule();
-		}, renewMs);
+			if (stopped) return;
+			if (outcome === "renewed") {
+				leaseExpiresAt = Date.now() + readerLeaseMs;
+				schedule(renewMs);
+			} else if (outcome === "ownership_lost" || Date.now() >= leaseExpiresAt) {
+				onLost();
+			} else {
+				schedule(renewRetryMs);
+			}
+		}, delayMs);
 	};
 
-	schedule();
+	schedule(renewMs);
 	return () => {
 		stopped = true;
 		if (timer !== undefined) clearTimeout(timer);
@@ -280,30 +293,43 @@ function startExclusiveHeartbeat(
 	const { renewMs, leaseMs } = opts;
 	let stopped = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	// Audit H4: a single transient renew timeout/error must NOT relinquish a
+	// still-valid lease. Track the actual expiry (updated only on success) and
+	// only call onLost on a definitive ownership loss or once the lease expires.
+	let leaseExpiresAt = Date.now() + leaseMs;
+	const renewRetryMs = Math.max(50, Math.floor(renewMs / 4));
 
-	const schedule = (): void => {
+	const schedule = (delayMs: number): void => {
 		if (stopped) return;
 		timer = setTimeout(async () => {
 			if (stopped) return;
+			let outcome: "renewed" | "ownership_lost" | "transient";
+			let raceTimeout: ReturnType<typeof setTimeout> | undefined; // L1: clear on settle
 			try {
 				const renewPromise = redis.eval(RENEW_EXCLUSIVE_SCRIPT, 1, keys.writer, token, String(leaseMs));
-				const timeoutPromise = new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error("renew_timeout")), renewMs),
-				);
+				const timeoutPromise = new Promise<never>((_, reject) => {
+					raceTimeout = setTimeout(() => reject(new Error("renew_timeout")), renewMs);
+				});
 				const res = await Promise.race([renewPromise, timeoutPromise]);
-				if (res !== 1) {
-					onLost();
-					return;
-				}
+				outcome = res === 1 ? "renewed" : "ownership_lost";
 			} catch {
-				onLost();
-				return;
+				outcome = "transient";
+			} finally {
+				if (raceTimeout !== undefined) clearTimeout(raceTimeout);
 			}
-			if (!stopped) schedule();
-		}, renewMs);
+			if (stopped) return;
+			if (outcome === "renewed") {
+				leaseExpiresAt = Date.now() + leaseMs;
+				schedule(renewMs);
+			} else if (outcome === "ownership_lost" || Date.now() >= leaseExpiresAt) {
+				onLost();
+			} else {
+				schedule(renewRetryMs);
+			}
+		}, delayMs);
 	};
 
-	schedule();
+	schedule(renewMs);
 	return () => {
 		stopped = true;
 		if (timer !== undefined) clearTimeout(timer);

@@ -3,6 +3,51 @@
  * US-056: Hono server bootstrap
  */
 
+import { sanitizeFsError } from "../fs/sql-fs/errors.js";
+
+/**
+ * FS error codes whose `.message` is safe to surface to API/MCP clients. These
+ * messages are produced by our own error constructors and contain only
+ * sandbox-internal detail (e.g. a virtual path) — never connection strings,
+ * host paths, or table names. Any error whose code is NOT in this set has its
+ * message replaced with a generic fallback so raw SQL/driver text cannot leak
+ * to clients (audit H5).
+ */
+export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
+	"ENOENT",
+	"EEXIST",
+	"EISDIR",
+	"ENOTDIR",
+	"EPERM",
+	"FORBIDDEN",
+	"ENOTEMPTY",
+	"ESESSIONCLOSING",
+	"ESHUTTINGDOWN",
+	"ELOOP",
+	"EINVAL",
+	"ELOCKTIMEOUT",
+	"ELOCKLOST",
+	"ECOHERENCE",
+	"ERUNTIME_BUSY",
+	"EREADONLY",
+	"EREADONLY_VIOLATION",
+]);
+
+/**
+ * Returns a client-safe error message. For a known-safe FS error code the real
+ * (additionally sanitized) message is returned; otherwise `fallback` is used so
+ * that unexpected/raw errors never echo infrastructure detail to clients.
+ */
+export function clientSafeErrorMessage(err: unknown, fallback = "Internal server error"): string {
+	if (err instanceof Error) {
+		const code = (err as Error & { code?: string }).code;
+		if (code !== undefined && SAFE_FS_ERROR_CODES.has(code)) {
+			return sanitizeFsError(err).message;
+		}
+	}
+	return fallback;
+}
+
 /**
  * Maps an FS error code to an HTTP status code.
  *
@@ -38,6 +83,9 @@ export function mapFsErrorToStatus(err: Error): number {
 		case "ENOTEMPTY":
 			return 409;
 		case "ESESSIONCLOSING":
+			return 503;
+		case "ESHUTTINGDOWN":
+			// Server is draining for shutdown — retryable (audit L5).
 			return 503;
 		case "ELOOP":
 			return 400;

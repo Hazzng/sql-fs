@@ -27,7 +27,7 @@ async function makeTestEnv(): Promise<{ sessionManager: SessionManager; fs: IFil
 	const sessionManager = new SessionManager({
 		createFs: async () => fs,
 	});
-	await sessionManager.getOrCreate("default", SANDBOX_ID);
+	await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 	return { sessionManager, fs };
 }
 
@@ -271,7 +271,7 @@ describe("POST /v1/sandboxes/:id/exec-sync", () => {
 		const timeoutSandboxId = `${SANDBOX_ID}-timeout`;
 
 		// Pre-create the session so we can spy on bash.exec
-		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId, undefined, "agent-1");
 
 		// Mock bash.exec to hang, but respond to the abort signal
 		vi.spyOn(session.bash, "exec").mockImplementation(
@@ -499,7 +499,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 
 		const timeoutSandboxId = `${SANDBOX_ID}-sse-plaintext-timeout`;
 
-		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId, undefined, "agent-1");
 
 		vi.spyOn(session.bash, "exec").mockImplementation(
 			(_script, opts) =>
@@ -542,7 +542,7 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		const timeoutSandboxId = `${SANDBOX_ID}-sse-timeout`;
 
 		// Pre-create session so we can spy on bash.exec
-		const session = await sessionManager.getOrCreate("default", timeoutSandboxId);
+		const session = await sessionManager.getOrCreate("default", timeoutSandboxId, undefined, "agent-1");
 
 		// Mock bash.exec to hang but respond to abort signal
 		vi.spyOn(session.bash, "exec").mockImplementation(

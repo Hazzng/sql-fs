@@ -282,13 +282,22 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
-		// When the script-tx is already open it holds the advisory lock — starting a new transaction
-		// here would deadlock trying to acquire the same lock. Route through the existing script-tx.
-		// When no script-tx is open yet, use a fresh transaction (original behavior, no extra RTT).
-		const scriptTx = this.#scriptTx;
-		if (scriptTx !== undefined) {
+		// Inside a script scope every write MUST run on the single script-tx so the
+		// whole script (or batch — audit H10) commits or rolls back atomically. The
+		// script-tx is opened lazily here on the first composite write; the advisory
+		// lock is re-entrant within that transaction, so routing subsequent composites
+		// through it cannot deadlock. Starting a *fresh* transaction here while a
+		// scope is active would (a) auto-commit the write outside the scope — breaking
+		// atomicity — and (b) deadlock against the script-tx's advisory lock.
+		if (this.#scriptScope) {
+			if (this.#scriptTx === undefined) {
+				await this.#openScriptTx();
+			}
+			const scriptTx = this.#scriptTx as Tx;
 			return runTrustedDbAsync(() => fn(scriptTx));
 		}
+		// No active scope — use a fresh, self-committing transaction (original
+		// behavior, no extra round-trip).
 		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
 	}
 
@@ -318,6 +327,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			if (!rest.includes("/")) result.push(key);
 		}
 		return result;
+	}
+
+	/**
+	 * Applies a metadata patch to EVERY pathCache entry sharing `inodeId`.
+	 * Audit M9: chmod/utimes change the inode, so all hardlink siblings (distinct
+	 * paths, same inode) must reflect the new mode/mtime — not just the one path
+	 * the call named.
+	 */
+	#updateCacheByInode(inodeId: bigint, patch: Partial<PathCacheEntry>): void {
+		for (const [p, e] of this.#pathCache) {
+			if (e.inodeId === inodeId) this.#pathCache.set(p, { ...e, ...patch });
+		}
 	}
 
 	/** Returns all pathCache paths rooted at dirPath (inclusive). */
@@ -598,11 +619,29 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (!this.#scriptScope) return;
 		this.#scriptScope = false;
 
+		const hadTx = this.#scriptTx !== undefined;
 		try {
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				await this.#scriptTxPromise;
 			}
+		} catch (err) {
+			// COMMIT failed — Postgres rolled the transaction back, but the
+			// in-memory caches still hold this script's uncommitted mutations.
+			// Discard them by reloading the committed state and clearing the dirty
+			// flag, so the session does NOT publish a version bump / path snapshot
+			// of data that never landed in Postgres (audit H7). Re-throw so the
+			// caller learns the write failed.
+			if (hadTx) {
+				try {
+					await this.reload();
+					this.clearDirty();
+				} catch {
+					// Reload also failed; the next ensureFreshCache probe will reload.
+					// Fall through to surface the original COMMIT error.
+				}
+			}
+			throw err;
 		} finally {
 			this.#scriptTx = undefined;
 			this.#scriptTxEnd = undefined;
@@ -630,8 +669,22 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (txPromise !== undefined) txPromise.catch(() => {});
 
 		if (hadTx) {
-			await this.reload();
-			this.clearDirty();
+			// Audit L3: abortScriptScope runs from the exec error path
+			// (`catch (err) { await abortScope(); throw err; }`). A reload() failure
+			// here must NOT propagate and mask the caller's original exec error.
+			// Swallow + log; the next ensureFreshCache probe reloads the cache.
+			try {
+				await this.reload();
+				this.clearDirty();
+			} catch (reloadErr) {
+				console.error(
+					JSON.stringify({
+						event: "abort_scope_reload_error",
+						sandboxId: this.#sandboxId,
+						error: (reloadErr as Error).message,
+					}),
+				);
+			}
 		}
 	}
 
@@ -685,6 +738,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		this.#assertWritable(path, "writeFile");
+		// Refuse to clobber an existing directory with a file (audit H2 #13). This
+		// also rejects writing to "/" (the root is a directory), closing #25.
+		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
@@ -737,6 +793,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		this.#assertWritable(path, "appendFile");
+		// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
+		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const mtime = new Date();
@@ -962,7 +1020,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			await this.#dialect.updateInode(tx, entry.inodeId, { mode });
 		});
 
-		this.#pathCache.set(path, { ...entry, mode });
+		this.#updateCacheByInode(entry.inodeId, { mode });
 		this.#dirty = true;
 	}
 
@@ -976,7 +1034,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			await this.#dialect.updateInode(tx, entry.inodeId, { mtime });
 		});
 
-		this.#pathCache.set(path, { ...entry, mtime });
+		this.#updateCacheByInode(entry.inodeId, { mtime });
 		this.#dirty = true;
 	}
 
@@ -1020,16 +1078,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async stat(inputPath: string): Promise<FsStat> {
 		const path = validatePath(inputPath);
-		let entry = this.#pathCache.get(path);
-		if (!entry) throw createEnoent(path);
+		const lentry = this.#pathCache.get(path);
+		if (!lentry) throw createEnoent(path);
 
-		// stat follows symlinks at the final component
-		if (entry.kind === INODE_KIND.SYMLINK) {
-			const target = entry.symlinkTarget ?? "";
-			const resolved = this.#pathCache.get(target);
-			if (!resolved) throw createEnoent(target);
-			entry = resolved;
-		}
+		// stat follows symlinks at the final component. Audit M7: the previous
+		// one-hop `pathCache.get(symlinkTarget)` broke for relative targets (keys
+		// are absolute) and multi-hop chains (returned an intermediate symlink).
+		// Resolve through the dialect path resolver — the same one readFile and
+		// realpath use — so relative/chained targets and loops are handled.
+		const entry = lentry.kind === INODE_KIND.SYMLINK ? await this.#resolveReadEntry(path) : lentry;
 
 		return {
 			isFile: entry.kind === INODE_KIND.FILE,
@@ -1086,6 +1143,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
 		this.#assertWritable(dest, "cp");
+		// Reject copying onto the root inode (empty basename) — would clobber "/"
+		// in pathCache and persist a corrupt root cross-replica (audit H2 #25).
+		if (this.#nameOf(dest) === "") throw createEisdir(dest);
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
@@ -1138,18 +1198,25 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return;
 		}
 
-		// Single file copy: new inode pointing to the same blob (CAS dedup)
+		// Single file copy: new inode pointing to the same blob (CAS dedup).
+		// Refuse to clobber an existing directory with a file (audit H2).
+		if (this.#pathCache.get(dest)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(dest);
 		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(dest);
 
 		const mtime = new Date();
 
+		// Preserve the source inode's kind. Audit M8: forcing kind=FILE here turned
+		// a copied symlink into a corrupt FILE inode (non-zero size, NULL content).
+		// Copying a symlink preserves the link (target + size), matching the
+		// recursive-cp path above.
 		const newInodeId = await this.#withTx(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
-				kind: INODE_KIND.FILE,
+				kind: srcEntry.kind,
 				mode: srcEntry.mode,
 				size: srcEntry.size,
 				contentSha256: srcEntry.contentSha256,
+				symlinkTarget: srcEntry.symlinkTarget,
 			});
 			const oldInodeId = await this.#dialect.upsertDirent(tx, destParentEntry.inodeId, destName, id);
 			if (oldInodeId !== null) {
@@ -1161,12 +1228,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		this.#pathCache.set(dest, {
 			inodeId: newInodeId,
-			kind: INODE_KIND.FILE,
+			kind: srcEntry.kind,
 			mode: srcEntry.mode,
 			size: srcEntry.size,
 			mtime,
 			contentSha256: srcEntry.contentSha256,
-			symlinkTarget: null,
+			symlinkTarget: srcEntry.symlinkTarget,
 		});
 		this.#dirty = true;
 	}
@@ -1200,6 +1267,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		// Capture displaced dest inode before async work
 		const destEntry = this.#pathCache.get(dest);
+
+		// Reject moving onto the root inode (empty basename) — would clobber "/"
+		// (audit H2 #25).
+		if (destName === "") throw createEisdir(dest);
+		// Reject overwriting a non-empty directory: replacing its dirent here would
+		// leave the destination's entire subtree orphaned in the DB and diverge the
+		// cache (audit H2 #8). Mirrors rename(2) ENOTEMPTY.
+		if (destEntry?.kind === INODE_KIND.DIRECTORY && this.#childPaths(dest).length > 0) {
+			throw createEnotempty(dest);
+		}
 
 		if (this.#dialect.mvComposite) {
 			await this.#withBareTx((tx) =>

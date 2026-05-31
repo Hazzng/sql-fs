@@ -76,7 +76,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 
 		const files: Record<string, string> = {
 			"hello.txt": Buffer.from("hello world").toString("base64"),
@@ -95,7 +95,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		expect(body.status).toBe("ok");
 		expect(body.fileCount).toBe(3);
 
-		const session = await sessionManager.getOrCreate("default", SANDBOX_ID);
+		const session = await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 		expect(await session.fs.readFile("/home/user/project/hello.txt")).toBe("hello world");
 		expect(await session.fs.readFile("/home/user/project/foo.js")).toBe("console.log('foo');");
 		expect(await session.fs.readFile("/home/user/project/sub/bar.md")).toBe("# Bar\nSome content");
@@ -107,7 +107,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const sessionManager = new SessionManager({ createFs: async () => fs });
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 
 		const files: Record<string, string> = {
 			"a.txt": Buffer.from("alpha").toString("base64"),
@@ -173,7 +173,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const { sessionManager } = makeTestEnv();
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 
 		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/ingest-files`, {
 			method: "POST",
@@ -230,7 +230,7 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const app = makeTestApp(sessionManager);
 		const token = await makeToken();
-		await sessionManager.getOrCreate("default", SANDBOX_ID);
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, "agent-1");
 
 		// Suppress the expected structured error log so the test output stays clean.
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});

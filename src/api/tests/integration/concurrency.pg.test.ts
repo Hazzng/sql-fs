@@ -99,7 +99,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		const results = await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -120,7 +120,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -158,7 +158,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		await Promise.all(
 			Array.from({ length: N }, (_, i) =>
@@ -195,7 +195,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
 			method: "PUT",
@@ -224,7 +224,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 		const total = 10;
 		const keep = 5;
 
@@ -272,7 +272,7 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		for (let i = 0; i < 10; i++) {
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/v.txt`, {
@@ -292,7 +292,7 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		const { app, sm } = makePgEnv();
 		const token = await makeToken();
 		const sbId = newId();
-		await sm.withSession("default", sbId, () => Promise.resolve());
+		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		// Initial write
 		await app.request(`/v1/sandboxes/${sbId}/files/home/user/counter.txt`, {
@@ -339,8 +339,8 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const sbA = newId();
 		const sbB = newId();
 		await Promise.all([
-			sm.withSession("default", sbA, () => Promise.resolve()),
-			sm.withSession("default", sbB, () => Promise.resolve()),
+			sm.withSession("default", sbA, () => Promise.resolve(), undefined, "tester"),
+			sm.withSession("default", sbB, () => Promise.resolve(), undefined, "tester"),
 		]);
 
 		await Promise.all([
@@ -377,8 +377,8 @@ describe.skipIf(!DB_URL)("Postgres: cross-sandbox isolation — writes in A not 
 		const sbA = newId();
 		const sbB = newId();
 		await Promise.all([
-			sm.withSession("default", sbA, () => Promise.resolve()),
-			sm.withSession("default", sbB, () => Promise.resolve()),
+			sm.withSession("default", sbA, () => Promise.resolve(), undefined, "tester"),
+			sm.withSession("default", sbB, () => Promise.resolve(), undefined, "tester"),
 		]);
 
 		await Promise.all([
@@ -434,7 +434,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 		// so the write always succeeds regardless of whether mkdir ran first.
 		for (const label of ["mkdir-first", "write-first"] as const) {
 			const sbId = newId();
-			await sm.withSession("default", sbId, () => Promise.resolve());
+			await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 			const ops =
 				label === "mkdir-first"
 					? ([
@@ -561,7 +561,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 
 		for (const label of ["delete-first", "read-first"] as const) {
 			const sbId = newId();
-			await sm.withSession("default", sbId, () => Promise.resolve());
+			await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 			await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },

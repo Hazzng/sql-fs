@@ -101,7 +101,7 @@ describe("S1 — concurrent mkdir /a and writeFile /a/x.txt", () => {
 		const token = await makeToken();
 
 		for (const sbId of ["s1-http-mkdir-first", "s1-http-write-first"]) {
-			await sm.getOrCreate("default", sbId);
+			await sm.getOrCreate("default", sbId, undefined, "tester");
 			const [mkRes, wRes] = await Promise.all([
 				app.request(`/v1/sandboxes/${sbId}/mkdir`, {
 					method: "POST",
@@ -200,7 +200,7 @@ describe("S2 — concurrent delete and read of the same file", () => {
 			["s2-http-delete-then-get-array", true],
 			["s2-http-get-then-delete-array", false],
 		] as const) {
-			await sm.getOrCreate("default", sbId);
+			await sm.getOrCreate("default", sbId, undefined, "tester");
 			await app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				method: "PUT",
 				headers: { Authorization: `Bearer ${token}` },
@@ -292,7 +292,7 @@ describe("S3 — concurrent writes with different content (last-write-wins)", ()
 		const token = await makeToken();
 
 		for (const sbId of ["s3-http-a-first", "s3-http-b-first"] as const) {
-			await sm.getOrCreate("default", sbId);
+			await sm.getOrCreate("default", sbId, undefined, "tester");
 			const [r1, r2] = await Promise.all([
 				app.request(`/v1/sandboxes/${sbId}/files/f.txt`, {
 					method: "PUT",

@@ -9,7 +9,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
-import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
+import { forbiddenResponse, isForbiddenError, isOwnedBy, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const createBodySchema = z.object({
@@ -21,6 +21,11 @@ const createBodySchema = z.object({
 	/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */
 	network: z.boolean().optional(),
 });
+
+// Audit H11 (#2): bound the optional initial-files map so a single create can't
+// buffer an unbounded number of files / bytes. Shares the bulk-write env knobs.
+const MAX_INITIAL_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
+const MAX_INITIAL_FILE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
 
 export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -47,6 +52,34 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			network = result.data.network ?? false;
 		} catch {
 			// No body provided — that's fine
+		}
+
+		if (files !== undefined) {
+			const entries = Object.entries(files);
+			if (entries.length > MAX_INITIAL_FILES) {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`Initial files exceed count limit (${MAX_INITIAL_FILES})`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
+			let totalBytes = 0;
+			for (const [, content] of entries) {
+				totalBytes += Buffer.byteLength(content, "utf8");
+				if (totalBytes > MAX_INITIAL_FILE_BYTES) {
+					return c.json(
+						{
+							error: "payload_too_large",
+							code: "PAYLOAD_TOO_LARGE",
+							details: [`Initial files exceed total byte limit (${MAX_INITIAL_FILE_BYTES})`],
+						},
+						413 as ContentfulStatusCode,
+					);
+				}
+			}
 		}
 
 		const owner = c.get("owner");
@@ -78,6 +111,18 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				});
 				if (files !== undefined) {
 					for (const [path, content] of Object.entries(files)) {
+						// Audit M6: create missing parent dirs so nested initial files
+						// (e.g. "src/app.ts") don't fail with ENOENT.
+						const slash = path.lastIndexOf("/");
+						const parent = slash > 0 ? path.slice(0, slash) : "/";
+						if (parent !== "/") {
+							try {
+								await session.fs.mkdir(parent, { recursive: true });
+							} catch (e) {
+								const code = (e as Error & { code?: string }).code;
+								if (code !== "EEXIST") throw e;
+							}
+						}
 						await session.fs.writeFile(path, content);
 					}
 				}
@@ -125,7 +170,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			if (meta === null) {
 				return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
 			}
-			if (meta.owner && meta.owner !== caller) {
+			if (!isOwnedBy(meta.owner, caller)) {
 				return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 			}
 			// If a future dialect/metadata store doesn't populate createdAt, return null
@@ -139,7 +184,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				lastUsedAt: null,
 			});
 		}
-		if (session.owner && session.owner !== caller) {
+		if (!isOwnedBy(session.owner, caller)) {
 			return c.json({ error: "forbidden", code: "FORBIDDEN" }, 403 as ContentfulStatusCode);
 		}
 		return c.json({

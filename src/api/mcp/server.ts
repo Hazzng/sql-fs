@@ -31,7 +31,14 @@ let sweeperTimer: ReturnType<typeof setInterval> | undefined;
 function closeTransport(entry: SessionEntry): void {
 	const t = entry.transport as { close?: () => void | Promise<void> };
 	try {
-		if (typeof t.close === "function") void t.close();
+		if (typeof t.close === "function") {
+			// Audit L8: a rejected close() promise would otherwise surface as an
+			// unhandled rejection (the surrounding try/catch only catches sync throws).
+			const r = t.close();
+			if (r !== undefined && typeof (r as Promise<void>).catch === "function") {
+				(r as Promise<void>).catch(() => {});
+			}
+		}
 	} catch {
 		// best-effort
 	}

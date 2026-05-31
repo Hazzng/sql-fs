@@ -20,6 +20,17 @@
 import { readFile } from "node:fs/promises";
 import type { BulkIngestFile } from "../fs/sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "./ingest-validation.js";
+import { positiveIntEnv } from "./lib/env.js";
+
+// Audit H11 (#5, #6, #10, #43): bound ingest manifests so a single call cannot
+// exhaust memory or host file descriptors.
+/** Max total entries (files + paths) in one ingest manifest. */
+const MAX_INGEST_FILES = Number(process.env.MAX_INGEST_FILES ?? "10000");
+/** Max total decoded/read bytes across one ingest manifest. */
+const MAX_INGEST_BYTES = Number(process.env.MAX_INGEST_BYTES ?? `${512 * 1024 * 1024}`);
+/** Max concurrent host-file reads for `paths` mode (FD / memory bound). Steps the
+ * read loop, so it must be a positive integer (0/NaN would hang or no-op). */
+const MAX_INGEST_PATHS_CONCURRENCY = positiveIntEnv(process.env.MAX_INGEST_PATHS_CONCURRENCY, 16);
 
 export interface BuildIngestPayloadArgs {
 	readonly basePath: string;
@@ -52,6 +63,13 @@ export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Prom
 	if (filesEntries.length === 0 && pathsEntries.length === 0) {
 		if (args.allowEmpty) return { ok: true, bulkFiles: [] };
 		return { ok: false, errors: ["at least one of `files` or `paths` must be non-empty"] };
+	}
+
+	if (filesEntries.length + pathsEntries.length > MAX_INGEST_FILES) {
+		return {
+			ok: false,
+			errors: [`too many entries: ${filesEntries.length + pathsEntries.length} (max ${MAX_INGEST_FILES})`],
+		};
 	}
 
 	// Validate everything before doing any I/O so the caller sees one
@@ -89,33 +107,44 @@ export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Prom
 	if (errors.length > 0) return { ok: false, errors };
 
 	const bulkFiles: BulkIngestFile[] = [];
+	let totalBytes = 0;
 
 	for (const [rel, b64] of filesEntries) {
-		bulkFiles.push({
-			path: `${basePath}/${rel}`,
-			content: new Uint8Array(Buffer.from(b64, "base64")),
-			mode: 0o644,
-		});
+		const content = new Uint8Array(Buffer.from(b64, "base64"));
+		totalBytes += content.byteLength;
+		if (totalBytes > MAX_INGEST_BYTES) {
+			return { ok: false, errors: [`ingest exceeds byte limit (${MAX_INGEST_BYTES})`] };
+		}
+		bulkFiles.push({ path: `${basePath}/${rel}`, content, mode: 0o644 });
 	}
 
 	if (pathsEntries.length > 0) {
-		const readResults = await Promise.allSettled(
-			pathsEntries.map(async ([rel, hostPath]) => ({ rel, bytes: await readFile(hostPath) })),
-		);
 		const unreadable: string[] = [];
-		for (let i = 0; i < readResults.length; i++) {
-			const result = readResults[i];
-			if (result === undefined) continue;
-			if (result.status === "rejected") {
-				const entry = pathsEntries[i];
-				if (entry !== undefined) unreadable.push(entry[0]);
-				continue;
+		// Read host files in bounded-concurrency batches so a large `paths` map
+		// can't open thousands of file descriptors at once (audit H11 #6).
+		for (let i = 0; i < pathsEntries.length; i += MAX_INGEST_PATHS_CONCURRENCY) {
+			const batch = pathsEntries.slice(i, i + MAX_INGEST_PATHS_CONCURRENCY);
+			const readResults = await Promise.allSettled(
+				batch.map(async ([rel, hostPath]) => ({ rel, bytes: await readFile(hostPath) })),
+			);
+			for (let j = 0; j < readResults.length; j++) {
+				const result = readResults[j];
+				if (result === undefined) continue;
+				if (result.status === "rejected") {
+					const entry = batch[j];
+					if (entry !== undefined) unreadable.push(entry[0]);
+					continue;
+				}
+				totalBytes += result.value.bytes.byteLength;
+				if (totalBytes > MAX_INGEST_BYTES) {
+					return { ok: false, errors: [`ingest exceeds byte limit (${MAX_INGEST_BYTES})`] };
+				}
+				bulkFiles.push({
+					path: `${basePath}/${result.value.rel}`,
+					content: new Uint8Array(result.value.bytes),
+					mode: 0o644,
+				});
 			}
-			bulkFiles.push({
-				path: `${basePath}/${result.value.rel}`,
-				content: new Uint8Array(result.value.bytes),
-				mode: 0o644,
-			});
 		}
 		if (unreadable.length > 0) {
 			return { ok: false, errors: [`unreadable host paths: ${unreadable.join(", ")}`] };

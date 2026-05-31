@@ -188,6 +188,25 @@ describe("withDistributedLock", () => {
 		).rejects.toBeInstanceOf(LockLostError);
 	});
 
+	it("a transient renew failure that recovers does NOT lose the lock (H4)", async () => {
+		const r = fake();
+		// First renew tick(s) throw (transient Redis blip), then Redis heals well
+		// before the (generous) lease would expire. The lock must survive.
+		r.failEval = true;
+		const result = await withDistributedLock(
+			asRedis(r),
+			KEY,
+			async () => {
+				await new Promise((res) => setTimeout(res, 60));
+				r.failEval = false; // heal — the retry should renew successfully
+				await new Promise((res) => setTimeout(res, 120));
+				return "ok";
+			},
+			{ leaseMs: 5_000, renewMs: 20, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
+		);
+		expect(result).toBe("ok");
+	});
+
 	it("release is no-op when the key is owned by a different token", async () => {
 		const r = fake();
 		// Manually plant a lock owned by a different token

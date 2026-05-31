@@ -11,13 +11,22 @@ import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import { clientSafeErrorMessage } from "../errors.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
+import { positiveIntEnv } from "../lib/env.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
+
+// Audit H11 (#39, #44): bound fs_export so a large sandbox can't be materialized
+// unboundedly into one in-memory JSON map / opened all at once.
+const MAX_EXPORT_FILES = Number(process.env.MAX_EXPORT_FILES ?? "10000");
+const MAX_EXPORT_BYTES = Number(process.env.MAX_EXPORT_BYTES ?? `${256 * 1024 * 1024}`);
+/** Steps the export read loop, so it must be a positive integer (0/NaN would hang or no-op). */
+const MAX_EXPORT_CONCURRENCY = positiveIntEnv(process.env.MAX_EXPORT_CONCURRENCY, 16);
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
@@ -36,23 +45,36 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				javascript: args.javascript ?? false,
 				network: false,
 			};
-			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
-			session.name = name;
-			await sessionManager.persistSandboxMeta(tenant, id, {
-				owner,
-				name,
-				python: runtimeOptions.python,
-				javascript: runtimeOptions.javascript,
-				network: runtimeOptions.network,
-			});
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: JSON.stringify({ id, name, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
-					},
-				],
-			};
+			try {
+				const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+				session.name = name;
+				await sessionManager.persistSandboxMeta(tenant, id, {
+					owner,
+					name,
+					python: runtimeOptions.python,
+					javascript: runtimeOptions.javascript,
+					network: runtimeOptions.network,
+				});
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ id, name, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
+						},
+					],
+				};
+			} catch (err) {
+				// Sanitize: getOrCreate/persistSandboxMeta can surface raw SQL/driver
+				// errors (audit H5) — never echo them to the MCP client.
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
+						},
+					],
+				};
+			}
 		},
 	);
 
@@ -81,9 +103,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					],
 				};
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
+						},
+					],
 				};
 			}
 		},
@@ -113,9 +139,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
 				};
 			}
-			const message = err instanceof Error ? err.message : String(err);
 			return {
-				content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
+					},
+				],
 			};
 		}
 	});
@@ -164,7 +194,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"When true, runs the script in read-only mode: parallel reads are unblocked across calls (no exclusive lock) and any mutating filesystem op is rejected with EREADONLY at the offending command.",
 				),
 		},
-		async (args) => {
+		async (args, extra) => {
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 			const scriptToRun = args.debug ? `set -x\n${args.script}` : args.script;
 			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
@@ -180,11 +210,18 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						controller.abort();
 					}, timeoutMs);
 
+					// Audit L4: abort the in-flight exec on MCP client disconnect rather
+					// than running to the full timeout.
+					const onDisconnect = (): void => controller.abort();
+					extra.signal.addEventListener("abort", onDisconnect, { once: true });
+					if (extra.signal.aborted) controller.abort();
+
 					try {
 						const execResult = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 							signal: controller.signal,
 						});
 						clearTimeout(timer);
+						extra.signal.removeEventListener("abort", onDisconnect);
 						if (timedOut) {
 							return {
 								stdout: "",
@@ -205,6 +242,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						};
 					} catch (e) {
 						clearTimeout(timer);
+						extra.signal.removeEventListener("abort", onDisconnect);
 						if (timedOut) {
 							return {
 								stdout: "",
@@ -256,9 +294,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						],
 					};
 				}
-				const message = err instanceof Error ? err.message : String(err);
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: message, exitCode: 1 }) }],
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ stdout: "", stderr: clientSafeErrorMessage(err, "internal error"), exitCode: 1 }),
+						},
+					],
 				};
 			}
 		},
@@ -408,29 +450,30 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				),
 		},
 		async (args) => {
-			const built = await buildBulkIngestPayload({
-				basePath: args.basePath ?? "/home/user",
-				files: args.files,
-				paths: args.paths,
-			});
-			if (!built.ok) {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: built.errors.join("; ") }) }],
-				};
-			}
-			const { bulkFiles } = built;
-
 			try {
-				await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+				const result = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+					// Authorization has passed — only now is it safe to touch the host
+					// filesystem. `buildBulkIngestPayload` in `paths` mode reads arbitrary
+					// host files off disk, so it MUST run AFTER the ownership check, never
+					// before (audit H3 — pre-authz host-read + readability oracle).
+					const built = await buildBulkIngestPayload({
+						basePath: args.basePath ?? "/home/user",
+						files: args.files,
+						paths: args.paths,
+					});
+					if (!built.ok) {
+						return { ok: false as const, error: built.errors.join("; ") };
+					}
 					const fs = session.fs as ICoherentFs;
 					if (typeof fs.bulkIngest !== "function") {
 						throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
 					}
-					await fs.bulkIngest(bulkFiles);
+					await fs.bulkIngest(built.bulkFiles);
+					return { ok: true as const, count: built.bulkFiles.length };
 				});
 
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: true, count: bulkFiles.length }) }],
+					content: [{ type: "text" as const, text: JSON.stringify(result) }],
 				};
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;
@@ -456,9 +499,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
 					};
 				}
-				const message = err instanceof Error ? err.message : String(err);
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
+						},
+					],
 				};
 			}
 		},
@@ -488,26 +535,44 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						const readErrors: string[] = [];
 
 						const candidates = allPaths.filter((p) => p.startsWith(prefix));
-						await Promise.all(
-							candidates.map(async (absPath) => {
-								try {
-									const buf = await session.fs.readFileBuffer(absPath);
-									const relativePath = absPath.slice(prefix.length);
+						if (candidates.length > MAX_EXPORT_FILES) {
+							throw Object.assign(new Error(`export exceeds file limit (${MAX_EXPORT_FILES})`), {
+								code: "EEXPORT_TOO_LARGE",
+							});
+						}
+						let totalBytes = 0;
+						// Read in bounded-concurrency batches with a running byte cap so a large
+						// sandbox can't open every file at once or blow up memory (audit H11).
+						for (let i = 0; i < candidates.length; i += MAX_EXPORT_CONCURRENCY) {
+							const batch = candidates.slice(i, i + MAX_EXPORT_CONCURRENCY);
+							await Promise.all(
+								batch.map(async (absPath) => {
 									try {
-										result[relativePath] = utf8Decoder.decode(buf);
-									} catch {
-										result[relativePath] =
-											`data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+										const buf = await session.fs.readFileBuffer(absPath);
+										totalBytes += buf.byteLength;
+										if (totalBytes > MAX_EXPORT_BYTES) {
+											throw Object.assign(new Error(`export exceeds byte limit (${MAX_EXPORT_BYTES})`), {
+												code: "EEXPORT_TOO_LARGE",
+											});
+										}
+										const relativePath = absPath.slice(prefix.length);
+										try {
+											result[relativePath] = utf8Decoder.decode(buf);
+										} catch {
+											result[relativePath] =
+												`data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+										}
+									} catch (e) {
+										const code = (e as Error & { code?: string }).code;
+										if (code === "EEXPORT_TOO_LARGE") throw e;
+										// EISDIR is expected — directories cannot be read as files
+										if (code !== "EISDIR") {
+											readErrors.push(absPath);
+										}
 									}
-								} catch (e) {
-									const code = (e as Error & { code?: string }).code;
-									// EISDIR is expected — directories cannot be read as files
-									if (code !== "EISDIR") {
-										readErrors.push(absPath);
-									}
-								}
-							}),
-						);
+								}),
+							);
+						}
 
 						return { files: result, errors: readErrors };
 					},
@@ -529,7 +594,21 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
 					};
 				}
-				const message = code === "ENOENT" ? "sandbox not found" : err instanceof Error ? err.message : String(err);
+				if (code === "EEXPORT_TOO_LARGE") {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									ok: false,
+									code: "EEXPORT_TOO_LARGE",
+									error: "export too large; narrow with basePath",
+								}),
+							},
+						],
+					};
+				}
+				const message = code === "ENOENT" ? "sandbox not found" : clientSafeErrorMessage(err, "internal error");
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
 				};

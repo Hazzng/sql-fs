@@ -6,6 +6,7 @@
 import { serve } from "@hono/node-server";
 import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { PostgresDialect } from "../fs/sql-fs/dialects/postgres.js";
 import { translateSqlError } from "../fs/sql-fs/errors.js";
@@ -15,7 +16,7 @@ import type { SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt } from "../redis/config.js";
 import { type AuthVariables, createAuthMiddleware } from "./auth.js";
-import { mapFsErrorToStatus } from "./errors.js";
+import { clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
@@ -153,6 +154,43 @@ const sessionManager = new SessionManager({
 	listSandboxesFn,
 });
 
+// ── Structured JSON request logging ───────────────────────────────────────────
+// Registered BEFORE the routes so it actually wraps /v1/* and /mcp (audit L6 —
+// it previously sat after the terminal handlers and never ran for them).
+app.use("*", async (c, next) => {
+	const start = Date.now();
+	await next();
+	const durationMs = Date.now() - start;
+	console.log(
+		JSON.stringify({
+			method: c.req.method,
+			path: c.req.path,
+			status: c.res?.status,
+			durationMs,
+		}),
+	);
+});
+
+// ── Global request body-size backstop (audit H11) ─────────────────────────────
+// Hard ceiling applied BEFORE auth/handlers so a multi-GB body can never be
+// buffered into memory (OOM). Sits above the tighter per-route limits
+// (raw-file write, bulk write, ingest). Configurable via MAX_REQUEST_BODY_BYTES.
+const MAX_REQUEST_BODY_BYTES = Number(process.env.MAX_REQUEST_BODY_BYTES ?? `${256 * 1024 * 1024}`);
+const bodyLimitMiddleware = bodyLimit({
+	maxSize: MAX_REQUEST_BODY_BYTES,
+	onError: (c) =>
+		c.json(
+			{
+				error: "payload_too_large",
+				code: "PAYLOAD_TOO_LARGE",
+				details: [`Request body exceeds limit (${MAX_REQUEST_BODY_BYTES} bytes)`],
+			},
+			413 as ContentfulStatusCode,
+		),
+});
+app.use("/v1/*", bodyLimitMiddleware);
+app.use("/mcp", bodyLimitMiddleware);
+
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
 const authMiddleware = createAuthMiddleware(tenantConfig);
@@ -180,23 +218,6 @@ app.use("/mcp", async (c, next) => {
 app.use("/mcp", authMiddleware);
 app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"), c.get("tenant")));
 
-// ── Middleware ─────────────────────────────────────────────────────────────────
-
-/** Structured JSON request logging */
-app.use("*", async (c, next) => {
-	const start = Date.now();
-	await next();
-	const durationMs = Date.now() - start;
-	console.log(
-		JSON.stringify({
-			method: c.req.method,
-			path: c.req.path,
-			status: c.res.status,
-			durationMs,
-		}),
-	);
-});
-
 // ── Health endpoints ───────────────────────────────────────────────────────────
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
@@ -212,24 +233,7 @@ app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-
-	const knownFsCodes = [
-		"ENOENT",
-		"EEXIST",
-		"EISDIR",
-		"ENOTDIR",
-		"EPERM",
-		"FORBIDDEN",
-		"ENOTEMPTY",
-		"ESESSIONCLOSING",
-		"ELOOP",
-		"EINVAL",
-		"ELOCKTIMEOUT",
-		"ELOCKLOST",
-		"ECOHERENCE",
-		"ERUNTIME_BUSY",
-	];
-	const message = knownFsCodes.includes(code) ? err.message : "Internal server error";
+	const message = clientSafeErrorMessage(err);
 
 	return c.json({ error: message, code }, status);
 });

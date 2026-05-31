@@ -344,12 +344,15 @@ describe("SessionManager.withSessionRead", () => {
 		const block = new Promise<void>((r) => {
 			onceResolve = r;
 		});
+		const recordingRead = async (key: string): Promise<string> => {
+			getCalls.push(key);
+			if (blockReads) await block;
+			return "0";
+		};
 		const fakeRedis: Partial<Redis> = {
-			get: vi.fn(async (key: string) => {
-				getCalls.push(key);
-				if (blockReads) await block;
-				return "0";
-			}),
+			get: vi.fn(recordingRead),
+			// ensureFreshCache + getOrCreate now read via GETEX (TTL refresh, audit H6).
+			getex: vi.fn(recordingRead) as unknown as Redis["getex"],
 			incr: vi.fn(async () => 1),
 			expire: vi.fn(async () => 1),
 			// eval is needed by withExecLockShared (distributed RW shared lock).
