@@ -9,7 +9,7 @@
 		"node": ">=22"
 	},
 	"scripts": {
-		"dev": "tsx watch src/api/server.ts",
+		"dev": "tsx watch --env-file .env src/api/server.ts",
 		"dev:portless": "portless",
 		"build": "tsc && node scripts/copy-postgres-migrations.mjs",
 		"start": "node dist/api/server.js",
