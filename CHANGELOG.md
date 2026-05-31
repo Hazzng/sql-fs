@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+### Patch Changes
+
+- [#109](https://github.com/Hazzng/sql-fs/pull/109) Thanks [@Hazzng](https://github.com/Hazzng)! - Fix dev server env loading and portless config: add --env-file .env to tsx watch, rename portless tunnel to sql-fs
+
 ## 0.6.0
 
 ### Minor Changes
