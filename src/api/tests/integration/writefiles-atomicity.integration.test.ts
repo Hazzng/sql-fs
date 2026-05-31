@@ -13,7 +13,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { PostgresDialect } from "../../../fs/sql-fs/dialects/postgres.js";
+import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { clientSafeErrorMessage, mapFsErrorToStatus } from "../../errors.js";
 import { fileRoutes } from "../../routes/files.js";
@@ -47,7 +47,7 @@ describe.skipIf(!process.env.DATABASE_URL)("writeFiles atomicity (H10, real Post
 		sessionManager = new SessionManager({
 			createFs: async (_tenantId: string, sandboxId: string) => {
 				// Each sandbox gets its own SqlFs (script-tx capable) over this dialect.
-				const { SqlFs } = await import("../../../fs/sql-fs/sql-fs.js");
+				const { SqlFs } = await import("../../../sql-fs/sql-fs.js");
 				const fs = new SqlFs({ dialect, sandboxId, allowSymlinks: false });
 				await dialect.transaction((tx) => dialect.createSandbox(tx, sandboxId, OWNER));
 				await fs.ready();

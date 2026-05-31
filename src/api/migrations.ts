@@ -1,7 +1,7 @@
 /**
  * Startup migration runner.
  *
- * Applies every .sql file under src/fs/sql-fs/migrations/postgres/ (lexicographic
+ * Applies every .sql file under src/sql-fs/migrations/postgres/ (lexicographic
  * order) to each configured tenant database. Migrations are idempotent
  * (CREATE TABLE IF NOT EXISTS / CREATE OR REPLACE FUNCTION), so rerunning on a
  * migrated database is a no-op.
@@ -24,7 +24,7 @@ import type { TenantConfig } from "./tenants.js";
 const MIGRATION_LOCK_KEY = 7_263_001_954_120_388n;
 
 function migrationFiles(): readonly string[] {
-	const dir = fileURLToPath(new URL("../fs/sql-fs/migrations/postgres/", import.meta.url));
+	const dir = fileURLToPath(new URL("../sql-fs/migrations/postgres/", import.meta.url));
 	return readdirSync(dir)
 		.filter((name) => name.endsWith(".sql"))
 		.sort()

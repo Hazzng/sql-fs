@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { readOnlyContext } from "../../../../api/read-only-context.js";
+import { readOnlyContext } from "../../../api/read-only-context.js";
 import { SqlFs } from "../../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
 

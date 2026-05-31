@@ -12,7 +12,7 @@ import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
-import { readOnlyContext } from "../../api/read-only-context.js";
+import { readOnlyContext } from "../api/read-only-context.js";
 import { runTrustedDbAsync } from "./defense.js";
 import {
 	createEexist,

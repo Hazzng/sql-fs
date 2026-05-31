@@ -15,7 +15,7 @@
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createSandboxFs, destroySandbox } from "../../../fs/sql-fs/index.js";
+import { createSandboxFs, destroySandbox } from "../../../sql-fs/index.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { fileRoutes } from "../../routes/files.js";
 import { SessionManager } from "../../session-manager.js";

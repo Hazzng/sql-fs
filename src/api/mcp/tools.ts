@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { ICoherentFs } from "../../fs/sql-fs/sql-fs.js";
+import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import { clientSafeErrorMessage } from "../errors.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";

@@ -18,7 +18,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import type { BulkIngestFile } from "../fs/sql-fs/types.js";
+import type { BulkIngestFile } from "../sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "./ingest-validation.js";
 import { positiveIntEnv } from "./lib/env.js";
 

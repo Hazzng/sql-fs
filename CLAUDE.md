@@ -28,7 +28,7 @@ pnpm lint:fix               # Fix lint errors (biome)
 pnpm test                   # Run ALL tests
 pnpm test:unit              # Unit tests only (no DB required)
 pnpm test:integration       # Integration tests (requires DB — skips if unavailable)
-pnpm test -- src/fs/sql-fs/sql-fs.cache.test.ts   # Run specific test file
+pnpm test -- src/sql-fs/sql-fs.cache.test.ts   # Run specific test file
 
 # Database
 pnpm db:generate            # Generate Drizzle migrations from schema changes
@@ -60,7 +60,7 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 
 ### Key Modules
 
-**SqlFs** (`src/fs/sql-fs/`): The core — implements `IFileSystem` from just-bash using SQL.
+**SqlFs** (`src/sql-fs/`): The core — implements `IFileSystem` from just-bash using SQL.
 
 - `types.ts` — `SqlDialect` interface, shared types (`InodeRow`, `DirentRow`, `PathCacheEntry`)
 - `sql-fs.ts` — Main class: implements all 20+ `IFileSystem` methods, manages pathCache (Map) and contentCache (LRU)
@@ -162,7 +162,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 ### Testing
 
 - **Framework:** Vitest
-- **File naming:** `*.test.ts` files live in a `tests/` subdirectory next to the source they cover (e.g., `src/fs/sql-fs/tests/`); integration tests live under `tests/integration/` or a sibling `integration/` directory.
+- **File naming:** `*.test.ts` files live in a `tests/` subdirectory next to the source they cover (e.g., `src/sql-fs/tests/`); integration tests live under `tests/integration/` or a sibling `integration/` directory.
 - **Unit tests:** Mock the `SqlDialect` interface. Test SqlFs methods in isolation. No real DB needed.
 - **Integration tests:** Run against real databases. Skip gracefully if DB URL env var is not set: `describe.skipIf(!process.env.DATABASE_URL)(...)`
 - **Assert full output:** Prefer exact match (`toBe`, `toEqual`) over partial (`toContain`). Assert both success and error cases.
@@ -223,7 +223,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 
 ```
 src/
-  fs/sql-fs/                     ← Core: IFileSystem backed by SQL
+  sql-fs/                     ← Core: IFileSystem backed by SQL
     types.ts                     ← SqlDialect interface + shared types
     sql-fs.ts                    ← SqlFs class (IFileSystem + caching)
     errors.ts                    ← Error constructors + translation

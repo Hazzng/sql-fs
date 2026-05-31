@@ -15,12 +15,12 @@
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
-import { createPostgresSandboxFs, destroyPostgresSandbox } from "../fs/sql-fs/index.js";
-import type { RedisBlobCache } from "../fs/sql-fs/redis-blob-cache.js";
-import { type RedisPathSnapshot, versionKey } from "../fs/sql-fs/redis-path-snapshot.js";
-import { SessionScopedFs } from "../fs/sql-fs/session-scoped-fs.js";
-import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../fs/sql-fs/sql-fs.js";
-import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../fs/sql-fs/types.js";
+import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
+import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
+import { type RedisPathSnapshot, versionKey } from "../sql-fs/redis-path-snapshot.js";
+import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
+import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
+import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
