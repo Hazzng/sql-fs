@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/version-0.6.2-blue" alt="Version" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen?logo=node.js&logoColor=white" alt="Node.js" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/MCP-2025--03--26-8b5cf6" alt="MCP" />
+  <img src="https://img.shields.io/badge/just--bash-2.14.5-f59e0b" alt="just-bash" />
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="License" />
 </p>
 
@@ -20,22 +20,14 @@ Most sandbox runtimes lose state when the process dies. sql-fs gives [just-bash]
 
 | Problem | Solution |
 |---|---|
-| In-memory FS lost on process death | Every write goes to Postgres — container restarts are transparent |
-| No remote access | HTTP REST API + MCP server expose bash over the network |
+| Sandbox cost at scale is expensive with time-based pricing | State lives in your existing Postgres database — no per-minute sandbox billing, just the DB you already pay for |
 | No isolation between agents | Row-level security (RLS) on `sandbox_id` — sandboxes are hard-isolated at the DB layer |
-| Reading the same files on every exec is slow | Two-layer in-process cache: path map (0ms stat/readdir) + LRU content cache (0ms readFile on hit) |
-| Horizontal scaling breaks warm session state | Stateless replicas + Redis distributed lock — only one replica runs exec for a sandbox at a time |
+| Cold-starting a session re-fetches the entire filesystem from Postgres | Two-layer in-process cache: path map (0ms stat/readdir) + LRU content cache (0ms readFile on hit) |
+| Concurrent requests from different replicas corrupt sandbox state | Stateless replicas + Redis distributed lock — only one replica runs exec for a sandbox at a time |
 | Duplicate file content wastes storage | Content-addressable blob store (sha256-keyed) — identical files across all sandboxes share one row |
 | Partial writes on script failure | Entire script runs in one DB transaction — it either fully commits or fully rolls back |
 
 ## Quick Start
-
-### In-memory (no DB required)
-
-```bash
-pnpm install
-FS_BACKEND=memory AUTH_SECRET=localdev pnpm dev
-```
 
 ### With Postgres
 
@@ -78,114 +70,41 @@ sb.ingest_files(files, base_path="/home/user/src")
 result = sb.exec("cd /home/user/src && npm install && npm test")
 print(result.stdout)
 
-# 4. Export modified sandbox
-pathlib.Path("result.tar.gz").write_bytes(sb.export(base_path="/home/user/src"))
+# 4. Export modified sandbox (tar + base64 via exec — no dedicated HTTP endpoint)
+import base64
+r = sb.exec("tar -czf - -C /home/user/src . | base64 -w 0", read_only=True, timeout_ms=60_000)
+pathlib.Path("result.tar.gz").write_bytes(base64.b64decode(r.stdout.strip()))
 
 # 5. Cleanup
 sb.delete()
 ```
 
-## MCP Server
-
-Mounted at `/mcp`. Streamable HTTP transport per MCP 2025-03-26 spec. Tool names are kept short to minimize agent context window usage.
-
-| Tool | Description |
-|------|-------------|
-| `sandbox_create` | Create an isolated bash sandbox; optional `python` / `javascript` runtime flags |
-| `sandbox_list` | List all sandboxes owned by the current user |
-| `sandbox_delete` | Delete a sandbox and all its files |
-| `bash_exec` | Execute a bash script, return buffered output |
-| `bash_exec_batch` | Execute multiple scripts in one round-trip; `readOnly:false` → sequential under one write-lock, `readOnly:true` → parallel under a shared read-lock |
-| `fs_ingest` | Bulk-upload files into a sandbox |
-| `fs_export` | Download sandbox files as a JSON map |
-
 ## How It Works
-
-### Key invariant
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
-In-process caches exist purely for speed during a single exec. Redis serializes requests across replicas and speeds up cold starts. If you dropped Redis and all caches, the system would still be correct — just slower.
+Each `exec` call flows through three stacked locks — in-process mutex → Redis distributed lock → `pg_advisory_xact_lock` — ensuring only one writer touches a sandbox at a time across any number of replicas. Writes always go to Postgres first; in-process caches (`pathCache` Map, `contentCache` LRU) and Redis (blob cache, path snapshot) are updated after and exist purely for speed.
 
-### Request flow
+Cross-replica coherence uses a single monotonic version counter in Redis — no pub/sub needed. When a replica acquires the exec lock and finds the counter advanced, it reloads `pathCache` from Postgres before proceeding.
 
-```
-POST /exec
-     │
-     ▼
-Auth middleware
-     │
-     ▼
-SessionManager.withSession(sandboxId, fn)
-     │
-     ├─[1] Acquire Redis exec lock       cross-replica mutex (SET NX PX + heartbeat)
-     ├─[2] Version check                 if counter changed → reload pathCache from Postgres
-     ├─[3] Acquire session.mutex         in-process mutex (same replica, same sandbox)
-     ├─[4] bash.exec(script)             the actual work
-     │       each write → Postgres tx (RLS scoping + pg_advisory_xact_lock)
-     │       → update in-process caches → set dirty = true
-     ├─[5] Release session.mutex
-     ├─[6] If dirty → INCR version counter → write path snapshot to Redis
-     └─[7] Release Redis exec lock
-```
-
-### Three lock layers
-
-Three locks stack on top of each other. Each is the fallback for the one above it.
-
-| Lock | Type | Scope | Purpose |
-|---|---|---|---|
-| `session.mutex` | async-mutex in Node heap | one replica, one sandbox | Prevents two concurrent requests on the same replica from interleaving inside `Bash` or `SqlFs`. Zero network cost. |
-| Redis exec lock | `SET NX PX` + heartbeat + Lua release | entire fleet | Only one replica runs exec for a given sandbox at a time. If Redis is down → fail closed (503). |
-| `pg_advisory_xact_lock` | Postgres transaction-scoped advisory lock | database | Last line of defense — serializes at DB level when the Redis lock fails (GC pause beyond lease, code paths that bypass `withSession`). Auto-released on commit/rollback; compatible with Neon transaction-mode pooling. |
-
-### Cache layers
-
-| Layer | What | Keyed by | Populated | Invalidated |
-|---|---|---|---|---|
-| L1 `pathCache` | `Map<path, entry>` — serves stat/readdir/getAllPaths at 0ms | absolute path | `loadAllPaths` recursive CTE at session start; updated on every write | On `reload()` (cross-replica version mismatch) |
-| L1 `contentCache` | LRU (50 MB cap) — serves readFile at 0ms on hit | inode ID | Lazy on first `readFile`; bulk-prewarmed after session start | On write/delete to that inode |
-| L2 blob cache | Redis bytes — avoids Postgres round-trips for reads | `sha256hex` | Fire-and-forget on every blob write | Never (content is immutable under its sha256) |
-| L2b path snapshot | Redis msgpack — speeds up cold starts | `sandboxId` | After every exec that dirtied the FS | On sandbox delete; version mismatch causes automatic fallthrough to Postgres |
-
-### Cross-replica coherence
-
-No pub/sub. A single monotonic version counter in Redis is sufficient because exec serialization (Lock 2) means only one replica ever writes a sandbox at a time.
-
-```
-Replica 1:  [acquire lock] → [exec] → [INCR ver] → [release lock]
-Replica 2:                    [blocked on Redis lock]
-                                                    [acquire lock] → [ver mismatch → reload from Postgres] → [exec]
-```
-
-### What is NOT guaranteed
-
-**Multi-step client atomicity.** The lock is held per `exec` call, not across multiple calls. Bundle read-compute-write into one script:
-
-```bash
-# BAD — another agent can slip in between the two exec calls
-balance=$(cat balance.txt)          # exec 1
-echo $((balance - 50)) > balance.txt  # exec 2
-
-# GOOD — the lock is held for the entire script
-balance=$(cat balance.txt)
-echo $((balance - 50)) > balance.txt
-```
-
-**File API + exec mixing.** The `/files/*` HTTP endpoints bypass the exec lock hierarchy. Use `exec` for all production and agent file access; the file API is for admin and test use only.
+> **Note:** The `/files/*` HTTP endpoints bypass the exec lock. Use `exec` for all agent and production file access; the file API is for admin and test use only.
 
 ## Schema
 
 ```
 sandboxes   id (UUID PK), root_inode, owner, created_at
+    
     │
-inodes      id (BIGSERIAL PK), sandbox_id, kind (file|dir|symlink),
+ 
+  inodes    id (BIGSERIAL PK), sandbox_id, kind (file|dir|symlink),
             mode, size, mtime, nlink, content_sha256 → blobs, symlink_target
     │
-dirents     parent_inode_id, name, inode_id, sandbox_id
-            PK: (parent_inode_id, name)   ← adjacency list; mv is O(1)
+  
+ dirents    parent_inode_id, name, inode_id, sandbox_id
+            PK: (parent_inode_id, name)  ← adjacency list; mv is O(1)
     │
-blobs       sha256 (PK), data, size       ← content-addressable; global dedup
+ 
+  blobs     sha256 (PK), data, size      ← content-addressable; global dedup
 ```
 
 Key design choices:
@@ -216,6 +135,11 @@ Key design choices:
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No | `3600000` | Path snapshot TTL (1h). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No | `false` | Monkey-patches host globals during exec for extra isolation. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No | `true` | When defense-in-depth is on: log violations instead of throwing. |
+| `ADMIN_RATE_LIMIT_WINDOW_MS` | No | `60000` | Rolling window (ms) for the admin token-generation endpoint. |
+| `ADMIN_RATE_LIMIT_MAX` | No | `5` | Max requests per window for the admin token-generation endpoint. |
+| `BOOTSTRAP_RATE_LIMIT_WINDOW_MS` | No | `60000` | Rolling window (ms) for the bootstrap token endpoint. |
+| `BOOTSTRAP_RATE_LIMIT_MAX` | No | `5` | Max requests per window for the bootstrap token endpoint. |
+| `TRUST_PROXY_HEADERS` | No | `false` | Set `true` to read client IP from `X-Forwarded-For` (use only behind a trusted reverse proxy). |
 
 ## Deployment
 
@@ -234,6 +158,7 @@ For multi-replica deployments, add `REDIS_URL`. All replicas share the same Post
 
 ```bash
 pnpm dev                    # hot-reload dev server
+pnpm dev:portless           # dev server exposed via portless tunnel
 pnpm typecheck              # type check (tsc --noEmit)
 pnpm lint:fix               # format + lint (Biome)
 pnpm test:unit              # unit tests — no DB required
@@ -242,6 +167,7 @@ pnpm test                   # all tests
 pnpm db:generate            # generate Drizzle migrations from schema changes
 pnpm db:migrate             # apply migrations
 pnpm db:gc                  # garbage-collect orphan blobs
+pnpm changeset              # record a version bump for the next release
 ```
 
 ## Benchmarking
