@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/version-0.6.2-blue" alt="Version" />
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen?logo=node.js&logoColor=white" alt="Node.js" />
   <img src="https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/just--bash-2.14.5-f59e0b" alt="just-bash" />
+  <img src="https://img.shields.io/badge/just--bash-3.0.1-f59e0b" alt="just-bash" />
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="License" />
 </p>
 
