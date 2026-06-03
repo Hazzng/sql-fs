@@ -14,7 +14,7 @@
 
 ---
 
-Most sandbox runtimes lose state when the process dies. sql-fs gives [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes a durable, Postgres-backed filesystem — so an AI agent can create an environment, run commands, come back hours later, and pick up exactly where it left off.
+Most sandbox platforms still spin up full VMs—slow cold starts and per-minute billing where costs stack up fast. [just-bash](https://github.com/nicholasgasior/just-bash) is the virtual bash runtime; we built the distributed, persistent layer around it—a Postgres-backed virtual filesystem over HTTP and MCP, with strong consistency across replicas and fast in-process caching, so sandboxes that are cheap to create, quick to resume, and durable across process restarts.
 
 ## Why
 
