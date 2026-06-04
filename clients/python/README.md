@@ -56,6 +56,24 @@ If you already hold a JWT (e.g. minted via `pnpm token:create`), pass `token=` i
 fs = Client(base_url="...", token="eyJhbGciOi...")
 ```
 
+### Per-file size limit
+
+`Client(max_file_size=...)` (default **64 MiB**) caps individual files on every
+write path — `ingest_files`, `fs.write`, `fs.write_files` — and is checked
+**client-side before anything is base64-encoded or sent**. An oversized file
+raises `ValidationError(code="EFILE_TOO_LARGE")` (with `status=None`) naming each
+offending path and size; nothing is transmitted. The limit is threaded to every
+`Sandbox` the client creates or attaches.
+
+```python
+fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=128 * 1024 * 1024)  # raise to 128 MiB
+fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=0)                   # disable the check
+```
+
+> The server also caps the whole request body (`MAX_REQUEST_BODY_BYTES`, default
+> 256 MB); after ~33% base64 inflation that's ~190 MB of raw bytes per call across
+> all files. The 64 MiB default keeps a single file well inside that.
+
 ## API surface
 
 ### `Client`
@@ -116,6 +134,10 @@ All exceptions derive from `SQLFSError`. HTTP status codes map to:
 | network | `TransportError` |
 
 Each error exposes `.code` (server error code, e.g. `ENOENT`), `.status`, and `.details`.
+
+`ValidationError` is also raised **client-side** with `code="EFILE_TOO_LARGE"` and
+`status=None` when a file exceeds `Client(max_file_size=...)` — before any HTTP
+request is made. `.details` lists each offending `path (size > limit)`.
 
 ## Performance patterns
 
