@@ -67,7 +67,7 @@ files = {str(p): p.read_bytes() for p in pathlib.Path("src").rglob("*") if p.is_
 sb.ingest_files(files, base_path="/home/user/src")
 
 # 3. Run commands — stdout/stderr stream back
-result = sb.exec("cd /home/user/src && npm install && npm test")
+result = sb.exec("grep -r 'TODO' /home/user/src || echo 'no TODOs found'")
 print(result.stdout)
 
 # 4. Export modified sandbox (tar + base64 via exec — no dedicated HTTP endpoint)
