@@ -165,10 +165,17 @@ sb.ingest_files(
 
 Returns the server's response dict, e.g. `{"status": "ok", "fileCount": 125}`.
 
+**Per-file size check (client-side).** Before encoding anything, each file is
+checked against the client's `max_file_size` (default 64 MiB — see
+`ref/client.md`). A file over the limit raises
+`ValidationError(code="EFILE_TOO_LARGE")` and **nothing is sent**. Raise or
+disable it with `Client(max_file_size=...)` / `max_file_size=0`.
+
 **Hard limits to keep in mind:**
-- All file bytes are buffered into one HTTP request body. Practical ceiling
-  before things get slow: ~10 MB total, ~500 files. For larger payloads, split
-  into multiple `ingest_files` calls.
+- All file bytes are buffered into one HTTP request body. The server caps the
+  whole body (default 256 MB); after ~33% base64 inflation that's ~190 MB of raw
+  bytes per call. Individual large files (tens of MB) ingest fine and store
+  byte-exact — split very large payloads across multiple `ingest_files` calls.
 
 ---
 

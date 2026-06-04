@@ -44,13 +44,54 @@ from .models import (
     TreeEntry,
 )
 
+#: Default per-file size ceiling (bytes) enforced client-side before any
+#: content is base64-encoded or sent over the network. 64 MiB. Override per
+#: client via ``Client(max_file_size=...)`` or disable with ``max_file_size=0``.
+DEFAULT_MAX_FILE_SIZE = 64 * 1024 * 1024
+
+
+def _content_size(content: Union[str, bytes]) -> int:
+    """Raw byte length of a write payload (``str`` measured as UTF-8)."""
+    return len(content.encode("utf-8")) if isinstance(content, str) else len(content)
+
+
+def _enforce_max_file_size(
+    files: Mapping[str, Union[str, bytes]],
+    max_file_size: int,
+) -> None:
+    """Reject oversized files *before* anything is encoded or sent.
+
+    Raises ``ValidationError`` (code ``EFILE_TOO_LARGE``) naming every offending
+    path and its size. A ``max_file_size`` of 0 (or negative) disables the check.
+    """
+    if max_file_size <= 0:
+        return
+    too_big = [
+        (path, size)
+        for path, content in files.items()
+        if (size := _content_size(content)) > max_file_size
+    ]
+    if too_big:
+        details = [f"{path} ({size} bytes > {max_file_size} limit)" for path, size in too_big]
+        raise ValidationError(
+            "file exceeds max_file_size: " + "; ".join(details),
+            code="EFILE_TOO_LARGE",
+            details=details,
+        )
+
 
 class FilesAPI:
     """`sandbox.fs.*` — file operations on a single sandbox."""
 
-    def __init__(self, transport: Transport, sandbox_id: str) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        sandbox_id: str,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    ) -> None:
         self._t = transport
         self._id = sandbox_id
+        self._max_file_size = max_file_size
 
     def read(self, path: str) -> ReadResult:
         """`GET /files/{path}` — read raw bytes + parsed `X-FS-Stat` header."""
@@ -74,6 +115,7 @@ class FilesAPI:
 
     def write(self, path: str, content: Union[str, bytes]) -> None:
         """`PUT /files/{path}` — write raw bytes; parents auto-created."""
+        _enforce_max_file_size({path: content}, self._max_file_size)
         body = content.encode("utf-8") if isinstance(content, str) else content
         self._t.request(
             "PUT",
@@ -89,6 +131,7 @@ class FilesAPI:
         Keys are absolute paths inside the sandbox, values are file contents
         (text). For binary content, prefer `ingest_files()` (base64).
         """
+        _enforce_max_file_size(files, self._max_file_size)
         self._t.request(
             "POST",
             f"/sandboxes/{self._id}/writeFiles",
@@ -146,11 +189,13 @@ class Sandbox:
         sandbox_id: str,
         *,
         record: Optional[SandboxRecord] = None,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
     ) -> None:
         self._t = transport
         self._id = sandbox_id
         self._record = record
-        self.fs = FilesAPI(transport, sandbox_id)
+        self._max_file_size = max_file_size
+        self.fs = FilesAPI(transport, sandbox_id, max_file_size)
 
     @property
     def id(self) -> str:
@@ -369,7 +414,12 @@ class Sandbox:
 
         Keys are paths relative to `base_path`. Values may be `str` (encoded
         utf-8) or `bytes` (encoded as-is); the SDK base64-encodes them.
+
+        Each file is checked against the client's ``max_file_size`` first; an
+        oversized file raises ``ValidationError`` (code ``EFILE_TOO_LARGE``)
+        before anything is encoded or sent over the network.
         """
+        _enforce_max_file_size(files, self._max_file_size)
         encoded: Dict[str, str] = {}
         for path, content in files.items():
             data = content.encode("utf-8") if isinstance(content, str) else content

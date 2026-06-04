@@ -9,7 +9,7 @@ import httpx
 
 from ._http import Transport
 from .models import SandboxInfo, SandboxRecord
-from .sandbox import Sandbox
+from .sandbox import DEFAULT_MAX_FILE_SIZE, Sandbox
 
 
 class Client:
@@ -28,6 +28,11 @@ class Client:
 
     The client is safe to keep around for the lifetime of your process. Use
     `with Client(...) as c:` to ensure HTTP connections are released.
+
+    `max_file_size` (bytes, default 64 MiB) caps individual files on every
+    write path (`ingest_files`, `fs.write`, `fs.write_files`). Oversized files
+    raise `ValidationError` (code `EFILE_TOO_LARGE`) client-side, before any
+    content is base64-encoded or sent. Set to 0 to disable the check.
     """
 
     def __init__(
@@ -44,6 +49,7 @@ class Client:
         max_retries: int = 3,
         user_agent: Optional[str] = None,
         http_client: Optional[httpx.Client] = None,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
     ) -> None:
         self._transport = Transport(
             base_url=base_url,
@@ -58,7 +64,7 @@ class Client:
             user_agent=user_agent,
             http_client=http_client,
         )
-        self.sandboxes = SandboxesResource(self._transport)
+        self.sandboxes = SandboxesResource(self._transport, max_file_size=max_file_size)
 
     @property
     def token(self) -> str:
@@ -78,8 +84,14 @@ class Client:
 class SandboxesResource:
     """`client.sandboxes.*` — sandbox CRUD."""
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        *,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    ) -> None:
         self._t = transport
+        self._max_file_size = max_file_size
 
     def list(self) -> List[SandboxRecord]:
         """`GET /v1/sandboxes` — list sandboxes owned by the caller."""
@@ -131,7 +143,7 @@ class SandboxesResource:
 
         resp = self._t.request("POST", "/sandboxes", json_body=body or None)
         record = SandboxRecord.from_api(resp.json())
-        return Sandbox(self._t, record.id, record=record)
+        return Sandbox(self._t, record.id, record=record, max_file_size=self._max_file_size)
 
     def get(self, sandbox_id: str) -> SandboxInfo:
         """`GET /v1/sandboxes/{id}` — fetch sandbox metadata."""
@@ -144,7 +156,7 @@ class SandboxesResource:
         Does not hit the network — use `.get(id)` first if you want to verify
         the sandbox exists / is accessible to the current token.
         """
-        return Sandbox(self._t, sandbox_id)
+        return Sandbox(self._t, sandbox_id, max_file_size=self._max_file_size)
 
     def delete(self, sandbox_id: str) -> None:
         """`DELETE /v1/sandboxes/{id}` — destroy the sandbox and all blobs."""
