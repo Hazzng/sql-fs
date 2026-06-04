@@ -447,6 +447,18 @@ Request body:
 The previous "≤25 files per batch" rule no longer applies — the dialect now uses a
 single bulk INSERT. Practical caps are HTTP body size and the 240 s ACA gateway window.
 
+**Size limits:** the only ceiling is the request body — `MAX_REQUEST_BODY_BYTES`
+(default 256 MB). Since base64 inflates content ~33%, that's ~190 MB of raw bytes
+per call, across all files. Multi-MB files ingest fine and store byte-exact (a
+single 128 MB file has been verified end-to-end). Individual files are buffered +
+base64-decoded in memory, so very large files are memory- and time-heavy — prefer
+splitting big payloads across several calls. (Clients such as the Python SDK also
+enforce their own per-file ceiling — default 64 MB — *before* sending.)
+
+> Fixed in this release: base64 validation previously overflowed V8's regex stack
+> on strings beyond ~1 MB, so files larger than ~750 KB returned
+> `500 INTERNAL_ERROR` during validation. Large-file ingest now succeeds.
+
 ---
 
 ## Admin Maintenance

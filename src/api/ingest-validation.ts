@@ -50,8 +50,13 @@ export function isValidRelativePath(p: string): boolean {
  *      bytes whose checksum no longer matches the value the caller sent.
  */
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// V8's regex engine overflows the call stack on strings beyond ~1 MB due to
+// recursion in the `*` quantifier path for very long inputs. Skip the regex
+// for large strings and rely solely on the canonical round-trip check, which
+// is native code and never overflows.
+const BASE64_RE_MAX_LEN = 1_000_000;
 export function isValidBase64(s: string): boolean {
-	if (!BASE64_RE.test(s)) return false;
+	if (s.length <= BASE64_RE_MAX_LEN && !BASE64_RE.test(s)) return false;
 	return Buffer.from(s, "base64").toString("base64") === s;
 }
 
