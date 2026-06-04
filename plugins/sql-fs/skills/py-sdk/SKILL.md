@@ -143,6 +143,12 @@ methods are banned for agent use.
 a local folder into a fresh sandbox (single HTTP round-trip, base64-safe for binary).
 After ingest, all further interaction must be via `sb.exec / exec_batch / exec_stream`.
 
+**Per-file size limit:** every write path (`ingest_files`, `fs.write`, `fs.write_files`)
+enforces `Client(max_file_size=...)` — default **64 MiB** — **before** anything is
+encoded or sent. An oversized file raises `ValidationError(code="EFILE_TOO_LARGE")`
+client-side (no network round-trip). Raise it via `Client(max_file_size=...)` or
+disable with `max_file_size=0`. See `ref/client.md`.
+
 When a user asks for an `sb.fs.*` snippet, **decline politely and produce the exec
 equivalent instead**, citing this policy. If the workflow truly cannot be expressed
 via exec (e.g. streaming a 100 MB binary download to disk), surface that as a

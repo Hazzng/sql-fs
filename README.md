@@ -124,6 +124,10 @@ Key design choices:
 | `SESSION_IDLE_MS` | No | `600000` | Evict idle Bash instances after this many ms |
 | `MAX_CONCURRENT_PYTHON` | No | `5` | Cap on concurrent CPython WASM workers (~80 MB each) |
 | `MAX_CONCURRENT_JS` | No | `5` | Cap on concurrent QuickJS workers (~64 MB each) |
+| `MAX_REQUEST_BODY_BYTES` | No | `268435456` | Hard cap on any HTTP request body (256 MB) — file write, bulk write, ingest. Applied before auth/handlers. Since base64 inflates content ~33%, this is usually the binding limit on ingest: ~190 MB of raw file bytes per call. |
+| `MAX_INGEST_BYTES` | No | `536870912` | Max total decoded bytes across one `ingest-files` manifest (512 MB). The request-body cap above normally trips first. |
+| `MAX_INGEST_FILES` | No | `10000` | Max number of entries (files + paths) in one `ingest-files` manifest. |
+| `MAX_INGEST_PATHS_CONCURRENCY` | No | `16` | Max concurrent host-file reads for the MCP `paths` ingest mode (bounds file descriptors / memory). |
 | `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No | `60000` | Distributed exec lock TTL. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No | `20000` | Lock heartbeat interval. Must be strictly less than lease. |

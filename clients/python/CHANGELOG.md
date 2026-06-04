@@ -5,6 +5,17 @@ All notable changes to the SQL-FS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-05
+
+### Added
+
+- `Client(max_file_size=...)` — a per-file size ceiling (default 64 MiB) enforced
+  client-side on every write path (`ingest_files`, `fs.write`, `fs.write_files`)
+  **before** any content is base64-encoded or sent. Oversized files raise
+  `ValidationError(code="EFILE_TOO_LARGE")` (with `status=None`) naming each
+  offending path and size. Set `max_file_size=0` to disable. The limit is threaded
+  to every `Sandbox` the client creates or attaches.
+
 ## [0.2.5] - 2026-05-27
 
 ### Changed

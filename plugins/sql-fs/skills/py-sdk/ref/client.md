@@ -26,6 +26,7 @@ Client(
     max_retries: int = 3,               # 5xx / 429 retries with jitter
     user_agent: str | None = None,      # defaults to "sqlfs-python/<ver>"
     http_client: httpx.Client | None = None,  # bring-your-own (e.g. for mocks)
+    max_file_size: int = 64 * 1024 * 1024,    # per-file ceiling (bytes); 0 disables
 )
 ```
 
@@ -35,6 +36,24 @@ Client(
 **Token bootstrap is lazy.** Constructing the `Client` does not hit the network —
 the JWT is minted on the first request that needs it (or when you read
 `client.token`).
+
+**`max_file_size` (bytes, default 64 MiB).** A per-file ceiling enforced
+**client-side**, before any content is base64-encoded or sent over the network.
+It applies to every write path — `sb.ingest_files(...)`, `sb.fs.write(...)`, and
+`sb.fs.write_files(...)`. A file larger than the limit raises
+`ValidationError(code="EFILE_TOO_LARGE")` naming each offending path and its
+size; nothing is transmitted. The limit is threaded down to every `Sandbox` the
+client creates or attaches. Set `max_file_size=0` to disable the check entirely.
+
+```python
+fs = Client(base_url=..., auth_secret=..., sub="agent", max_file_size=128 * 1024 * 1024)  # raise to 128 MiB
+fs = Client(base_url=..., auth_secret=..., sub="agent", max_file_size=0)                   # disable
+```
+
+> Sizing note: the server caps the whole HTTP request body (default 256 MB) and
+> base64 inflates content ~33%, so the practical per-request ceiling is ~190 MB
+> of raw bytes regardless of `max_file_size`. The default 64 MiB keeps a single
+> file well inside that, with margin for batching several files in one ingest.
 
 ---
 

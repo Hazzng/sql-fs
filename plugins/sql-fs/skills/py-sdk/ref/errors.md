@@ -26,7 +26,7 @@ SQLFSError                    base — never raised directly by the SDK
 ├── AuthError                     401 / 403
 ├── NotFoundError                 404
 ├── ConflictError                 409 (EEXIST, ENOTEMPTY)
-├── ValidationError               400 (INVALID_INPUT, EISDIR, ENOTDIR, EINVAL, ELOOP)
+├── ValidationError               400 (INVALID_INPUT, EISDIR, ENOTDIR, EINVAL, ELOOP); also client-side EFILE_TOO_LARGE
 ├── ExecTimeoutError              408 (script ran longer than timeout_ms)
 ├── RateLimitError                429
 ├── ServerError                   5xx after retries exhausted
@@ -51,6 +51,30 @@ SQLFSError                    base — never raised directly by the SDK
 
 The SDK retries 429 / 5xx / network failures up to `max_retries` (default 3)
 with exponential jitter. The exception you see is the **final** failure.
+
+---
+
+## Client-side validation (raised before any HTTP request)
+
+Not every `ValidationError` comes from the server. The SDK enforces the
+`Client(max_file_size=...)` per-file ceiling (default 64 MiB) locally, so an
+oversized file fails **before** anything is base64-encoded or sent:
+
+| `code` | Raised by | Cause |
+|---|---|---|
+| `EFILE_TOO_LARGE` | `ingest_files`, `fs.write`, `fs.write_files` | A file exceeds the client's `max_file_size`. `e.status` is `None` (no HTTP round-trip happened); `e.details` lists each offending `path (size > limit)`. |
+
+```python
+from sqlfs import ValidationError
+
+try:
+    sb.ingest_files({"huge.bin": payload})
+except ValidationError as e:
+    if e.code == "EFILE_TOO_LARGE":
+        print("too big, never sent:", e.details)   # e.status is None
+```
+
+Set `max_file_size=0` on the `Client` to disable this check.
 
 ---
 
