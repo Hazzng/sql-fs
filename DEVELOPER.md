@@ -503,7 +503,6 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 | `src/api/routes/exec.ts` | HTTP exec routes — branches on `readOnly` to funnel through `withOwnedSessionOrRehydrate` (write) or `withOwnedSessionRead` (read); maps `EREADONLY_VIOLATION` → 422 |
 | `src/api/mcp/tools.ts` | MCP `bash_exec` / `bash_exec_batch` — same `readOnly` branching as HTTP routes |
 | `thoughts/shared/research/2026-05-10_13-03-37_parallel-readonly-bash-exec.md` | Design doc for the parallel-readOnly feature |
-| `tasks/arch-redis-caching-and-locking.md` | Full design doc for the multi-replica architecture |
 
 ---
 

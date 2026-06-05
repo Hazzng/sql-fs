@@ -894,4 +894,4 @@ The ~10ms cold-hit cost is paid once per replica per sandbox, amortized across a
 - `src/fs/sql-fs/dialects/postgres.ts:106-111` — PostgresDialect.deleteSandbox pattern
 - `src/api/__tests__/integration/concurrency.pg.test.ts` — 17 failing tests (acceptance criterion)
 - `src/fs/sql-fs/sql-fs.cache.test.ts:56-82` — Mock dialect pattern to follow
-- `tasks/IMPLEMENT-multi-replica-redis.md` — Phase A/C/E gap discovery documentation
+- The removed legacy multi-replica task document contained the original Phase A/C/E gap discovery notes.

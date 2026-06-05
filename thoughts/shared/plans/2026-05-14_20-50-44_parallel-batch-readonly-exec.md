@@ -67,7 +67,7 @@ Following Test-Driven Development:
 
 1. **RED** — Write tests that pin the parallel-readOnly contract (wall-clock, order, deadline, violation isolation, cap, MCP disconnect). They fail against today's sequential loop.
 2. **GREEN** — Add an ALS-sniff branch at the top of `executeBatch`. Read path → bounded `Promise.all`. Write path → unchanged loop. Wire MCP handler to forward a disconnect signal.
-3. **REFACTOR + DOCS** — Update MCP tool docstring, refresh DEVELOPER.md, add an integration probe to `scripts/stress-test.ts`, and add a changeset.
+3. **REFACTOR + DOCS** — Update MCP tool docstring, refresh DEVELOPER.md, add an integration probe, and add a changeset.
 
 The ALS-sniff detection means **no call-site changes** in routes or the MCP handler beyond the disconnect-signal wiring — `executeBatch` self-detects which path it's on.
 
@@ -393,7 +393,7 @@ Also close out Open Question #4 in the linked research doc `thoughts/shared/rese
 
 #### 3. Integration probe in stress-test
 
-**File**: `scripts/stress-test.ts`
+**Source**: removed legacy stress harness
 
 **Changes**: Add a scenario (next to existing cross-request RW-lock tests near `:581`) that exercises intra-batch parallelism:
 
@@ -439,13 +439,13 @@ preserved. MCP client disconnect now propagates into in-flight scripts.
 - [x] MCP tool description rendered correctly (smoke-test via an MCP client `list_tools` call)
 
 #### Phase 3: Manual Verification
-- [x] Run `scripts/stress-test.ts` end-to-end; new `scenarioParallelReadOnlyBatch` reports < 2 s wall-clock
+- [x] Run the legacy stress harness end-to-end; new `scenarioParallelReadOnlyBatch` reports < 2 s wall-clock
 - [x] DEVELOPER.md proofread; cross-reference still resolves to the research doc
 
 ### Phase 3: Discoveries and Notable Information
 
 **Implementation Adaptations:**
-- The plan's `scenarioParallelReadOnlyBatch` used HTTP `fetch` with `baseUrl`/`token` variables, but `scripts/stress-test.ts` doesn't start an HTTP server — all scenarios use the `SessionManager` in-process. Adapted to call `sm.withSessionRead` + `executeBatch` directly (the same pattern as `scenarioCrossReplicaRw`). This provides equivalent coverage without requiring a running server.
+- The plan's `scenarioParallelReadOnlyBatch` used HTTP `fetch` with `baseUrl`/`token` variables, but the legacy stress harness did not start an HTTP server. It was adapted to call `sm.withSessionRead` + `executeBatch` directly.
 - `executeBatch` is imported from `../src/api/lib/batch-exec.js` in the stress-test. The import is clean — no type conflicts.
 - The scenario seeds the sandbox via `sm.withSession` first (to populate the in-memory session pool), then calls `sm.withSessionRead` which finds the session directly without needing `getSandboxMetaFn` to be configured.
 
@@ -466,7 +466,7 @@ preserved. MCP client disconnect now propagates into in-flight scripts.
 
 ### Integration Tests
 - Real bash via just-bash `InMemoryFs`: 5 readOnly `sleep` scripts in < expected wall-clock
-- `scripts/stress-test.ts` scenario: 10× sleep 0.5 readOnly batch < 2 s
+- Legacy stress scenario: 10× sleep 0.5 readOnly batch < 2 s
 - Mixed batch (`readOnly:false`) still sequential
 
 ### Manual Testing Steps

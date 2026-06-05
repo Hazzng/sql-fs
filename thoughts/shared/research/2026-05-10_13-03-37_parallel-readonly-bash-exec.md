@@ -153,9 +153,9 @@ The `SqlFs` class already has a `#dirty` flag pattern (`wasDirty`, `clearDirty`,
 
 The `async-mutex` package only provides an exclusive `Mutex`. It does NOT provide a shared/exclusive RW lock. The issue explicitly says to hand-roll this. The import can stay (used by `session.mutex` until refactored) or be dropped after the RW lock is in place.
 
-### 11. `scripts/stress-test.ts` — Existing Scenario Structure
+### 11. Legacy Stress Harness — Existing Scenario Structure
 
-The stress harness already runs four scenarios (lifecycle, concurrent exec, idle reap, batch) and produces `tasks/stress-test-results.md`. The parallel readOnly scenario needs to:
+The removed stress harness ran four scenarios (lifecycle, concurrent exec, idle reap, batch). The parallel readOnly scenario needed to:
 - Create a sandbox
 - Fire N concurrent `readOnly` exec requests via HTTP
 - Assert wall time ≈ `max(per-op latency)` rather than `sum(per-op latency)` (i.e., the ops ran in parallel, not serialized)
@@ -341,7 +341,7 @@ However, the issue says "surfaces a hard error" — this means logging the viola
 | `src/api/mcp/tools.ts` | 160-242 | `bash_exec` handler — branch on `args.readOnly` |
 | `src/fs/sql-fs/sql-fs.ts` | 122+ | `SqlFs` class — add `#readOnly`, `setReadOnly()`, guard write methods |
 | `src/fs/sql-fs/errors.ts` | — | Add `erofs(path)` / `EREADONLY` error constructor |
-| `scripts/stress-test.ts` | — | Add parallel readOnly scenario |
+| Removed legacy stress harness | — | Add parallel readOnly scenario |
 
 ---
 
@@ -385,7 +385,7 @@ In `src/api/session-manager.ts`:
 - Integration: readOnly exec containing a write → fails with EROFS / exitCode ≠ 0
 - Integration: writer waits for in-flight readers; new readers wait for queued writer
 - Cache-freshness regression: alternating write+read sequence — readers see writer's published state
-- Stress: add parallel readOnly scenario to `scripts/stress-test.ts`
+- Stress: add a parallel readOnly scenario to the legacy harness
 
 ---
 

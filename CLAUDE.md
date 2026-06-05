@@ -256,9 +256,6 @@ src/
     cli/
       gc.ts                      ← Blob GC CLI
     tests/                       ← API unit + e2e tests (integration/ inside)
-tasks/
-  prd-sql-fs-api.md          ← 105 user stories (23 epics)
-  IMPLEMENT.md                   ← 6-phase implementation plan
 ```
 
 ## Changelog & Version Bump Requirement
@@ -305,8 +302,6 @@ After the release PR merges to `main`, the release pipeline cuts a GitHub Releas
 
 ## Implementation Guidance
 
-- Read `tasks/IMPLEMENT.md` for the phased implementation plan with verification steps.
-- Read `tasks/prd-sql-fs-api.md` for full user story details and acceptance criteria.
-- Phase 1 (SqlFs + Postgres) must be completed first — everything else depends on it.
-- When implementing a user story, check its acceptance criteria and write tests that verify each criterion.
-- After completing a set of stories, run `pnpm typecheck && pnpm lint:fix && pnpm test:unit` before moving on.
+- Use the current source, tests, and `thoughts/shared/` design records as the authoritative implementation context.
+- Write focused tests for each behavioral change.
+- Run `pnpm typecheck && pnpm lint:fix && pnpm test:unit` before completing substantial work.

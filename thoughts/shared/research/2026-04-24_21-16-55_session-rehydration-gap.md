@@ -215,7 +215,7 @@ Single-flighted via `#pendingReload`. Drops pathCache + contentCache, repopulate
 
 ### 6. Multi-Replica Redis Plan: Three Independent Gap Discoveries
 
-**File**: `tasks/IMPLEMENT-multi-replica-redis.md`
+**Source**: removed legacy multi-replica implementation task
 
 All three phases that involved testing independently discovered and documented this gap:
 
@@ -420,4 +420,3 @@ The ~10ms cold-hit cost is paid once per replica per sandbox, amortized across a
 4. **MySQL/Azure SQL dialects**: `sandboxExists` is trivial for both but deferred. V1 targets Postgres only.
 
 5. **Metrics**: Should `vfs.session.rehydrate_total` and `vfs.session.rehydrate_duration_ms` be added in the main PR or as a follow-up?
-
