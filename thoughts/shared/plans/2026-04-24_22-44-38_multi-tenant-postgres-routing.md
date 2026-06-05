@@ -1151,8 +1151,7 @@ Covered phase by phase above. Phase 5 consolidates them into a single walkthroug
 
 ## References
 
-- Architecture doc: `tasks/arch-redis-caching-and-locking.md`
-- Implementation plan (through Phase 5): `tasks/IMPLEMENT.md`
+- Architecture and implementation context was originally captured in the now-removed legacy task documents.
 - Existing session-manager version counter: `src/api/session-manager.ts:302-379`
 - Existing distributed lock: `src/api/distributed-lock.ts`
 - Existing migrations: `src/fs/sql-fs/migrations/postgres/`

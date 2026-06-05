@@ -4,6 +4,6 @@ dist/
 .env.*
 !.env.example
 *.tsbuildinfo
-scripts/ralph/archive/
+.claude/worktrees/
 docs/
 docker-compose.local.yml

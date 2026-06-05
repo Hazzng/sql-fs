@@ -1,0 +1,214 @@
+name: TypeScript SDK Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "clients/typescript/**"
+      - ".github/workflows/ts-sdk-release.yml"
+  pull_request:
+    paths:
+      - "clients/typescript/**"
+      - ".github/workflows/ts-sdk-release.yml"
+
+concurrency:
+  group: ts-sdk-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: clients/typescript
+
+jobs:
+  verify:
+    name: Test & typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Verify version consistency
+        run: pnpm check:version
+
+  detect:
+    name: Detect release
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      RELEASE: ${{ steps.detect.outputs.RELEASE }}
+      VERSION: ${{ steps.detect.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect version from CHANGELOG
+        id: detect
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::clients/typescript/CHANGELOG.md not found"
+            exit 1
+          fi
+
+          VERSION=$(awk '
+            /^## \[Unreleased\]/ { next }
+            /^## \[[^]]+\]/ {
+              line = $0
+              sub(/^## \[/, "", line)
+              sub(/\].*/, "", line)
+              print line
+              exit
+            }
+          ' CHANGELOG.md)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No versioned section (## [x.y.z]) found in clients/typescript/CHANGELOG.md"
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::CHANGELOG version '$VERSION' is not valid SemVer (expected MAJOR.MINOR.PATCH with optional -prerelease)"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+          TAG="ts-sdk-v$VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "RELEASE=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists — skipping npm publish"
+          else
+            echo "RELEASE=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG not found — will build, publish to npm, and create GitHub Release"
+          fi
+
+  release:
+    name: Build & publish
+    if: needs.detect.outputs.RELEASE == 'true'
+    needs: detect
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # git push tag + GitHub Release creation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Verify version consistency
+        run: |
+          CHANGELOG_VER="${{ needs.detect.outputs.VERSION }}"
+          PKG_VER=$(node -p "require('./package.json').version")
+
+          if [ "$CHANGELOG_VER" != "$PKG_VER" ]; then
+            echo "::error::Version mismatch: CHANGELOG=$CHANGELOG_VER, package.json=$PKG_VER"
+            exit 1
+          fi
+
+          pnpm check:version
+
+      - name: Extract CHANGELOG section
+        id: changelog
+        run: |
+          VERSION="${{ needs.detect.outputs.VERSION }}"
+
+          CONTENT=$(awk -v ver="$VERSION" '
+            BEGIN { header = "## [" ver "]" }
+            index($0, header) == 1 { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/^[[:space:]]*$/d')
+
+          if [ -z "$CONTENT" ]; then
+            echo "::error::No CHANGELOG entry found for version [$VERSION]"
+            exit 1
+          fi
+
+          BYTES=$(printf '%s' "$CONTENT" | wc -c)
+          if [ "$BYTES" -gt 10000 ]; then
+            echo "::error::CHANGELOG entry for [$VERSION] is $BYTES bytes; max 10000"
+            exit 1
+          fi
+
+          {
+            echo "CONTENT<<EOF"
+            echo "$CONTENT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-sdk-dist-${{ needs.detect.outputs.VERSION }}
+          path: clients/typescript/dist/
+          retention-days: 30
+
+      - name: Publish to npm
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create and push git tag
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            --method POST \
+            --field ref="refs/tags/ts-sdk-v${{ needs.detect.outputs.VERSION }}" \
+            --field sha="${GITHUB_SHA}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ts-sdk-v${{ needs.detect.outputs.VERSION }}
+          name: TypeScript SDK v${{ needs.detect.outputs.VERSION }}
+          body: |
+            ## TypeScript SDK v${{ needs.detect.outputs.VERSION }}
+
+            ${{ steps.changelog.outputs.CONTENT }}
+
+            ---
+
+            Install via npm:
+            ```
+            npm install sql-fs-sdk@${{ needs.detect.outputs.VERSION }}
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

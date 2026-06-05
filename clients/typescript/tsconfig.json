@@ -1,0 +1,13 @@
+{
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "src",
+		"outDir": "dist",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"types": ["node"],
+		"noUnusedLocals": true,
+		"noUnusedParameters": true
+	},
+	"include": ["src"],
+	"exclude": ["dist", "tests"]
+}

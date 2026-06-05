@@ -45,6 +45,8 @@ docker-compose -f docker-compose.local.yml up
 
 ## Typical Agent Workflow
 
+Python:
+
 ```bash
 pip install sql-fs-sdk
 ```
@@ -78,6 +80,29 @@ pathlib.Path("result.tar.gz").write_bytes(base64.b64decode(r.stdout.strip()))
 # 5. Cleanup
 sb.delete()
 ```
+
+TypeScript:
+
+```bash
+npm install sql-fs-sdk
+```
+
+```ts
+import { Client } from "sql-fs-sdk";
+
+const client = new Client({
+	baseUrl: "http://localhost:8080",
+	authSecret: "localdev",
+	sub: "agent-001",
+});
+
+const sandbox = await client.sandboxes.create({ name: "my-project" });
+const result = await sandbox.exec("echo hello");
+console.log(result.stdout);
+await sandbox.delete();
+```
+
+See [clients/typescript/README.md](clients/typescript/README.md) for the full TypeScript API.
 
 ## How It Works
 
