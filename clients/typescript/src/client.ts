@@ -69,17 +69,17 @@ export class SandboxesResource {
 		if (options.files !== undefined) {
 			body.files = { ...options.files };
 		}
-		if (options.python) {
-			body.python = true;
+		if (options.python !== undefined) {
+			body.python = options.python;
 		}
-		if (options.javascript) {
-			body.javascript = true;
+		if (options.javascript !== undefined) {
+			body.javascript = options.javascript;
 		}
-		if (options.network) {
-			body.network = true;
+		if (options.network !== undefined) {
+			body.network = options.network;
 		}
 		const response = await this.transport.request("POST", "/sandboxes", {
-			jsonBody: Object.keys(body).length > 0 ? body : null,
+			jsonBody: body,
 			idempotent: false,
 		});
 		const record = sandboxRecordFromApi(await readJsonObject(response));

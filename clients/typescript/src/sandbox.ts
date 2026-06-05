@@ -219,7 +219,7 @@ export class Sandbox {
 		options: { basePath?: string } = {},
 	): Promise<Record<string, unknown>> {
 		enforceMaxFileSize(files, this.maxFileSize);
-		const encoded: Record<string, string> = {};
+		const encoded: Record<string, string> = Object.create(null) as Record<string, string>;
 		for (const [path, content] of Object.entries(files)) {
 			encoded[path] = toBase64(content);
 		}
