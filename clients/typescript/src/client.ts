@@ -80,6 +80,7 @@ export class SandboxesResource {
 		}
 		const response = await this.transport.request("POST", "/sandboxes", {
 			jsonBody: Object.keys(body).length > 0 ? body : null,
+			idempotent: false,
 		});
 		const record = sandboxRecordFromApi(await readJsonObject(response));
 		return new Sandbox(this.transport, record.id, { record, maxFileSize: this.maxFileSize });

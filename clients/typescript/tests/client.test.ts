@@ -7,6 +7,7 @@ import {
 	NotFoundError,
 	RateLimitError,
 	ServerError,
+	TransportError,
 	ValidationError,
 } from "../src/index.js";
 
@@ -32,13 +33,9 @@ function textResponse(status: number, body = "", headers?: HeadersInit): Respons
 	return new Response(body, { status, headers });
 }
 
-function makeFetch(responses: Response[]) {
+function makeFetch(responses: Array<Response | Error>) {
 	const captured: CapturedRequest[] = [];
 	const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-		const response = responses.shift();
-		if (!response) {
-			throw new Error("unexpected fetch call");
-		}
 		const request: CapturedRequest = { url: String(input), init: init ?? {} };
 		if (typeof init?.body === "string") {
 			request.body = JSON.parse(init.body);
@@ -46,6 +43,13 @@ function makeFetch(responses: Response[]) {
 			request.body = init.body;
 		}
 		captured.push(request);
+		const response = responses.shift();
+		if (!response) {
+			throw new Error("unexpected fetch call");
+		}
+		if (response instanceof Error) {
+			throw response;
+		}
 		return response;
 	});
 	return { fetchMock, captured };
@@ -307,6 +311,52 @@ describe("TypeScript SQL-FS SDK", () => {
 				.exec("echo hi > /tmp/x", { retryOn5xx: true }),
 		).rejects.toMatchObject(new ServerError("coherence", { code: "ECOHERENCE", status: 503 }));
 		expect(coherence.fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not retry network errors for sandbox creation or write exec", async () => {
+		const create = makeFetch([
+			new TypeError("connection reset"),
+			jsonResponse(201, { id: "duplicate", owner: "alice" }),
+		]);
+		await expect(
+			new Client({ baseUrl, token: "t.k.n", maxRetries: 3, fetch: create.fetchMock }).sandboxes.create(),
+		).rejects.toBeInstanceOf(TransportError);
+		expect(create.fetchMock).toHaveBeenCalledTimes(1);
+
+		const exec = makeFetch([
+			new TypeError("connection reset"),
+			jsonResponse(200, { stdout: "ran twice\n", stderr: "", exitCode: 0, timedOut: false, durationMs: 1 }),
+		]);
+		await expect(
+			new Client({ baseUrl, token: "t.k.n", maxRetries: 3, fetch: exec.fetchMock }).sandboxes
+				.attach("sb")
+				.exec("echo mutation >> /tmp/log"),
+		).rejects.toBeInstanceOf(TransportError);
+		expect(exec.fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries network errors only for read-only or explicitly idempotent exec", async () => {
+		const readOnly = makeFetch([
+			new TypeError("connection reset"),
+			jsonResponse(200, { stdout: "ok\n", stderr: "", exitCode: 0, timedOut: false, durationMs: 1 }),
+		]);
+		await expect(
+			new Client({ baseUrl, token: "t.k.n", maxRetries: 1, fetch: readOnly.fetchMock }).sandboxes
+				.attach("sb")
+				.exec("cat /tmp/x", { readOnly: true }),
+		).resolves.toMatchObject({ stdout: "ok\n" });
+		expect(readOnly.fetchMock).toHaveBeenCalledTimes(2);
+
+		const optedIn = makeFetch([
+			new TypeError("connection reset"),
+			jsonResponse(200, { stdout: "ok\n", stderr: "", exitCode: 0, timedOut: false, durationMs: 1 }),
+		]);
+		await expect(
+			new Client({ baseUrl, token: "t.k.n", maxRetries: 1, fetch: optedIn.fetchMock }).sandboxes
+				.attach("sb")
+				.exec("mkdir -p /tmp/x", { retryOn5xx: true }),
+		).resolves.toMatchObject({ stdout: "ok\n" });
+		expect(optedIn.fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("retries read-only exec 5xx and ECOHERENCE", async () => {

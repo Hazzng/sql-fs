@@ -139,12 +139,14 @@ export class Transport {
 		}
 
 		const timeout = options.timeout ?? this.timeout;
+		const idempotent = options.idempotent ?? true;
+		const readOnly = options.readOnly ?? false;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
 			let response: Response;
 			try {
 				response = await this.fetchWithTimeout(url, { method, headers, body }, timeout);
 			} catch (error) {
-				if (attempt >= this.maxRetries) {
+				if (attempt >= this.maxRetries || (!idempotent && !readOnly)) {
 					throw new TransportError(`network error after ${attempt + 1} attempts: ${formatError(error)}`);
 				}
 				await sleepBackoff(attempt);
@@ -155,8 +157,8 @@ export class Transport {
 				retryStatus.has(response.status) &&
 				attempt < this.maxRetries &&
 				(await shouldRetryResponse(response, {
-					idempotent: options.idempotent ?? true,
-					readOnly: options.readOnly ?? false,
+					idempotent,
+					readOnly,
 				}))
 			) {
 				const retryAfter = parseRetryAfter(response);
