@@ -139,7 +139,7 @@ overhead per chunk.
 
 ## Ingest (bootstrap only)
 
-### `sb.ingest_files(files, *, base_path="/home/user/project") -> dict`
+### `sb.ingest_files(files, *, base_path="/home/user/project", allow_oversized=False) -> dict`
 
 Maps to `POST /v1/sandboxes/{id}/ingest-files`. **Allowed for one-time
 bootstrap of a fresh sandbox** — for any further file mutation, switch to
@@ -170,6 +170,26 @@ checked against the client's `max_file_size` (default 64 MiB — see
 `ref/client.md`). A file over the limit raises
 `ValidationError(code="EFILE_TOO_LARGE")` and **nothing is sent**. Raise or
 disable it with `Client(max_file_size=...)` / `max_file_size=0`.
+
+**8 MiB `python3` read limit (client-side).** Any file larger than 8 MiB raises
+`ValidationError(code="EFILE_TOO_LARGE_FOR_CPYTHON")` and **nothing is sent**.
+The `python3` runtime (CPython WASM) reads sandbox files through an 8 MiB IPC
+bridge — `open()` on a larger file fails with an opaque error. The bytes
+themselves ingest fine and stay usable from bash (`cat`/`grep`/`awk`) and
+`js-exec`; only `python3 open()` can't read them. Pass `allow_oversized=True` to
+ingest anyway (accepting that `python3` can't read the file), or split the file
+into <8 MiB chunks and recombine them in your script:
+
+```python
+# Blocked — a 17 MB CSV the python3 runtime can't open():
+sb.ingest_files({"data.csv": big_csv_bytes})           # raises EFILE_TOO_LARGE_FOR_CPYTHON
+
+# Option A — store it anyway for bash/js-exec (grep/awk/cut), not python3:
+sb.ingest_files({"data.csv": big_csv_bytes}, allow_oversized=True)
+
+# Option B — split into <8 MiB chunks, recombine in python3 (see SKILL.md):
+sb.ingest_files({"chunk1.csv": part1, "chunk2.csv": part2, "chunk3.csv": part3})
+```
 
 **Hard limits to keep in mind:**
 - All file bytes are buffered into one HTTP request body. The server caps the

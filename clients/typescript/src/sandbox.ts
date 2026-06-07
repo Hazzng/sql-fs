@@ -216,9 +216,11 @@ export class Sandbox {
 
 	async ingestFiles(
 		files: Record<string, FileContent>,
-		options: { basePath?: string } = {},
+		options: { basePath?: string; allowOversized?: boolean } = {},
 	): Promise<Record<string, unknown>> {
 		enforceMaxFileSize(files, this.maxFileSize);
+		// Files >8 MiB can't be read by python3's open() (CPython WASM IPC bridge cap).
+		enforceCpythonReadLimit(files, options.allowOversized ?? false);
 		const encoded: Record<string, string> = Object.create(null) as Record<string, string>;
 		for (const [path, content] of Object.entries(files)) {
 			encoded[path] = toBase64(content);
@@ -286,6 +288,39 @@ function enforceMaxFileSize(files: Record<string, FileContent>, maxFileSize: num
 		code: "EFILE_TOO_LARGE",
 		details,
 	});
+}
+
+/**
+ * Largest file the `python3` runtime (CPython compiled to WASM) can read via
+ * `open()`. CPython reads sandbox files through an 8 MiB SharedArrayBuffer IPC
+ * bridge; `open()` on a larger file fails with an opaque error. The bytes still
+ * ingest fine and stay readable from bash and js-exec — only `python3` cannot
+ * read them.
+ */
+export const cpythonReadLimit = 8 * 1024 * 1024;
+
+/**
+ * Reject files the `python3` runtime could not later `open()`. Throws
+ * ValidationError (code `EFILE_TOO_LARGE_FOR_CPYTHON`) unless `allowOversized`
+ * is set — in which case the file ingests but `python3` open() fails on it.
+ */
+function enforceCpythonReadLimit(files: Record<string, FileContent>, allowOversized: boolean): void {
+	if (allowOversized) {
+		return;
+	}
+	const tooBig = Object.entries(files)
+		.map(([path, content]) => [path, contentSize(content)] as const)
+		.filter(([, size]) => size > cpythonReadLimit);
+	if (tooBig.length === 0) {
+		return;
+	}
+	const details = tooBig.map(([path, size]) => `${path} (${size} bytes > ${cpythonReadLimit} python3 open() limit)`);
+	throw new ValidationError(
+		`file exceeds the 8 MiB limit that the python3 (CPython WASM) runtime can read via open(): ${details.join(
+			"; ",
+		)}. The bytes ingest fine and stay usable from bash (cat/grep/awk) and js-exec — only python3 open() will fail on these files. Pass allowOversized: true to ingest anyway, or split the file into <8 MiB chunks if you need to read it from python3.`,
+		{ code: "EFILE_TOO_LARGE_FOR_CPYTHON", details },
+	);
 }
 
 function toBytes(content: FileContent): Uint8Array<ArrayBuffer> {

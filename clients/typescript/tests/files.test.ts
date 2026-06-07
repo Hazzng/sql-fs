@@ -63,4 +63,28 @@ describe("TypeScript SQL-FS SDK files", () => {
 		);
 		expect(blocked.fetchMock).not.toHaveBeenCalled();
 	});
+
+	it("blocks ingest of files >8 MiB the python3 runtime can't open()", async () => {
+		const { fetchMock } = makeFetch([jsonResponse(200, {})]);
+		const sb = makeClient(fetchMock).sandboxes.attach("sb");
+		const big = new Uint8Array(8 * 1024 * 1024 + 1);
+
+		await expect(sb.ingestFiles({ "big.csv": big })).rejects.toMatchObject({
+			code: "EFILE_TOO_LARGE_FOR_CPYTHON",
+			details: [`big.csv (${big.byteLength} bytes > ${8 * 1024 * 1024} python3 open() limit)`],
+		});
+		// Nothing should have been sent over the network.
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("ingests an oversized file when allowOversized is set", async () => {
+		const { fetchMock, captured } = makeFetch([jsonResponse(200, { count: 1 })]);
+		const sb = makeClient(fetchMock).sandboxes.attach("sb");
+		const big = new Uint8Array(8 * 1024 * 1024 + 1);
+
+		await expect(sb.ingestFiles({ "big.csv": big }, { allowOversized: true })).resolves.toEqual({ count: 1 });
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		const sentBody = captured[0]?.body as { files: Record<string, string> };
+		expect(Object.keys(sentBody.files)).toEqual(["big.csv"]);
+	});
 });
