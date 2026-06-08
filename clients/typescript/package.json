@@ -1,6 +1,6 @@
 {
 	"name": "sql-fs-sdk",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"description": "TypeScript SDK for the SQL-FS API - persistent bash sandboxes for AI agents",
 	"type": "module",
 	"license": "MIT",
