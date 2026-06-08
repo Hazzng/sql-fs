@@ -207,6 +207,18 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `SESSION_IDLE_MS` | No (default: 600000) | Idle timeout before session eviction (ms) |
 | `MAX_CONCURRENT_PYTHON` | No (default: 5) | Max concurrent Python executions across all sessions. CPython WASM workers cost ~80MB each (EXIT_RUNTIME per invocation); the semaphore caps concurrency to prevent OOM. Excess scripts queue FIFO. |
 | `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
+| `MAX_CONCURRENT_PYODIDE` | No (default: 2) | Max concurrent `pyodide` execs (OS-isolated Deno subprocesses, numpy/pandas/scipy/openpyxl) across all sessions. Routed independently of `MAX_CONCURRENT_PYTHON` (which stays `stdlib`-only). Each child loads a ~2 GB-ceiling WASM heap — keep this low. Excess scripts queue FIFO. |
+| `MAX_PYODIDE_QUEUE` | No (default: 100) | Max queued `pyodide` execs waiting on the concurrency semaphore. Beyond this, new execs fail fast with `ERUNTIME_BUSY` (503). |
+| `PYODIDE_QUEUE_TIMEOUT_MS` | No (default: 60000) | Max time a `pyodide` exec waits in the semaphore queue before failing with `ERUNTIME_BUSY` (503). |
+| `MAX_RESIDENT_PYODIDE` | No (default: 2) | Cap on **resident** `pyodide` subprocesses (residency LRU), independent of `SESSION_IDLE_MS` — bounds total live Deno children so warm subprocesses don't accumulate per active session. MUST be `>= MAX_CONCURRENT_PYODIDE` (a busy worker is never evictable); the server fails to boot otherwise. Eviction/idle-kill targets only idle workers; an evicted session cold-starts a fresh child on its next exec. |
+| `PYODIDE_IDLE_MS` | No (default: 120000) | Idle window before a resident `pyodide` subprocess is idle-killed by the residency sweep (ms). Should be `< SESSION_IDLE_MS` so warm children are reclaimed well before their session is evicted. |
+| `PYODIDE_RUNTIME_TIMEOUT_MS` | No (default: 60000) | Cap on a single owned `pyodide` run (Deno spawn + Pyodide init + execution). On timeout the child is SIGKILLed (generation retired) and the exec throws (script transaction rolls back). Cold start (numpy/pandas/scipy/openpyxl load) takes several seconds — size accordingly. |
+| `PYODIDE_MAX_FILE_BYTES` | No (default: 33554432) | Per-file cap (bytes, 32 MiB) on files staged into / drained out of a `pyodide` exec. |
+| `PYODIDE_MAX_TOTAL_BYTES` | No (default: 134217728) | Total cap (bytes, 128 MiB) across all files staged into / drained out of a single `pyodide` exec. |
+| `PYODIDE_MAX_FRAME_BYTES` | No (default: per-frame IPC cap) | Max size (bytes) of a single IPC frame on the Node↔Deno channel, measured on the base64 wire size. Oversized frames kill the child. |
+| `PYODIDE_MAX_AGGREGATE_BYTES` | No (default: aggregate IPC cap) | Max aggregate response bytes per `pyodide` run on the IPC channel. Exceeding it kills the child (slowloris guard). |
+| `PYODIDE_ASSET_DIR` | `pyodide` runtime | Absolute path to the vendored Pyodide asset dir (wasm + stdlib + wheels + custom lock). Resolved by Node and passed to the Deno child as `--allow-read=<dir>` + argv (never via the child's scrubbed env). Set in the Docker image. |
+| `DENO_BIN_PATH` | No (default: `deno`) | Path to the vendored Deno binary used to spawn the `pyodide` runner. Set in the Docker image. |
 | `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No (default: 60000) | Distributed exec lock lease duration (ms). Lock auto-expires if the holder dies. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No (default: 20000) | Heartbeat interval for exec lock renewal (ms). Must be strictly less than `REDIS_EXEC_LOCK_LEASE_MS` to guarantee renewal fires before expiry. |
@@ -221,6 +233,12 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
 | `BLOB_GC_MIN_AGE_MS` | No (default: 10800000) | Grace window (ms, default 3h) before an orphan blob becomes collectible by `pnpm db:gc`. Orphans whose `last_referenced_at` is newer than this are kept; the `ON CONFLICT DO UPDATE` row lock on blob writes is the actual dedup re-adoption race guard — this window is churn/margin control. Rows with NULL `last_referenced_at` (legacy, pre-migration-0006) are treated as ancient and always collectible. Override per-run with `--min-age-ms`. |
+
+### Pyodide memory posture (accepted availability risk — design D5, spike S3)
+
+There is **no per-child OOM isolation**. Spike S3 proved that on `node:22-slim` as the non-root `app` user neither lever works: the cgroup v2 hierarchy is mounted read-only (`memory.max` is unwritable) and `RLIMIT_AS` is unusable because a 2 GiB-max WASM heap reserves ~10.7 GB of *virtual* address space (an `RLIMIT_AS` low enough to bound RSS makes the WASM allocation fail). The **operator-set container memory limit is the only real guard** — it covers Node plus *all* Deno children together, so a runaway child may OOM-kill the whole container.
+
+Size the container limit as **`MAX_RESIDENT_PYODIDE × per-process ceiling` + Node baseline + DB/Redis pools** (the Pyodide ~2 GB WASM cap is the per-instance heap ceiling). Use `MAX_RESIDENT_PYODIDE=1` on small hosts. On OOM-kill the child exits and the manager respawns a fresh generation on the next exec.
 
 ## File Layout
 

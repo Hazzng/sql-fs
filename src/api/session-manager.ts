@@ -38,6 +38,7 @@ import { logAudit } from "./lib/audit.js";
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
 // command from just-bash (enabled via `python: true` below) is the safe path.
 import { PyodideSandbox } from "./pyodide/manager.js";
+import { MAX_RESIDENT_PYODIDE_DEFAULT, PYODIDE_IDLE_MS_DEFAULT, PyodideResidency } from "./pyodide/residency.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -169,6 +170,14 @@ export interface Session {
 	 * teardown path (destroy / reaper / shutdown / failed-create).
 	 */
 	pyodideSandbox?: PyodideSandbox;
+	/**
+	 * Single-flight guard for {@link SessionManager.ensurePyodideAdmitted}. When a
+	 * residency eviction / idle-kill disposes this session's worker, the next
+	 * pyodide exec re-admits a fresh manager; concurrent readOnly execs that both
+	 * observe the disposed worker share this one admission rather than racing to
+	 * replace `pyodideSandbox`. Cleared on settle.
+	 */
+	pyodideAdmitInflight?: Promise<PyodideSandbox>;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -246,6 +255,16 @@ export interface SessionManagerOptions {
 	readonly pathCacheMaxBytes?: number;
 	readonly maxConcurrentPython?: number;
 	readonly maxConcurrentJs?: number;
+	/** Cap on in-flight `pyodide` execs across all sessions. Default `MAX_CONCURRENT_PYODIDE` env / 2. */
+	readonly maxConcurrentPyodide?: number;
+	/**
+	 * Cap on resident `pyodide` subprocesses (residency LRU). Default
+	 * `MAX_RESIDENT_PYODIDE` env / 2. MUST be `>= maxConcurrentPyodide` — the
+	 * constructor throws otherwise (a busy worker can never be evicted).
+	 */
+	readonly maxResidentPyodide?: number;
+	/** Idle window before a resident `pyodide` subprocess is idle-killed (ms). Default `PYODIDE_IDLE_MS` env / 120000. */
+	readonly pyodideIdleMs?: number;
 	readonly redis?: Redis;
 	readonly execLockOptions?: Partial<DistributedRWLockOptions>;
 	/** Feature flag: use the distributed RW lock keyspace. Set to false during rolling deploys. Defaults to true. */
@@ -337,6 +356,8 @@ export class SessionManager {
 
 	private readonly pythonSem: Semaphore;
 	private readonly jsSem: Semaphore;
+	private readonly pyodideSem: Semaphore;
+	private readonly pyodideResidency: PyodideResidency;
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
 	private readonly createPyodideSandbox: () => PyodideSandbox;
@@ -350,6 +371,9 @@ export class SessionManager {
 		pathCacheMaxBytes,
 		maxConcurrentPython,
 		maxConcurrentJs,
+		maxConcurrentPyodide,
+		maxResidentPyodide,
+		pyodideIdleMs,
 		redis,
 		execLockOptions,
 		rwlockEnabled,
@@ -399,6 +423,32 @@ export class SessionManager {
 			inFlight: 0,
 			waiters: [],
 		};
+		const pyodideLimit = maxConcurrentPyodide ?? Number(process.env.MAX_CONCURRENT_PYODIDE ?? "2");
+		this.pyodideSem = {
+			limit: pyodideLimit,
+			maxWaiters: Number(process.env.MAX_PYODIDE_QUEUE ?? "100"),
+			waitTimeoutMs: Number(process.env.PYODIDE_QUEUE_TIMEOUT_MS ?? "60000"),
+			inFlight: 0,
+			waiters: [],
+		};
+		// Residency caps RESIDENT subprocesses (design D4); the semaphore above caps
+		// IN-FLIGHT execs (design D5). Startup invariant: MAX_RESIDENT >= MAX_CONCURRENT
+		// — a busy worker is never evictable, so fewer resident slots than concurrent
+		// execs would deadlock. Fail boot on violation.
+		const maxResident =
+			maxResidentPyodide ?? Number(process.env.MAX_RESIDENT_PYODIDE ?? `${MAX_RESIDENT_PYODIDE_DEFAULT}`);
+		if (maxResident < pyodideLimit) {
+			throw Object.assign(
+				new Error(
+					`EINVAL: MAX_RESIDENT_PYODIDE (${maxResident}) must be >= MAX_CONCURRENT_PYODIDE (${pyodideLimit}) — a busy worker cannot be evicted`,
+				),
+				{ code: "EINVAL" },
+			);
+		}
+		this.pyodideResidency = new PyodideResidency({
+			maxResident,
+			idleMs: pyodideIdleMs ?? Number(process.env.PYODIDE_IDLE_MS ?? `${PYODIDE_IDLE_MS_DEFAULT}`),
+		});
 		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 		this.createPyodideSandbox = createPyodideSandbox ?? ((): PyodideSandbox => new PyodideSandbox());
@@ -489,7 +539,6 @@ export class SessionManager {
 
 		const creationPromise = (async (): Promise<Session> => {
 			let createdFs: IFileSystem | undefined;
-			let createdSandbox: PyodideSandbox | undefined;
 			try {
 				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
 				createdFs = fs;
@@ -513,12 +562,32 @@ export class SessionManager {
 					...(resolvedRuntime.javascript ? [nodeCommand] : []),
 				];
 
-				// "pyodide" runtime: own a per-session PyodideSandbox and register the
-				// custom python3/python commands that route through it. The Deno child
-				// spawns lazily on first exec; disposePyodide kills it on teardown.
+				// "pyodide" runtime: register the custom python3/python commands. The
+				// PyodideSandbox manager is admitted LAZILY on the first python exec
+				// (in execWithRuntimeThrottle, AFTER the pyodide semaphore slot is held —
+				// so residency admission always holds a slot, which guarantees fewer than
+				// MAX_RESIDENT workers are busy and an idle eviction victim always exists,
+				// so resident subprocesses can never exceed MAX_RESIDENT). Admitting here
+				// at session-creation instead would reserve a slot for a cold (childless)
+				// manager with no slot held, allowing soft-over-admission and needless
+				// eviction churn of other sessions' warm managers. The Deno child spawns
+				// on first run; disposePyodide kills it on teardown. The command resolves
+				// the LIVE session.pyodideSandbox (via sessionRef) so the lazily admitted /
+				// re-admitted manager is picked up — sessionRef.current is set right after
+				// the session literal below.
+				const sessionRef: { current?: Session } = {};
 				if (resolvedRuntime.pythonRuntime === "pyodide") {
-					createdSandbox = this.createPyodideSandbox();
-					customCommands.push(...createPyodideCommands(createdSandbox));
+					customCommands.push(
+						...createPyodideCommands(() => {
+							const live = sessionRef.current?.pyodideSandbox;
+							if (live === undefined) {
+								throw Object.assign(new Error("EPYODIDE_NO_SANDBOX: pyodide sandbox unavailable"), {
+									code: "EPYODIDE_NO_SANDBOX",
+								});
+							}
+							return live;
+						}),
+					);
 				}
 
 				const bash = new Bash({
@@ -574,11 +643,13 @@ export class SessionManager {
 					lastSeenVersion: initialVersion,
 					publishPending: false,
 					cwd: bash.getCwd(),
-					pyodideSandbox: createdSandbox,
+					// Admitted lazily on first python exec (see the pyodide branch above).
+					pyodideSandbox: undefined,
 				};
+				// Let the pyodide command resolver reach the live session.pyodideSandbox.
+				sessionRef.current = session;
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
-				createdSandbox = undefined; // ownership transferred to session
 				return session;
 			} catch (err) {
 				// Disconnect any FS we built before the failure so the dialect
@@ -591,14 +662,9 @@ export class SessionManager {
 						// best-effort
 					}
 				}
-				// Likewise kill any partially-built Pyodide child before rethrow.
-				if (createdSandbox !== undefined) {
-					try {
-						await createdSandbox.dispose();
-					} catch {
-						// best-effort
-					}
-				}
+				// No pyodide manager is built during getOrCreate (admission is lazy —
+				// on first exec, post-semaphore), so there is no partial Pyodide child
+				// to dispose here.
 				throw err;
 			} finally {
 				this.pending.delete(key);
@@ -1126,6 +1192,8 @@ export class SessionManager {
 		if (this.shuttingDown) return;
 		this.shuttingDown = true;
 		this.stopReaper();
+		// Stop the residency idle-kill sweep so it can't fire mid-shutdown.
+		this.pyodideResidency.stop();
 
 		const drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
 
@@ -1136,7 +1204,7 @@ export class SessionManager {
 
 		// Reject any queued runtime semaphore waiters: they would otherwise
 		// hold their request closures alive past shutdown.
-		for (const sem of [this.pythonSem, this.jsSem]) {
+		for (const sem of [this.pythonSem, this.jsSem, this.pyodideSem]) {
 			while (sem.waiters.length > 0) {
 				const w = sem.waiters.shift();
 				if (w === undefined) break;
@@ -1208,9 +1276,14 @@ export class SessionManager {
 		}
 	}
 
-	/** Best-effort SIGKILL of a session's Pyodide child on any teardown path. */
+	/**
+	 * Best-effort SIGKILL of a session's Pyodide child on any teardown path, and
+	 * release of its residency slot. Releasing first prevents a concurrent
+	 * residency idle-kill / eviction from racing the teardown on the same worker.
+	 */
 	private async disposePyodide(session: Session): Promise<void> {
 		if (session.pyodideSandbox === undefined) return;
+		this.pyodideResidency.release(session.pyodideSandbox);
 		try {
 			await session.pyodideSandbox.dispose();
 		} catch {
@@ -1296,9 +1369,11 @@ export class SessionManager {
 	}
 
 	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
-		// Only "stdlib" (WASM python3) routes through pythonSem; "pyodide" gets its
-		// own semaphore in Phase 6.
+		// "stdlib" (WASM python3) routes through pythonSem; "pyodide" (OS-isolated
+		// Deno subprocess) routes through its own pyodideSem — the two are mutually
+		// exclusive per session. `usesPyodide` is independent of `usesPython`.
 		const usesPython = session.runtimeOptions.pythonRuntime === "stdlib" && PYTHON_INVOCATION_REGEX.test(script);
+		const usesPyodide = session.runtimeOptions.pythonRuntime === "pyodide" && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
 		// Apply the session-tracked cwd as the starting directory for this exec,
@@ -1350,26 +1425,78 @@ export class SessionManager {
 			return result;
 		};
 
-		if (!usesPython && !usesJs) {
+		if (!usesPython && !usesPyodide && !usesJs) {
 			return updateCwd(await execFn());
 		}
 
+		// Deadlock-avoidance: acquire in a fixed global order (pyodide → python → js)
+		// and roll back already-held slots if a later acquire fails. python/pyodide
+		// never co-occur, but pyodide+js (or python+js) can in one script.
 		const signal = opts?.signal;
-		if (usesPython) await this.acquireSlot(this.pythonSem, signal);
+		if (usesPyodide) await this.acquireSlot(this.pyodideSem, signal);
+		if (usesPython) {
+			try {
+				await this.acquireSlot(this.pythonSem, signal);
+			} catch (e) {
+				if (usesPyodide) this.releaseSlot(this.pyodideSem);
+				throw e;
+			}
+		}
 		if (usesJs) {
 			try {
 				await this.acquireSlot(this.jsSem, signal);
 			} catch (e) {
 				if (usesPython) this.releaseSlot(this.pythonSem);
+				if (usesPyodide) this.releaseSlot(this.pyodideSem);
 				throw e;
 			}
 		}
 
 		try {
+			// Admit the pyodide manager LAZILY here — AFTER the pyodide semaphore slot
+			// is held — so residency admission always runs while holding a slot. That
+			// guarantees fewer than MAX_RESIDENT workers are busy at admit time, so an
+			// idle eviction victim always exists and resident subprocesses can never
+			// exceed MAX_RESIDENT. Also re-admits (single-flight) after a residency
+			// eviction / idle-kill disposed the prior worker (cold-start on next exec).
+			if (usesPyodide) await this.ensurePyodideAdmitted(session);
 			return updateCwd(await execFn());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);
+			if (usesPyodide) {
+				this.releaseSlot(this.pyodideSem);
+				// Refresh the residency idle clock from run completion (the worker is
+				// idle again now), so PYODIDE_IDLE_MS counts from last use.
+				if (session.pyodideSandbox !== undefined) this.pyodideResidency.touch(session.pyodideSandbox);
+			}
 		}
+	}
+
+	/**
+	 * Ensure the pyodide session has a live (non-disposed) manager, re-admitting a
+	 * fresh one through the residency LRU if a prior eviction / idle-kill disposed
+	 * it. Single-flight via `session.pyodideAdmitInflight` so concurrent readOnly
+	 * execs that both observe the disposed worker don't race to replace it.
+	 */
+	private async ensurePyodideAdmitted(session: Session): Promise<void> {
+		const current = session.pyodideSandbox;
+		if (current !== undefined && current.disposed !== true) return;
+		const inflight = session.pyodideAdmitInflight;
+		if (inflight !== undefined) {
+			await inflight;
+			return;
+		}
+		const p = this.pyodideResidency
+			.admit(() => this.createPyodideSandbox())
+			.then((worker) => {
+				session.pyodideSandbox = worker;
+				return worker;
+			})
+			.finally(() => {
+				session.pyodideAdmitInflight = undefined;
+			});
+		session.pyodideAdmitInflight = p;
+		await p;
 	}
 }

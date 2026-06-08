@@ -94,12 +94,23 @@ function base64ByteLength(b64: string): number {
 	return Math.floor((b64.length * 3) / 4) - padding;
 }
 
-export function createPyodideCommands(sandbox: PyodideSandbox, opts: PyodideCommandOptions = {}): CustomCommand[] {
+/**
+ * `sandbox` may be a {@link PyodideSandbox} (fixed, used by unit tests) or a
+ * resolver `() => PyodideSandbox`. The SessionManager passes a resolver that reads
+ * the LIVE `session.pyodideSandbox`, so a residency re-admit after eviction
+ * (Phase 6) is picked up without rebuilding the command. The resolver is called
+ * per invocation.
+ */
+export function createPyodideCommands(
+	sandbox: PyodideSandbox | (() => PyodideSandbox),
+	opts: PyodideCommandOptions = {},
+): CustomCommand[] {
 	const caps: Caps = {
 		maxFileBytes: opts.maxFileBytes ?? envInt("PYODIDE_MAX_FILE_BYTES", PYODIDE_MAX_FILE_BYTES_DEFAULT),
 		maxTotalBytes: opts.maxTotalBytes ?? envInt("PYODIDE_MAX_TOTAL_BYTES", PYODIDE_MAX_TOTAL_BYTES_DEFAULT),
 	};
-	const handler = (args: string[], ctx: CommandContext): Promise<ExecResult> => runPython(sandbox, caps, args, ctx);
+	const getSandbox = typeof sandbox === "function" ? sandbox : (): PyodideSandbox => sandbox;
+	const handler = (args: string[], ctx: CommandContext): Promise<ExecResult> => runPython(getSandbox, caps, args, ctx);
 	return [defineCommand("python3", handler), defineCommand("python", handler)];
 }
 
@@ -114,13 +125,15 @@ interface Parsed {
 }
 
 async function runPython(
-	sandbox: PyodideSandbox,
+	getSandbox: () => PyodideSandbox,
 	caps: Caps,
 	args: string[],
 	ctx: CommandContext,
 ): Promise<ExecResult> {
 	const first = args[0];
 
+	// `--version` / `-h` / `-m` short-circuit WITHOUT resolving the sandbox, so the
+	// metadata surface works even before a manager has been lazily admitted.
 	if (first === "--version" || first === "-V") return { stdout: VERSION_LINE, stderr: "", exitCode: 0 };
 	if (first === "-h" || first === "--help") return { stdout: "", stderr: HINT, exitCode: 0 };
 	if (first === "-m") return errResult("python3: the -m option is not supported in the pyodide runtime", 2);
@@ -145,9 +158,10 @@ async function runPython(
 
 	const input: RunRequestInput = { code: parsed.code, argv: parsed.argv, stdin: parsed.stdin, files, cwd: ctx.cwd };
 
-	// Manager THROWS on timeout/abort/integrity/child-exit — let it propagate so
-	// bash.exec rejects and the script transaction rolls back (drains nothing).
-	const resp = await sandbox.run(input, ctx.signal ?? NEVER_ABORT);
+	// Resolve the sandbox only now (an actual run is required). Manager THROWS on
+	// timeout/abort/integrity/child-exit — let it propagate so bash.exec rejects and
+	// the script transaction rolls back (drains nothing).
+	const resp = await getSandbox().run(input, ctx.signal ?? NEVER_ABORT);
 
 	// Abort that landed after the response but before the drain → drain nothing.
 	if (ctx.signal?.aborted) throw makeAbortError();

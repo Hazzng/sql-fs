@@ -201,6 +201,19 @@ export class PyodideSandbox {
 	}
 
 	/**
+	 * True once {@link dispose} has run. A disposed manager is terminal — every
+	 * future {@link run} throws {@link PyodideDisposedError} and the child is never
+	 * respawned. The residency LRU disposes a worker on eviction / idle-kill, so the
+	 * owning session checks this flag to re-admit a fresh manager on its next exec
+	 * (Phase 6). Distinct from `state === "dead"`, which is a RESPAWNABLE kill
+	 * (timeout / abort / integrity / unexpected exit) the manager recovers from
+	 * itself on the next run.
+	 */
+	get disposed(): boolean {
+		return this.#disposed;
+	}
+
+	/**
 	 * Run untrusted Python on the owned child, serialized behind any prior run().
 	 * Resolves with the `result`/`error` response (the caller inspects `exitCode`).
 	 * Rejects with AbortError on cancellation, {@link PyodideTimeoutError} on an
@@ -374,6 +387,24 @@ export class PyodideSandbox {
 
 	// ── Child lifecycle ──────────────────────────────────────────────────────────
 
+	/**
+	 * Memory posture (design D5, accepted availability risk; spike S3).
+	 *
+	 * We deliberately do NOT attempt to cap this child's RSS here. S3 proved that
+	 * on `node:22-slim` as the non-root `app` user neither lever works: the cgroup
+	 * v2 hierarchy is mounted read-only (writing `memory.max` / creating a child
+	 * cgroup is denied), and `RLIMIT_AS` (`prlimit --as`) is unusable because a
+	 * 2 GiB-max WASM heap reserves ~10.7 GB of *virtual* address space (VmSize)
+	 * against ~41 MB resident (VmRSS) — an `RLIMIT_AS` low enough to bound RSS makes
+	 * the WASM allocation fail outright (`RangeError: could not allocate memory`).
+	 *
+	 * The **operator-set container memory limit is therefore the only real guard**;
+	 * it covers Node + every Deno child together, so a runaway child may OOM-kill
+	 * the whole container (no per-child OOM isolation). Operators size the limit as
+	 * `MAX_RESIDENT_PYODIDE × per-process ceiling` (use `MAX_RESIDENT_PYODIDE=1` on
+	 * small hosts). On OOM-kill the child exits → {@link PyodideChildExitError} →
+	 * the manager respawns a fresh generation on the next run.
+	 */
 	#spawnChild(): void {
 		this.#generation += 1;
 		const gen = this.#generation;
