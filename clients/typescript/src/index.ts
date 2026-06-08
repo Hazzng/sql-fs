@@ -15,6 +15,7 @@ export {
 	type ExecResult,
 	type FileKind,
 	type FileStat,
+	type PythonRuntime,
 	ReadResult,
 	type SandboxInfo,
 	type SandboxRecord,

@@ -1,13 +1,17 @@
 export type FileKind = "file" | "dir" | "symlink";
 export type StreamEventType = "stdout" | "stderr" | "exit";
 
+/** Python runtime selection. null = no Python. */
+export type PythonRuntime = "stdlib" | "pyodide" | null;
+
 export interface SandboxRecord {
 	id: string;
 	name: string | null;
 	owner: string;
 	createdAt: string;
-	python: boolean;
+	python_runtime: PythonRuntime;
 	javascript: boolean;
+	network: boolean;
 }
 
 export interface SandboxInfo {
@@ -84,8 +88,9 @@ export function sandboxRecordFromApi(payload: ApiObject): SandboxRecord {
 		name: payload.name == null ? null : String(payload.name),
 		owner: String(payload.owner),
 		createdAt: String(payload.createdAt),
-		python: Boolean(payload.python),
+		python_runtime: (payload.python_runtime ?? null) as PythonRuntime,
 		javascript: Boolean(payload.javascript),
+		network: Boolean(payload.network),
 	};
 }
 

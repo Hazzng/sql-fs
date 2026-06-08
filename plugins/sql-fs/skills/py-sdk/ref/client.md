@@ -115,7 +115,7 @@ sb = fs.sandboxes.create(
     name="my-project",                     # human label, optional
     env={"GREETING": "hi"},                 # initial sandbox env vars
     files={"/home/user/seed.txt": "..."},   # text-only seed (use ingest_files for many/binary)
-    python=False,                           # enable CPython WASM runtime
+    python_runtime="stdlib",                # "stdlib" (CPython WASM) | "pyodide" (numpy/pandas/scipy/openpyxl) | None
     javascript=False,                       # enable QuickJS runtime
     network=False,                          # enable outbound fetch() from js-exec (opt-in)
 )

@@ -58,7 +58,7 @@ curl -fsS -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{}' | jq
-# → {"id":"...","owner":"admin","createdAt":"...","python":false,"javascript":false}
+# → {"id":"...","owner":"admin","createdAt":"...","python_runtime":null,"javascript":false,"network":false}
 ```
 
 ---

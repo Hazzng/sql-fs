@@ -29,7 +29,7 @@ async function setup(): Promise<void> {
 
 	const sandbox = await client.sandboxes.create({
 		name: "typescript-sdk-e2e",
-		python: true,
+		python_runtime: "stdlib",
 		javascript: true,
 		files: { "/home/user/seed.txt": "seeded" },
 	});

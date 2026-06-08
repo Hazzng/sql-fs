@@ -206,7 +206,7 @@ These come from real benchmarks (`clients/python/examples/perf_benchmark.py`):
   process — cwd, env vars, and shell functions persist within that window.
 
 - **Batch multi-step Python into one `python3` script, not many `python3 -c` calls.**
-  On `python=True` sandboxes, `python3` is CPython-on-WASM, stdlib only, and each
+  On `python_runtime="stdlib"` sandboxes, `python3` is CPython-on-WASM, stdlib only, and each
   call cold-boots a fresh isolated interpreter (~1.4 s, no shared state). Write
   your logic to a file and run `python3 script.py` once rather than looping
   `python3 -c '...'` — one script with a loop avoids paying the cold-boot N times.

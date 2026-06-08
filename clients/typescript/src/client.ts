@@ -1,6 +1,12 @@
 import { Transport, type TransportOptions } from "./http.js";
 import { defaultMaxFileSize, isRecord, readJsonObject } from "./internal.js";
-import { type SandboxInfo, type SandboxRecord, sandboxInfoFromApi, sandboxRecordFromApi } from "./models.js";
+import {
+	type PythonRuntime,
+	type SandboxInfo,
+	type SandboxRecord,
+	sandboxInfoFromApi,
+	sandboxRecordFromApi,
+} from "./models.js";
 import { Sandbox } from "./sandbox.js";
 
 export interface ClientOptions extends TransportOptions {
@@ -11,7 +17,7 @@ export interface CreateSandboxOptions {
 	name?: string;
 	env?: Record<string, string>;
 	files?: Record<string, string>;
-	python?: boolean;
+	python_runtime?: PythonRuntime;
 	javascript?: boolean;
 	network?: boolean;
 }
@@ -69,8 +75,8 @@ export class SandboxesResource {
 		if (options.files !== undefined) {
 			body.files = { ...options.files };
 		}
-		if (options.python !== undefined) {
-			body.python = options.python;
+		if (options.python_runtime !== undefined) {
+			body.python_runtime = options.python_runtime;
 		}
 		if (options.javascript !== undefined) {
 			body.javascript = options.javascript;

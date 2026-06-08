@@ -27,7 +27,7 @@ def main() -> int:
         token=token,
         sub="quickstart",
     ) as fs:
-        sb = fs.sandboxes.create(name="quickstart", python=False)
+        sb = fs.sandboxes.create(name="quickstart")
         print(f"created sandbox {sb.id}")
         try:
             # Bulk write — single round-trip for many files.

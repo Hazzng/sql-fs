@@ -2,6 +2,20 @@
 
 All notable changes to the TypeScript SDK are documented here.
 
+## [0.4.0] - 2026-06-08
+
+### Changed
+
+- **Breaking:** replaced the boolean `python` create option with the
+  `python_runtime` enum (`"stdlib" | "pyodide" | null`). `SandboxRecord.python`
+  is now `SandboxRecord.python_runtime`. Migrate `python: true` →
+  `python_runtime: "stdlib"` and `python: false` → omit (or `null`).
+
+### Added
+
+- `SandboxRecord.network` is now surfaced (previously server-only).
+- Exported the `PythonRuntime` type.
+
 ## [0.3.1] - 2026-06-08
 
 ### Added

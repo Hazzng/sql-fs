@@ -309,17 +309,32 @@ Propagate the enum to every external representation (research Q5) and reconcile 
 ### Phase 2: Success Criteria
 
 #### Phase 2: Programmatic Verification
-- [ ] `pnpm typecheck && pnpm lint:fix && pnpm test:unit` pass
-- [ ] Python SDK suite passes (`cd clients/python && <its test command>`); TS SDK suite passes (`cd clients/typescript && <its test command>`)
-- [ ] `mcp-tools.test.ts` passes with the new `python_runtime` assertions
-- [ ] OpenAPI spec still serializes (server boots; `GET /openapi.json` valid JSON) and `.changeset/*.md` exists
+- [x] `pnpm typecheck && pnpm lint:fix && pnpm test:unit` pass (877 pass / 4 skip — +2 new MCP `python_runtime` echo tests)
+- [x] Python SDK suite passes (`uv run --extra dev pytest` — 37 pass; also `mypy --strict` + `ruff` clean); TS SDK suite passes (`pnpm install && pnpm typecheck && pnpm test` — 19 pass)
+- [x] `mcp-tools.test.ts` passes with the new `python_runtime` assertions (sandbox_create echoes `python_runtime`; sandbox_list echoes per-sandbox `python_runtime`)
+- [x] OpenAPI spec still serializes (route is `c.json(openapiSpec)`; spec JSON-round-trips, 24 KB, Sandbox + create-body carry `python_runtime`+`network`, `python` removed) and `.changeset/python-runtime-enum.md` exists (major)
 
 #### Phase 2: Agent Verification
-- [ ] Agent diffs every research-Q5 surface against a checklist (Python SDK model+client, TS SDK model+client, MCP create+list, OpenAPI record+create, all docs) and confirms **no remaining boolean `python`**
-- [ ] Agent confirms `network` now appears in both SDK `SandboxRecord` types and the OpenAPI record + create schemas
+- [x] Agent diffs every research-Q5 surface against a checklist (Python SDK model+client, TS SDK model+client, MCP create+list, OpenAPI record+create, all docs) and confirms **no remaining boolean `python`** — also caught + fixed 3 surfaces the plan's docs list omitted (both SDK READMEs + the Python `__init__.py` module docstring)
+- [x] Agent confirms `network` now appears in both SDK `SandboxRecord` types (TS `models.ts:14`/`:93`, Py `models.py:27`/`:38`) and the OpenAPI record (`Sandbox.properties.network` + `required`) + create schemas
 
 ### Phase 2: Discoveries and Notable Information
-_Placeholder — filled by the implementing agent during/after Phase 2._
+
+**Surfaces the plan's docs list (step 6) under-counted.** Beyond the six `plugins/sql-fs/skills/*` docs, three more user-facing SDK doc surfaces carried boolean `python` and had to change for the "no remaining boolean `python`" gate: `clients/python/README.md`, `clients/python/src/sqlfs/__init__.py` (the module-level quick-start docstring), and `clients/typescript/README.md`. Sweep the READMEs + module docstrings, not just the plugin skill docs.
+
+**SDK packages are standalone (no pnpm workspace).** There is **no `pnpm-workspace.yaml`** — `clients/typescript` is its own package (`sql-fs-sdk@0.3.0`) and is NOT covered by the root `pnpm typecheck`/`test:unit` (root `tsconfig` is `include: ["src"]`). To run the TS SDK suite you must `cd clients/typescript && pnpm install` first (its `node_modules` was absent), then `pnpm typecheck && pnpm test`. The **root** `biome` (`pnpm lint:fix`) DOES lint `clients/typescript/src` (only `clients/python/.venv` is biome-ignored), so SDK TS style is enforced centrally.
+
+**Python SDK runner:** no `.venv` committed; use `uv run --extra dev pytest` (creates `.venv`, builds the editable pkg). 37 tests pass. `mypy --strict` + `ruff` also clean. `pyproject.toml` pins `[tool.mypy] python_version = "3.9"` which newer mypy warns is unsupported (must be ≥3.10) but still runs clean — pre-existing, not ours to fix here. **`uv run` rewrites `clients/python/uv.lock`** (syncs the `sql-fs-sdk` self-package version). When NOT bumping the version it just re-normalizes/re-sorts (spurious → revert); when bumping (this phase) it's a legitimate version sync (keep). Note: the committed lock self-version was **stale at `0.2.3`** vs pyproject `0.3.0` — a pre-existing drift now corrected to `0.4.0`.
+
+**Changeset (`pnpm changeset` TUI is non-interactive here, so hand-authored):** mirrors existing `.changeset/*.md` — front-matter `"sql-fs-api": major` + body. Changesets track ONLY `sql-fs-api` (the root). ⚠️ **The SDKs are NOT changeset-managed and need their own version bumps** (see below) — a Codex review correctly flagged that the root changeset alone would never publish the breaking SDK change.
+
+**SDK release model + version bumps (Codex review, post-implementation fixes).** Each SDK has its own release pipeline — `.github/workflows/ts-sdk-release.yml` / `python-sdk-release.yml` — that fires on a push to `main` touching `clients/<sdk>/**` and **publishes only when the version is new** (TS: `pnpm check:version` requires `package.json` ↔ `src/version.ts` ↔ `CHANGELOG.md` to all agree; Python: detects version from `CHANGELOG.md`, cross-checks `pyproject.toml` + `src/sqlfs/_version.py`, and skips publish if the git tag already exists). **Consequence:** a breaking SDK change with no version bump is silently *skipped at publish* (0.3.0 is immutable on npm/PyPI) → the change never reaches users. **Fix applied:** bumped both SDKs **0.3.0 → 0.4.0** (conventional 0.x breaking bump — minor) with `## [0.4.0] - 2026-06-08` CHANGELOG entries, across all version files each (TS: `package.json` + `src/version.ts` + `CHANGELOG.md`, verified by `pnpm check:version`; Python: `pyproject.toml` + `_version.py` + `CHANGELOG.md`, verified by `uv lock --check`). Picked 0.4.0 not 1.0.0 to keep the SDKs pre-1.0 (initial release was 0.3.0). **Also (Codex finding 2):** two SDK README API-surface lines still advertised boolean `python` (TS `README.md:61` signature list, Py `README.md:84` method table) — both migrated to `python_runtime` (+`network` on the Py row).
+
+**OpenAPI verification without a live server:** the route is literally `app.get("/openapi.json", (c) => c.json(openapiSpec))`, so `JSON.stringify(openapiSpec)` round-tripping (via a one-shot `npx tsx -e`) deterministically proves `GET /openapi.json` returns valid JSON — no dev server needed for this programmatic check.
+
+**SDK public type export (minor addition beyond the plan):** exported `PythonRuntime` from both SDKs (`clients/typescript/src/index.ts`, Python `__init__.py` + `models.py __all__`) so users assigning `python_runtime` can name the type — parity with the new field. **`network` was newly added to both `SandboxRecord` types** (it existed server-side but was never surfaced in the SDK record — the plan's "reconcile asymmetry").
+
+**SandboxInfo unchanged:** the SDKs' `.get()` model (`SandboxInfo`) was deliberately NOT given `python_runtime` — Phase 2 only touched `SandboxRecord` (create/list). The server's GET now returns the capability fields (Phase 1) but the SDK `SandboxInfo` model still doesn't parse them (pre-existing, out of scope).
 
 ---
 
