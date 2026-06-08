@@ -220,7 +220,14 @@ sys.stderr = __sqlfs_err
 	try {
 		// User code runs in a FRESH namespace each call (bounds variable scope;
 		// sys.modules / package globals persist within the session — design D3).
+		// Seed it like CPython: __name__ = "__main__" for every mode (so the common
+		// `if __name__ == "__main__":` guard fires), and __file__ = argv[0] for the
+		// script-file form (argv[0] is "-c"/"-"/"" for the inline/stdin/bare modes,
+		// where CPython sets no __file__).
 		const ns = pyodide.globals.get("dict")();
+		ns.set("__name__", "__main__");
+		const argv0 = req.argv?.[0] ?? "";
+		if (argv0 && argv0 !== "-c" && argv0 !== "-") ns.set("__file__", argv0);
 		try {
 			await pyodide.runPythonAsync(req.code, { globals: ns });
 		} finally {

@@ -14,7 +14,14 @@
 
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
-import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import type {
+	BashExecResult,
+	CustomCommand,
+	DefenseInDepthConfig,
+	ExecOptions,
+	IFileSystem,
+	SecurityViolation,
+} from "just-bash";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../sql-fs/redis-path-snapshot.js";
@@ -22,6 +29,7 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, PythonRuntime, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
+import { createPyodideCommands } from "./commands/pyodide-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
@@ -29,6 +37,7 @@ import { logAudit } from "./lib/audit.js";
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
 // command from just-bash (enabled via `python: true` below) is the safe path.
+import { PyodideSandbox } from "./pyodide/manager.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -152,6 +161,14 @@ export interface Session {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
+	/**
+	 * Per-session Pyodide subprocess manager — present ONLY when
+	 * `runtimeOptions.pythonRuntime === "pyodide"`. Owned first-class by the
+	 * session: the Deno child spawns lazily on the first `python3`/`python`
+	 * exec and is killed via {@link SessionManager.disposePyodide} on every
+	 * teardown path (destroy / reaper / shutdown / failed-create).
+	 */
+	pyodideSandbox?: PyodideSandbox;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -264,6 +281,13 @@ export interface SessionManagerOptions {
 	 * Flip to `false` once logs are clean to enforce the security boundary.
 	 */
 	readonly defenseAuditMode?: boolean;
+	/**
+	 * Factory for a per-session {@link PyodideSandbox}, invoked in `getOrCreate`
+	 * only when `pythonRuntime === "pyodide"`. Defaults to `() => new
+	 * PyodideSandbox()` (env-driven `PYODIDE_ASSET_DIR`/`DENO_BIN_PATH`). Override
+	 * to inject a fake child for tests, or to pass runtime caps/timeouts.
+	 */
+	readonly createPyodideSandbox?: () => PyodideSandbox;
 }
 
 interface SemaphoreWaiter {
@@ -315,6 +339,7 @@ export class SessionManager {
 	private readonly jsSem: Semaphore;
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
+	private readonly createPyodideSandbox: () => PyodideSandbox;
 	private shuttingDown = false;
 
 	constructor({
@@ -335,6 +360,7 @@ export class SessionManager {
 		listSandboxesFn,
 		defenseInDepth,
 		defenseAuditMode,
+		createPyodideSandbox,
 	}: SessionManagerOptions) {
 		this.tenantConfig = tenantConfig;
 		this.createFsOverride = createFs;
@@ -375,6 +401,7 @@ export class SessionManager {
 		};
 		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
+		this.createPyodideSandbox = createPyodideSandbox ?? ((): PyodideSandbox => new PyodideSandbox());
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -462,6 +489,7 @@ export class SessionManager {
 
 		const creationPromise = (async (): Promise<Session> => {
 			let createdFs: IFileSystem | undefined;
+			let createdSandbox: PyodideSandbox | undefined;
 			try {
 				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
 				createdFs = fs;
@@ -476,7 +504,7 @@ export class SessionManager {
 				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
 				// not registered (audit C1 — host sandbox escape). Python sandboxes
 				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
-				const customCommands = [
+				const customCommands: CustomCommand[] = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
@@ -484,6 +512,14 @@ export class SessionManager {
 					// non-JS sandboxes keep the default "command not found" behaviour.
 					...(resolvedRuntime.javascript ? [nodeCommand] : []),
 				];
+
+				// "pyodide" runtime: own a per-session PyodideSandbox and register the
+				// custom python3/python commands that route through it. The Deno child
+				// spawns lazily on first exec; disposePyodide kills it on teardown.
+				if (resolvedRuntime.pythonRuntime === "pyodide") {
+					createdSandbox = this.createPyodideSandbox();
+					customCommands.push(...createPyodideCommands(createdSandbox));
+				}
 
 				const bash = new Bash({
 					fs,
@@ -538,9 +574,11 @@ export class SessionManager {
 					lastSeenVersion: initialVersion,
 					publishPending: false,
 					cwd: bash.getCwd(),
+					pyodideSandbox: createdSandbox,
 				};
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
+				createdSandbox = undefined; // ownership transferred to session
 				return session;
 			} catch (err) {
 				// Disconnect any FS we built before the failure so the dialect
@@ -549,6 +587,14 @@ export class SessionManager {
 				if (createdFs !== undefined) {
 					try {
 						await this.disconnectFs(createdFs);
+					} catch {
+						// best-effort
+					}
+				}
+				// Likewise kill any partially-built Pyodide child before rethrow.
+				if (createdSandbox !== undefined) {
+					try {
+						await createdSandbox.dispose();
 					} catch {
 						// best-effort
 					}
@@ -1040,6 +1086,7 @@ export class SessionManager {
 						}
 					}
 				} finally {
+					await this.disposePyodide(session);
 					await this.disconnectFs(session.fs);
 				}
 				if (cleanupError !== undefined) throw cleanupError;
@@ -1114,6 +1161,7 @@ export class SessionManager {
 				}
 				this.sessions.delete(key);
 				try {
+					await this.disposePyodide(session);
 					await this.disconnectFs(session.fs);
 				} catch {
 					// best-effort
@@ -1153,9 +1201,20 @@ export class SessionManager {
 					})
 					.catch(() => {})
 					.finally(() => {
+						void this.disposePyodide(session);
 						void this.disconnectFs(session.fs);
 					});
 			}
+		}
+	}
+
+	/** Best-effort SIGKILL of a session's Pyodide child on any teardown path. */
+	private async disposePyodide(session: Session): Promise<void> {
+		if (session.pyodideSandbox === undefined) return;
+		try {
+			await session.pyodideSandbox.dispose();
+		} catch {
+			// best-effort — the child is being torn down
 		}
 	}
 
