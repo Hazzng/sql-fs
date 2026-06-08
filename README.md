@@ -169,6 +169,47 @@ Key design choices:
 | `BOOTSTRAP_RATE_LIMIT_WINDOW_MS` | No | `60000` | Rolling window (ms) for the bootstrap token endpoint. |
 | `BOOTSTRAP_RATE_LIMIT_MAX` | No | `5` | Max requests per window for the bootstrap token endpoint. |
 | `TRUST_PROXY_HEADERS` | No | `false` | Set `true` to read client IP from `X-Forwarded-For` (use only behind a trusted reverse proxy). |
+| `MCP_API_KEY` | No | — | Enables static-header auth on `/mcp` (see [MCP auth](#mcp-auth-for-static-header-clients-eg-librechat)). Pre-shared secret (≥16 chars) accepted as `Authorization: Bearer <key>`. When unset, `/mcp` stays JWT-only. |
+| `MCP_IDENTITY_HEADER` | No | `x-librechat-user-id` | Header whose value becomes the sandbox owner (`sub`) for static-header requests. |
+| `MCP_DEFAULT_SUB` | No | — | Owner used for static-header requests when the identity header is absent. When unset, a missing identity header is rejected (`401 AUTH_IDENTITY_REQUIRED`). |
+| `MCP_STATIC_TENANT` | No | `default` | Tenant assigned to static-header requests. Must be a configured tenant. |
+
+## MCP auth (for static-header clients, e.g. LibreChat)
+
+The `/mcp` endpoint normally requires a `Authorization: Bearer <JWT>` signed with `AUTH_SECRET` (the SDKs mint this automatically from `auth_secret`). External MCP clients that can only send **fixed headers** — notably [LibreChat](https://github.com/danny-avila/LibreChat) — cannot mint a per-request JWT.
+
+Setting **`MCP_API_KEY`** turns on a second, additive auth path on `/mcp`:
+
+- A `Authorization: Bearer <MCP_API_KEY>` is accepted **without** JWT verification (constant-time compared).
+- The sandbox **owner** (`sub`) is derived from a forwarded identity header (`MCP_IDENTITY_HEADER`, default `x-librechat-user-id`), so each end-user gets an **isolated** sandbox/owner.
+- Any token that is *not* the API key still falls through to JWT verification, so JWT clients keep working on `/mcp` unchanged.
+
+```yaml
+# librechat.yaml — point LibreChat's MCP client at sql-fs
+mcpServers:
+  sql-fs:
+    type: streamable-http
+    url: https://your-sql-fs.example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_API_KEY}"      # the shared service credential
+      x-librechat-user-id: "{{LIBRECHAT_USER_ID}}" # forwarded per end-user → owner
+```
+
+```bash
+# Server config
+MCP_API_KEY=<long-random-shared-secret>   # ≥16 chars; guards code execution — keep it secret
+MCP_IDENTITY_HEADER=x-librechat-user-id    # default; the header carrying the end-user id
+# MCP_DEFAULT_SUB=shared                    # optional: shared owner when no identity header
+# MCP_STATIC_TENANT=default                 # optional: tenant for static-header requests
+```
+
+> **Security model.** The forwarded identity header is trusted as the end-user identity, so it must be set by your proxy/LibreChat and **not** be settable by untrusted callers. Treat `MCP_API_KEY` like a password: anyone who has it *and* can reach `/mcp` directly can choose any `sub`. Put `/mcp` behind your ingress, keep the key secret, and ensure the identity header is stamped by a trusted hop. Cross-sandbox isolation is still enforced by RLS scoped to `(owner, tenant)`.
+
+| Response | Cause |
+|---|---|
+| `401 AUTH_IDENTITY_REQUIRED` | API key matched but no identity header and no `MCP_DEFAULT_SUB`. |
+| `401 AUTH_IDENTITY_INVALID` | Identity header present but empty, >256 chars, or contains control characters. |
+| `401 AUTH_INVALID` | Token is neither the API key nor a valid JWT. |
 
 ## Deployment
 
