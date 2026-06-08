@@ -33,17 +33,30 @@ export function withMcpCors(req: Request, res: Response): Response {
 	return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-/** Preflight for browser MCP clients (e.g. Inspector UI). No JWT required. */
-export function mcpOptionsResponse(req: Request): Response {
+const MCP_BASE_ALLOW_HEADERS =
+	"authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id";
+
+/**
+ * Preflight for browser MCP clients (e.g. Inspector UI). No JWT required.
+ *
+ * @param req - The OPTIONS request (used for Origin).
+ * @param extraAllowHeader - Optional extra request header to advertise in
+ *   `Access-Control-Allow-Headers` — e.g. the configured static-auth identity
+ *   header — so a browser client is allowed to send it on the actual request.
+ */
+export function mcpOptionsResponse(req: Request, extraAllowHeader?: string): Response {
 	const allow = allowOriginHeader(req.headers.get("origin") ?? undefined);
+	const allowHeaders =
+		extraAllowHeader !== undefined && extraAllowHeader.length > 0
+			? `${MCP_BASE_ALLOW_HEADERS}, ${extraAllowHeader}`
+			: MCP_BASE_ALLOW_HEADERS;
 	return new Response(null, {
 		status: 204,
 		headers: {
 			"Access-Control-Allow-Origin": allow,
 			...(allow !== "*" ? { Vary: "Origin" } : {}),
 			"Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-			"Access-Control-Allow-Headers":
-				"authorization, content-type, accept, mcp-session-id, mcp-protocol-version, last-event-id",
+			"Access-Control-Allow-Headers": allowHeaders,
 			"Access-Control-Max-Age": "86400",
 		},
 	});

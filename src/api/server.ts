@@ -15,7 +15,7 @@ import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
-import { type AuthVariables, createAuthMiddleware } from "./auth.js";
+import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
 import { clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
@@ -206,16 +206,33 @@ app.route("/v1/sandboxes", ingestRoutes(sessionManager));
 
 // ── MCP endpoint (requires auth) + CORS for browser MCP clients (Inspector UI) ─
 
+// Static-header (API-key) auth for MCP clients that cannot mint a per-request
+// JWT (e.g. LibreChat). Enabled only when MCP_API_KEY is set; otherwise /mcp
+// keeps JWT-only behaviour. A non-matching Bearer token still falls through to
+// JWT verification, so existing JWT clients keep working on /mcp regardless.
+const staticMcpAuth = loadStaticMcpAuthConfig(tenantConfig);
+if (staticMcpAuth !== undefined) {
+	console.log(
+		JSON.stringify({
+			event: "mcp_static_auth_enabled",
+			identityHeader: staticMcpAuth.identityHeader,
+			tenant: staticMcpAuth.tenant,
+			defaultSub: staticMcpAuth.defaultSub ?? null,
+		}),
+	);
+}
+const mcpAuthMiddleware = createAuthMiddleware(tenantConfig, { staticAuth: staticMcpAuth });
+
 app.use("/mcp", async (c, next) => {
 	if (c.req.method === "OPTIONS") {
-		return mcpOptionsResponse(c.req.raw);
+		return mcpOptionsResponse(c.req.raw, staticMcpAuth?.identityHeader);
 	}
 	await next();
 	if (c.res !== undefined) {
 		c.res = withMcpCors(c.req.raw, c.res);
 	}
 });
-app.use("/mcp", authMiddleware);
+app.use("/mcp", mcpAuthMiddleware);
 app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"), c.get("tenant")));
 
 // ── Health endpoints ───────────────────────────────────────────────────────────
