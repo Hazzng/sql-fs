@@ -842,7 +842,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx);
+			await dialect.gcOrphanBlobs(tx, 0);
 		});
 
 		// Blob should still exist (referenced by the inode)
@@ -877,10 +877,10 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — should delete the orphan blob
 		const deleted = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx);
+			return await dialect.gcOrphanBlobs(tx, 0);
 		});
 
-		expect(deleted).toBeGreaterThanOrEqual(1);
+		expect(deleted.length).toBeGreaterThanOrEqual(1);
 
 		// Blob should be gone
 		const result = await dialect.transaction(async (tx) => {
@@ -924,7 +924,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — blob should survive (still referenced by inodeId2)
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx);
+			await dialect.gcOrphanBlobs(tx, 0);
 		});
 
 		const result = await dialect.transaction(async (tx) => {
@@ -936,6 +936,331 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 		// Cleanup: delete second inode (blob becomes orphan, will be cleaned by sandbox delete cascade for inodes)
 		await dialect.transaction(async (tx) => {
 			await dialect.deleteInode(tx, inodeId2);
+		});
+	});
+
+	it("re-referencing an existing blob bumps last_referenced_at", async () => {
+		const sha256 = new Uint8Array(32).fill(0xdd);
+		const data = new TextEncoder().encode("rereferenced content");
+
+		// First upsert: inserts the row with last_referenced_at = now().
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const firstRows = await dialect.transaction(async (tx) => {
+			return await tx<{ last_referenced_at: Date }[]>`
+				SELECT last_referenced_at FROM blobs WHERE sha256 = ${sha256}
+			`;
+		});
+		const first = firstRows[0]!.last_referenced_at;
+
+		// now() is the transaction start time; the two upserts run in separate
+		// transactions, so this sleep guarantees the second is strictly later.
+		await new Promise((r) => setTimeout(r, 5));
+
+		// Second upsert: ON CONFLICT DO UPDATE bumps last_referenced_at to now().
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const secondRows = await dialect.transaction(async (tx) => {
+			return await tx<{ last_referenced_at: Date }[]>`
+				SELECT last_referenced_at FROM blobs WHERE sha256 = ${sha256}
+			`;
+		});
+		const second = secondRows[0]!.last_referenced_at;
+
+		expect(second.getTime()).toBeGreaterThan(first.getTime());
+
+		// Cleanup: blob is unreferenced; remove it directly.
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
+		});
+	});
+
+	// Compares a sha256 against the Uint8Array[] returned by gcOrphanBlobs.
+	const includesSha = (deleted: Uint8Array[], sha: Uint8Array): boolean => {
+		const target = Buffer.from(sha).toString("hex");
+		return deleted.some((d) => Buffer.from(d).toString("hex") === target);
+	};
+
+	it("orphan inside the grace window survives, then is collected once grace is zero", async () => {
+		const sha256 = new Uint8Array(32).fill(0x11);
+		const data = new TextEncoder().encode("grace window content");
+
+		// Upsert blob (last_referenced_at = now()), reference it, then orphan it.
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: data.length,
+				contentSha256: sha256,
+			});
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId);
+		});
+
+		// 1h grace window: the orphan is fresh, so it must survive.
+		const survived = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+		});
+		expect(includesSha(survived, sha256)).toBe(false);
+		const stillThere = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(stillThere).toEqual(data);
+
+		// Zero grace window: the orphan is now eligible and gets collected.
+		const collected = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 0);
+		});
+		expect(includesSha(collected, sha256)).toBe(true);
+		const gone = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(gone).toBeNull();
+	});
+
+	it("orphan with NULL last_referenced_at is collected even under a long grace window", async () => {
+		const sha256 = new Uint8Array(32).fill(0x22);
+		const data = new TextEncoder().encode("legacy null content");
+
+		// Insert directly with an explicit NULL last_referenced_at and no inode.
+		await dialect.transaction(async (tx) => {
+			await tx`
+				INSERT INTO blobs (sha256, data, size, last_referenced_at)
+				VALUES (${sha256}, ${data}, ${data.length}, NULL)
+			`;
+		});
+
+		// Long grace window — NULL is treated as ancient, so it is still collected.
+		const collected = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+		});
+		expect(includesSha(collected, sha256)).toBe(true);
+
+		const gone = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(gone).toBeNull();
+	});
+
+	it("blob referenced only by another sandbox survives no-context GC (RLS escape)", async () => {
+		const sha256 = new Uint8Array(32).fill(0x33);
+		const data = new TextEncoder().encode("cross sandbox content");
+		const otherSandboxId = `${sandboxId}-other`;
+
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, otherSandboxId);
+		});
+
+		try {
+			await dialect.transaction(async (tx) => {
+				await dialect.upsertBlob(tx, sha256, data);
+			});
+			// The referencing inode lives in the OTHER sandbox.
+			await dialect.transaction(async (tx) => {
+				await dialect.setSandboxContext(tx, otherSandboxId);
+				await dialect.createInode(tx, {
+					sandboxId: otherSandboxId,
+					kind: 1,
+					mode: 0o644,
+					size: data.length,
+					contentSha256: sha256,
+				});
+			});
+
+			// GC runs with NO setSandboxContext — the RLS escape lets the
+			// context-less tx see the other sandbox's inode, so the anti-join
+			// keeps this blob alive.
+			const deleted = await dialect.transaction(async (tx) => {
+				return await dialect.gcOrphanBlobs(tx, 0);
+			});
+			expect(includesSha(deleted, sha256)).toBe(false);
+
+			const survived = await dialect.transaction(async (tx) => {
+				return await dialect.getBlob(tx, sha256);
+			});
+			expect(survived).toEqual(data);
+		} finally {
+			// deleteSandbox cascades the inode, but blobs are global (no sandbox_id),
+			// so the now-orphan blob must be removed explicitly to avoid leaking.
+			await dialect.transaction(async (tx) => {
+				await dialect.deleteSandbox(tx, otherSandboxId);
+				await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
+			});
+		}
+	});
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombstone fix (rm/overwrite/GC)", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-tombstone-${Date.now()}`;
+		const res = await dialect.transaction(async (tx) => dialect.createSandbox(tx, sandboxId));
+		rootInodeId = res.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	const countInode = (id: bigint): Promise<number> =>
+		dialect.transaction(async (tx) => {
+			const rows = await tx<{ n: number }[]>`SELECT count(*)::int AS n FROM inodes WHERE id = ${String(id)}`;
+			return rows[0]!.n;
+		});
+
+	it("rmComposite hard-deletes a single-linked inode (no nlink=0 tombstone left behind)", async () => {
+		const sha = new Uint8Array(32).fill(0x51);
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 3, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => dialect.insertDirent(tx, rootInodeId, "single.txt", inodeId));
+
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "single.txt"));
+
+		// Regression: the inode ROW must be gone, not lingering at nlink=0.
+		expect(await countInode(inodeId)).toBe(0);
+	});
+
+	it("rmComposite decrements a hardlinked inode instead of deleting it", async () => {
+		const sha = new Uint8Array(32).fill(0x52);
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 3, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "link1.txt", inodeId);
+			await dialect.insertDirent(tx, rootInodeId, "link2.txt", inodeId);
+			await dialect.incrementNlink(tx, inodeId); // two links → nlink = 2
+		});
+
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link2.txt"));
+
+		const inode = await dialect.transaction(async (tx) => dialect.getInode(tx, inodeId));
+		expect(inode).not.toBeNull();
+		expect(inode!.nlink).toBe(1); // survives with the remaining link
+
+		// removing the last link now hard-deletes it
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link1.txt"));
+		expect(await countInode(inodeId)).toBe(0);
+	});
+
+	it("writeFileComposite overwrite hard-deletes the replaced inode and frees its blob for GC", async () => {
+		const shaA = new Uint8Array(32).fill(0x53);
+		const shaB = new Uint8Array(32).fill(0x54);
+		const dataA = new TextEncoder().encode("AAA");
+		const dataB = new TextEncoder().encode("BBBB");
+
+		const inodeA = await dialect.transaction(async (tx) =>
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataA.length, shaA, dataA),
+		);
+		const inodeB = await dialect.transaction(async (tx) =>
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataB.length, shaB, dataB),
+		);
+		expect(inodeB).not.toBe(inodeA);
+		// Regression: the replaced inode must be deleted, not left as an nlink=0 tombstone.
+		expect(await countInode(inodeA)).toBe(0);
+
+		// Old blob is now a true orphan → collected; the new blob survives.
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		const blobA = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaA));
+		const blobB = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaB));
+		expect(blobA).toBeNull();
+		expect(blobB).toEqual(dataB);
+
+		// cleanup
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "ow.txt"));
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${shaB}`;
+		});
+	});
+
+	it("gcOrphanBlobs ignores an nlink=0 inode tombstone (legacy backlog) and collects its blob", async () => {
+		const sha = new Uint8Array(32).fill(0x55);
+		const data = new TextEncoder().encode("tomb");
+		await dialect.transaction(async (tx) => dialect.upsertBlob(tx, sha, data));
+		// Simulate a tombstone left by an older buggy build: nlink=0 but still references the blob.
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: data.length, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => {
+			await tx`UPDATE inodes SET nlink = 0 WHERE id = ${String(inodeId)}`;
+		});
+
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+
+		const blob = await dialect.transaction(async (tx) => dialect.getBlob(tx, sha));
+		expect(blob).toBeNull(); // collected despite the tombstone reference
+
+		// cleanup the tombstone inode
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM inodes WHERE id = ${String(inodeId)}`;
+		});
+	});
+
+	it("mvComposite over a single-linked destination hard-deletes the replaced inode (no tombstone)", async () => {
+		const shaSrc = new Uint8Array(32).fill(0x56);
+		const shaDst = new Uint8Array(32).fill(0x57);
+		const dataSrc = new TextEncoder().encode("SRC");
+		const dataDst = new TextEncoder().encode("DST");
+
+		const srcInode = await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, shaSrc, dataSrc);
+			const id = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: dataSrc.length,
+				contentSha256: shaSrc,
+			});
+			await dialect.insertDirent(tx, rootInodeId, "mvsrc.txt", id);
+			return id;
+		});
+		const dstInode = await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, shaDst, dataDst);
+			const id = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: dataDst.length,
+				contentSha256: shaDst,
+			});
+			await dialect.insertDirent(tx, rootInodeId, "mvdst.txt", id);
+			return id;
+		});
+
+		// Move src onto the existing dst, overwriting it.
+		await dialect.transaction(async (tx) =>
+			dialect.mvComposite(tx, sandboxId, rootInodeId, "mvsrc.txt", rootInodeId, "mvdst.txt"),
+		);
+
+		// Regression: the overwritten destination inode must be deleted, not an nlink=0 tombstone.
+		expect(await countInode(dstInode)).toBe(0);
+		expect(await countInode(srcInode)).toBe(1); // src inode now lives at mvdst.txt
+
+		// The dest's old blob is freed for GC; the moved src blob survives.
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaDst))).toBeNull();
+		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaSrc))).toEqual(dataSrc);
+
+		// cleanup
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "mvdst.txt"));
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${shaSrc}`;
 		});
 	});
 });

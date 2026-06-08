@@ -20,6 +20,7 @@ import {
 	type SandboxListEntry,
 	type SandboxMeta,
 	type SqlDialect,
+	type TransactionOptions,
 	type UpdateInodeOpts,
 } from "../types.js";
 
@@ -78,7 +79,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// ── Transactions ──────────────────────────────────────────────────────────────
 
-	async transaction<T>(fn: (tx: PgTx) => Promise<T>): Promise<T> {
+	async transaction<T>(fn: (tx: PgTx) => Promise<T>, opts?: TransactionOptions): Promise<T> {
+		if (opts?.isolationLevel !== undefined) {
+			// `postgres` passes this string after BEGIN, e.g. BEGIN ISOLATION LEVEL REPEATABLE READ.
+			return this.db().begin(`isolation level ${opts.isolationLevel}`, fn) as Promise<T>;
+		}
 		return this.db().begin(fn) as Promise<T>;
 	}
 
@@ -129,16 +134,21 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 					AND (SELECT 1 FROM ctx) IS NOT NULL
 				RETURNING inode_id
 			),
+			-- Delete and decrement are split into two mutually-exclusive CTEs
+			-- (by the snapshot nlink) so each inode row is touched exactly once.
+			-- Postgres applies ONLY the UPDATE when a row is both updated and deleted
+			-- in one statement, which would leave an nlink=0 inode tombstone that
+			-- still references content_sha256 and pins its blob against GC.
+			deleted_inode AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT inode_id FROM removed_dirent)
+					AND nlink <= 1
+			),
 			decremented AS (
 				UPDATE inodes
 				SET nlink = nlink - 1
-				FROM removed_dirent
-				WHERE inodes.id = removed_dirent.inode_id
-				RETURNING inodes.id, inodes.nlink
-			),
-			cleaned AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+				WHERE id IN (SELECT inode_id FROM removed_dirent)
+					AND nlink > 1
 			)
 			SELECT inode_id AS removed_inode_id FROM removed_dirent
 		`;
@@ -165,7 +175,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			blob_insert AS (
 				INSERT INTO blobs (sha256, data, size)
 				SELECT ${sha256}, ${data}, ${size} FROM ctx
-				ON CONFLICT (sha256) DO NOTHING
+				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
@@ -183,16 +193,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id
 				RETURNING inode_id
 			),
+			-- Drop the replaced inode in two mutually-exclusive statements (see
+			-- rmComposite): a combined update+delete of the same row applies only
+			-- the UPDATE, leaving an nlink=0 tombstone that pins the old blob.
+			deleted_old_inode AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT inode_id FROM old_dirent)
+					AND nlink <= 1
+			),
 			decremented AS (
 				UPDATE inodes
 				SET nlink = nlink - 1
-				FROM old_dirent
-				WHERE inodes.id = old_dirent.inode_id
-				RETURNING inodes.id, inodes.nlink
-			),
-			cleaned AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+				WHERE id IN (SELECT inode_id FROM old_dirent)
+					AND nlink > 1
 			)
 			SELECT id AS new_inode_id FROM new_inode
 		`;
@@ -231,15 +244,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 					AND (SELECT 1 FROM ctx) IS NOT NULL
 				RETURNING inode_id
 			),
-			decremented AS (
-				UPDATE inodes
-				SET nlink = nlink - 1
-				FROM old_dest
-				WHERE inodes.id = old_dest.inode_id
-				RETURNING inodes.id, inodes.nlink
+			-- Split delete/decrement by snapshot nlink so the overwritten
+			-- destination inode is touched exactly once (see rmComposite): a
+			-- combined update+delete applies only the UPDATE, leaving an nlink=0
+			-- tombstone that pins the destination's old blob against GC.
+			deleted_dest_inode AS (
+				DELETE FROM inodes
+				WHERE id IN (SELECT inode_id FROM old_dest)
+					AND nlink <= 1
 			)
-			DELETE FROM inodes
-			WHERE id IN (SELECT id FROM decremented WHERE nlink <= 0)
+			UPDATE inodes
+			SET nlink = nlink - 1
+			WHERE id IN (SELECT inode_id FROM old_dest)
+				AND nlink > 1
 		`;
 		const rows = await tx<{ inode_id: string }[]>`
 			UPDATE dirents
@@ -582,14 +599,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`
 			INSERT INTO blobs (sha256, data, size)
 			VALUES (${sha256}, ${data}, ${data.length})
-			ON CONFLICT (sha256) DO NOTHING
+			ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
 		`;
 		// Fire-and-forget: don't hold the PG transaction (and the per-sandbox
 		// advisory lock acquired in setSandboxContext) open on Redis latency.
 		// RedisBlobCache.set() swallows its own errors so this promise cannot
 		// reject. Safe under races: blobs are content-addressable and the PG
-		// insert is ON CONFLICT DO NOTHING, so a concurrent SET with identical
-		// bytes is a no-op.
+		// insert is ON CONFLICT DO UPDATE (touch-only — it bumps
+		// last_referenced_at but never rewrites data/size), so a concurrent SET
+		// with identical bytes is a no-op.
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
@@ -698,16 +716,34 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return out;
 	}
 
-	// US-014
-	async gcOrphanBlobs(tx: PgTx): Promise<number> {
+	// US-014: collect orphan blobs older than the grace window.
+	// Runs with NO sandbox context — the RLS escape (migration 0005) lets a
+	// context-less tx see every inode so the anti-join is correct. NOT EXISTS
+	// (vs NOT IN) is null-safe and lets the planner use idx_inodes_content_sha256.
+	// Dedup re-adoption race: a concurrent writer that touches+locks an existing
+	// orphan blob (ON CONFLICT DO UPDATE) and then inserts its inode can be missed
+	// here under READ COMMITTED — EvalPlanQual re-checks the updated blob row but
+	// the NOT EXISTS subquery keeps the stale snapshot and never sees the new
+	// inode, so a small/zero grace window would delete a freshly-referenced blob.
+	// The CALLER (runBlobGc) must therefore run this at REPEATABLE READ, which
+	// turns that conflict into a serialization failure (retried) instead of
+	// silent content loss. The grace window is defense-in-depth / churn control.
+	// `i.nlink > 0` excludes nlink=0 inode tombstones: the composite write/delete
+	// paths no longer create them, but rows left by older buggy builds would
+	// otherwise pin their blobs forever — this lets GC clear that backlog.
+	async gcOrphanBlobs(tx: PgTx, minAgeMs: number): Promise<Uint8Array[]> {
 		const rows = await tx<{ sha256: Buffer }[]>`
-			DELETE FROM blobs
-			WHERE sha256 NOT IN (
-				SELECT content_sha256 FROM inodes WHERE content_sha256 IS NOT NULL
+			DELETE FROM blobs b
+			WHERE NOT EXISTS (
+				SELECT 1 FROM inodes i WHERE i.content_sha256 = b.sha256 AND i.nlink > 0
 			)
-			RETURNING sha256
+			AND (
+				b.last_referenced_at IS NULL
+				OR b.last_referenced_at < now() - (${minAgeMs} * interval '1 millisecond')
+			)
+			RETURNING b.sha256
 		`;
-		return rows.length;
+		return rows.map((r) => new Uint8Array(r.sha256));
 	}
 
 	// US-015
@@ -962,7 +998,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 		if (uniqueBlobs.size > 0) {
 			const blobRows = [...uniqueBlobs.values()];
-			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING`;
+			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`;
 		}
 
 		// ── Phase D: bulk insert file inodes ─────────────────────────────────────

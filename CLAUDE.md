@@ -34,7 +34,7 @@ pnpm test -- src/sql-fs/sql-fs.cache.test.ts   # Run specific test file
 # Database
 pnpm db:generate            # Scaffold a new migration SQL from schema changes (drizzle-kit)
                             # Migrations are APPLIED automatically on server boot (src/api/migrations.ts), not by a CLI
-pnpm db:gc                  # Run blob garbage collection
+pnpm db:gc                  # Run multi-tenant orphan-blob GC (external scheduler; see BLOB_GC_MIN_AGE_MS)
 
 # Docker
 docker build -t sql-fs-api .
@@ -83,7 +83,8 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 - `routes/files.ts` — File ops: read, write, delete, mkdir, bulk write, tree listing
 - `routes/exec.ts` — Bash execution: sync (JSON) and streaming (SSE)
 - `routes/ingest.ts` — Ingest (tar.gz / JSON manifest) and export (tar.gz download)
-- `routes/admin.ts` — Admin endpoints (blob GC)
+- `blob-gc.ts` — Multi-tenant orphan-blob GC orchestrator (`runBlobGc`); invoked by `cli/gc.ts`
+- `cli/gc.ts` — Blob GC CLI (`pnpm db:gc`), for an external cron / k8s CronJob
 - `mcp/server.ts` — MCP server setup with streamable HTTP transport
 - `mcp/tools.ts` — 10 MCP tool definitions and handlers
 
@@ -219,6 +220,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No (default: 3600000) | TTL for path snapshot entries (ms, default 1h). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
+| `BLOB_GC_MIN_AGE_MS` | No (default: 10800000) | Grace window (ms, default 3h) before an orphan blob becomes collectible by `pnpm db:gc`. Orphans whose `last_referenced_at` is newer than this are kept; the `ON CONFLICT DO UPDATE` row lock on blob writes is the actual dedup re-adoption race guard — this window is churn/margin control. Rows with NULL `last_referenced_at` (legacy, pre-migration-0006) are treated as ancient and always collectible. Override per-run with `--min-age-ms`. |
 
 ## File Layout
 
@@ -245,17 +247,17 @@ src/
     validation.ts                ← Zod middleware
     session-manager.ts           ← Warm Bash instance pool
     errors.ts                    ← HTTP error helpers
+    blob-gc.ts                   ← Orphan-blob GC orchestrator (runBlobGc)
     routes/
       sandboxes.ts               ← CRUD
       files.ts                   ← File operations
       exec.ts                    ← Bash execution (sync + SSE)
       ingest.ts                  ← Ingest/export
-      admin.ts                   ← GC endpoint
     mcp/
       server.ts                  ← MCP server
       tools.ts                   ← Tool definitions + handlers
     cli/
-      gc.ts                      ← Blob GC CLI
+      gc.ts                      ← Blob GC CLI (pnpm db:gc)
     tests/                       ← API unit + e2e tests (integration/ inside)
 ```
 

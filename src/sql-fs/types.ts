@@ -106,6 +106,17 @@ export interface BulkIngestFile {
 	readonly mode: number;
 }
 
+/** Options for a transaction. */
+export interface TransactionOptions {
+	/**
+	 * Isolation level for the transaction. Defaults to the connection default
+	 * (READ COMMITTED). Use `repeatable read` for the orphan-blob GC so a
+	 * concurrent dedup re-adoption surfaces as a serialization failure (retry)
+	 * instead of silently deleting a freshly-referenced blob.
+	 */
+	readonly isolationLevel?: "repeatable read" | "serializable";
+}
+
 /**
  * SqlDialect abstracts all database-specific SQL operations so that SqlFs
  * can work with Postgres, MySQL, and Azure SQL without modification.
@@ -127,8 +138,9 @@ export interface SqlDialect<Tx = unknown> {
 	/**
 	 * Wraps the callback in a BEGIN/COMMIT transaction.
 	 * Rolls back automatically on error and re-throws the original error.
+	 * `opts.isolationLevel` overrides the default (READ COMMITTED).
 	 */
-	transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+	transaction<T>(fn: (tx: Tx) => Promise<T>, opts?: TransactionOptions): Promise<T>;
 
 	// ── Sandbox context ──────────────────────────────────────────────────────────
 
@@ -329,10 +341,18 @@ export interface SqlDialect<Tx = unknown> {
 	getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>>;
 
 	/**
-	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.
-	 * Returns the count of blobs deleted.
+	 * Deletes orphan blobs — those whose sha256 is not referenced by any inode's
+	 * content_sha256 — that are older than the `minAgeMs` grace window.
+	 *
+	 * `minAgeMs` is the grace window in milliseconds: orphans whose
+	 * `last_referenced_at` is younger than this are kept (they may be re-adopted
+	 * by an in-flight dedup upsert). A NULL `last_referenced_at` is treated as
+	 * ancient and is always eligible for collection. Pass `0` to collect every
+	 * orphan immediately.
+	 *
+	 * Returns the sha256s of the deleted blobs (for later cache invalidation).
 	 */
-	gcOrphanBlobs(tx: Tx): Promise<number>;
+	gcOrphanBlobs(tx: Tx, minAgeMs: number): Promise<Uint8Array[]>;
 
 	// ── Bulk / tree operations ────────────────────────────────────────────────────
 

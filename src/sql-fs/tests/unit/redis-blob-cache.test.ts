@@ -1,6 +1,7 @@
 /**
  * Unit tests for RedisBlobCache. Uses an in-memory fake Redis client that
- * implements only the methods the cache relies on (`getBuffer`, `set`).
+ * implements only the methods the cache relies on (`getBuffer`, `mgetBuffer`,
+ * `set`, `unlink`).
  */
 
 import type { Redis } from "ioredis";
@@ -17,6 +18,8 @@ class FakeRedis {
 	failGet = false;
 	failMget = false;
 	failSet = false;
+	failUnlink = false;
+	unlinkCalls: number[] = [];
 
 	async getBuffer(key: string): Promise<Buffer | null> {
 		if (this.failGet) throw new Error("redis get failed");
@@ -32,6 +35,16 @@ class FakeRedis {
 		if (this.failSet) throw new Error("redis set failed");
 		this.store.set(key, { data: value, ttlMs });
 		return "OK";
+	}
+
+	async unlink(...keys: string[]): Promise<number> {
+		if (this.failUnlink) throw new Error("redis unlink failed");
+		this.unlinkCalls.push(keys.length);
+		let deleted = 0;
+		for (const key of keys) {
+			if (this.store.delete(key)) deleted++;
+		}
+		return deleted;
 	}
 }
 
@@ -194,6 +207,83 @@ describe("RedisBlobCache.mget", () => {
 		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const result = await cache.mget([sha(0x01), sha(0x02)]);
 		expect(result).toEqual([null, null]);
+		expect(errSpy).toHaveBeenCalled();
+		errSpy.mockRestore();
+	});
+});
+
+describe("RedisBlobCache.mdel", () => {
+	it("deletes the correct tenant-prefixed keys and leaves others intact", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default");
+		fake.store.set(`vfs:default:blob:${hexSha(0x01)}`, { data: Buffer.from([1]), ttlMs: 1000 });
+		fake.store.set(`vfs:default:blob:${hexSha(0x02)}`, { data: Buffer.from([2]), ttlMs: 1000 });
+		const unrelated = `vfs:default:blob:${hexSha(0x03)}`;
+		fake.store.set(unrelated, { data: Buffer.from([3]), ttlMs: 1000 });
+
+		await cache.mdel([sha(0x01), sha(0x02)]);
+
+		expect(fake.store.has(`vfs:default:blob:${hexSha(0x01)}`)).toBe(false);
+		expect(fake.store.has(`vfs:default:blob:${hexSha(0x02)}`)).toBe(false);
+		expect(fake.store.has(unrelated)).toBe(true);
+	});
+
+	it("scopes deletes to its own tenant prefix", async () => {
+		const { fake, client } = makeClient();
+		const cacheA = new RedisBlobCache(client, "tenant-a");
+		const keyA = `vfs:tenant-a:blob:${hexSha(0x01)}`;
+		const keyB = `vfs:tenant-b:blob:${hexSha(0x01)}`;
+		fake.store.set(keyA, { data: Buffer.from([1]), ttlMs: 1000 });
+		fake.store.set(keyB, { data: Buffer.from([1]), ttlMs: 1000 });
+
+		await cacheA.mdel([sha(0x01)]);
+
+		expect(fake.store.has(keyA)).toBe(false);
+		expect(fake.store.has(keyB)).toBe(true);
+	});
+
+	it("chunks UNLINK at 1024 keys per round-trip", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default");
+		// Build 1500 distinct shas by encoding the index into the first 2 bytes.
+		const shas: Uint8Array[] = [];
+		for (let i = 0; i < 1500; i++) {
+			const s = new Uint8Array(32);
+			s[0] = i & 0xff;
+			s[1] = (i >> 8) & 0xff;
+			shas.push(s);
+		}
+
+		await cache.mdel(shas);
+
+		expect(fake.unlinkCalls).toEqual([1024, 476]);
+	});
+
+	it("no-ops when cache is disabled", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default", { enabled: false });
+		const key = `vfs:default:blob:${hexSha(0x01)}`;
+		fake.store.set(key, { data: Buffer.from([1]), ttlMs: 1000 });
+
+		await cache.mdel([sha(0x01)]);
+
+		expect(fake.store.has(key)).toBe(true);
+		expect(fake.unlinkCalls).toEqual([]);
+	});
+
+	it("no-ops on empty input (no round-trip)", async () => {
+		const { fake, client } = makeClient();
+		const cache = new RedisBlobCache(client, "default");
+		await cache.mdel([]);
+		expect(fake.unlinkCalls).toEqual([]);
+	});
+
+	it("fails open on Redis error", async () => {
+		const { fake, client } = makeClient();
+		fake.failUnlink = true;
+		const cache = new RedisBlobCache(client, "default");
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		await expect(cache.mdel([sha(0x01)])).resolves.toBeUndefined();
 		expect(errSpy).toHaveBeenCalled();
 		errSpy.mockRestore();
 	});
