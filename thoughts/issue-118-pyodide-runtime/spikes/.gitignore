@@ -1,0 +1,4 @@
+# Spike S1/S2 download artifacts — large, reproducible from the pinned manifest.
+# Never commit the Deno binary or the ~400 MB Pyodide distribution.
+assets/
+*.log

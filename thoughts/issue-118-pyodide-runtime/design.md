@@ -60,8 +60,11 @@ threat model** — it would expose the host under the same uid. Compensating con
 scoped to read-only Pyodide assets only. We **recommend** (do not require) operators add a gVisor/seccomp layer.
 **Security acceptance is first-class:** an adversarial suite proves `import js; js.process.env`, `js.fetch(...)`,
 `pyodide.code.run_js(...)`, `ctypes.CDLL(None)`, `import('node:child_process')` **fail closed** (no secret read,
-no network, no host-FS reach) **and** that escaped JS **cannot forge, interleave, or replay an IPC control
-frame** — proving capability denial, not merely a thrown error.
+no network, no host-FS reach) **and** that escaped JS **cannot produce an _accepted_ IPC control frame**
+(spike S2 finding A: it *can* write raw bytes to stdout via `import("node:fs").writeSync(1,…)`, but the
+Node-side validator rejects every forged/interleaved/replayed/stale-generation frame and kills the child —
+the secret `requestId`/`seq`/`generation` are never exposed to untrusted code) — proving capability denial,
+not merely a thrown error.
 
 ## Patterns to Follow
 
@@ -215,9 +218,12 @@ Each must pass a POC before its dependent phase is built; fail any → revisit t
    numpy/pandas/scipy from disk, install the **frozen openpyxl+et_xmlfile** lock, run a pandas→openpyxl
    round-trip, and capture stdout/stderr — all with **zero network**.
 2. **IPC integrity (gates P3/P4) — confirm the *committed* design, do not re-choose transport.** The
-   stdin/stdout + realm-lockdown framing works under the deny flags with binary payloads, and after lockdown an
-   adversarial `Deno.stdout.write`/`console.log`/raw-fd attempt **cannot forge, interleave, or replay** a control
-   frame; verify generation-id rejection of a killed-generation message.
+   stdin/stdout + realm-lockdown framing works under the deny flags with binary payloads. Lockdown blocks the
+   deletable primitives (`Deno.stdout.write`/`console.log`/`require`), but **finding A:** `import("node:fs").writeSync(1,…)`
+   still reaches stdout — so the provable invariant is that an adversary **cannot produce an _accepted_** forged /
+   interleaved / replayed / stale-generation control frame (the Node-side validator rejects each and kills the
+   child; the secret `requestId`/`seq`/`generation` are never exposed to untrusted code). Verify generation-id
+   rejection of a killed-generation message.
 3. **Per-child memory behavior (gates P6).** Confirm `node:22-slim` non-root cannot reliably set cgroup
    `memory.max` (and that `prlimit --as` is unusable with V8); validate the container-limit guard + accepted
    availability risk (Decision 5) is the operating model.

@@ -29,22 +29,40 @@ Three POCs from `design.md` §"Required Spikes". Each must pass before its depen
     --cached-only --no-config --allow-read=<assetdir> s1_runner.ts <assetdir>
   ```
   `s1_runner.ts` reads `<assetdir>` from `Deno.args` (**not** `Deno.env`), then `loadPyodide({ indexURL, lockFileURL, packageBaseUrl })` from local paths, `loadPackage(["numpy","pandas","scipy"])`, install the frozen openpyxl+et_xmlfile lock, run a pandas→openpyxl round-trip (DataFrame → `out.xlsx` bytes → read back), and print the round-trip byte length. **Assert zero network** (the deny flags + a packet-capture or a deliberate offline run prove it).
-- **S2 — IPC integrity** (gates Phase 3/4). Script `spikes/s2-ipc.ts`. Implement length-prefixed JSON framing over stdin/stdout with a binary payload; after realm lockdown (capture stdout writer, delete `Deno`/`console`/write primitives from `globalThis`), run an adversarial snippet that tries `Deno.stdout.write`/`console.log`/raw-fd to **forge, interleave, or replay** a control frame, and a stale-`generation` message. Assert all are rejected.
+- **S2 — IPC integrity** (gates Phase 3/4). Script `spikes/s2-ipc.ts`. Implement length-prefixed JSON framing with a binary payload; model the real runner realm (install **then** delete `Deno`/`console`/`require`/`__dirname`/`__filename` from `globalThis`), and run an adversarial snippet that tries to **forge, interleave, or replay** a control frame, a stale-`generation` message, and a forged `ready` handshake. **Result (finding A): realm lockdown is not stdout containment** — `Deno.stdout.write`/`console.log`/`require` are blocked, but `import("node:fs").writeSync(1,…)` reaches stdout. The provable invariant is narrower: a frame validator rejects every forged/interleaved/replayed/stale-generation/bad-handshake frame, so escaped JS **cannot produce an _accepted_ frame** (it can't guess the secret `requestId`/`seq`/`generation`). Assert each is rejected and exit 0.
 - **S3 — Per-child memory** (gates Phase 6). Script `spikes/s3-memory.sh`. In a `node:22-slim` non-root context, attempt to set cgroup v2 `memory.max` for a child and attempt `prlimit --as`; confirm both are unavailable/unusable (V8 vaddr reservation). Document that the **container memory limit + accepted availability risk (design D5)** is the operating model.
 
 ### Phase 0: Success Criteria
 
 #### Phase 0: Programmatic Verification
-- [ ] `spikes/s1-pyodide-deno.sh` exits 0 and prints the pandas→openpyxl round-trip byte length with zero network access
-- [ ] `spikes/s2-ipc.ts` exits 0 and prints PASS for each of: forged-frame rejected, interleave rejected, replay rejected, stale-generation rejected
-- [ ] `spikes/s3-memory.sh` exits 0 and prints the memory-limit probe result (cgroup write denied / prlimit unusable)
+- [x] `spikes/s1-pyodide-deno.sh` exits 0 and prints the pandas→openpyxl round-trip byte length with zero network access — `S1 PASS pyodide=0.29.4 roundtrip_xlsx_bytes=~4970` (varies ±1; openpyxl embeds timestamps), exit 0
+- [x] `spikes/s2-ipc.ts` exits 0 and prints PASS for each of: forged-frame rejected, interleave rejected, replay rejected, stale-generation rejected — all four PASS (+ realm-lockdown, baseline, oversized), exit 0
+- [x] `spikes/s3-memory.sh` exits 0 and prints the memory-limit probe result (cgroup write denied / prlimit unusable) — `cgroup_write_denied=1 rlimit_as_unusable=1`, exit 0
 
 #### Phase 0: Agent Verification
-- [ ] Agent reviews `S1-findings.md`, `S2-findings.md`, `S3-findings.md` and confirms each gate's pass/fail is **explicit** before Phase 3/Phase 6 begin
-- [ ] Agent confirms the exact Deno version and pyodide version validated in S1 match what Phase 3 pins
+- [x] Agent reviews `S1-findings.md`, `S2-findings.md`, `S3-findings.md` and confirms each gate's pass/fail is **explicit** before Phase 3/Phase 6 begin — each note opens with `GATE: ✅ PASS`
+- [x] Agent confirms the exact Deno version and pyodide version validated in S1 match what Phase 3 pins — Phase 3 names no specific patch yet ("pins versions in a constant"); S1 is the source of truth → Phase 3 must pin **Deno v2.8.2** + **Pyodide 0.29.4** (recorded in `S1-findings.md`)
 
 ### Phase 0: Discoveries and Notable Information
-_Placeholder — filled by the implementing agent during/after Phase 0._
+
+**Validated pins (Phase 3 MUST adopt these — see `spikes/S1-findings.md`):** Deno **v2.8.2**, Pyodide **0.29.4** (full dist `pyodide-0.29.4.tar.bz2`, 408 MB, ships CPython 3.12), openpyxl **3.1.5** (`py2.py3-none-any`), et_xmlfile **2.0.0** (`py3-none-any`). The plan's `fetch-pyodide-assets.mjs` ("pins versions in a constant") names no patch yet — no conflict; S1 is the source of truth.
+
+**Surprises (carry into Phase 3 `runner.ts`):**
+- **Deno is detected as Node by Pyodide** (`process.versions.node` is populated), so it uses the **Node-fs load path** — Pyodide 0.29.4 has **no `Deno.readFile` branch** (its only alternative is browser `fetch`, which needs network). The Node-fs path is therefore the correct & only offline path.
+- **Emscripten (`pyodide.asm.js`) needs CommonJS globals the Deno ESM realm lacks.** Before importing `pyodide.mjs`, `runner.ts` MUST set on `globalThis`: `require = createRequire(import.meta.url)` (from `node:module`), `__dirname = <assetDir>`, `__filename = <assetDir>/pyodide.asm.js`. Otherwise: `ReferenceError: require is not defined` / `__dirname is not defined` during `loadPyodide`. These node-builtin imports are NOT blocked by `--deny-import`/`--no-npm` (remote/npm only).
+- **The npm `import("ws")` is never reached** — Pyodide's `initNodeModules` returns early (`typeof A < "u"`), so `--no-npm` causes no failure. Only `node:url/fs/fs-promises/vm/path` are imported.
+
+**Adaptations / plan mismatches to fix in Phase 3:**
+- **openpyxl + et_xmlfile are NOT in the Pyodide distribution** (absent from `pyodide-lock.json` and disk; numpy/pandas/scipy/**micropip** ARE present). Plan line 354's `loadPackage([...,"openpyxl"])` **by name throws** `No known package with name 'openpyxl'` against the stock lock. It only works once `build-pyodide-lock.mjs` produces the **custom lock** naming openpyxl+et_xmlfile (plan line 303). S1 instead vendors the two pure-python wheels and loads them by **direct `file://` URL** — also valid. Phase 3 should do one or the other deliberately.
+- **`packageBaseUrl` is unnecessary** (plan lines 31/354): S1 used only `loadPyodide({ indexURL, lockFileURL, stdout, stderr })` and `loadPackage` resolved wheels relative to `indexURL`. Drop it or set `= indexURL`.
+
+**Gotchas:** `indexURL` must end with `/` and be absolute; asset dir passed as **argv** (never `Deno.env` — `--deny-env`); `DENO_NO_UPDATE_CHECK=1` in the **spawn env** (read by the Deno runtime, not the program); vendored wheels must live **inside** the `--allow-read` asset dir. **Zero-network proof = success under `--deny-net`** (any network attempt throws). Cold load (loadPyodide + packages) takes several seconds → informs Phase 6 exec-timeout default.
+
+**S2 finding A (HIGH) — realm lockdown is NOT stdout containment.** S2 models the real runner realm (installs + then deletes `require`/`__dirname`/`__filename` alongside `Deno`/`console`). The deletable primitives are blocked, but **`(await import("node:fs")).writeSync(1, bytes)` still reaches stdout under the full deny-belt** (`import` is syntax; `node:` builtins aren't gated by `--deny-import`/`--no-npm`; `--deny-write` doesn't block the open stdout fd; a dedicated control fd doesn't help — `fs.writeSync(anyFd,…)` works). ⇒ **Node-side frame validation with secret `requestId`/`seq`/`generation` is the LOAD-BEARING control, not defense-in-depth.** A stdout-writing attacker still cannot forge an *accepted* frame (it must guess unguessable secrets; can't read its own stdout to replay) — worst case is a corrupt/forged frame → kill-the-child. **Phase 3 `runner.ts` must (1) delete `require`/`__dirname`/`__filename` in lockdown and (2) NEVER expose `requestId`/`seq`/`generation` to untrusted Python.** Plan updated at Phase 3 (runner lockdown) + Phase 4 (`validateInbound` is primary control). The plan's `ready` handshake rules (plan.md:415, valid-once/pre-response/current-gen) were already correct; S2 now matches them exactly.
+
+**S3 numbers (Phase 6 operating model):** non-root **cannot** write cgroup `memory.max` (read-only mount) nor create a child cgroup. RLIMIT_AS (`prlimit --as`/`ulimit -v`) is **unusable for RSS**: a 2 GiB-max WASM heap reserves **VmSize ≈ 10,712 MB** vs **VmRSS ≈ 41 MB**, and a 2 GiB RLIMIT_AS makes the allocation fail (`RangeError: could not allocate memory`). ⇒ **container memory limit is the only guard**; manager must respawn-on-exit (incl. OOM-kill); per-child OOM isolation is an accepted risk.
+
+**Spike hygiene:** all downloaded assets live under `spikes/assets/` and are git-ignored (`spikes/.gitignore` covers `assets/` + `*.log`) — the ~408 MB Pyodide dist + Deno binary + wheels are reproducible from the script, never committed. To re-run: `bash spikes/s1-pyodide-deno.sh` (cached after first download); S2 via the bootstrapped `spikes/assets/deno-v2.8.2/deno` under the deny-belt; `bash spikes/s3-memory.sh` (needs Docker).
 
 ---
 
@@ -352,7 +370,8 @@ export function decodeFrames(buf: Uint8Array): { frames: Frame[]; rest: Uint8Arr
 
 - Resolve asset paths (`indexURL`, `lockFileURL` (the custom lock), `packageBaseUrl` — all local, derived from the absolute asset dir) from `Deno.args` (**argv only**, passed by Node). **Never `Deno.env`** — it is blocked by `--deny-env`. (`DENO_NO_UPDATE_CHECK` is set in Node's spawn env and read by the Deno runtime, not by the program.)
 - `const pyodide = await loadPyodide({ indexURL, lockFileURL, packageBaseUrl, stdout, stderr })`; preload `await pyodide.loadPackage(["numpy","pandas","scipy","openpyxl"])`.
-- **Realm lockdown BEFORE any untrusted Python:** capture the raw stdout writer (`Deno.stdout.write` bound), then delete `Deno`, `console`, and other write primitives from `globalThis`. All control-frame writes go through the captured writer only.
+- **Realm lockdown BEFORE any untrusted Python:** capture the raw stdout writer (`Deno.stdout.write` bound), then delete from `globalThis`: `Deno`, `console`, **and the Node-compat globals S1 installs for Pyodide — `require`, `__dirname`, `__filename`** (spike S2 finding A: these are live write primitives — `require("fs").writeSync(1,…)` — and must be deleted too). All control-frame writes go through the captured writer only.
+  - **S2 finding A (HIGH) — lockdown is NOT stdout containment.** `(await import("node:fs")).writeSync(1, bytes)` still reaches stdout under the deny-belt (`import` is syntax; `node:` builtins aren't gated by `--deny-import`/`--no-npm`; `--deny-write` doesn't block the open stdout fd; a dedicated fd doesn't help — `fs.writeSync(anyFd,…)` works). The **Node-side frame validation with secret `requestId`/`seq`/`generation` is therefore LOAD-BEARING, not defense-in-depth** (Phase 4). To keep that guarantee, **`runner.ts` MUST NOT expose `requestId`/`seq`/`generation` to untrusted Python** — pass only `code`/`argv`/`stdin`/`files` into Pyodide; keep the integrity fields in JS closure.
 - IPC loop: read length-prefixed frames from stdin (`Deno.stdin`), for each `run` frame: stage `files` into MEMFS (`FS.mkdirTree` + `FS.writeFile`), reset Python `globals`, run `pyodide.runPythonAsync(code, ...)`, capture stdout/stderr via Pyodide stream callbacks into base64 fields, compute the `{created,modified,deleted}` diff against the staged input set, and emit exactly one `result`/`error` frame carrying the matching `requestId`/`seq`/`generation`.
 - Between execs: fresh `globals` + wipe staged MEMFS paths (bounds variable scope + staged files; `sys.modules`/package globals persist within a session — same trust boundary, per design D3).
 
@@ -373,7 +392,7 @@ export function decodeFrames(buf: Uint8Array): { frames: Frame[]; rest: Uint8Arr
 - [ ] `pnpm lint:fix` passes
 
 #### Phase 3: Agent Verification
-- [ ] Agent re-runs an S2 forge attempt against the built `runner.ts`; confirms the forged frame is **not** emitted on the control channel
+- [ ] Agent re-runs an S2 forge attempt against the built `runner.ts`; confirms the forged frame is **not accepted** — escaped JS may write bytes to stdout (S2 finding A: `import("node:fs").writeSync(1,…)`), but the Node side rejects it, kills the child, and drains nothing
 - [ ] Agent confirms the deny-belt blocks remote import, npm import, update check, FS write, env read, subprocess spawn, FFI, and network (each attempt fails closed)
 - [ ] Agent reviews `runner.ts` to confirm realm lockdown happens **before** the first untrusted `runPythonAsync`
 
@@ -398,6 +417,7 @@ The trusted Node half: spawn/own the Deno subprocess, frame the protocol with fu
   - **`ready` handshake (explicit exception):** carries `generation` only (no `requestId`/`seq`). It is valid **exactly once**, **before any `result`/`error`**, and **only with the current `generation`**. A second `ready`, a `ready` after the first response, or a stale/wrong-generation `ready` is an integrity violation → kill the child. (The handshake marks the `starting → idle` transition.)
 - **Size caps measured on the base64-encoded wire size** (accounts for ~33% expansion): `PYODIDE_MAX_FRAME_BYTES` per frame + `PYODIDE_MAX_AGGREGATE_BYTES` aggregate per response.
 - Any malformed / oversized / duplicate / out-of-sequence / wrong-generation / unexpected frame → throw a typed `IpcIntegrityError` that the manager turns into **kill-the-child**.
+- **This validation is the PRIMARY, load-bearing security control — not defense-in-depth (spike S2 finding A).** Realm lockdown in `runner.ts` cannot contain stdout (`(await import("node:fs")).writeSync(1,…)` reaches it under the deny-belt), so untrusted code *can* write raw bytes to the channel. It still cannot produce an **accepted** frame: `requestId`/`seq`/`generation` are unguessable secrets never exposed to the child's Python (Phase 3 requirement), and a process cannot read its own stdout to replay. Treat `validateInbound` as security-critical; the worst an attacker achieves is corrupting/forging a frame → kill-the-child (self-DoS), never a drain of forged files.
 
 #### 2. Manager / worker state machine
 **File**: `src/api/pyodide/manager.ts` (new)
@@ -608,12 +628,13 @@ Prove the boundary holds. This suite is the security sign-off gate (design Open 
 **File**: `src/api/pyodide/tests/integration/frame-forgery.integration.test.ts` (new)
 **Action**: create
 
-- Escaped JS attempting `Deno.stdout.write`/`console.log`/raw-fd **cannot** forge a control frame, replay a stale-generation frame, forge or replay a `ready` handshake (duplicate / post-response / wrong-generation), nor redirect a drain write outside cwd (assert the Node side kills the child and drains nothing).
+- **Threat model (per spike S2 finding A):** escaped JS **can** write arbitrary bytes to stdout — `Deno.stdout.write`/`console.log`/raw-fd are blocked by realm lockdown, but `(await import("node:fs")).writeSync(1, …)` is **not** (node: builtins aren't on the deny-belt; `--deny-write` doesn't gate the open stdout fd). The invariant is therefore **narrower**: escaped JS **cannot produce an _accepted_ control frame**, because `requestId`/`seq`/`generation` are unguessable secrets never exposed to untrusted Python (Phase 3 requirement) and a process can't read its own stdout to replay a real frame.
+- Assert, for each attempt — a guessed/forged control frame, an interleaved/out-of-sequence frame, a replayed frame, a stale/wrong-`generation` frame, a forged/duplicate/post-response/wrong-generation `ready` handshake, **and** a frame injected specifically via `import("node:fs").writeSync(1, …)` — that the **Node side kills the child and drains nothing**. Also assert a drain write resolved outside cwd is rejected. **Do NOT assert "stdout cannot be written"** (it can) — assert "no forged frame is ever _accepted_, and any forgery attempt → kill-the-child + zero drain."
 
 ### Phase 7: Success Criteria
 
 #### Phase 7: Programmatic Verification
-- [ ] `pnpm test -- src/api/pyodide/tests/integration/escape.integration.test.ts src/api/pyodide/tests/integration/frame-forgery.integration.test.ts` pass (every escape blocked, every deny-belt item denied, fresh-globals isolation holds, control-frame + `ready`-handshake forgery/replay and drain-redirect blocked)
+- [ ] `pnpm test -- src/api/pyodide/tests/integration/escape.integration.test.ts src/api/pyodide/tests/integration/frame-forgery.integration.test.ts` pass (every escape blocked, every deny-belt item denied, fresh-globals isolation holds; no forged/guessed/interleaved/replayed/stale-generation control frame or forged `ready` handshake is ever **accepted** — each forgery attempt, including one injected via `import("node:fs").writeSync(1,…)`, **kills the child and drains nothing** — and drain-redirect outside cwd is rejected)
 - [ ] Full `pnpm test:integration` green with both containers up + assets present
 
 #### Phase 7: Agent Verification
