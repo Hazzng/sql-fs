@@ -22,7 +22,11 @@ const SANDBOX_BASE = "/home/user/proj";
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".next", "__pycache__"]);
 const SKIP_NAMES = new Set([".DS_Store"]);
 
-async function collect(root: string, base = root, out: Record<string, Uint8Array> = {}): Promise<Record<string, Uint8Array>> {
+async function collect(
+	root: string,
+	base = root,
+	out: Record<string, Uint8Array> = {},
+): Promise<Record<string, Uint8Array>> {
 	for (const entry of await readdir(root, { withFileTypes: true })) {
 		if (entry.isDirectory()) {
 			if (SKIP_DIRS.has(entry.name)) continue;
