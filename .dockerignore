@@ -8,3 +8,8 @@ dist
 tasks/
 .dockerignore
 Dockerfile
+# Vendored Pyodide assets are regenerated fresh in the builder stage; never copy
+# a (possibly stale) local copy into the build context.
+vendor
+# Design records + ~408 MB of spike scratch assets — not part of the image.
+thoughts

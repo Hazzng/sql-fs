@@ -6,3 +6,9 @@ dist/
 *.tsbuildinfo
 .claude/worktrees/
 docs/
+docker-compose.local.yml
+.tmp/
+
+# Vendored Pyodide runtime assets — reproduced by scripts/fetch-pyodide-assets.mjs
+# (pinned Deno binary + Pyodide distribution + wheels + download cache). Never committed.
+vendor/

@@ -356,9 +356,25 @@ Vendor the runtime assets and write the Deno-side harness that loads Pyodide off
 **File**: `src/pyodide-runner/protocol.ts` (new)
 **Action**: create — runtime-agnostic (`Uint8Array`/`DataView`, no `Buffer`/`Deno`).
 
+> **Note (as implemented in Phase 3 — supersedes the original files-only sketch).**
+> FS entries carry a `kind` so the manager/drain (Phase 5) can apply dirs-before-files
+> and represent script-created **empty directories**. `created` is ordered
+> dirs-before-files (dirs shallow→deep); `deleted` is depth-first (deepest first).
+> See Phase 3 Discoveries for why (resolves a plan inconsistency vs the Phase 5
+> "dirs-before-files" / "delete depth-first" drain spec).
+
 ```ts
 export const PROTOCOL_VERSION = 1;
 export type FrameType = "run" | "result" | "error" | "ready";
+
+// A staged-in / drained-out filesystem entry. `data` is base64 file contents for
+// `kind:"file"` and "" for `kind:"dir"`.
+export interface FsEntry {
+  readonly path: string;
+  readonly kind: "file" | "dir";
+  readonly mode: number;
+  readonly data: string;        // base64 file contents; "" for dirs
+}
 
 export interface RunRequest {
   readonly type: "run";
@@ -368,7 +384,7 @@ export interface RunRequest {
   readonly code: string;        // resolved script or -c body
   readonly argv: readonly string[];
   readonly stdin: string;       // base64
-  readonly files: ReadonlyArray<{ path: string; mode: number; data: string /*base64*/ }>;
+  readonly files: readonly FsEntry[];   // cwd subtree staged into MEMFS (files + dirs)
   readonly cwd: string;
 }
 
@@ -380,9 +396,9 @@ export interface RunResponse {
   readonly stdout: string;      // base64
   readonly stderr: string;      // base64
   readonly exitCode: number;
-  readonly created: ReadonlyArray<{ path: string; mode: number; data: string /*base64*/ }>;
-  readonly modified: ReadonlyArray<{ path: string; mode: number; data: string /*base64*/ }>;
-  readonly deleted: readonly string[];
+  readonly created: readonly FsEntry[];   // dirs-before-files (dirs shallow→deep)
+  readonly modified: readonly FsEntry[];  // changed files
+  readonly deleted: readonly string[];    // depth-first (deepest first)
 }
 
 // `ready` is a ONE-TIME pre-run handshake (no requestId/seq), validated separately
@@ -416,19 +432,43 @@ export function decodeFrames(buf: Uint8Array): { frames: Frame[]; rest: Uint8Arr
 ### Phase 3: Success Criteria
 
 #### Phase 3: Programmatic Verification
-- [ ] `node scripts/fetch-pyodide-assets.mjs && node scripts/build-pyodide-lock.mjs` produce `vendor/pyodide/` + the custom lock
-- [ ] `pnpm typecheck` passes (protocol.ts compiles; runner.ts excluded)
-- [ ] Running the built `runner.ts` under the committed flags with a fixture `run` frame on stdin returns a valid `result` frame whose pandas→openpyxl output bytes decode correctly — **zero network**:
-      `deno run <committed-flags> --allow-read=$PYODIDE_ASSET_DIR dist/pyodide-runner/runner.ts < fixture-frame.bin`
-- [ ] `pnpm lint:fix` passes
+- [x] `node scripts/fetch-pyodide-assets.mjs && node scripts/build-pyodide-lock.mjs` produce `vendor/pyodide/` + the custom lock — fetch verifies pinned SHA256 of the dist + downloads/verifies both wheels; build-lock wrote `pyodide-lock.custom.json` (381 packages, openpyxl+et_xmlfile added)
+- [x] `pnpm typecheck` passes (protocol.ts compiles; runner.ts excluded via tsconfig `exclude`)
+- [x] Running the built `runner.ts` under the committed flags with a fixture `run` frame on stdin returns a valid `result` frame whose pandas→openpyxl output bytes decode correctly — **zero network** (ran under `--deny-net`): `out.xlsx` drained 4970 bytes (PK zip), exit 0, ready+result frames, integrity fields echoed. Extended (post-review) to a 2-frame fixture: `created` carries `kind:"dir"` entries (empty dir + nested dir) ordered dirs-before-files, and a second frame confirms the cwd subtree is fully wiped between execs
+- [x] `pnpm lint:fix` passes (runner.ts biome-ignored — Deno-realm patterns; see Discoveries)
 
 #### Phase 3: Agent Verification
-- [ ] Agent re-runs an S2 forge attempt against the built `runner.ts`; confirms the forged frame is **not accepted** — escaped JS may write bytes to stdout (S2 finding A: `import("node:fs").writeSync(1,…)`), but the Node side rejects it, kills the child, and drains nothing
-- [ ] Agent confirms the deny-belt blocks remote import, npm import, update check, FS write, env read, subprocess spawn, FFI, and network (each attempt fails closed)
-- [ ] Agent reviews `runner.ts` to confirm realm lockdown happens **before** the first untrusted `runPythonAsync`
+- [x] Agent re-runs an S2 forge attempt against the built `runner.ts`; confirms the forged frame is **not accepted** — re-ran `s2-ipc.ts` under the committed flags via the vendored Deno (ALL PASS: forged/interleave/replay/stale-generation + ready-handshake violations rejected; finding A reconfirmed). Code review: `runner.ts` passes ONLY `argv`/`stdin`/`cwd` into Python — `requestId`/`seq`/`generation` never cross into Pyodide, so a forger can't produce an accepted frame. (The reject+kill-the-child wiring is Phase 4's `validateInbound`, which the S2 validator models — there is no Node manager yet in Phase 3.)
+- [x] Agent confirms the deny-belt blocks remote import, npm import, FS write, env read, subprocess spawn, FFI, sys-info, and network (deny-belt probe under the committed flags: all 8 fail closed). Update-check is suppressed by `DENO_NO_UPDATE_CHECK=1` (spawn env) + `--deny-net`.
+- [x] Agent reviews `runner.ts` to confirm realm lockdown happens **before** the first untrusted `runPythonAsync` — `delete g.Deno/console/require/__dirname/__filename` (lines ~111-115) run after the trusted `loadPyodide`/`loadPackage` (79-103) and before the first untrusted `runPythonAsync(req.code)` (line ~200, reached only when a `run` frame arrives in the IPC loop)
 
 ### Phase 3: Discoveries and Notable Information
-_Placeholder — filled by the implementing agent during/after Phase 3._
+
+**Design fork resolved (Phase-0-authorized "do one or the other deliberately").** Two coherent paths existed for openpyxl/et_xmlfile (absent from the stock dist): (A) a custom lock + `loadPackage`-by-name, or (B) the **S1-proven** `file://` wheel load. **runner.ts uses path B** — it's the only end-to-end-proven offline path (lowest risk for the verification gate). `build-pyodide-lock.mjs` still produces `pyodide-lock.custom.json` (the plan's deliverable) but the runner does NOT depend on it. The custom lock is a supplementary manifest / future path to loadPackage-by-name.
+
+**`build-pyodide-lock.mjs` uses a deterministic offline MERGE, not `micropip.freeze`** (deliberate deviation). Offline `micropip.freeze` is unproven/fragile; the merge (read stock lock → append openpyxl+et_xmlfile entries with sha256 from the vendored wheels → write custom lock) is deterministic, fast, no runtime spawn, and produces an equivalent artifact. Schema mirrored from a stock pure-python entry (`affine`): `{name, version, file_name, install_dir:"site", sha256, package_type:"package", imports, depends, unvendored_tests:false, shared_library:false}`.
+
+**Checksum pinning is platform-aware.** `fetch-pyodide-assets.mjs` SHA256-pins the platform-INDEPENDENT bytes — `pyodide.mjs`, `pyodide.asm.wasm`, `python_stdlib.zip`, and the two wheels — to the exact S1-validated artifacts (hard-fail on mismatch). The **Deno binary is pinned by version + official dl.deno.land URL only**: its bytes are platform-specific (arm64-darwin locally vs linux-x64 in Docker), so a single cross-arch checksum is impossible. Pinned wheel sha256: openpyxl-3.1.5 `5282c12b…`, et_xmlfile-2.0.0 `7a91720b…`.
+
+**Pyodide 0.29.4 ships CPython 3.13, not 3.12** (Phase 0 note said 3.12). The dist wheels are tagged `cp313-cp313-pyemscripten_2025_0_wasm32`; lock `info.platform = emscripten_4_0_9`. Immaterial to behaviour — noted for accuracy.
+
+**Stdout capture must NOT use `pyodide.setStdout({batched})`** — batched only flushes per-line, so a final `print(..., end="")` (no newline) is silently dropped. The runner instead **redirects Python `sys.stdout`/`sys.stderr` to `io.StringIO`** in the prelude and reads `getvalue()` after the run (then restores `sys.__stdout__`/`__stderr__`). Captures everything regardless of newlines/flush. (Found via the fixture test: first attempt drained the xlsx fine but `result.stdout` was empty.)
+
+**`runner.ts` is excluded from BOTH tsc and biome.** tsc: `tsconfig.json` `exclude` (Deno globals won't compile under the Node config). biome: added `src/pyodide-runner/runner.ts` to `files.ignore` — its Deno-realm patterns (`as any` on Deno globals, the 5 realm-lockdown `delete` statements) trip `noExplicitAny`/`noDelete`, which are wrong for this file (the deletes are one-time security lockdown, not a perf concern). `protocol.ts` stays fully linted+typed (clean, runtime-agnostic). Also added `vendor` to biome `files.ignore` (Phase 1 Discoveries flagged this).
+
+**Build wiring:** `dist/pyodide-runner/` ends up with `protocol.js` (tsc, Node side) + `protocol.ts` + `runner.ts` (raw, copied by `scripts/copy-pyodide-runner.mjs`, wired into `pnpm build`). `runner.ts` imports `./protocol.ts` (explicit `.ts`) — Deno resolves the raw `.ts`; Node imports `protocol.js`. Both coexist.
+
+**`.dockerignore` needed two adds** (the plan's Dockerfile change implied them): `vendor` (builder regenerates it fresh; never copy a stale local copy) and `thoughts` (holds ~408 MB of spike scratch assets — would bloat the build context). Dockerfile builder also `apt-get install`s `curl unzip bzip2` (needed by the fetch script).
+
+**Verification economy:** to avoid a redundant 408 MB Pyodide download, `vendor/` was seeded from the byte-identical S1 spike cache, then the two wheels were deleted to force a REAL download+SHA256-verify of small artifacts. The fetch script's skip-if-present + checksum-verify paths ran against the real pinned bytes; the 408 MB download path is identical curl/tar logic to the proven `s1-pyodide-deno.sh`. In Docker/CI the script does a full fresh download.
+
+**Gotcha for Phase 4/5:** the runner reads `[assetDir, generation]` from `Deno.args`; emits a `ready` frame (generation only) before reading any `run` frame; per `run` it stages files → fresh-namespace `runPythonAsync` → diffs the cwd subtree → emits exactly one `result`/`error` (echoing `requestId`/`seq`/`generation` from the request, held in JS). Manager spawn (Phase 4) must pass `--allow-read=<assetDir>`, the assetDir + generation as argv, and `DENO_NO_UPDATE_CHECK=1` in the (scrubbed) env. Cold load (loadPyodide + numpy/pandas/scipy + 2 wheels) takes several seconds — informs the exec-timeout default.
+
+**Post-review protocol extension (Codex review — fixed in Phase 3, resolves a plan internal-inconsistency).** The plan's Phase 3 protocol modelled `created`/`modified` as files-only (`{path, mode, data}`), but the plan's Phase 5 drain says "apply **dirs-before-files**" and "for `deleted`: delete **depth-first**" — which is dir-aware. Two valid review findings followed: (1) the files-only protocol can't represent script-created **empty directories** or the dir ordering Phase 5 demands; (2) the wipe unlinked only files (`baseline ∪ seen`, `seen` excluded dirs), so script-created **dirs leaked** into the next exec in the same warm child. **Fix (cheapest here, not retrofitted in Phase 5):**
+- `protocol.ts` now has a shared `FsEntry { path; kind: "file" | "dir"; mode; data }` (`data: ""` for dirs), used by `RunRequest.files` (input staging — can carry empty dirs) and `RunResponse.created`/`modified` (output). `created` is ordered **dirs-before-files (dirs shallow→deep)**; `deleted` is **depth-first (deepest first)** — both drain-ready for Phase 5.
+- `runner.ts`: `walkTree(cwd)` now walks dirs + files; staging handles `kind`; the baseline is snapshotted AFTER staging (so staging-infra dirs that pre-exist in the caller's tree aren't mis-reported as created); the diff emits created dirs + files / modified files / deleted; the wipe now **recursively clears the entire cwd subtree depth-first** (files via `unlink`, dirs via `rmdir`) so no dir leaks across execs. (`sys.modules`/package globals still persist — design D3 unchanged.)
+- Verified: the extended fixture creates a file + empty dir + nested-dir-with-file → `created` carries `kind:"dir"` entries ordered dirs-before-files; a second frame's `os.listdir(".")` is empty → cwd fully wiped between execs.
+- `.tmp` added to `biome.json` `files.ignore` (it's gitignored ephemeral scratch; biome was linting the throwaway verification probes).
 
 ---
 
