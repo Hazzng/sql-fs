@@ -145,7 +145,7 @@ describe("PostgresDialect metadata helpers — SQL error translation", () => {
 			dialect.updateSandboxMeta(tx, "sandbox-missing", {
 				owner: null,
 				name: null,
-				python: false,
+				python_runtime: null,
 				javascript: false,
 				network: false,
 			}),
@@ -160,7 +160,7 @@ describe("PostgresDialect metadata helpers — SQL error translation", () => {
 			dialect.updateSandboxMeta(tx, "sandbox-meta", {
 				owner: null,
 				name: null,
-				python: false,
+				python_runtime: null,
 				javascript: false,
 				network: false,
 			}),

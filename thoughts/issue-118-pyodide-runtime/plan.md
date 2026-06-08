@@ -225,21 +225,37 @@ it("re-runs idempotently after a simulated python-column drop (N+1)", async () =
 ### Phase 1: Success Criteria
 
 #### Phase 1: Programmatic Verification
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm lint:fix` passes (no remaining `python:` boolean in server code)
-- [ ] `pnpm test:unit` passes (updated rehydrate/advisory-lock/sandboxes assertions green)
-- [ ] `pnpm test:integration` migration test passes: `python_runtime` column + CHECK exist; legacy `python=true` row reads back `stdlib`; migration re-runs cleanly after a simulated `python` drop
-- [ ] Server starts (`pnpm dev`) without migration errors
+- [x] `pnpm typecheck` passes
+- [x] `pnpm lint:fix` passes (no remaining `python:` boolean in server code) — clean after adding `thoughts` to biome `files.ignore` (Phase 0 vendored Pyodide `.d.ts` assets were polluting the lint; biome doesn't read `.gitignore`)
+- [x] `pnpm test:unit` passes (875 pass / 4 skip; updated rehydrate/advisory-lock/sandboxes/session-manager + extra meta-literal assertions green)
+- [x] `pnpm test:integration` migration test passes: `python_runtime` column + CHECK exist; legacy `python=true` row reads back `stdlib`; migration re-runs cleanly after a simulated `python` drop (full integration suite 106 pass)
+- [x] Server starts (`pnpm dev`) without migration errors — booted on :8080; `migration_ok` logged for `0006_python_runtime.sql` (idempotent "already exists, skipping" NOTICE is not an error), then `server_start`. Agent-managed boot; server shut down after checks.
 
 #### Phase 1: Agent Verification
 _(Dev-server protocol: see Success Criteria Guidelines — if no server is running for this worktree, ask the user to start `pnpm dev` or authorise the agent to manage it.)_
-- [ ] Against the running dev server, create a `stdlib` sandbox and a `null` (no `python_runtime`) sandbox; confirm **create-201, list, AND GET** all echo `python_runtime`
-- [ ] In the `stdlib` sandbox, `bash_exec` `python3 -c "print(1)"` returns `1`, exit 0
-- [ ] In the `null` sandbox, `python3 -c "print(1)"` reports command-not-found (Python not registered)
-- [ ] Agent reviews `postgres.ts` `getSandboxMeta`/`updateSandboxMeta` to confirm COALESCE read + dual-write are both present
+- [x] Against the running dev server, create a `stdlib` sandbox and a `null` (no `python_runtime`) sandbox; confirm **create-201, list, AND GET** all echo `python_runtime` — stdlib: all three echo `"stdlib"`; null: create+GET echo `null`. (Bonus: legacy `{"python":true}` body → 400 via `.strict()`.)
+- [x] In the `stdlib` sandbox, `bash_exec` `python3 -c "print(1)"` returns `1`, exit 0 — `{"stdout":"1\n","exitCode":0}`
+- [x] In the `null` sandbox, `python3 -c "print(1)"` reports command-not-found (Python not registered) — exit 127, `bash: python3: command not available…`
+- [x] Agent reviews `postgres.ts` `getSandboxMeta`/`updateSandboxMeta` to confirm COALESCE read + dual-write are both present — `getSandboxMeta`/`listSandboxes` select `COALESCE(python_runtime, CASE WHEN python THEN 'stdlib' END)`; `updateSandboxMeta` sets both `python_runtime = ${meta.python_runtime}` and `python = ${meta.python_runtime === "stdlib"}`
 
 ### Phase 1: Discoveries and Notable Information
-_Placeholder — filled by the implementing agent during/after Phase 1._
+
+**Type-rename blast radius (plan under-listed the files to touch).** Renaming the shared types (`SandboxMeta.python`→`python_runtime`, `SandboxListEntry.python`→`python_runtime`, `RuntimeOptions.python`→`pythonRuntime`) breaks the **whole-program** `tsc` typecheck, so every consumer had to change in Phase 1 — not just the files the plan named. Beyond the plan's step-6 list, these also required edits to compile:
+- **`src/api/mcp/tools.ts`** (plan defers MCP to **Phase 2**). It consumes `RuntimeOptions`/`SandboxMeta`/`SandboxListEntry`, so it can't be deferred for typecheck. **Adaptation:** kept its existing **boolean `python` MCP wire contract** (input `python: z.boolean()`, output `python: …`) and only rewired it internally onto the new fields (`pythonRuntime: (args.python ?? false) ? "stdlib" : null`; persist `python_runtime`; echo `python: runtimeOptions.pythonRuntime === "stdlib"` / `s.python_runtime === "stdlib"`). **Phase 2 still owns the real MCP migration** (enum input schema, `python_runtime` echo, `network` field, descriptions). The MCP wire contract is therefore unchanged by Phase 1.
+- **Extra `SandboxMeta` mock literals** the plan didn't list: `src/api/tests/unit/ingest.test.ts`, `exec.test.ts`, `exec-batch.test.ts`, `files.test.ts` (all `python: false`→`python_runtime: null`).
+- **Extra `RuntimeOptions` literals** the plan didn't list: `src/api/tests/unit/session-manager.test.ts` (many `getOrCreate(..., {python,…})` args + a `toEqual` assertion) and `src/api/tests/session-manager.script-tx.test.ts` (2). The `toEqual({ python: true, … })` on `runtimeOptions` shared the exact literal string with the `getOrCreate` args, so a single `replace_all` fixed both.
+
+**`openapi-spec.ts` is plain `as const` data, NOT typed against `SandboxMeta`** → its `python: { type: "boolean" }` does NOT break typecheck and was correctly **left for Phase 2**. `clients/` SDKs are outside `tsconfig` `include: ["src"]` → not in the main typecheck either (Phase 2).
+
+**Gotcha for any future migration — the dev DB must be migrated before integration tests.** Integration tests like `defense-in-depth.integration.test.ts` connect straight to `DATABASE_URL` and **assume the schema is already migrated** (they never call `runMigrations`). Because `getSandboxMeta`/`listSandboxes` now reference `python_runtime`, running integration tests against the local `sqlfs` DB failed with `column "python_runtime" does not exist` until 0006 was applied. **Fix:** apply the new migration to the dev DB once (`docker exec -i sqlfs-postgres psql -U sqlfs_app -d sqlfs < src/sql-fs/migrations/postgres/0006_python_runtime.sql`, idempotent) — in prod the boot-time runner does this automatically. Any later phase that adds a migration must re-apply it to the dev DB before `pnpm test:integration`.
+
+**Biome lints git-ignored vendored assets (deviation: edited `biome.json`).** Biome 1.9.0 has no `vcs.useIgnoreFile` here, so `pnpm lint:fix` scanned the **Phase 0** git-ignored Pyodide `.d.ts` assets under `thoughts/.../spikes/assets/` and reported ~870 errors in third-party code. **Adaptation (outside the plan's file list):** added `"thoughts"` to `biome.json` `files.ignore` (matching the existing `scripts`/`clients/python/.venv` exclusions). Needed for the Phase 1 lint gate to pass honestly. **Note for Phase 3:** the new `vendor/deno/` + `vendor/pyodide/` asset dirs will need the same biome ignore (they're git-ignored too).
+
+**`.strict()` on `createBodySchema`** implements the design's "reject legacy `python: bool`": an unknown key (incl. legacy `python`) now returns 400 `INVALID_INPUT`. Confirmed **no existing test sends `python:` in a request body** (all `python:` test literals were `SandboxMeta`/`RuntimeOptions` mocks, not HTTP bodies), so this is safe.
+
+**Test count moved 105→106** integration tests (new Test B "re-runs idempotently after a simulated python-column drop (N+1)"). Unit tests: 875 pass / 4 skip.
+
+**Env note for running integration locally:** the suite does NOT auto-load `.env` (`vitest.setup.ts` only seeds `TENANT_DATABASES`); pass `DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5433/sqlfs` (and `REDIS_URL`) explicitly on the command line.
 
 ---
 

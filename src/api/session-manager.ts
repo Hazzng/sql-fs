@@ -20,7 +20,7 @@ import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, versionKey } from "../sql-fs/redis-path-snapshot.js";
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
-import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
+import type { PathCacheEntry, PythonRuntime, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -108,7 +108,8 @@ function asScriptTxFs(fs: IFileSystem): IScriptTxFs | undefined {
  * because `just-bash` decides which commands to register when the `Bash` instance is built.
  */
 export interface RuntimeOptions {
-	readonly python: boolean;
+	/** Python runtime: "stdlib" (CPython WASM), "pyodide", or null (no Python). */
+	readonly pythonRuntime: PythonRuntime;
 	readonly javascript: boolean;
 	/**
 	 * When true, the `js-exec` runtime is given a permissive `NetworkConfig` that
@@ -119,7 +120,7 @@ export interface RuntimeOptions {
 	readonly network: boolean;
 }
 
-const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
+const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { pythonRuntime: null, javascript: false, network: false };
 
 /**
  * Syntactically valid sandbox id: UUIDs and dashed/underscored slugs, 1–128
@@ -486,7 +487,10 @@ export class SessionManager {
 
 				const bash = new Bash({
 					fs,
-					python: resolvedRuntime.python || undefined,
+					// "stdlib" → just-bash's WASM python3; "pyodide" leaves python
+					// unregistered here (Phase 5 adds the custom python3 commands);
+					// null → no Python.
+					python: resolvedRuntime.pythonRuntime === "stdlib" || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
 					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
 					// Bash itself remains air-gapped — no curl/wget/DNS — because
@@ -896,7 +900,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network }
+			? { pythonRuntime: meta.python_runtime, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
@@ -943,7 +947,7 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network }
+			? { pythonRuntime: meta.python_runtime, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) {
@@ -1233,7 +1237,9 @@ export class SessionManager {
 	}
 
 	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
-		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
+		// Only "stdlib" (WASM python3) routes through pythonSem; "pyodide" gets its
+		// own semaphore in Phase 6.
+		const usesPython = session.runtimeOptions.pythonRuntime === "stdlib" && PYTHON_INVOCATION_REGEX.test(script);
 		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
 
 		// Apply the session-tracked cwd as the starting directory for this exec,

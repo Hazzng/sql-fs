@@ -57,11 +57,14 @@ export interface PathCacheEntry {
 	readonly symlinkTarget: string | null;
 }
 
+/** Python runtime selection. null = no Python. */
+export type PythonRuntime = "stdlib" | "pyodide" | null;
+
 /** Persisted sandbox metadata needed for session rehydration on cold replicas. */
 export interface SandboxMeta {
 	readonly owner: string | null;
 	readonly name: string | null;
-	readonly python: boolean;
+	readonly python_runtime: PythonRuntime;
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;
@@ -75,7 +78,7 @@ export interface SandboxListEntry {
 	readonly name: string | null;
 	readonly owner: string | null;
 	readonly createdAt: Date;
-	readonly python: boolean;
+	readonly python_runtime: PythonRuntime;
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;

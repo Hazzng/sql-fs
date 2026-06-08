@@ -40,8 +40,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		async (args) => {
 			const id = randomUUID();
 			const name = args.name ?? null;
+			// Phase 1: keep the boolean `python` MCP input/output contract; map it
+			// internally onto the new pythonRuntime/python_runtime fields. Phase 2
+			// migrates this surface to the `python_runtime` enum.
 			const runtimeOptions = {
-				python: args.python ?? false,
+				pythonRuntime: ((args.python ?? false) ? "stdlib" : null) as "stdlib" | null,
 				javascript: args.javascript ?? false,
 				network: false,
 			};
@@ -51,7 +54,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				await sessionManager.persistSandboxMeta(tenant, id, {
 					owner,
 					name,
-					python: runtimeOptions.python,
+					python_runtime: runtimeOptions.pythonRuntime,
 					javascript: runtimeOptions.javascript,
 					network: runtimeOptions.network,
 				});
@@ -59,7 +62,12 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					content: [
 						{
 							type: "text" as const,
-							text: JSON.stringify({ id, name, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
+							text: JSON.stringify({
+								id,
+								name,
+								python: runtimeOptions.pythonRuntime === "stdlib",
+								javascript: runtimeOptions.javascript,
+							}),
 						},
 					],
 				};
@@ -95,7 +103,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 									name: s.name,
 									owner: s.owner,
 									createdAt: s.createdAt.toISOString(),
-									python: s.python,
+									python: s.python_runtime === "stdlib",
 									javascript: s.javascript,
 								})),
 							}),
