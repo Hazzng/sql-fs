@@ -5,13 +5,14 @@
  * POST /v1/auth/admin      (Bearer + X-Admin-Secret) — mint tokens for arbitrary subs.
  */
 
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import { parseNonNegativeInt } from "../../redis/config.js";
 import type { AuthVariables } from "../auth.js";
 import { logAudit } from "../lib/audit.js";
+import { constantTimeEqual } from "../lib/constant-time.js";
 import { signToken } from "../lib/jwt.js";
 import { clientIp, rateLimit } from "../rate-limit.js";
 import { loadTenantConfig } from "../tenants.js";
@@ -33,14 +34,6 @@ const EXPIRES_IN_SECONDS: Record<string, number> = {
 	"30d": 2592000,
 	"1y": 31536000,
 };
-
-function constantTimeEqual(a: string, b: string): boolean {
-	// Hash both inputs to fixed-length 32-byte digests so timingSafeEqual cannot
-	// throw on length mismatch and there is no length oracle from an early return.
-	const aDigest = createHash("sha256").update(a, "utf8").digest();
-	const bDigest = createHash("sha256").update(b, "utf8").digest();
-	return timingSafeEqual(aDigest, bDigest);
-}
 
 function expiresAt(expiresIn: string): string | null {
 	if (expiresIn === "never") return null;

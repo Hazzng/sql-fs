@@ -114,6 +114,44 @@ echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq
 
 ---
 
+## MCP static-header auth (LibreChat and other fixed-header clients)
+
+The `/mcp` endpoint defaults to the same JWT Bearer auth as `/v1/*`. MCP clients that
+can only send **fixed headers** (e.g. [LibreChat](https://github.com/danny-avila/LibreChat))
+cannot mint a per-request JWT. Setting **`MCP_API_KEY`** on the server enables an additive
+static-header path on `/mcp`:
+
+- `Authorization: Bearer <MCP_API_KEY>` is accepted without JWT verification (constant-time compare).
+- The sandbox **owner** (`sub`) is taken from a forwarded identity header — `MCP_IDENTITY_HEADER`,
+  default `x-librechat-user-id` — so each end-user gets an isolated sandbox.
+- A non-matching token still falls through to JWT verification, so JWT clients keep working on `/mcp`.
+
+```yaml
+# librechat.yaml
+mcpServers:
+  sql-fs:
+    type: streamable-http
+    url: https://your-sql-fs.example.com/mcp
+    headers:
+      Authorization: "Bearer ${MCP_API_KEY}"
+      x-librechat-user-id: "{{LIBRECHAT_USER_ID}}"
+```
+
+Server env vars:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_API_KEY` | — (off) | Pre-shared secret (≥16 chars) enabling static `/mcp` auth. Keep it secret — it guards code execution. |
+| `MCP_IDENTITY_HEADER` | `x-librechat-user-id` | Header whose value becomes the sandbox owner. |
+| `MCP_DEFAULT_SUB` | — | Shared owner when the identity header is absent. When unset, a missing header is rejected. |
+| `MCP_STATIC_TENANT` | `default` | Tenant for static-header requests; must be configured. |
+
+> **Trust note.** The identity header is trusted as the end-user identity, so it must be stamped
+> by your proxy/LibreChat and not be settable by untrusted callers. Anyone holding `MCP_API_KEY`
+> who can reach `/mcp` directly can pick any `sub` — keep the key secret and `/mcp` behind your ingress.
+
+---
+
 ## Environment setup (put in ~/.zshrc or .env)
 
 ```bash
@@ -138,6 +176,8 @@ alias vfs-bootstrap='curl -fsS -X POST "$VIRTUALFS_BASE_URL/v1/auth/bootstrap" -
 | `{"error":"unknown_tenant","code":"AUTH_UNKNOWN_TENANT"}` | `tenant` claim in JWT not configured on server | Omit `tenant` claim or update server config |
 | `{"error":"forbidden","code":"FORBIDDEN"}` | Sandbox owned by a different `sub`, OR wrong/missing `X-Auth-Secret` on bootstrap | Use the token that created the sandbox; double-check `AUTH_SECRET` |
 | `{"error":"auth_not_configured","code":"AUTH_NOT_CONFIGURED"}` | Server has no `AUTH_SECRET` env var | Ask the deployer to set `AUTH_SECRET` |
+| `{"error":"identity_required","code":"AUTH_IDENTITY_REQUIRED"}` | Static `/mcp` API key matched but no identity header and no `MCP_DEFAULT_SUB` | Send the `MCP_IDENTITY_HEADER` (default `x-librechat-user-id`) or set `MCP_DEFAULT_SUB` |
+| `{"error":"invalid_identity","code":"AUTH_IDENTITY_INVALID"}` | Identity header present but empty, >256 chars, or contains control characters | Forward a valid user id/email in the identity header |
 | `{"error":"admin_not_configured","code":"ADMIN_NOT_CONFIGURED"}` | Server has no `ADMIN_SECRET` env var | Ask the deployer to set `ADMIN_SECRET` |
 | `{"error":"rate_limited","code":"RATE_LIMITED"}` | Too many requests to `/v1/auth/bootstrap` or `/v1/auth/admin` (default 5 / 60s). Response includes `Retry-After` header. | Wait `Retry-After` seconds, or raise `*_RATE_LIMIT_*` env vars. |
 
