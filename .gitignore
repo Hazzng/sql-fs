@@ -6,4 +6,3 @@ dist/
 *.tsbuildinfo
 .claude/worktrees/
 docs/
-docker-compose.local.yml

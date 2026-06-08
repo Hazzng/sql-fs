@@ -14,9 +14,85 @@ Thank you for your interest. This guide covers everything you need to go from ze
 git clone https://github.com/your-org/sql-fs-api.git
 cd sql-fs-api
 pnpm install
-cp .env.example .env        # fill in DATABASE_URL and AUTH_SECRET at minimum
+cp .env.example .env        # defaults target the local compose stack (below)
 pnpm dev                    # dev server at http://localhost:8080
 ```
+
+## Local database
+
+The unit tests need no database, but the **integration suite** (`pnpm test:integration`)
+requires Postgres (and, for the distributed-lock / cache suites, Redis). The fastest
+way to get both is the bundled compose stack:
+
+```bash
+docker compose -f docker-compose.local.yml up -d
+```
+
+This starts Postgres + Redis and runs `scripts/initdb/00-create-app-role.sql`, which
+provisions a **non-superuser** role `sqlfs_app` that **owns** the `sqlfs` database.
+Point your connection strings at it (these are the defaults baked into `.env.example`):
+
+```bash
+export DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs
+export REDIS_URL=redis://localhost:6379
+```
+
+### Why a non-superuser owner role (do not use the default `postgres` user)
+
+Migration `0005_enable_rls.sql` turns on `FORCE ROW LEVEL SECURITY` for sandbox
+isolation. The connecting role therefore has hard requirements that aren't obvious:
+
+- **Not a superuser.** A superuser (the `postgres` image's default role) has
+  `BYPASSRLS` and **silently bypasses** the policy. The RLS suite then fails with
+  confusing errors — under "sandbox A's context", queries return rows from *every*
+  sandbox.
+- **Owns the schema and tables.** The boot-time migration runner creates objects in
+  `public`, and `rls.integration.test.ts` re-applies `0005`'s
+  `ALTER TABLE … FORCE ROW LEVEL SECURITY`, which requires table ownership (a
+  non-owner fails with `must be owner of table inodes` / `permission denied for schema public`).
+- **`CREATEDB`.** The multi-tenant and migrations suites create ephemeral databases
+  at runtime from `DATABASE_URL`.
+
+The compose `initdb` script sets all three up for you. If you bring your own Postgres,
+mirror it (Postgres 16):
+
+```sql
+CREATE ROLE sqlfs_app LOGIN PASSWORD 'sqlfs_app' NOSUPERUSER NOBYPASSRLS CREATEDB;
+CREATE DATABASE sqlfs OWNER sqlfs_app;
+\connect sqlfs
+ALTER SCHEMA public OWNER TO sqlfs_app;   -- PG15+: lets the migration runner CREATE in public
+```
+
+### Applying migrations
+
+There is no manual migrate step — the server applies every migration in
+`src/sql-fs/migrations/postgres/` on boot (`src/api/migrations.ts`). Start it once
+against the compose database to create the schema before running the integration suite:
+
+```bash
+DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs pnpm dev   # creates tables on boot; stop once it logs "server_start"
+```
+
+(`pnpm db:generate` only *scaffolds* a new migration SQL from `schema.ts`; it does not apply anything.)
+
+### Running the suite
+
+```bash
+DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs \
+REDIS_URL=redis://localhost:6379 \
+pnpm test:integration
+```
+
+All suites share one database, so a fully parallel run can occasionally hit transient
+`deadlock detected` errors (DDL-vs-DML lock contention between files). If you see one,
+re-run serialized — it's not a real failure:
+
+```bash
+pnpm test:integration -- --no-file-parallelism --poolOptions.forks.singleFork
+```
+
+Reset the database to a clean slate (re-runs the `initdb` script) with
+`docker compose -f docker-compose.local.yml down -v`.
 
 ## Development workflow
 

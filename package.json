@@ -23,7 +23,6 @@
 		"test:integration": "vitest run src/sql-fs/tests/integration src/api/tests/integration",
 		"test:comparison": "vitest run --config vitest.comparison.config.ts",
 		"db:generate": "drizzle-kit generate",
-		"db:migrate": "drizzle-kit migrate",
 		"db:gc": "tsx src/api/cli/gc.ts",
 		"token:create": "tsx src/api/cli/token.ts",
 		"changeset": "changeset",

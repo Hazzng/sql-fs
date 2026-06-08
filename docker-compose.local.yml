@@ -1,0 +1,50 @@
+# Local backing services for sql-fs development and the integration test suite.
+#
+#   docker compose -f docker-compose.local.yml up -d
+#
+#   DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs \
+#   REDIS_URL=redis://localhost:6379 \
+#   pnpm test:integration
+#
+# Postgres is provisioned by scripts/initdb/00-create-app-role.sql with a
+# NON-SUPERUSER role `sqlfs_app` that OWNS the `sqlfs` database. This is required,
+# not cosmetic:
+# migration 0005 enables FORCE ROW LEVEL SECURITY, and a superuser (the postgres
+# image's default role) silently bypasses RLS via BYPASSRLS — which makes the
+# RLS isolation tests fail. Always connect as `sqlfs_app`, never as the
+# bootstrap `postgres` superuser. See CONTRIBUTING.md → "Local database".
+#
+# Reset to a clean database (re-runs the initdb script):
+#   docker compose -f docker-compose.local.yml down -v
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      # Bootstrap superuser — used only to run the initdb script below. The app
+      # and tests connect as the non-superuser `sqlfs_app` role it creates.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+      - sqlfs-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  sqlfs-pgdata:

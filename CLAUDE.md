@@ -16,7 +16,8 @@ HTTP/MCP Client → Hono API → Session Manager → Bash (just-bash) → IFileS
 
 ```bash
 # Development
-pnpm dev                    # Start dev server with hot reload (tsx watch)
+pnpm dev                    # Start dev server with hot reload (tsx watch) on a fixed port (PORT, default 8080)
+pnpm dev:portless           # Preferred: run the dev server on a dynamic port behind a stable https://sql-fs.localhost URL (portless)
 pnpm build                  # Compile TypeScript to dist/
 pnpm start                  # Run production server from dist/
 
@@ -31,8 +32,8 @@ pnpm test:integration       # Integration tests (requires DB — skips if unavai
 pnpm test -- src/sql-fs/sql-fs.cache.test.ts   # Run specific test file
 
 # Database
-pnpm db:generate            # Generate Drizzle migrations from schema changes
-pnpm db:migrate             # Apply migrations to database
+pnpm db:generate            # Scaffold a new migration SQL from schema changes (drizzle-kit)
+                            # Migrations are APPLIED automatically on server boot (src/api/migrations.ts), not by a CLI
 pnpm db:gc                  # Run blob garbage collection
 
 # Docker
