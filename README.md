@@ -33,14 +33,31 @@ Most sandbox platforms still spin up full VMs—slow cold starts and per-minute 
 
 ```bash
 cp .env.example .env          # set DATABASE_URL and AUTH_SECRET
-pnpm db:migrate               # apply migrations
-pnpm dev                      # server at http://localhost:8080
+pnpm dev                      # applies migrations on first boot, serves at http://localhost:8080
 ```
+
+Migrations run automatically when the server boots (`src/api/migrations.ts`); there
+is no separate migrate step. (`pnpm db:generate` scaffolds a new migration SQL from
+`schema.ts` changes via drizzle-kit; the boot-time runner then applies it.)
 
 ### Docker Compose
 
+Spin up a local Postgres + Redis for development and the integration test suite:
+
 ```bash
-docker-compose -f docker-compose.local.yml up
+docker compose -f docker-compose.local.yml up -d
+```
+
+This provisions a **non-superuser** `sqlfs_app` role that owns the `sqlfs`
+database — required, because migration `0005` enables `FORCE ROW LEVEL SECURITY`
+and a superuser silently bypasses it. See
+[CONTRIBUTING.md → Local database](CONTRIBUTING.md#local-database). Then point the
+server (or tests) at the stack:
+
+```bash
+export DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs
+export REDIS_URL=redis://localhost:6379
+pnpm dev                      # or: pnpm test:integration
 ```
 
 ## Typical Agent Workflow
@@ -143,7 +160,7 @@ Key design choices:
 |---|---|---|---|
 | `FS_BACKEND` | Yes | — | `postgres` \| `memory` |
 | `DATABASE_URL` | Yes (postgres) | — | Postgres connection string (use pooler endpoint for Neon) |
-| `DATABASE_DIRECT_URL` | Yes (postgres) | — | Direct connection for DDL / migrations |
+| `DATABASE_DIRECT_URL` | No | `DATABASE_URL` | Direct (non-pooler) connection used **only** by drizzle-kit (`pnpm db:generate`). The server's boot-time migration runner uses `DATABASE_URL`. Falls back to `DATABASE_URL` when unset. |
 | `AUTH_SECRET` | Yes | — | Secret for Bearer token validation |
 | `PORT` | No | `8080` | HTTP server port |
 | `SESSION_IDLE_MS` | No | `600000` | Evict idle Bash instances after this many ms |
@@ -193,8 +210,7 @@ pnpm lint:fix               # format + lint (Biome)
 pnpm test:unit              # unit tests — no DB required
 pnpm test:integration       # integration tests — requires DATABASE_URL
 pnpm test                   # all tests
-pnpm db:generate            # generate Drizzle migrations from schema changes
-pnpm db:migrate             # apply migrations
+pnpm db:generate            # scaffold a new migration SQL from schema changes (applied on server boot)
 pnpm db:gc                  # garbage-collect orphan blobs
 pnpm changeset              # record a version bump for the next release
 ```
