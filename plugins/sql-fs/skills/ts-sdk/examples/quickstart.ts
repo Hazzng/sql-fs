@@ -22,7 +22,7 @@ async function main(): Promise<number> {
 		console.log(`created sandbox ${sb.id}`);
 		try {
 			// Single buffered exec — get back a flat ExecResult.
-			const r = await sb.exec("echo hello && uname -srm");
+			const r = await sb.exec("echo hello && pwd");
 			if (!r.ok) {
 				console.error(`unexpected exit ${r.exitCode}: ${r.error}`);
 				return 1;

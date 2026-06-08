@@ -340,7 +340,7 @@ curl -s -X POST "$BASE_URL/v1/sandboxes/$SB/exec-sync-batch" \
   -d '{
     "scripts": [
       {"id": "tree", "script": "find /home/user -type f | head -20"},
-      {"id": "uname", "script": "uname -srm"}
+      {"id": "count", "script": "find /home/user -type f | wc -l"}
     ],
     "timeoutMs": 30000,
     "readOnly": true
@@ -365,7 +365,7 @@ Response `200`:
 {
   "results": [
     {"id": "tree", "stdout": "...", "stderr": "", "exitCode": 0, "durationMs": 42},
-    {"id": "uname", "stdout": "Linux ...", "stderr": "", "exitCode": 0, "durationMs": 8}
+    {"id": "count", "stdout": "12\n", "stderr": "", "exitCode": 0, "durationMs": 8}
   ]
 }
 ```

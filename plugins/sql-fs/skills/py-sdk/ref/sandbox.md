@@ -75,7 +75,7 @@ results = sb.exec_batch(
     [
         {"id": "tree", "script": "find /home/user -type f | head -20"},
         {"id": "imports", "script": "grep -rn '^from langgraph' /home/user | head -10"},
-        {"id": "uname", "script": "uname -srm"},
+        {"id": "count", "script": "find /home/user -type f | wc -l"},
     ],
     timeout_ms=60_000,            # outer ceiling covering the whole batch
     per_script_timeout_ms=5_000,  # each script independently limited to 5 s

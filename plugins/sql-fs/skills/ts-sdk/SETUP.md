@@ -98,7 +98,7 @@ const client = new Client({
 
 const sb = await client.sandboxes.create({ name: "smoke-test" });
 try {
-  const result = await sb.exec("echo hello && uname -srm");
+  const result = await sb.exec("echo hello && pwd");
   if (!result.ok) throw new Error(`unexpected exit ${result.exitCode}: ${result.error}`);
   console.log(result.stdout);
 } finally {

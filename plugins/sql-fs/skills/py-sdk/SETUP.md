@@ -96,7 +96,7 @@ with Client(
 ) as fs:
     sb = fs.sandboxes.create(name="smoke-test")
     try:
-        result = sb.exec("echo hello && uname -srm")
+        result = sb.exec("echo hello && pwd")
         assert result.ok, f"unexpected exit {result.exit_code}: {result.error}"
         print(result.stdout)
     finally:

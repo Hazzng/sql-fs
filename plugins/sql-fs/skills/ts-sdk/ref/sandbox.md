@@ -92,7 +92,7 @@ const results = await sb.execBatch(
   [
     { id: "tree", script: "find /home/user -type f | head -20" },
     { id: "imports", script: "grep -rn '^from langgraph' /home/user | head -10" },
-    { id: "uname", script: "uname -srm" },
+    { id: "count", script: "find /home/user -type f | wc -l" },
   ],
   { timeoutMs: 60_000, perScriptTimeoutMs: 5_000, readOnly: true },
 );
