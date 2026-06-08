@@ -5,6 +5,17 @@ All notable changes to the SQL-FS Python SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-08
+
+### Added
+
+- `ingest_files(..., allow_oversized=False)` — rejects files larger than 8 MiB
+  with `ValidationError(code="EFILE_TOO_LARGE_FOR_CPYTHON")` before anything is
+  sent. The `python3` runtime (CPython WASM) reads sandbox files through an 8 MiB
+  IPC bridge, so `open()` fails on larger files. Pass `allow_oversized=True` to
+  ingest anyway (the bytes stay usable from bash and `js-exec`; only `python3
+  open()` can't read them), or split the file into <8 MiB chunks.
+
 ## [0.3.0] - 2026-06-05
 
 ### Added
