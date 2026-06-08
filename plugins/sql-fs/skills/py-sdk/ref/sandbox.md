@@ -37,7 +37,7 @@ sb.record      # SandboxRecord | None — full record at creation; None if attac
 
 ## Exec
 
-### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False) -> ExecResult`
+### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False, retry_on_5xx=False) -> ExecResult`
 
 Buffered bash execution. Maps to `POST /v1/sandboxes/{id}/exec-sync`. Blocks
 until the script exits and returns a flat `ExecResult` with
@@ -51,6 +51,7 @@ result = sb.exec(
     timeout_ms=15_000,            # 1 ≤ ms ≤ 300_000
     debug=False,                  # True = prepend `set -x` for tracing
     read_only=False,              # True = skip exclusive lock; raises ValidationError on any write
+    retry_on_5xx=False,           # opt in to retrying transient 5xx on this write exec
 )
 print(result.stdout)              # str
 print(result.error)               # alias for .stderr
@@ -61,10 +62,13 @@ The SDK sets the underlying httpx timeout to `timeout_ms / 1000 + 5 s`, so a
 genuine server-side timeout surfaces as `ExecTimeoutError` (HTTP 408), not as a
 client-side network timeout.
 
-**Idempotency:** `exec` is **not** retried automatically (the server cannot
-safely re-execute a script). Wrap your own retry logic if needed.
+**Idempotency:** by default `exec` is **not** retried (the server cannot safely
+re-execute an arbitrary write script). It *is* retried on transient 5xx when
+`read_only=True` (always safe) or when you opt in with `retry_on_5xx=True` —
+set the latter only when the script is idempotent, since a retried write that
+already committed to Postgres would run twice.
 
-### `sb.exec_batch(scripts, *, timeout_ms=30_000, per_script_timeout_ms=None, read_only=False) -> list[BatchExecResult]`
+### `sb.exec_batch(scripts, *, timeout_ms=30_000, per_script_timeout_ms=None, read_only=False, retry_on_5xx=False) -> list[BatchExecResult]`
 
 Maps to `POST /v1/sandboxes/{id}/exec-sync-batch`. Run up to **50 scripts
 sequentially** (or in parallel when `read_only=True`) in one HTTP round-trip.

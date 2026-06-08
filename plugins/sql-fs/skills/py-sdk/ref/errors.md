@@ -26,7 +26,8 @@ SQLFSError                    base — never raised directly by the SDK
 ├── AuthError                     401 / 403
 ├── NotFoundError                 404
 ├── ConflictError                 409 (EEXIST, ENOTEMPTY)
-├── ValidationError               400 (INVALID_INPUT, EISDIR, ENOTDIR, EINVAL, ELOOP); also client-side EFILE_TOO_LARGE
+├── ValidationError               400 (INVALID_INPUT, EISDIR, ENOTDIR, EINVAL, ELOOP); 422 (EREADONLY_VIOLATION);
+│                                 also client-side EFILE_TOO_LARGE / EFILE_TOO_LARGE_FOR_CPYTHON
 ├── ExecTimeoutError              408 (script ran longer than timeout_ms)
 ├── RateLimitError                429
 ├── ServerError                   5xx after retries exhausted
@@ -62,7 +63,8 @@ oversized file fails **before** anything is base64-encoded or sent:
 
 | `code` | Raised by | Cause |
 |---|---|---|
-| `EFILE_TOO_LARGE` | `ingest_files`, `fs.write`, `fs.write_files` | A file exceeds the client's `max_file_size`. `e.status` is `None` (no HTTP round-trip happened); `e.details` lists each offending `path (size > limit)`. |
+| `EFILE_TOO_LARGE` | `ingest_files`, `fs.write`, `fs.write_files` | A file exceeds the client's `max_file_size` (default 64 MiB). `e.status` is `None` (no HTTP round-trip happened); `e.details` lists each offending `path (size > limit)`. |
+| `EFILE_TOO_LARGE_FOR_CPYTHON` | `ingest_files` | A file exceeds **8 MiB**, which the `python3` runtime (CPython WASM) can't `open()`. `e.status` is `None`; `e.details` lists each offending path. Pass `allow_oversized=True` to ingest anyway (usable from bash/`js-exec`, not `python3`), or split into <8 MiB chunks. |
 
 ```python
 from sqlfs import ValidationError
@@ -71,10 +73,14 @@ try:
     sb.ingest_files({"huge.bin": payload})
 except ValidationError as e:
     if e.code == "EFILE_TOO_LARGE":
-        print("too big, never sent:", e.details)   # e.status is None
+        print("too big, never sent:", e.details)            # e.status is None
+    elif e.code == "EFILE_TOO_LARGE_FOR_CPYTHON":
+        # >8 MiB: python3 can't open it. Ingest for bash/js-exec use anyway:
+        sb.ingest_files({"huge.bin": payload}, allow_oversized=True)
 ```
 
-Set `max_file_size=0` on the `Client` to disable this check.
+Set `max_file_size=0` on the `Client` to disable the `EFILE_TOO_LARGE` check. The
+8 MiB `EFILE_TOO_LARGE_FOR_CPYTHON` guard is bypassed per-call with `allow_oversized=True`.
 
 ---
 
