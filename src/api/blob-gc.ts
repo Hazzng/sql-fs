@@ -27,6 +27,39 @@ function redactCredentials(message: string): string {
 	return message.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]*@/gi, "$1***@");
 }
 
+/** Postgres SQLSTATEs that mean "retry the whole transaction". */
+const RETRYABLE_SQLSTATES = new Set(["40001", "40P01"]); // serialization_failure, deadlock_detected
+const MAX_GC_ATTEMPTS = 5;
+
+function isRetryable(err: unknown): boolean {
+	const code = (err as { code?: unknown }).code;
+	return typeof code === "string" && RETRYABLE_SQLSTATES.has(code);
+}
+
+/**
+ * Run the orphan-blob sweep at REPEATABLE READ, retrying on serialization
+ * failure. The isolation level is load-bearing for correctness: a concurrent
+ * dedup re-adoption (writer touches+locks an existing orphan blob, then inserts
+ * its inode) would, under READ COMMITTED, let GC delete the freshly-referenced
+ * blob (EvalPlanQual re-checks the blob row but not the inode anti-join). At
+ * REPEATABLE READ that conflict raises 40001 and we retry, by which point the
+ * inode is committed and the blob is correctly kept.
+ */
+async function gcOrphanBlobsRetrying(dialect: PostgresDialect, minAgeMs: number): Promise<Uint8Array[]> {
+	let lastErr: unknown;
+	for (let attempt = 1; attempt <= MAX_GC_ATTEMPTS; attempt++) {
+		try {
+			return await dialect.transaction((tx) => dialect.gcOrphanBlobs(tx, minAgeMs), {
+				isolationLevel: "repeatable read",
+			});
+		} catch (err) {
+			lastErr = err;
+			if (!isRetryable(err) || attempt === MAX_GC_ATTEMPTS) throw err;
+		}
+	}
+	throw lastErr; // unreachable: the loop either returns or throws
+}
+
 /**
  * Garbage-collect orphan blobs across tenants. Each tenant gets a dedicated
  * dialect connection that NEVER sets a sandbox context, so the RLS escape
@@ -41,7 +74,7 @@ export async function runBlobGc(tenantConfig: TenantConfig, opts: BlobGcOptions)
 		const dialect = new PostgresDialect(url);
 		try {
 			await dialect.connect();
-			const deleted = await dialect.transaction((tx) => dialect.gcOrphanBlobs(tx, opts.minAgeMs));
+			const deleted = await gcOrphanBlobsRetrying(dialect, opts.minAgeMs);
 			if (deleted.length > 0 && opts.redis && opts.blobCacheEnabled !== false) {
 				await new RedisBlobCache(opts.redis, tenantId).mdel(deleted);
 			}

@@ -20,6 +20,7 @@ import {
 	type SandboxListEntry,
 	type SandboxMeta,
 	type SqlDialect,
+	type TransactionOptions,
 	type UpdateInodeOpts,
 } from "../types.js";
 
@@ -78,7 +79,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// ── Transactions ──────────────────────────────────────────────────────────────
 
-	async transaction<T>(fn: (tx: PgTx) => Promise<T>): Promise<T> {
+	async transaction<T>(fn: (tx: PgTx) => Promise<T>, opts?: TransactionOptions): Promise<T> {
+		if (opts?.isolationLevel !== undefined) {
+			// `postgres` passes this string after BEGIN, e.g. BEGIN ISOLATION LEVEL REPEATABLE READ.
+			return this.db().begin(`isolation level ${opts.isolationLevel}`, fn) as Promise<T>;
+		}
 		return this.db().begin(fn) as Promise<T>;
 	}
 
@@ -715,8 +720,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// Runs with NO sandbox context — the RLS escape (migration 0005) lets a
 	// context-less tx see every inode so the anti-join is correct. NOT EXISTS
 	// (vs NOT IN) is null-safe and lets the planner use idx_inodes_content_sha256.
-	// The grace window + the DO-UPDATE row lock on the blob upsert path close the
-	// dedup re-adoption race (see plan 2026-06-08 orphan-blob-gc).
+	// Dedup re-adoption race: a concurrent writer that touches+locks an existing
+	// orphan blob (ON CONFLICT DO UPDATE) and then inserts its inode can be missed
+	// here under READ COMMITTED — EvalPlanQual re-checks the updated blob row but
+	// the NOT EXISTS subquery keeps the stale snapshot and never sees the new
+	// inode, so a small/zero grace window would delete a freshly-referenced blob.
+	// The CALLER (runBlobGc) must therefore run this at REPEATABLE READ, which
+	// turns that conflict into a serialization failure (retried) instead of
+	// silent content loss. The grace window is defense-in-depth / churn control.
 	// `i.nlink > 0` excludes nlink=0 inode tombstones: the composite write/delete
 	// paths no longer create them, but rows left by older buggy builds would
 	// otherwise pin their blobs forever — this lets GC clear that backlog.

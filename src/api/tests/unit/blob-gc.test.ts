@@ -25,6 +25,12 @@ const state = vi.hoisted(() => ({
 	mdelCalls: [] as Array<{ tenantId: string; shas: ReadonlyArray<Uint8Array> }>,
 	// Per-url configured GC return values.
 	gcReturns: new Map<string, Uint8Array[]>(),
+	// Isolation level requested for each transaction() call.
+	isolationLevels: [] as Array<string | undefined>,
+	// One url per gcOrphanBlobs invocation (counts retries).
+	gcAttempts: [] as string[],
+	// Per-url: throw an error with this `code` for the next `remaining` calls.
+	gcErrors: new Map<string, { code?: string; remaining: number }>(),
 }));
 
 vi.mock("../../../sql-fs/dialects/postgres.js", () => ({
@@ -42,11 +48,18 @@ vi.mock("../../../sql-fs/dialects/postgres.js", () => ({
 		async disconnect(): Promise<void> {
 			state.disconnected.push(this.#url);
 		}
-		async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
+		async transaction<T>(fn: (tx: unknown) => Promise<T>, opts?: { isolationLevel?: string }): Promise<T> {
+			state.isolationLevels.push(opts?.isolationLevel);
 			return fn({});
 		}
 		async gcOrphanBlobs(_tx: unknown, minAgeMs: number): Promise<Uint8Array[]> {
 			state.minAgeMsSeen.push(minAgeMs);
+			state.gcAttempts.push(this.#url);
+			const fail = state.gcErrors.get(this.#url);
+			if (fail !== undefined && fail.remaining > 0) {
+				fail.remaining -= 1;
+				throw Object.assign(new Error(`serialization failure (${fail.code ?? "none"})`), { code: fail.code });
+			}
 			return state.gcReturns.get(this.#url) ?? [];
 		}
 	},
@@ -89,6 +102,9 @@ beforeEach(() => {
 	state.mdelCalls.length = 0;
 	state.gcReturns.clear();
 	state.gcReturns.set(OK_URL, SHA_T1);
+	state.isolationLevels.length = 0;
+	state.gcAttempts.length = 0;
+	state.gcErrors.clear();
 	vi.spyOn(console, "log").mockImplementation(() => undefined);
 	vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
@@ -138,5 +154,45 @@ describe("runBlobGc", () => {
 		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis, blobCacheEnabled: false });
 
 		expect(state.mdelCalls).toEqual([]);
+	});
+
+	it("runs the GC transaction at REPEATABLE READ (closes the dedup re-adoption race)", async () => {
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+
+		// Only t1 reaches a transaction (t2 fails at connect).
+		expect(state.isolationLevels).toEqual(["repeatable read"]);
+	});
+
+	it("retries the GC transaction on a serialization failure (40001) and then succeeds", async () => {
+		state.gcErrors.set(OK_URL, { code: "40001", remaining: 2 }); // fail twice, succeed on the 3rd
+
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+
+		const t1 = results.find((r) => r.tenantId === "t1");
+		expect(t1).toEqual({ tenantId: "t1", deleted: SHA_T1.length }); // no error — eventually succeeded
+		expect(state.gcAttempts.filter((u) => u === OK_URL)).toHaveLength(3);
+		expect(state.mdelCalls).toEqual([{ tenantId: "t1", shas: SHA_T1 }]); // invalidation still runs once
+	});
+
+	it("gives up after the retry cap on persistent serialization failures and records the tenant error", async () => {
+		state.gcErrors.set(OK_URL, { code: "40001", remaining: 99 }); // always fail
+
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+
+		const t1 = results.find((r) => r.tenantId === "t1");
+		expect(t1?.deleted).toBe(0);
+		expect(t1?.error).toBeTruthy();
+		expect(state.gcAttempts.filter((u) => u === OK_URL)).toHaveLength(5); // MAX_GC_ATTEMPTS
+		expect(state.disconnected).toContain(OK_URL); // still disconnected in finally
+	});
+
+	it("does not retry a non-serialization error", async () => {
+		state.gcErrors.set(OK_URL, { code: "23505", remaining: 1 }); // unique_violation — not retryable
+
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+
+		const t1 = results.find((r) => r.tenantId === "t1");
+		expect(t1?.error).toBeTruthy();
+		expect(state.gcAttempts.filter((u) => u === OK_URL)).toHaveLength(1); // no retry
 	});
 });

@@ -106,6 +106,17 @@ export interface BulkIngestFile {
 	readonly mode: number;
 }
 
+/** Options for a transaction. */
+export interface TransactionOptions {
+	/**
+	 * Isolation level for the transaction. Defaults to the connection default
+	 * (READ COMMITTED). Use `repeatable read` for the orphan-blob GC so a
+	 * concurrent dedup re-adoption surfaces as a serialization failure (retry)
+	 * instead of silently deleting a freshly-referenced blob.
+	 */
+	readonly isolationLevel?: "repeatable read" | "serializable";
+}
+
 /**
  * SqlDialect abstracts all database-specific SQL operations so that SqlFs
  * can work with Postgres, MySQL, and Azure SQL without modification.
@@ -127,8 +138,9 @@ export interface SqlDialect<Tx = unknown> {
 	/**
 	 * Wraps the callback in a BEGIN/COMMIT transaction.
 	 * Rolls back automatically on error and re-throws the original error.
+	 * `opts.isolationLevel` overrides the default (READ COMMITTED).
 	 */
-	transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+	transaction<T>(fn: (tx: Tx) => Promise<T>, opts?: TransactionOptions): Promise<T>;
 
 	// ── Sandbox context ──────────────────────────────────────────────────────────
 
