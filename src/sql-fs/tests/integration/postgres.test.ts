@@ -1099,6 +1099,172 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 	});
 });
 
+describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombstone fix (rm/overwrite/GC)", () => {
+	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
+	let sandboxId: string;
+	let rootInodeId: bigint;
+
+	beforeAll(async () => {
+		await dialect.connect();
+		sandboxId = `test-tombstone-${Date.now()}`;
+		const res = await dialect.transaction(async (tx) => dialect.createSandbox(tx, sandboxId));
+		rootInodeId = res.rootInodeId;
+	});
+
+	afterAll(async () => {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, sandboxId);
+		});
+		await dialect.disconnect();
+	});
+
+	const countInode = (id: bigint): Promise<number> =>
+		dialect.transaction(async (tx) => {
+			const rows = await tx<{ n: number }[]>`SELECT count(*)::int AS n FROM inodes WHERE id = ${String(id)}`;
+			return rows[0]!.n;
+		});
+
+	it("rmComposite hard-deletes a single-linked inode (no nlink=0 tombstone left behind)", async () => {
+		const sha = new Uint8Array(32).fill(0x51);
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 3, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => dialect.insertDirent(tx, rootInodeId, "single.txt", inodeId));
+
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "single.txt"));
+
+		// Regression: the inode ROW must be gone, not lingering at nlink=0.
+		expect(await countInode(inodeId)).toBe(0);
+	});
+
+	it("rmComposite decrements a hardlinked inode instead of deleting it", async () => {
+		const sha = new Uint8Array(32).fill(0x52);
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: 3, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => {
+			await dialect.insertDirent(tx, rootInodeId, "link1.txt", inodeId);
+			await dialect.insertDirent(tx, rootInodeId, "link2.txt", inodeId);
+			await dialect.incrementNlink(tx, inodeId); // two links → nlink = 2
+		});
+
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link2.txt"));
+
+		const inode = await dialect.transaction(async (tx) => dialect.getInode(tx, inodeId));
+		expect(inode).not.toBeNull();
+		expect(inode!.nlink).toBe(1); // survives with the remaining link
+
+		// removing the last link now hard-deletes it
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link1.txt"));
+		expect(await countInode(inodeId)).toBe(0);
+	});
+
+	it("writeFileComposite overwrite hard-deletes the replaced inode and frees its blob for GC", async () => {
+		const shaA = new Uint8Array(32).fill(0x53);
+		const shaB = new Uint8Array(32).fill(0x54);
+		const dataA = new TextEncoder().encode("AAA");
+		const dataB = new TextEncoder().encode("BBBB");
+
+		const inodeA = await dialect.transaction(async (tx) =>
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataA.length, shaA, dataA),
+		);
+		const inodeB = await dialect.transaction(async (tx) =>
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataB.length, shaB, dataB),
+		);
+		expect(inodeB).not.toBe(inodeA);
+		// Regression: the replaced inode must be deleted, not left as an nlink=0 tombstone.
+		expect(await countInode(inodeA)).toBe(0);
+
+		// Old blob is now a true orphan → collected; the new blob survives.
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		const blobA = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaA));
+		const blobB = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaB));
+		expect(blobA).toBeNull();
+		expect(blobB).toEqual(dataB);
+
+		// cleanup
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "ow.txt"));
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${shaB}`;
+		});
+	});
+
+	it("gcOrphanBlobs ignores an nlink=0 inode tombstone (legacy backlog) and collects its blob", async () => {
+		const sha = new Uint8Array(32).fill(0x55);
+		const data = new TextEncoder().encode("tomb");
+		await dialect.transaction(async (tx) => dialect.upsertBlob(tx, sha, data));
+		// Simulate a tombstone left by an older buggy build: nlink=0 but still references the blob.
+		const inodeId = await dialect.transaction(async (tx) =>
+			dialect.createInode(tx, { sandboxId, kind: 1, mode: 0o644, size: data.length, contentSha256: sha }),
+		);
+		await dialect.transaction(async (tx) => {
+			await tx`UPDATE inodes SET nlink = 0 WHERE id = ${String(inodeId)}`;
+		});
+
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+
+		const blob = await dialect.transaction(async (tx) => dialect.getBlob(tx, sha));
+		expect(blob).toBeNull(); // collected despite the tombstone reference
+
+		// cleanup the tombstone inode
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM inodes WHERE id = ${String(inodeId)}`;
+		});
+	});
+
+	it("mvComposite over a single-linked destination hard-deletes the replaced inode (no tombstone)", async () => {
+		const shaSrc = new Uint8Array(32).fill(0x56);
+		const shaDst = new Uint8Array(32).fill(0x57);
+		const dataSrc = new TextEncoder().encode("SRC");
+		const dataDst = new TextEncoder().encode("DST");
+
+		const srcInode = await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, shaSrc, dataSrc);
+			const id = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: dataSrc.length,
+				contentSha256: shaSrc,
+			});
+			await dialect.insertDirent(tx, rootInodeId, "mvsrc.txt", id);
+			return id;
+		});
+		const dstInode = await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, shaDst, dataDst);
+			const id = await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: dataDst.length,
+				contentSha256: shaDst,
+			});
+			await dialect.insertDirent(tx, rootInodeId, "mvdst.txt", id);
+			return id;
+		});
+
+		// Move src onto the existing dst, overwriting it.
+		await dialect.transaction(async (tx) =>
+			dialect.mvComposite(tx, sandboxId, rootInodeId, "mvsrc.txt", rootInodeId, "mvdst.txt"),
+		);
+
+		// Regression: the overwritten destination inode must be deleted, not an nlink=0 tombstone.
+		expect(await countInode(dstInode)).toBe(0);
+		expect(await countInode(srcInode)).toBe(1); // src inode now lives at mvdst.txt
+
+		// The dest's old blob is freed for GC; the moved src blob survives.
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaDst))).toBeNull();
+		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaSrc))).toEqual(dataSrc);
+
+		// cleanup
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "mvdst.txt"));
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${shaSrc}`;
+		});
+	});
+});
+
 describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — loadAllPaths", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
 	let sandboxId: string;
