@@ -50,6 +50,11 @@ fs = Client(base_url=..., auth_secret=..., sub="agent", max_file_size=128 * 1024
 fs = Client(base_url=..., auth_secret=..., sub="agent", max_file_size=0)                   # disable
 ```
 
+> The `max_file_size` check is separate from the 8 MiB `python3` read limit that
+> `ingest_files` enforces — see `ref/sandbox.md`. A file between 8 MiB and
+> `max_file_size` ingests fine but can't be read by the `python3` runtime unless
+> you pass `allow_oversized=True`.
+
 > Sizing note: the server caps the whole HTTP request body (default 256 MB) and
 > base64 inflates content ~33%, so the practical per-request ceiling is ~190 MB
 > of raw bytes regardless of `max_file_size`. The default 64 MiB keeps a single
@@ -187,12 +192,13 @@ The `Client` retries up to `max_retries` times on **transient** failures only:
 | 5xx | **Yes** — exponential jitter, capped at 8 s per attempt |
 | network (DNS, TCP, TLS, read-timeout) | **Yes** — exponential jitter |
 
-After `max_retries` exhaustion the SDK raises `ServerError` (for 5xx) or
-`TransportError` (for network failures). Streaming endpoints
-(`exec_stream`) are **not** retried — they have at-most-once
-semantics because the server can't safely re-execute a script.
+`exec` / `exec_batch` are only retried on transient 5xx when `read_only=True`
+(always safe) or when you opt in with `retry_on_5xx=True`; otherwise the server
+can't safely re-run an arbitrary write. `exec_stream` is **never** retried —
+at-most-once semantics. After `max_retries` exhaustion the SDK raises
+`ServerError` (for 5xx) or `TransportError` (for network failures).
 
-See `plugins/sqlfs/skills/py-sdk/ref/errors.md` for the full exception
+See `plugins/sql-fs/skills/py-sdk/ref/errors.md` for the full exception
 hierarchy.
 
 ---

@@ -16,11 +16,11 @@ Invoke with optional sub-commands:
 
 | Invocation | What happens |
 |---|---|
-| `/sqlfs:py-sdk` | General assistant — answer questions, generate snippets |
-| `/sqlfs:py-sdk setup` | Walk through install, env vars, first sandbox |
-| `/sqlfs:py-sdk exec <script>` | Generate a ready-to-run `sb.exec(...)` snippet for `$ARGUMENTS` |
-| `/sqlfs:py-sdk ingest <path>` | Generate an `sb.ingest_files(...)` snippet for a local directory |
-| `/sqlfs:py-sdk explore` | Build an `exec_batch` exploration script for the active sandbox |
+| `/sql-fs:py-sdk` | General assistant — answer questions, generate snippets |
+| `/sql-fs:py-sdk setup` | Walk through install, env vars, first sandbox |
+| `/sql-fs:py-sdk exec <script>` | Generate a ready-to-run `sb.exec(...)` snippet for `$ARGUMENTS` |
+| `/sql-fs:py-sdk ingest <path>` | Generate an `sb.ingest_files(...)` snippet for a local directory |
+| `/sql-fs:py-sdk explore` | Build an `exec_batch` exploration script for the active sandbox |
 
 Current arguments: **$ARGUMENTS**
 
@@ -65,24 +65,24 @@ either `auth_secret=...` (with `sub=...`) or a pre-minted `token=...`.
 
 ## Supporting docs — read these when relevant
 
-All reference material lives under `plugins/sqlfs/skills/py-sdk/` in this project:
+All reference material lives under `plugins/sql-fs/skills/py-sdk/` in this project:
 
-- **Setup & auth** → `plugins/sqlfs/skills/py-sdk/SETUP.md`
+- **Setup & auth** → `plugins/sql-fs/skills/py-sdk/SETUP.md`
   Read this when the user asks about install, env vars, token vs auth_secret, or first-time setup.
 
-- **Client reference** → `plugins/sqlfs/skills/py-sdk/ref/client.md`
+- **Client reference** → `plugins/sql-fs/skills/py-sdk/ref/client.md`
   `Client(...)` constructor + `client.sandboxes.{list,create,get,attach,delete}`. Read this for sandbox lifecycle.
 
-- **Sandbox reference** → `plugins/sqlfs/skills/py-sdk/ref/sandbox.md`
+- **Sandbox reference** → `plugins/sql-fs/skills/py-sdk/ref/sandbox.md`
   `sb.exec / exec_batch / exec_stream`, `sb.ingest_files`, `sb.delete`. Read this for everything an agent does inside a sandbox.
 
-- **Models reference** → `plugins/sqlfs/skills/py-sdk/ref/models.md`
+- **Models reference** → `plugins/sql-fs/skills/py-sdk/ref/models.md`
   Field-by-field shape of `ExecResult`, `BatchExecResult`, `StreamEvent`, `SandboxRecord`, etc. Read this when shaping return-value handling.
 
-- **Error reference** → `plugins/sqlfs/skills/py-sdk/ref/errors.md`
+- **Error reference** → `plugins/sql-fs/skills/py-sdk/ref/errors.md`
   Exception hierarchy + HTTP-status mapping. Read this when writing `try/except` blocks.
 
-- **Working examples** → `plugins/sqlfs/skills/py-sdk/examples/`
+- **Working examples** → `plugins/sql-fs/skills/py-sdk/examples/`
   - `quickstart.py` — create sandbox, ingest, exec, delete
   - `ingest-explore.py` — load a codebase via `ingest_files` then explore via `exec_batch`
   - `exec-stream.py` — SSE streaming with proper iteration
@@ -103,7 +103,7 @@ method names, parameter spellings, and known gotchas from the SDK.
    the finally block — sandboxes survive process exit and accumulate.
 4. **Sandbox filesystem is durable** (Postgres-backed). Bash session state (env vars,
    cwd, shell functions) resets after 10 min idle — re-export anything you need.
-5. **For any task that runs scripts**: read `plugins/sqlfs/skills/py-sdk/ref/sandbox.md`
+5. **For any task that runs scripts**: read `plugins/sql-fs/skills/py-sdk/ref/sandbox.md`
    first to use the right method and timeout shape.
 
 ---
@@ -143,11 +143,15 @@ methods are banned for agent use.
 a local folder into a fresh sandbox (single HTTP round-trip, base64-safe for binary).
 After ingest, all further interaction must be via `sb.exec / exec_batch / exec_stream`.
 
-**Per-file size limit:** every write path (`ingest_files`, `fs.write`, `fs.write_files`)
-enforces `Client(max_file_size=...)` — default **64 MiB** — **before** anything is
-encoded or sent. An oversized file raises `ValidationError(code="EFILE_TOO_LARGE")`
+**Per-file size limits (client-side):** every write path (`ingest_files`, `fs.write`,
+`fs.write_files`) enforces `Client(max_file_size=...)` — default **64 MiB** — **before**
+anything is encoded or sent. An oversized file raises `ValidationError(code="EFILE_TOO_LARGE")`
 client-side (no network round-trip). Raise it via `Client(max_file_size=...)` or
-disable with `max_file_size=0`. See `ref/client.md`.
+disable with `max_file_size=0`. Additionally, `ingest_files` rejects any file **> 8 MiB**
+with `ValidationError(code="EFILE_TOO_LARGE_FOR_CPYTHON")` because the `python3` runtime
+(CPython WASM) can't `open()` it; pass `allow_oversized=True` to ingest anyway (the bytes
+stay usable from bash/`js-exec`, only `python3 open()` fails), or split into <8 MiB chunks.
+See `ref/client.md` and `ref/sandbox.md`.
 
 When a user asks for an `sb.fs.*` snippet, **decline politely and produce the exec
 equivalent instead**, citing this policy. If the workflow truly cannot be expressed

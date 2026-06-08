@@ -30,7 +30,7 @@ def main() -> int:
         print(f"created sandbox {sb.id}")
         try:
             # Single buffered exec — get back a flat ExecResult.
-            r = sb.exec("echo hello && uname -srm")
+            r = sb.exec("echo hello && pwd")
             if not r.ok:
                 print(f"unexpected exit {r.exit_code}: {r.error}", file=sys.stderr)
                 return 1

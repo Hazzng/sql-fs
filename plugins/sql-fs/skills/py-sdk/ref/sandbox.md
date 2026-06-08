@@ -37,7 +37,7 @@ sb.record      # SandboxRecord | None — full record at creation; None if attac
 
 ## Exec
 
-### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False) -> ExecResult`
+### `sb.exec(script, *, cwd=None, env=None, timeout_ms=30_000, debug=False, read_only=False, retry_on_5xx=False) -> ExecResult`
 
 Buffered bash execution. Maps to `POST /v1/sandboxes/{id}/exec-sync`. Blocks
 until the script exits and returns a flat `ExecResult` with
@@ -51,6 +51,7 @@ result = sb.exec(
     timeout_ms=15_000,            # 1 ≤ ms ≤ 300_000
     debug=False,                  # True = prepend `set -x` for tracing
     read_only=False,              # True = skip exclusive lock; raises ValidationError on any write
+    retry_on_5xx=False,           # opt in to retrying transient 5xx on this write exec
 )
 print(result.stdout)              # str
 print(result.error)               # alias for .stderr
@@ -61,10 +62,13 @@ The SDK sets the underlying httpx timeout to `timeout_ms / 1000 + 5 s`, so a
 genuine server-side timeout surfaces as `ExecTimeoutError` (HTTP 408), not as a
 client-side network timeout.
 
-**Idempotency:** `exec` is **not** retried automatically (the server cannot
-safely re-execute a script). Wrap your own retry logic if needed.
+**Idempotency:** by default `exec` is **not** retried (the server cannot safely
+re-execute an arbitrary write script). It *is* retried on transient 5xx when
+`read_only=True` (always safe) or when you opt in with `retry_on_5xx=True` —
+set the latter only when the script is idempotent, since a retried write that
+already committed to Postgres would run twice.
 
-### `sb.exec_batch(scripts, *, timeout_ms=30_000, per_script_timeout_ms=None, read_only=False) -> list[BatchExecResult]`
+### `sb.exec_batch(scripts, *, timeout_ms=30_000, per_script_timeout_ms=None, read_only=False, retry_on_5xx=False) -> list[BatchExecResult]`
 
 Maps to `POST /v1/sandboxes/{id}/exec-sync-batch`. Run up to **50 scripts
 sequentially** (or in parallel when `read_only=True`) in one HTTP round-trip.
@@ -75,7 +79,7 @@ results = sb.exec_batch(
     [
         {"id": "tree", "script": "find /home/user -type f | head -20"},
         {"id": "imports", "script": "grep -rn '^from langgraph' /home/user | head -10"},
-        {"id": "uname", "script": "uname -srm"},
+        {"id": "count", "script": "find /home/user -type f | wc -l"},
     ],
     timeout_ms=60_000,            # outer ceiling covering the whole batch
     per_script_timeout_ms=5_000,  # each script independently limited to 5 s
@@ -139,7 +143,7 @@ overhead per chunk.
 
 ## Ingest (bootstrap only)
 
-### `sb.ingest_files(files, *, base_path="/home/user/project") -> dict`
+### `sb.ingest_files(files, *, base_path="/home/user/project", allow_oversized=False) -> dict`
 
 Maps to `POST /v1/sandboxes/{id}/ingest-files`. **Allowed for one-time
 bootstrap of a fresh sandbox** — for any further file mutation, switch to
@@ -170,6 +174,26 @@ checked against the client's `max_file_size` (default 64 MiB — see
 `ref/client.md`). A file over the limit raises
 `ValidationError(code="EFILE_TOO_LARGE")` and **nothing is sent**. Raise or
 disable it with `Client(max_file_size=...)` / `max_file_size=0`.
+
+**8 MiB `python3` read limit (client-side).** Any file larger than 8 MiB raises
+`ValidationError(code="EFILE_TOO_LARGE_FOR_CPYTHON")` and **nothing is sent**.
+The `python3` runtime (CPython WASM) reads sandbox files through an 8 MiB IPC
+bridge — `open()` on a larger file fails with an opaque error. The bytes
+themselves ingest fine and stay usable from bash (`cat`/`grep`/`awk`) and
+`js-exec`; only `python3 open()` can't read them. Pass `allow_oversized=True` to
+ingest anyway (accepting that `python3` can't read the file), or split the file
+into <8 MiB chunks and recombine them in your script:
+
+```python
+# Blocked — a 17 MB CSV the python3 runtime can't open():
+sb.ingest_files({"data.csv": big_csv_bytes})           # raises EFILE_TOO_LARGE_FOR_CPYTHON
+
+# Option A — store it anyway for bash/js-exec (grep/awk/cut), not python3:
+sb.ingest_files({"data.csv": big_csv_bytes}, allow_oversized=True)
+
+# Option B — split into <8 MiB chunks, recombine in python3 (see SKILL.md):
+sb.ingest_files({"chunk1.csv": part1, "chunk2.csv": part2, "chunk3.csv": part3})
+```
 
 **Hard limits to keep in mind:**
 - All file bytes are buffered into one HTTP request body. The server caps the

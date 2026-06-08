@@ -14,11 +14,11 @@ Invoke with optional sub-commands:
 
 | Invocation | What happens |
 |---|---|
-| `/sqlfs:api` | General assistant — answer questions, generate commands |
-| `/sqlfs:api setup` | Walk through auth bootstrap and first sandbox |
-| `/sqlfs:api exec <script>` | Generate a ready-to-run exec-sync curl for `$ARGUMENTS` |
-| `/sqlfs:api ingest <path>` | Generate an ingest-files payload for a local directory |
-| `/sqlfs:api explore` | Load the active sandbox tree and start exploring |
+| `/sql-fs:api` | General assistant — answer questions, generate commands |
+| `/sql-fs:api setup` | Walk through auth bootstrap and first sandbox |
+| `/sql-fs:api exec <script>` | Generate a ready-to-run exec-sync curl for `$ARGUMENTS` |
+| `/sql-fs:api ingest <path>` | Generate an ingest-files payload for a local directory |
+| `/sql-fs:api explore` | Load the active sandbox tree and start exploring |
 
 Current arguments: **$ARGUMENTS**
 
@@ -43,21 +43,21 @@ Exception: `POST /v1/auth/bootstrap` is unauthenticated — it is how you obtain
 
 ## Supporting docs — read these when relevant
 
-All reference material lives under `plugins/sqlfs/skills/api/` in this project:
+All reference material lives under `plugins/sql-fs/skills/api/` in this project:
 
-- **Setup & Auth** → `plugins/sqlfs/skills/api/SETUP.md`
+- **Setup & Auth** → `plugins/sql-fs/skills/api/SETUP.md`
   Read this when the user asks about tokens, first-time setup, or multi-tenant config.
 
-- **Endpoint reference** → `plugins/sqlfs/skills/api/ref/endpoints.md`
+- **Endpoint reference** → `plugins/sql-fs/skills/api/ref/endpoints.md`
   Full schema for every route. Read this when generating curl commands.
 
-- **Error codes** → `plugins/sqlfs/skills/api/ref/errors.md`
+- **Error codes** → `plugins/sql-fs/skills/api/ref/errors.md`
   HTTP → FS code mapping. Read this when debugging API responses.
 
-- **Bash capabilities** → `plugins/sqlfs/skills/api/ref/bash.md`
+- **Bash capabilities** → `plugins/sql-fs/skills/api/ref/bash.md`
   What just-bash supports and what it doesn't. Read this before writing scripts.
 
-- **Working examples** → `plugins/sqlfs/skills/api/examples/`
+- **Working examples** → `plugins/sql-fs/skills/api/examples/`
   - `quickstart.sh` — create sandbox, write file, exec, delete
   - `ingest-files.sh` — upload a local folder via the `ingest-files` JSON manifest
   - `ingest-explore.sh` — load a codebase and grep/cat via bash_exec
@@ -74,7 +74,7 @@ response shapes, and known gotchas from the live API.
 2. Sandbox filesystem survives session eviction (Postgres is durable). Shell state (env vars,
    cwd, functions) resets after 10 min of idle.
 3. Never produce `curl` commands that omit `-s` — noisy progress meters obscure the output.
-4. For any task that touches files: read `plugins/sqlfs/skills/api/ref/endpoints.md` first.
+4. For any task that touches files: read `plugins/sql-fs/skills/api/ref/endpoints.md` first.
 
 ---
 

@@ -49,10 +49,55 @@ from .models import (
 #: client via ``Client(max_file_size=...)`` or disable with ``max_file_size=0``.
 DEFAULT_MAX_FILE_SIZE = 64 * 1024 * 1024
 
+#: Largest file the ``python3`` runtime (CPython compiled to WASM) can read via
+#: ``open()``. CPython reads sandbox files through an 8 MiB SharedArrayBuffer
+#: IPC bridge; ``open()`` on a larger file fails with an opaque
+#: ``FileNotFoundError`` / ``OSError``. The bytes still ingest fine and stay
+#: readable from bash (``cat``/``grep``/``awk``) and ``js-exec`` — only
+#: ``python3`` cannot read them.
+CPYTHON_READ_LIMIT = 8 * 1024 * 1024
+
 
 def _content_size(content: Union[str, bytes]) -> int:
     """Raw byte length of a write payload (``str`` measured as UTF-8)."""
     return len(content.encode("utf-8")) if isinstance(content, str) else len(content)
+
+
+def _enforce_cpython_read_limit(
+    files: Mapping[str, Union[str, bytes]],
+    *,
+    allow_oversized: bool,
+) -> None:
+    """Reject files the ``python3`` runtime could not later ``open()``.
+
+    Raises ``ValidationError`` (code ``EFILE_TOO_LARGE_FOR_CPYTHON``) naming
+    every file above :data:`CPYTHON_READ_LIMIT`. Pass ``allow_oversized=True``
+    to ingest anyway — the file is stored and usable from bash/js-exec, but
+    ``python3`` ``open()`` will fail on it.
+    """
+    if allow_oversized:
+        return
+    too_big = [
+        (path, size)
+        for path, content in files.items()
+        if (size := _content_size(content)) > CPYTHON_READ_LIMIT
+    ]
+    if too_big:
+        details = [
+            f"{path} ({size} bytes > {CPYTHON_READ_LIMIT} python3 open() limit)"
+            for path, size in too_big
+        ]
+        raise ValidationError(
+            "file exceeds the 8 MiB limit that the python3 (CPython WASM) runtime "
+            "can read via open(): "
+            + "; ".join(details)
+            + ". The bytes ingest fine and stay usable from bash (cat/grep/awk) and "
+            "js-exec — only python3 open() will fail on these files. Pass "
+            "allow_oversized=True to ingest anyway, or split the file into <8 MiB "
+            "chunks if you need to read it from python3.",
+            code="EFILE_TOO_LARGE_FOR_CPYTHON",
+            details=details,
+        )
 
 
 def _enforce_max_file_size(
@@ -409,17 +454,25 @@ class Sandbox:
         files: Mapping[str, Union[str, bytes]],
         *,
         base_path: str = "/home/user/project",
+        allow_oversized: bool = False,
     ) -> Dict[str, Any]:
         """`POST /ingest-files` — write a JSON manifest of files (auto base64).
 
         Keys are paths relative to `base_path`. Values may be `str` (encoded
         utf-8) or `bytes` (encoded as-is); the SDK base64-encodes them.
 
-        Each file is checked against the client's ``max_file_size`` first; an
-        oversized file raises ``ValidationError`` (code ``EFILE_TOO_LARGE``)
-        before anything is encoded or sent over the network.
+        Two client-side checks run before anything is encoded or sent:
+
+        1. Each file is checked against the client's ``max_file_size``; an
+           oversized file raises ``ValidationError`` (code ``EFILE_TOO_LARGE``).
+        2. Any file larger than 8 MiB (:data:`CPYTHON_READ_LIMIT`) raises
+           ``ValidationError`` (code ``EFILE_TOO_LARGE_FOR_CPYTHON``) because the
+           ``python3`` runtime cannot ``open()`` it. Pass ``allow_oversized=True``
+           to ingest anyway — the file stays usable from bash/js-exec, but
+           ``python3`` ``open()`` will fail on it.
         """
         _enforce_max_file_size(files, self._max_file_size)
+        _enforce_cpython_read_limit(files, allow_oversized=allow_oversized)
         encoded: Dict[str, str] = {}
         for path, content in files.items():
             data = content.encode("utf-8") if isinstance(content, str) else content

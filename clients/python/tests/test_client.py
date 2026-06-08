@@ -622,6 +622,35 @@ def test_ingest_files_base64_encodes():
     assert sent["files"]["b.bin"] == base64.b64encode(b"\x00\x01").decode()
 
 
+@respx.mock
+def test_ingest_files_blocks_oversized_for_cpython():
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/ingest-files").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "fileCount": 1})
+    )
+    sb = make_client().sandboxes.attach("sb")
+    big = b"\x00" * (8 * 1024 * 1024 + 1)
+    with pytest.raises(ValidationError) as exc:
+        sb.ingest_files({"big.csv": big})
+    assert exc.value.code == "EFILE_TOO_LARGE_FOR_CPYTHON"
+    limit = 8 * 1024 * 1024
+    assert exc.value.details == [f"big.csv ({len(big)} bytes > {limit} python3 open() limit)"]
+    # Nothing sent over the network.
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_ingest_files_allow_oversized_bypasses_cpython_check():
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/ingest-files").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "fileCount": 1})
+    )
+    sb = make_client().sandboxes.attach("sb")
+    big = b"\x00" * (8 * 1024 * 1024 + 1)
+    sb.ingest_files({"big.csv": big}, allow_oversized=True)
+    assert route.call_count == 1
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert list(sent["files"].keys()) == ["big.csv"]
+
+
 # ── Error mapping ────────────────────────────────────────────────────────────
 @respx.mock
 def test_400_maps_to_validation_error():
