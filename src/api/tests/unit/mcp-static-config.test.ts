@@ -73,6 +73,30 @@ describe("loadStaticMcpAuthConfig", () => {
 		).toThrow(/not a valid HTTP header name/);
 	});
 
+	it.each([
+		"authorization",
+		"Authorization",
+		"cookie",
+		"content-type",
+		"accept",
+		"mcp-session-id",
+		"mcp-protocol-version",
+		"last-event-id",
+	])("rejects reserved identity header %p (would collapse all users to one owner)", (header) => {
+		expect(() => loadStaticMcpAuthConfig(tenants, { MCP_API_KEY: STRONG_KEY, MCP_IDENTITY_HEADER: header })).toThrow(
+			/reserved and cannot carry a per-user identity/,
+		);
+	});
+
+	it("attaches code AUTH_CONFIG_INVALID to config validation errors", () => {
+		try {
+			loadStaticMcpAuthConfig(tenants, { MCP_API_KEY: "short" });
+			throw new Error("expected loadStaticMcpAuthConfig to throw");
+		} catch (e) {
+			expect((e as { code?: string }).code).toBe("AUTH_CONFIG_INVALID");
+		}
+	});
+
 	it("throws when MCP_DEFAULT_SUB is invalid", () => {
 		expect(() =>
 			loadStaticMcpAuthConfig(tenants, { MCP_API_KEY: STRONG_KEY, MCP_DEFAULT_SUB: "a".repeat(257) }),

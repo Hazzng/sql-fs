@@ -19,7 +19,7 @@
  *   // the sandbox owner/sub is derived from a forwarded identity header.
  */
 
-import type { Context, Next } from "hono";
+import type { Context, MiddlewareHandler, Next } from "hono";
 import { createMiddleware } from "hono/factory";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { jwtVerify } from "jose";
@@ -64,6 +64,28 @@ const MAX_IDENTITY_LENGTH = 256;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 /** Minimum length for MCP_API_KEY — it guards remote code execution, so weak keys are refused. */
 const MIN_API_KEY_LENGTH = 16;
+/**
+ * Headers that cannot carry a per-user identity. If `MCP_IDENTITY_HEADER` were
+ * one of these, every static-auth request would derive `owner` from a shared
+ * transport value (e.g. `Authorization: Bearer <MCP_API_KEY>`, or a session's
+ * `last-event-id`), silently collapsing all end-users into one sandbox owner
+ * and defeating isolation. Mirrors the MCP transport headers advertised in
+ * `mcp-cors.ts`. Reject them at startup.
+ */
+const RESERVED_IDENTITY_HEADERS = new Set<string>([
+	"authorization",
+	"cookie",
+	"content-type",
+	"accept",
+	"mcp-session-id",
+	"mcp-protocol-version",
+	"last-event-id",
+]);
+
+/** Build a startup config error with a stable `code` for consistent diagnostics. */
+function configError(message: string): Error {
+	return Object.assign(new Error(message), { code: "AUTH_CONFIG_INVALID" });
+}
 
 /**
  * Normalize and validate a forwarded identity value.
@@ -96,8 +118,10 @@ export function sanitizeIdentity(raw: string | undefined): string | undefined {
  * @param tenantConfig - Active tenant config, used to validate `MCP_STATIC_TENANT`.
  * @param env - Environment to read from. Defaults to `process.env`.
  * @returns The config, or `undefined` when `MCP_API_KEY` is unset.
- * @throws If `MCP_API_KEY` is too short, the identity header name is invalid,
- *   `MCP_DEFAULT_SUB` is malformed, or `MCP_STATIC_TENANT` is not configured.
+ * @throws If `MCP_API_KEY` is too short, the identity header name is invalid or
+ *   reserved (e.g. `authorization`), `MCP_DEFAULT_SUB` is malformed, or
+ *   `MCP_STATIC_TENANT` is not configured. All such errors carry
+ *   `code: "AUTH_CONFIG_INVALID"`.
  */
 export function loadStaticMcpAuthConfig(
 	tenantConfig: TenantConfig,
@@ -106,12 +130,17 @@ export function loadStaticMcpAuthConfig(
 	const apiKey = env.MCP_API_KEY;
 	if (apiKey === undefined || apiKey.length === 0) return undefined;
 	if (apiKey.length < MIN_API_KEY_LENGTH) {
-		throw new Error(`MCP_API_KEY must be at least ${MIN_API_KEY_LENGTH} characters (use a long random value).`);
+		throw configError(`MCP_API_KEY must be at least ${MIN_API_KEY_LENGTH} characters (use a long random value).`);
 	}
 
 	const identityHeader = (env.MCP_IDENTITY_HEADER ?? "x-librechat-user-id").trim().toLowerCase();
 	if (!HEADER_NAME_PATTERN.test(identityHeader)) {
-		throw new Error(`MCP_IDENTITY_HEADER "${identityHeader}" is not a valid HTTP header name.`);
+		throw configError(`MCP_IDENTITY_HEADER "${identityHeader}" is not a valid HTTP header name.`);
+	}
+	if (RESERVED_IDENTITY_HEADERS.has(identityHeader)) {
+		throw configError(
+			`MCP_IDENTITY_HEADER "${identityHeader}" is reserved and cannot carry a per-user identity; choose a dedicated header such as x-librechat-user-id.`,
+		);
 	}
 
 	let defaultSub: string | undefined;
@@ -119,13 +148,13 @@ export function loadStaticMcpAuthConfig(
 	if (rawDefaultSub !== undefined && rawDefaultSub.length > 0) {
 		defaultSub = sanitizeIdentity(rawDefaultSub);
 		if (defaultSub === undefined) {
-			throw new Error("MCP_DEFAULT_SUB is invalid (must be ≤256 chars and contain no control characters).");
+			throw configError("MCP_DEFAULT_SUB is invalid (must be ≤256 chars and contain no control characters).");
 		}
 	}
 
 	const tenant = env.MCP_STATIC_TENANT ?? DEFAULT_TENANT_ID;
 	if (!tenantConfig.hasTenant(tenant)) {
-		throw new Error(`MCP_STATIC_TENANT "${tenant}" is not a configured tenant.`);
+		throw configError(`MCP_STATIC_TENANT "${tenant}" is not a configured tenant.`);
 	}
 
 	return { apiKey, identityHeader, defaultSub, tenant };
@@ -190,7 +219,10 @@ async function handleStaticAuth(
  */
 const UNAUTHENTICATED_PATHS = new Set<string>(["POST /v1/auth/bootstrap"]);
 
-export function createAuthMiddleware(tenantConfig: TenantConfig, options: AuthMiddlewareOptions = {}) {
+export function createAuthMiddleware(
+	tenantConfig: TenantConfig,
+	options: AuthMiddlewareOptions = {},
+): MiddlewareHandler<{ Variables: AuthVariables }> {
 	const staticAuth = options.staticAuth;
 	return createMiddleware<{ Variables: AuthVariables }>(async (c, next) => {
 		const requestKey = `${c.req.method.toUpperCase()} ${c.req.path}`;

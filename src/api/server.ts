@@ -217,7 +217,9 @@ if (staticMcpAuth !== undefined) {
 			event: "mcp_static_auth_enabled",
 			identityHeader: staticMcpAuth.identityHeader,
 			tenant: staticMcpAuth.tenant,
-			defaultSub: staticMcpAuth.defaultSub ?? null,
+			// Log only whether a fallback owner is configured — MCP_DEFAULT_SUB can be
+			// an email/identifier and must not be written verbatim to process logs.
+			hasDefaultSub: staticMcpAuth.defaultSub !== undefined,
 		}),
 	);
 }

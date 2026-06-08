@@ -57,7 +57,12 @@ describe("static MCP auth", () => {
 	});
 
 	afterEach(() => {
-		process.env.AUTH_SECRET = savedSecret ?? "";
+		// Restore exactly — never convert an originally-undefined var into "".
+		if (savedSecret === undefined) {
+			Reflect.deleteProperty(process.env, "AUTH_SECRET");
+		} else {
+			process.env.AUTH_SECRET = savedSecret;
+		}
 	});
 
 	it("accepts the static API key and derives owner from the identity header", async () => {
