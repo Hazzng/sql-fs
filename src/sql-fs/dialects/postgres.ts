@@ -165,7 +165,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			blob_insert AS (
 				INSERT INTO blobs (sha256, data, size)
 				SELECT ${sha256}, ${data}, ${size} FROM ctx
-				ON CONFLICT (sha256) DO NOTHING
+				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
@@ -582,14 +582,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`
 			INSERT INTO blobs (sha256, data, size)
 			VALUES (${sha256}, ${data}, ${data.length})
-			ON CONFLICT (sha256) DO NOTHING
+			ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
 		`;
 		// Fire-and-forget: don't hold the PG transaction (and the per-sandbox
 		// advisory lock acquired in setSandboxContext) open on Redis latency.
 		// RedisBlobCache.set() swallows its own errors so this promise cannot
 		// reject. Safe under races: blobs are content-addressable and the PG
-		// insert is ON CONFLICT DO NOTHING, so a concurrent SET with identical
-		// bytes is a no-op.
+		// insert is ON CONFLICT DO UPDATE (touch-only — it bumps
+		// last_referenced_at but never rewrites data/size), so a concurrent SET
+		// with identical bytes is a no-op.
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
@@ -698,16 +699,25 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return out;
 	}
 
-	// US-014
-	async gcOrphanBlobs(tx: PgTx): Promise<number> {
+	// US-014: collect orphan blobs older than the grace window.
+	// Runs with NO sandbox context — the RLS escape (migration 0005) lets a
+	// context-less tx see every inode so the anti-join is correct. NOT EXISTS
+	// (vs NOT IN) is null-safe and lets the planner use idx_inodes_content_sha256.
+	// The grace window + the DO-UPDATE row lock on the blob upsert path close the
+	// dedup re-adoption race (see plan 2026-06-08 orphan-blob-gc).
+	async gcOrphanBlobs(tx: PgTx, minAgeMs: number): Promise<Uint8Array[]> {
 		const rows = await tx<{ sha256: Buffer }[]>`
-			DELETE FROM blobs
-			WHERE sha256 NOT IN (
-				SELECT content_sha256 FROM inodes WHERE content_sha256 IS NOT NULL
+			DELETE FROM blobs b
+			WHERE NOT EXISTS (
+				SELECT 1 FROM inodes i WHERE i.content_sha256 = b.sha256
 			)
-			RETURNING sha256
+			AND (
+				b.last_referenced_at IS NULL
+				OR b.last_referenced_at < now() - (${minAgeMs} * interval '1 millisecond')
+			)
+			RETURNING b.sha256
 		`;
-		return rows.length;
+		return rows.map((r) => new Uint8Array(r.sha256));
 	}
 
 	// US-015
@@ -962,7 +972,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 		if (uniqueBlobs.size > 0) {
 			const blobRows = [...uniqueBlobs.values()];
-			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO NOTHING`;
+			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`;
 		}
 
 		// ── Phase D: bulk insert file inodes ─────────────────────────────────────

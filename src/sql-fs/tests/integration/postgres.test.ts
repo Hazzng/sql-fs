@@ -842,7 +842,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx);
+			await dialect.gcOrphanBlobs(tx, 0);
 		});
 
 		// Blob should still exist (referenced by the inode)
@@ -877,10 +877,10 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — should delete the orphan blob
 		const deleted = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx);
+			return await dialect.gcOrphanBlobs(tx, 0);
 		});
 
-		expect(deleted).toBeGreaterThanOrEqual(1);
+		expect(deleted.length).toBeGreaterThanOrEqual(1);
 
 		// Blob should be gone
 		const result = await dialect.transaction(async (tx) => {
@@ -924,7 +924,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — blob should survive (still referenced by inodeId2)
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx);
+			await dialect.gcOrphanBlobs(tx, 0);
 		});
 
 		const result = await dialect.transaction(async (tx) => {
@@ -937,6 +937,165 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 		await dialect.transaction(async (tx) => {
 			await dialect.deleteInode(tx, inodeId2);
 		});
+	});
+
+	it("re-referencing an existing blob bumps last_referenced_at", async () => {
+		const sha256 = new Uint8Array(32).fill(0xdd);
+		const data = new TextEncoder().encode("rereferenced content");
+
+		// First upsert: inserts the row with last_referenced_at = now().
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const firstRows = await dialect.transaction(async (tx) => {
+			return await tx<{ last_referenced_at: Date }[]>`
+				SELECT last_referenced_at FROM blobs WHERE sha256 = ${sha256}
+			`;
+		});
+		const first = firstRows[0]!.last_referenced_at;
+
+		// now() is the transaction start time; the two upserts run in separate
+		// transactions, so this sleep guarantees the second is strictly later.
+		await new Promise((r) => setTimeout(r, 5));
+
+		// Second upsert: ON CONFLICT DO UPDATE bumps last_referenced_at to now().
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+
+		const secondRows = await dialect.transaction(async (tx) => {
+			return await tx<{ last_referenced_at: Date }[]>`
+				SELECT last_referenced_at FROM blobs WHERE sha256 = ${sha256}
+			`;
+		});
+		const second = secondRows[0]!.last_referenced_at;
+
+		expect(second.getTime()).toBeGreaterThan(first.getTime());
+
+		// Cleanup: blob is unreferenced; remove it directly.
+		await dialect.transaction(async (tx) => {
+			await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
+		});
+	});
+
+	// Compares a sha256 against the Uint8Array[] returned by gcOrphanBlobs.
+	const includesSha = (deleted: Uint8Array[], sha: Uint8Array): boolean => {
+		const target = Buffer.from(sha).toString("hex");
+		return deleted.some((d) => Buffer.from(d).toString("hex") === target);
+	};
+
+	it("orphan inside the grace window survives, then is collected once grace is zero", async () => {
+		const sha256 = new Uint8Array(32).fill(0x11);
+		const data = new TextEncoder().encode("grace window content");
+
+		// Upsert blob (last_referenced_at = now()), reference it, then orphan it.
+		await dialect.transaction(async (tx) => {
+			await dialect.upsertBlob(tx, sha256, data);
+		});
+		const inodeId = await dialect.transaction(async (tx) => {
+			return await dialect.createInode(tx, {
+				sandboxId,
+				kind: 1,
+				mode: 0o644,
+				size: data.length,
+				contentSha256: sha256,
+			});
+		});
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteInode(tx, inodeId);
+		});
+
+		// 1h grace window: the orphan is fresh, so it must survive.
+		const survived = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+		});
+		expect(includesSha(survived, sha256)).toBe(false);
+		const stillThere = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(stillThere).toEqual(data);
+
+		// Zero grace window: the orphan is now eligible and gets collected.
+		const collected = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 0);
+		});
+		expect(includesSha(collected, sha256)).toBe(true);
+		const gone = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(gone).toBeNull();
+	});
+
+	it("orphan with NULL last_referenced_at is collected even under a long grace window", async () => {
+		const sha256 = new Uint8Array(32).fill(0x22);
+		const data = new TextEncoder().encode("legacy null content");
+
+		// Insert directly with an explicit NULL last_referenced_at and no inode.
+		await dialect.transaction(async (tx) => {
+			await tx`
+				INSERT INTO blobs (sha256, data, size, last_referenced_at)
+				VALUES (${sha256}, ${data}, ${data.length}, NULL)
+			`;
+		});
+
+		// Long grace window — NULL is treated as ancient, so it is still collected.
+		const collected = await dialect.transaction(async (tx) => {
+			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+		});
+		expect(includesSha(collected, sha256)).toBe(true);
+
+		const gone = await dialect.transaction(async (tx) => {
+			return await dialect.getBlob(tx, sha256);
+		});
+		expect(gone).toBeNull();
+	});
+
+	it("blob referenced only by another sandbox survives no-context GC (RLS escape)", async () => {
+		const sha256 = new Uint8Array(32).fill(0x33);
+		const data = new TextEncoder().encode("cross sandbox content");
+		const otherSandboxId = `${sandboxId}-other`;
+
+		await dialect.transaction(async (tx) => {
+			await dialect.createSandbox(tx, otherSandboxId);
+		});
+
+		try {
+			await dialect.transaction(async (tx) => {
+				await dialect.upsertBlob(tx, sha256, data);
+			});
+			// The referencing inode lives in the OTHER sandbox.
+			await dialect.transaction(async (tx) => {
+				await dialect.setSandboxContext(tx, otherSandboxId);
+				await dialect.createInode(tx, {
+					sandboxId: otherSandboxId,
+					kind: 1,
+					mode: 0o644,
+					size: data.length,
+					contentSha256: sha256,
+				});
+			});
+
+			// GC runs with NO setSandboxContext — the RLS escape lets the
+			// context-less tx see the other sandbox's inode, so the anti-join
+			// keeps this blob alive.
+			const deleted = await dialect.transaction(async (tx) => {
+				return await dialect.gcOrphanBlobs(tx, 0);
+			});
+			expect(includesSha(deleted, sha256)).toBe(false);
+
+			const survived = await dialect.transaction(async (tx) => {
+				return await dialect.getBlob(tx, sha256);
+			});
+			expect(survived).toEqual(data);
+		} finally {
+			// deleteSandbox cascades the inode, but blobs are global (no sandbox_id),
+			// so the now-orphan blob must be removed explicitly to avoid leaking.
+			await dialect.transaction(async (tx) => {
+				await dialect.deleteSandbox(tx, otherSandboxId);
+				await tx`DELETE FROM blobs WHERE sha256 = ${sha256}`;
+			});
+		}
 	});
 });
 

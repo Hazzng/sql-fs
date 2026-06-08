@@ -329,10 +329,18 @@ export interface SqlDialect<Tx = unknown> {
 	getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>>;
 
 	/**
-	 * Deletes blobs whose sha256 is not referenced by any inode's content_sha256.
-	 * Returns the count of blobs deleted.
+	 * Deletes orphan blobs — those whose sha256 is not referenced by any inode's
+	 * content_sha256 — that are older than the `minAgeMs` grace window.
+	 *
+	 * `minAgeMs` is the grace window in milliseconds: orphans whose
+	 * `last_referenced_at` is younger than this are kept (they may be re-adopted
+	 * by an in-flight dedup upsert). A NULL `last_referenced_at` is treated as
+	 * ancient and is always eligible for collection. Pass `0` to collect every
+	 * orphan immediately.
+	 *
+	 * Returns the sha256s of the deleted blobs (for later cache invalidation).
 	 */
-	gcOrphanBlobs(tx: Tx): Promise<number>;
+	gcOrphanBlobs(tx: Tx, minAgeMs: number): Promise<Uint8Array[]>;
 
 	// ── Bulk / tree operations ────────────────────────────────────────────────────
 

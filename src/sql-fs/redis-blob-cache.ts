@@ -88,4 +88,23 @@ export class RedisBlobCache {
 			console.error(JSON.stringify({ event: "redis_blob_set_error", error: (err as Error).message }));
 		}
 	}
+
+	/**
+	 * Bulk-delete cache entries for the given sha256s (e.g. after blob GC).
+	 * Chunked like `mget`; uses UNLINK (non-blocking reclaim). Fail-open: a Redis
+	 * error is logged and swallowed — stale entries are harmless (no inode
+	 * references them) and expire by TTL.
+	 */
+	async mdel(sha256s: ReadonlyArray<Uint8Array>): Promise<void> {
+		if (!this.#enabled || sha256s.length === 0) return;
+		const CHUNK = 1024;
+		try {
+			for (let i = 0; i < sha256s.length; i += CHUNK) {
+				const keys = sha256s.slice(i, i + CHUNK).map((s) => this.#key(s));
+				await this.#client.unlink(...keys);
+			}
+		} catch (err) {
+			console.error(JSON.stringify({ event: "redis_blob_mdel_error", error: (err as Error).message }));
+		}
+	}
 }
