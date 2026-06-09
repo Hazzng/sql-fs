@@ -408,4 +408,30 @@ describe("pyodide drain — manifest validation (review #7)", () => {
 		await drain(fs, "/home/user", resp, caps);
 		expect(await fs.readFile("/home/user/d/x.txt", "utf8")).toBe("hi");
 	});
+
+	it("replaces an existing file with a directory at the same path (file→dir, review #2)", async () => {
+		const fs = await fsAt("/home/user");
+		await fs.writeFile("/home/user/x", "i was a file");
+		const resp = makeResponse({ created: [{ path: "/home/user/x", kind: "dir", mode: 0o755, data: "" }] });
+		await drain(fs, "/home/user", resp, caps);
+		expect((await fs.stat("/home/user/x")).isDirectory).toBe(true);
+	});
+
+	it("replaces an existing directory with a file at the same path (dir→file, review #2)", async () => {
+		const fs = await fsAt("/home/user");
+		await fs.mkdir("/home/user/x", { recursive: true });
+		const resp = makeResponse({ created: [fileEntry("/home/user/x", "now a file")] });
+		await drain(fs, "/home/user", resp, caps);
+		expect((await fs.stat("/home/user/x")).isFile).toBe(true);
+		expect(await fs.readFile("/home/user/x", "utf8")).toBe("now a file");
+	});
+
+	it("rejects a drain through a symlinked ancestor directory (review #7)", async () => {
+		const fs = await fsAt("/home/user");
+		await fs.mkdir("/home/user/real", { recursive: true });
+		await fs.symlink("/home/user/real", "/home/user/link");
+		const resp = makeResponse({ created: [fileEntry("/home/user/link/evil.txt", "x")] });
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+		expect(await fs.exists("/home/user/real/evil.txt")).toBe(false);
+	});
 });

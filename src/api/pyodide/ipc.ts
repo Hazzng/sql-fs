@@ -145,6 +145,15 @@ function assertFsEntry(entry: unknown, label: string): void {
 	if (typeof entry.data !== "string") throw new IpcIntegrityError(`${label}: missing/invalid data`);
 	if (entry.kind === "dir" && entry.data !== "")
 		throw new IpcIntegrityError(`${label}: dir entry must have empty data`);
+	// `data` MUST be valid base64 for a file (it is decoded straight into persisted
+	// bytes by the drain). Reject malformed payloads here rather than silently
+	// decoding garbage. (`""` is a legal empty file.)
+	if (entry.kind === "file" && !isBase64(entry.data)) throw new IpcIntegrityError(`${label}: data is not valid base64`);
+}
+
+/** Strict canonical-base64 check: length a multiple of 4, only the base64 alphabet + padding. */
+function isBase64(s: string): boolean {
+	return s.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(s);
 }
 
 /**

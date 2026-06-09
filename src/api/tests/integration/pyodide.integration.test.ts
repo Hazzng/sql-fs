@@ -13,7 +13,7 @@
 
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../sql-fs/index.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
@@ -32,22 +32,31 @@ const COLD = 120_000;
 
 describe.skipIf(SKIP)("pyodide runtime — end-to-end (real Deno + Pyodide)", () => {
 	let sm: SessionManager;
-	const cleanup: string[] = [];
+	let cleanup: string[] = [];
+	const savedEnv = new Map<string, string | undefined>();
 
 	beforeAll(() => {
+		for (const k of ["PYODIDE_ASSET_DIR", "DENO_BIN_PATH"]) savedEnv.set(k, process.env[k]);
 		process.env.PYODIDE_ASSET_DIR = ASSET_DIR;
 		process.env.DENO_BIN_PATH = DENO_BIN;
 		sm = new SessionManager({ tenantConfig: loadTenantConfig() });
 	});
 
+	// Clean up each test's sandbox (session + Deno child + DB rows) per test, rather
+	// than letting them accumulate until the final shutdown().
+	afterEach(async () => {
+		for (const id of cleanup) {
+			await sm.destroy(TENANT, id).catch(() => {});
+			await destroySandbox("postgres", id).catch(() => {});
+		}
+		cleanup = [];
+	});
+
 	afterAll(async () => {
 		await sm.shutdown({ drainTimeoutMs: 5_000 }).catch(() => {});
-		for (const id of cleanup) {
-			try {
-				await destroySandbox("postgres", id);
-			} catch {
-				/* ignore */
-			}
+		for (const [k, v] of savedEnv) {
+			if (v === undefined) Reflect.deleteProperty(process.env, k);
+			else process.env[k] = v;
 		}
 	});
 
@@ -147,6 +156,53 @@ describe.skipIf(SKIP)("pyodide runtime — end-to-end (real Deno + Pyodide)", ()
 			expect(r2.exitCode).toBe(0);
 			expect(r2.stdout).toContain("LEAK=clean");
 			expect(r2.stdout).toContain("FOO=clean");
+		},
+		COLD,
+	);
+
+	it(
+		"a file script can import a sibling module from its own directory (sys.path, review #1)",
+		async () => {
+			const id = `pyo-syspath-${Date.now()}`;
+			cleanup.push(id);
+			const session = await sm.getOrCreate(TENANT, id, PYODIDE, "owner");
+			const cwd = session.cwd;
+			await session.fs.mkdir(`${cwd}/pkg`, { recursive: true });
+			await session.fs.writeFile(`${cwd}/pkg/helper.py`, "VALUE = 42\n");
+			await session.fs.writeFile(`${cwd}/pkg/main.py`, "import helper\nprint('val', helper.VALUE)\n");
+			// Sibling import only resolves if the script's dir (pkg/) is on sys.path[0].
+			const r = await sm.execWithRuntimeThrottle(session, "python3 pkg/main.py");
+			expect(r.exitCode).toBe(0);
+			expect(r.stdout).toContain("val 42");
+		},
+		COLD,
+	);
+
+	it(
+		"replaces a file with a directory and drains the replacement (file↔dir baseline, review #2)",
+		async () => {
+			const id = `pyo-replace-${Date.now()}`;
+			cleanup.push(id);
+			const session = await sm.getOrCreate(TENANT, id, PYODIDE, "owner");
+			const cwd = session.cwd;
+			await session.fs.mkdir(cwd, { recursive: true });
+			await session.fs.writeFile(`${cwd}/x`, "i am a file");
+			await session.fs.writeFile(
+				`${cwd}/replace.py`,
+				[
+					"import os",
+					"os.remove('x')",
+					"os.mkdir('x')",
+					"open('x/inside.txt','w').write('hi')",
+					"print('replaced')",
+				].join("\n"),
+			);
+			const r = await sm.execWithRuntimeThrottle(session, "python3 replace.py");
+			expect(r.exitCode).toBe(0);
+			expect(r.stdout).toContain("replaced");
+			// The file→dir replacement must persist to SqlFs (was invisible before #2).
+			expect((await session.fs.stat(`${cwd}/x`)).isDirectory).toBe(true);
+			expect(await session.fs.readFile(`${cwd}/x/inside.txt`, "utf8")).toBe("hi");
 		},
 		COLD,
 	);

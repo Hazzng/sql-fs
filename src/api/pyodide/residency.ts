@@ -177,7 +177,9 @@ export class PyodideResidency {
 			if (!this.#evictable(worker)) continue;
 			if (now - touched >= this.#idleMs) {
 				this.#residents.delete(worker);
-				void worker.dispose();
+				// Swallow a dispose() rejection — the child is being torn down best-effort
+				// and an unhandled rejection from the timer must not crash the process.
+				worker.dispose().catch(() => {});
 			}
 		}
 	}

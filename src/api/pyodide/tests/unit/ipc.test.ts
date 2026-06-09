@@ -205,6 +205,16 @@ describe("validateInbound — drain entry schema (FsEntry[] / string[])", () => 
 		const frame = responseFrame({ deleted: [42] as never });
 		expect(() => validateInbound(frame, RESPONSE_CTX)).toThrow(IpcIntegrityError);
 	});
+
+	it("rejects a file entry whose data is not valid base64 (review #4)", () => {
+		const frame = responseFrame({ created: [{ path: "/cwd/x", kind: "file", mode: 0o644, data: "not base64!!" }] });
+		expect(() => validateInbound(frame, RESPONSE_CTX)).toThrow(IpcIntegrityError);
+	});
+
+	it("rejects a file entry whose base64 length is not a multiple of 4 (review #4)", () => {
+		const frame = responseFrame({ created: [{ path: "/cwd/x", kind: "file", mode: 0o644, data: "QQQ" }] });
+		expect(() => validateInbound(frame, RESPONSE_CTX)).toThrow(IpcIntegrityError);
+	});
 });
 
 describe("validateInbound — direction / shape", () => {

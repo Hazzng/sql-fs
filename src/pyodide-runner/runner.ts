@@ -75,8 +75,10 @@ function emit(frame: Frame): void {
 }
 
 // ── Pyodide instance + MEMFS handle (assigned by the init sequence below) ────
-let pyodide;
-let FS;
+// deno-lint-ignore no-explicit-any
+let pyodide: any;
+// deno-lint-ignore no-explicit-any
+let FS: any;
 
 /**
  * Adversarial self-test (spike S2 hard gate). Runs AFTER realm lockdown and
@@ -233,9 +235,11 @@ async function runOne(req: RunRequest): Promise<RunResponse> {
 	// the diff baseline (excludes staging infrastructure dirs, which pre-exist
 	// from the caller's SqlFs tree).
 	const baseFiles = new Map<string, Uint8Array>();
-	const basePaths = new Set<string>();
+	// Track KIND per path (not just presence) so a file↔dir replacement at the same
+	// path is detectable — otherwise `os.remove('x'); os.mkdir('x')` is invisible.
+	const baseKind = new Map<string, "file" | "dir">();
 	for (const node of walkTree(cwd)) {
-		basePaths.add(node.path);
+		baseKind.set(node.path, node.kind);
 		if (node.kind === "file" && node.bytes) baseFiles.set(node.path, node.bytes);
 	}
 
@@ -254,6 +258,13 @@ import sys, os, io, json as __json
 sys.argv = __json.loads(__sqlfs_argv) or [""]
 os.chdir(__sqlfs_cwd)
 sys.stdin = io.StringIO(__sqlfs_stdin)
+# CPython parity: a FILE script runs with its OWN directory at sys.path[0] so sibling
+# imports resolve (argv[0] is "-c"/"-"/"" for the inline/stdin/bare modes, where cwd
+# applies). Snapshot sys.path so the insert is undone per run (the warm child persists it).
+__sqlfs_syspath_saved = list(sys.path)
+__sqlfs_argv0 = sys.argv[0] if sys.argv else ""
+if __sqlfs_argv0 and __sqlfs_argv0 not in ("-c", "-"):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__sqlfs_argv0)))
 # Snapshot the FULL os.environ, then apply the exec's exported env. The warm child
 # persists os.environ across runs, so we snapshot/restore the WHOLE mapping (not just
 # injected keys) to keep env strictly per-execution — a script that sets a NEW
@@ -300,6 +311,7 @@ sys.stderr = __sqlfs_err
 	await pyodide.runPythonAsync(`
 sys.stdout = sys.__stdout__
 sys.stderr = sys.__stderr__
+sys.path[:] = __sqlfs_syspath_saved
 os.environ.clear()
 os.environ.update(__sqlfs_env_saved)
 __sqlfs_env_saved.clear()
@@ -308,27 +320,44 @@ __sqlfs_env_saved.clear()
 
 	// ── Diff the cwd subtree (dirs + files) against the staged baseline ───────
 	const after = walkTree(cwd);
+	const afterKind = new Map<string, "file" | "dir">();
+	for (const node of after) afterKind.set(node.path, node.kind);
+
 	const createdDirs: FsEntry[] = [];
 	const createdFiles: FsEntry[] = [];
 	const modified: FsEntry[] = [];
-	const afterPaths = new Set<string>();
 	for (const node of after) {
-		afterPaths.add(node.path);
 		if (node.kind === "dir") {
-			if (!basePaths.has(node.path)) createdDirs.push({ path: node.path, kind: "dir", mode: node.mode, data: "" });
+			// New, OR a path that was a FILE before (file→dir replacement) — both are a
+			// "created dir" the drain materializes (replacing the old file in place).
+			if (baseKind.get(node.path) !== "dir") createdDirs.push({ path: node.path, kind: "dir", mode: node.mode, data: "" });
 			continue;
 		}
 		const bytes = node.bytes ?? new Uint8Array(0);
-		const before = baseFiles.get(node.path);
 		const entry: FsEntry = { path: node.path, kind: "file", mode: node.mode, data: Buffer.from(bytes).toString("base64") };
-		if (before === undefined) createdFiles.push(entry);
-		else if (!sameBytes(before, bytes)) modified.push(entry);
+		if (baseKind.get(node.path) !== "file") createdFiles.push(entry); // new, or dir→file replacement
+		else if (!sameBytes(baseFiles.get(node.path) ?? new Uint8Array(0), bytes)) modified.push(entry);
 	}
 	// dirs-before-files, dirs shallow→deep, so the drain can apply created in order.
 	createdDirs.sort((a, b) => depth(a.path) - depth(b.path));
 	const created: FsEntry[] = [...createdDirs, ...createdFiles];
-	// deleted: any baseline path gone, deepest-first (children before parents).
-	const deleted = [...basePaths].filter((p) => !afterPaths.has(p)).sort((a, b) => depth(b) - depth(a));
+
+	// deleted: a baseline path gone from the after-tree, EXCEPT those shadowed by an
+	// ancestor that is now a FILE (a dir→file replacement implicitly drops the old
+	// children; emitting them as separate deletes would also collide with the created
+	// file under drain validation). Deepest-first (children before parents).
+	const cwdNoSlash = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+	const shadowedByFile = (p: string): boolean => {
+		let parent = p.slice(0, p.lastIndexOf("/"));
+		while (parent.length > cwdNoSlash.length && parent.startsWith(`${cwdNoSlash}/`)) {
+			if (afterKind.get(parent) === "file") return true;
+			parent = parent.slice(0, parent.lastIndexOf("/"));
+		}
+		return false;
+	};
+	const deleted = [...baseKind.keys()]
+		.filter((p) => !afterKind.has(p) && !shadowedByFile(p))
+		.sort((a, b) => depth(b) - depth(a));
 
 	// Wipe the ENTIRE cwd subtree (files + dirs, deepest-first) so the next exec
 	// in this warm child starts from a clean cwd — no leftover dirs leak across
@@ -377,7 +406,9 @@ __sqlfs_env_saved.clear()
 const ready: ReadyFrame = { type: "ready", generation };
 emit(ready);
 
-let buf = new Uint8Array(0);
+// `decodeFrames` returns `rest` as a `Uint8Array<ArrayBufferLike>`; widen the
+// accumulator's type so the reassignment type-checks under `deno check`.
+let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 const reader = stdinReadable.getReader();
 for (;;) {
 	const { value, done } = await reader.read();

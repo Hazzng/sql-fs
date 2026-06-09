@@ -68,7 +68,7 @@ if [[ ! -f "${PYODIDE_DIR}/pyodide.mjs" ]]; then
 else
 	echo "[s1] Pyodide ${PYODIDE_VERSION} already extracted" >&2
 fi
-echo "[s1] pyodide assets: $(ls "${PYODIDE_DIR}" | wc -l | tr -d ' ') files in ${PYODIDE_DIR}" >&2
+echo "[s1] pyodide assets: $(find "${PYODIDE_DIR}" -maxdepth 1 -type f | wc -l | tr -d ' ') files in ${PYODIDE_DIR}" >&2
 
 # --- 2b. Vendor openpyxl + et_xmlfile wheels (NOT in the pyodide dist) -------
 # FINDING (gates Phase 3): openpyxl + et_xmlfile are absent from pyodide

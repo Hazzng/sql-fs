@@ -15,6 +15,7 @@
 		"start": "node dist/api/server.js",
 		"bench:remote-bash": "python3 scripts/benchmark_remote_bash.py",
 		"typecheck": "tsc --noEmit",
+		"typecheck:runner": "${DENO_BIN_PATH:-vendor/deno/deno} check src/pyodide-runner/runner.ts",
 		"lint": "biome check .",
 		"lint:fix": "biome check --write .",
 		"test": "vitest run",

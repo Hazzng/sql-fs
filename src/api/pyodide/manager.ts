@@ -472,6 +472,13 @@ export class PyodideSandbox {
 			if (this.#child !== child) return;
 			this.#failOwned(err, true);
 		});
+		// The synchronous try/catch around `stdin.write` only catches sync throws; a
+		// torn-down child can also emit an ASYNC stream error (EPIPE / destroyed) on
+		// stdin. Route it through #failOwned so a broken pipe can't escape unhandled.
+		child.stdin?.on("error", (err: Error) => {
+			if (this.#child !== child) return;
+			this.#failOwned(err, true);
+		});
 	}
 
 	#killChild(): void {

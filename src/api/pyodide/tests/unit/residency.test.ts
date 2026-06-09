@@ -135,6 +135,19 @@ describe("PyodideResidency — idle-kill", () => {
 		expect(residency.residentCount).toBe(0);
 	});
 
+	it("swallows a dispose() rejection in the idle-kill sweep (review #8)", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		residency = new PyodideResidency({ maxResident: 2, idleMs: 1000, sweepIntervalMs: 1000 });
+		const w: FakeWorker = { state: "idle", dispose: vi.fn(() => Promise.reject(new Error("dispose boom"))) };
+		await residency.admit(() => asSandbox(w));
+		// The sweep must not surface an unhandled rejection when dispose rejects (an
+		// unhandled rejection here would fail this test).
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(w.dispose).toHaveBeenCalledTimes(1);
+		expect(residency.residentCount).toBe(0); // still removed from the registry
+	});
+
 	it("does NOT idle-kill a busy worker even past the idle window", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(0);

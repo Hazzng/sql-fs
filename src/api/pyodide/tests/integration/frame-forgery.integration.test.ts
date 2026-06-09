@@ -24,7 +24,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { RunResponse } from "../../../../pyodide-runner/protocol.js";
 import { PyodideDrainError, drain } from "../../../commands/pyodide-command.js";
 import { SessionManager } from "../../../session-manager.js";
@@ -77,8 +77,11 @@ function frameOf(jsonExpr: string): string {
 describe.skipIf(!ASSETS_PRESENT)("pyodide frame-forgery suite (real Deno child)", () => {
 	let sm: SessionManager;
 	let session: Awaited<ReturnType<SessionManager["getOrCreate"]>>;
+	let sandboxId: string;
+	const savedEnv = new Map<string, string | undefined>();
 
 	beforeAll(() => {
+		for (const k of ["PYODIDE_ASSET_DIR", "DENO_BIN_PATH"]) savedEnv.set(k, process.env[k]);
 		process.env.PYODIDE_ASSET_DIR = ASSET_DIR;
 		process.env.DENO_BIN_PATH = DENO_BIN;
 		sm = new SessionManager({ createFs: (): Promise<IFileSystem> => Promise.resolve(new InMemoryFs()) });
@@ -86,13 +89,24 @@ describe.skipIf(!ASSETS_PRESENT)("pyodide frame-forgery suite (real Deno child)"
 
 	afterAll(async () => {
 		await sm.shutdown({ drainTimeoutMs: 5_000 }).catch(() => {});
+		for (const [k, v] of savedEnv) {
+			if (v === undefined) Reflect.deleteProperty(process.env, k);
+			else process.env[k] = v;
+		}
 	});
 
 	beforeEach(async () => {
 		// Fresh session per test — each forgery kills the child; a fresh session keeps
 		// the assertions independent (each cold-starts its own child on first exec).
-		session = await sm.getOrCreate(TENANT, `forge-${Date.now()}-${Math.random().toString(36).slice(2)}`, PYODIDE);
+		sandboxId = `forge-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		session = await sm.getOrCreate(TENANT, sandboxId, PYODIDE);
 		await session.fs.mkdir(session.cwd, { recursive: true });
+	});
+
+	afterEach(async () => {
+		// Clean up the per-test session (its Deno child) rather than letting them
+		// accumulate until the final shutdown().
+		await sm.destroy(TENANT, sandboxId).catch(() => {});
 	});
 
 	/**

@@ -40,12 +40,12 @@ const COLD = 120_000;
 describe.skipIf(!ASSETS_PRESENT)("pyodide adversarial escape suite (real Deno child)", () => {
 	let sm: SessionManager;
 	let session: Awaited<ReturnType<SessionManager["getOrCreate"]>>;
-	let savedSecret: string | undefined;
+	const savedEnv = new Map<string, string | undefined>();
 
 	beforeAll(async () => {
+		for (const k of ["PYODIDE_ASSET_DIR", "DENO_BIN_PATH", "AUTH_SECRET"]) savedEnv.set(k, process.env[k]);
 		process.env.PYODIDE_ASSET_DIR = ASSET_DIR;
 		process.env.DENO_BIN_PATH = DENO_BIN;
-		savedSecret = process.env.AUTH_SECRET;
 		process.env.AUTH_SECRET = SECRET; // planted in the parent — the child must not see it
 		sm = new SessionManager({ createFs: (): Promise<IFileSystem> => Promise.resolve(new InMemoryFs()) });
 		session = await sm.getOrCreate(TENANT, "escape", PYODIDE, "owner");
@@ -56,8 +56,11 @@ describe.skipIf(!ASSETS_PRESENT)("pyodide adversarial escape suite (real Deno ch
 
 	afterAll(async () => {
 		await sm.shutdown({ drainTimeoutMs: 5_000 }).catch(() => {});
-		if (savedSecret === undefined) Reflect.deleteProperty(process.env, "AUTH_SECRET");
-		else process.env.AUTH_SECRET = savedSecret;
+		// Restore every env var we set so this suite doesn't pollute later test files.
+		for (const [k, v] of savedEnv) {
+			if (v === undefined) Reflect.deleteProperty(process.env, k);
+			else process.env[k] = v;
+		}
 	});
 
 	/** Write `code` to a script file and run it on the warm child. */

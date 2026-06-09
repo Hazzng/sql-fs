@@ -65,6 +65,14 @@ interface Caps {
 export interface PyodideCommandOptions {
 	readonly maxFileBytes?: number;
 	readonly maxTotalBytes?: number;
+	/**
+	 * Called after each completed `run()` (the worker is idle again). The
+	 * SessionManager wires this to refresh the residency idle clock PER COMMAND, so a
+	 * long earlier command in a multi-command bash script can't leave the worker
+	 * idle-and-stale long enough for the residency sweep to dispose it before the next
+	 * command (which would otherwise fail with EPYODIDE_DISPOSED).
+	 */
+	readonly onRunComplete?: () => void;
 }
 
 /** A drain / staging policy violation. Surfaces as a non-zero exec, rolling back the script tx. */
@@ -114,7 +122,9 @@ export function createPyodideCommands(
 		maxTotalBytes: opts.maxTotalBytes ?? envInt("PYODIDE_MAX_TOTAL_BYTES", PYODIDE_MAX_TOTAL_BYTES_DEFAULT),
 	};
 	const getSandbox = typeof sandbox === "function" ? sandbox : (): PyodideSandbox => sandbox;
-	const handler = (args: string[], ctx: CommandContext): Promise<ExecResult> => runPython(getSandbox, caps, args, ctx);
+	const onRunComplete = opts.onRunComplete;
+	const handler = (args: string[], ctx: CommandContext): Promise<ExecResult> =>
+		runPython(getSandbox, caps, args, ctx, onRunComplete);
 	return [defineCommand("python3", handler), defineCommand("python", handler)];
 }
 
@@ -140,6 +150,7 @@ async function runPython(
 	caps: Caps,
 	args: string[],
 	ctx: CommandContext,
+	onRunComplete?: () => void,
 ): Promise<ExecResult> {
 	const first = args[0];
 
@@ -203,6 +214,9 @@ async function runPython(
 		}
 		throw err;
 	}
+	// The worker is idle again — refresh its residency clock NOW (per command), not
+	// only after the whole bash.exec, so the sweep can't dispose it between commands.
+	onRunComplete?.();
 
 	// Abort that landed after the response but before the drain → drain nothing.
 	if (ctx.signal?.aborted) throw makeAbortError();
@@ -364,8 +378,10 @@ async function stageCwd(fs: IFileSystem, cwd: string, caps: Caps): Promise<{ fil
 		let names: string[];
 		try {
 			names = await fs.readdir(dir);
-		} catch {
-			return;
+		} catch (err) {
+			// Do NOT swallow: a readdir failure would silently stage a PARTIAL cwd and
+			// run the script against it with no signal. Surface it as a staging error.
+			throw new PyodideDrainError(`cannot read directory while staging: ${dir} (${(err as Error).message})`);
 		}
 		for (const name of names) {
 			if (name === "." || name === "..") continue;
@@ -471,10 +487,21 @@ export async function drain(fs: IFileSystem, cwd: string, resp: RunResponse, cap
 async function applyEntry(fs: IFileSystem, cwd: string, entry: FsEntry): Promise<void> {
 	const resolved = fs.resolvePath(cwd, entry.path);
 
-	// Default-deny: never write through / over an existing symlink at the target.
+	// Default-deny: never write through a symlinked ANCESTOR directory (a symlinked
+	// ancestor could redirect the write outside cwd — `resolvePath` is lexical and
+	// doesn't follow links). SqlFs default-denies symlink creation, so this is
+	// defense-in-depth, but it closes the symlink-traversal gap the final-target
+	// check alone left open.
+	await assertNoSymlinkAncestor(fs, cwd, resolved);
+
+	// Default-deny over an existing symlink at the target; and if a target of the
+	// WRONG KIND already exists (file↔dir replacement), remove it first so the new
+	// kind can be materialized in place.
 	if (await fs.exists(resolved)) {
 		const st = await fs.lstat(resolved);
 		if (st.isSymbolicLink) throw new PyodideDrainError(`refusing to drain over a symlink: ${entry.path}`);
+		const existingKind = st.isDirectory ? "dir" : "file";
+		if (existingKind !== entry.kind) await fs.rm(resolved, { recursive: true, force: true });
 	}
 
 	if (entry.kind === "dir") {
@@ -487,4 +514,21 @@ async function applyEntry(fs: IFileSystem, cwd: string, entry: FsEntry): Promise
 	// writeFile creates with the default 0644; only chmod when the runner reported
 	// a non-default mode (e.g. an executable bit).
 	if ((entry.mode & 0o777) !== 0o644) await fs.chmod(resolved, entry.mode & 0o777);
+}
+
+/**
+ * Reject any symlinked directory on the path from cwd down to `resolved`'s parent.
+ * Walks the ancestor chain (strictly between cwd and the target) and throws on the
+ * first symlink. Defense-in-depth against symlink traversal during drain.
+ */
+async function assertNoSymlinkAncestor(fs: IFileSystem, cwd: string, resolved: string): Promise<void> {
+	const cwdNoSlash = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+	let parent = resolved.slice(0, resolved.lastIndexOf("/"));
+	while (parent.length > cwdNoSlash.length && parent.startsWith(`${cwdNoSlash}/`)) {
+		if (await fs.exists(parent)) {
+			const st = await fs.lstat(parent);
+			if (st.isSymbolicLink) throw new PyodideDrainError(`refusing to drain through a symlinked directory: ${parent}`);
+		}
+		parent = parent.slice(0, parent.lastIndexOf("/"));
+	}
 }

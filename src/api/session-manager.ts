@@ -579,15 +579,27 @@ export class SessionManager {
 				const sessionRef: { current?: Session } = {};
 				if (resolvedRuntime.pythonRuntime === "pyodide") {
 					customCommands.push(
-						...createPyodideCommands(() => {
-							const live = sessionRef.current?.pyodideSandbox;
-							if (live === undefined) {
-								throw Object.assign(new Error("EPYODIDE_NO_SANDBOX: pyodide sandbox unavailable"), {
-									code: "EPYODIDE_NO_SANDBOX",
-								});
-							}
-							return live;
-						}),
+						...createPyodideCommands(
+							() => {
+								const live = sessionRef.current?.pyodideSandbox;
+								if (live === undefined) {
+									throw Object.assign(new Error("EPYODIDE_NO_SANDBOX: pyodide sandbox unavailable"), {
+										code: "EPYODIDE_NO_SANDBOX",
+									});
+								}
+								return live;
+							},
+							{
+								// Refresh the residency idle clock after EACH python command (not only
+								// after the whole bash.exec), so a long earlier command in a
+								// multi-command script can't leave the worker idle-and-stale for the
+								// sweep to dispose before the next command.
+								onRunComplete: () => {
+									const live = sessionRef.current?.pyodideSandbox;
+									if (live !== undefined) this.pyodideResidency.touch(live);
+								},
+							},
+						),
 					);
 				}
 

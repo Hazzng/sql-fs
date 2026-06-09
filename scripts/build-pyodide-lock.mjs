@@ -53,6 +53,9 @@ function findWheel(re) {
 function parseNameVersion(fileName) {
 	// PEP 427 wheel: {name}-{version}-{pytag}-{abitag}-{platformtag}.whl
 	const [name, version] = fileName.split("-");
+	if (!name || !version) {
+		throw new Error(`malformed wheel filename (expected {name}-{version}-…): ${fileName}`);
+	}
 	return { name, version };
 }
 

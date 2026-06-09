@@ -12,9 +12,10 @@
  *
  * INTEGRITY. Platform-independent runtime bytes are SHA-256-pinned to the exact
  * artifacts spike S1 validated (pyodide.mjs / pyodide.asm.wasm / python_stdlib.zip
- * and the two pure-python wheels). The Deno binary is pinned by version + the
- * official dl.deno.land URL only — its bytes are platform-specific, so a single
- * cross-arch checksum is impossible; we verify it extracted and is executable.
+ * and the two pure-python wheels). The Deno binary is platform-specific, so it is
+ * pinned PER TARGET in `DENO_SHA256` and verified after extraction: an unpinned
+ * target OR a checksum mismatch is a HARD FAILURE — we never run an unverified Deno
+ * binary (all four supported targets are pinned).
  *
  * Requires `curl`, `unzip`, and `tar` (with bzip2) on PATH — present on macOS and
  * installed in the Docker builder stage. Mirrors the proven spike
@@ -51,6 +52,19 @@ const SHA256 = {
 	"python_stdlib.zip": "92cb24faa546818f3ef4050fd5bd2b6487bd2042efed2113af141d035f30efb4",
 	[PINS.openpyxlWheel]: "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2",
 	[PINS.etXmlfileWheel]: "7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa",
+};
+
+// SHA-256 of the EXTRACTED Deno binary, per target, for PINS.deno. The binary is
+// platform-specific, so it's keyed by target rather than a single hash. After
+// download/extraction the binary is verified against this map: an UNPINNED target
+// or a MISMATCH is a HARD FAILURE (supply-chain / tamper guard) — we never run an
+// unverified Deno binary. To bump PINS.deno: download deno-<target>.zip for every
+// target below, and record sha256 of the extracted `deno`.
+const DENO_SHA256 = {
+	"aarch64-apple-darwin": "9d25a1a5a67579eb607ed27a73141548b163e29df38735bc5556b7d887992435",
+	"x86_64-apple-darwin": "a06e411d2da878b9240ecab047ea4ad3f2d1297dfff6bae9de7059baf34733dd",
+	"x86_64-unknown-linux-gnu": "30761b46413a814d5f83081bf6011e0c900a5b4154f64b03a065e97511079fa0",
+	"aarch64-unknown-linux-gnu": "f7dc66b53f77133b4ca9a24c77d1fb48e49cd8c26a4043e49f6b0b8195f09d80",
 };
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -95,12 +109,29 @@ function denoTarget() {
 	return target;
 }
 
+function verifyDeno(target) {
+	const expected = DENO_SHA256[target];
+	const actual = sha256(DENO_BIN);
+	if (!expected) {
+		// HARD FAIL — never run an unverified Deno binary. Add the target's hash to
+		// DENO_SHA256 (download deno-<target>.zip for PINS.deno and sha256 the binary).
+		throw new Error(
+			`Deno binary for ${target} is not pinned in DENO_SHA256 (its sha256 is ${actual}) — add it before building`,
+		);
+	}
+	if (actual !== expected) {
+		throw new Error(`Deno binary checksum mismatch for ${target}: expected ${expected}, got ${actual}`);
+	}
+	log(`verified Deno binary for ${target} (sha256 ok)`);
+}
+
 function fetchDeno() {
+	const target = denoTarget();
 	if (existsSync(DENO_BIN)) {
+		verifyDeno(target); // verify even when already present (catches a swapped binary)
 		log(`Deno ${PINS.deno} already present`);
 		return;
 	}
-	const target = denoTarget();
 	mkdirSync(DENO_DIR, { recursive: true });
 	mkdirSync(CACHE, { recursive: true });
 	const zip = join(CACHE, `deno-${PINS.deno}-${target}.zip`);
@@ -117,6 +148,7 @@ function fetchDeno() {
 		/* not macOS / no xattr */
 	}
 	if (!existsSync(DENO_BIN)) throw new Error("Deno binary not present after extraction");
+	verifyDeno(target);
 	log(`Deno ${PINS.deno} ready at ${DENO_BIN}`);
 }
 

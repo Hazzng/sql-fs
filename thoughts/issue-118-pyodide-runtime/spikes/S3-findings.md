@@ -7,7 +7,7 @@ Decision 5: as the non-root `node` user in `node:22-slim`, **per-child memory
 limiting is unavailable/unusable**, so the **operator-set container memory limit
 + accepted availability risk is the guard**.
 
-```
+```text
 cgroup_write_denied=1 rlimit_as_unusable=1 (vaddr_decoupled=1 rlimit_breaks_wasm=1)
 S3 PASS: non-root cannot set cgroup memory.max; prlimit --as is unusable for RSS
          (V8/WASM vaddr >> RSS). Container memory limit is the real guard.

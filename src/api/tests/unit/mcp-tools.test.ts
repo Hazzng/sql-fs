@@ -124,7 +124,11 @@ describe("MCP tools — python_runtime echo", () => {
 
 		const result = (await getHandler()({ python_runtime: "pyodide" }, {})) as { content: { text: string }[] };
 		const body = JSON.parse(result.content[0]!.text);
-		expect(body.python_runtime).toBe("pyodide");
+		// Assert the capability echo present in the MCP record (python_runtime +
+		// javascript; `network` is intentionally not surfaced in MCP records) plus the
+		// dynamic id.
+		expect(body).toMatchObject({ python_runtime: "pyodide", javascript: false });
+		expect(typeof body.id).toBe("string");
 	});
 
 	it("sandbox_list echoes python_runtime per sandbox", async () => {
@@ -147,6 +151,15 @@ describe("MCP tools — python_runtime echo", () => {
 
 		const result = (await getHandler()({}, {})) as { content: { text: string }[] };
 		const body = JSON.parse(result.content[0]!.text);
-		expect(body.sandboxes[0].python_runtime).toBe("stdlib");
+		// Assert the whole per-sandbox MCP record (not just python_runtime); `network`
+		// is intentionally not surfaced in MCP records.
+		expect(body.sandboxes).toHaveLength(1);
+		expect(body.sandboxes[0]).toMatchObject({
+			id: "sb-1",
+			name: null,
+			owner: "test-owner",
+			python_runtime: "stdlib",
+			javascript: false,
+		});
 	});
 });
