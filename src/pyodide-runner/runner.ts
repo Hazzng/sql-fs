@@ -123,8 +123,8 @@ try {
 		stderr: () => {},
 	});
 
-	// numpy/pandas/scipy ship in the distribution → load by name.
-	await pyodide.loadPackage(["numpy", "pandas", "scipy"]);
+	// numpy/pandas/matplotlib loaded by name from the stock lock.
+	await pyodide.loadPackage(["numpy", "pandas", "matplotlib"]);
 	// openpyxl + et_xmlfile are NOT in the distribution; load the vendored pure-python
 	// wheels by local file:// URL (discovered in the asset dir). loadPackage reads
 	// them via node:fs under --allow-read — no network. (Phase 0 Discoveries: the

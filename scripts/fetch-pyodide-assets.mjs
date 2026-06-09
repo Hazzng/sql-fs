@@ -47,7 +47,7 @@ const WHEEL_URLS = {
 // SHA-256 of the platform-independent artifacts, pinned to the exact bytes
 // spike S1 validated. Mismatch ⇒ hard failure (supply-chain / corruption guard).
 const SHA256 = {
-	"pyodide.mjs": "c8dffeefeb6f9c4bf635baf0cdb51f4da06df0e3aab4fe1a99b8ad3570065461",
+	"pyodide.mjs": "8fdfed5eaf81bde14bcdeaeea11f2672675b2362248f8537446b6fda5e4a4751",
 	"pyodide.asm.wasm": "10090fe41e019ae669d512e1f747021a8db2aaab0f6dd6f85fa9368c55d681e3",
 	"python_stdlib.zip": "92cb24faa546818f3ef4050fd5bd2b6487bd2042efed2113af141d035f30efb4",
 	[PINS.openpyxlWheel]: "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2",
