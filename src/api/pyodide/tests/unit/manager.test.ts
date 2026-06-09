@@ -10,7 +10,7 @@
 import { Buffer } from "node:buffer";
 import type { SpawnOptions } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { IpcFrameTooLargeError, IpcIntegrityError } from "../../ipc.js";
+import { IpcFrameTooLargeError, IpcIntegrityError, encodeFrame } from "../../ipc.js";
 import type { RunRequestInput } from "../../manager.js";
 import {
 	COMMITTED_FLAGS,
@@ -26,7 +26,13 @@ const INPUT: RunRequestInput = { code: "print(1)", argv: ["x.py"], stdin: "", fi
 let seq = 0;
 function makeManager(
 	harness: Harness,
-	opts: { runtimeTimeoutMs?: number; maxFrameBytes?: number; maxAggregateBytes?: number } = {},
+	opts: {
+		runtimeTimeoutMs?: number;
+		maxFrameBytes?: number;
+		maxAggregateBytes?: number;
+		maxChildRssBytes?: number;
+		readChildRssBytes?: (pid: number) => Promise<number | null>;
+	} = {},
 ): PyodideSandbox {
 	return new PyodideSandbox({
 		assetDir: "/vendor/pyodide",
@@ -38,6 +44,9 @@ function makeManager(
 		runtimeTimeoutMs: opts.runtimeTimeoutMs ?? 5_000,
 		maxFrameBytes: opts.maxFrameBytes,
 		maxAggregateBytes: opts.maxAggregateBytes,
+		maxChildRssBytes: opts.maxChildRssBytes,
+		readChildRssBytes: opts.readChildRssBytes,
+		preloadPackages: ["numpy", "pandas"],
 	});
 }
 
@@ -122,6 +131,34 @@ describe("PyodideSandbox — happy path & serialization", () => {
 
 		expect(order).toEqual([1, 2]);
 		expect(harness.children).toHaveLength(1);
+	});
+
+	it("reassembles ready and result frames delivered one byte at a time", async () => {
+		const harness = makeHarness();
+		const manager = track(makeManager(harness));
+		const p = manager.run(INPUT, new AbortController().signal);
+		const child = await harness.nextChild();
+
+		for (const byte of encodeFrame({ type: "ready", generation: child.generation })) {
+			child.stdout.write(Buffer.from([byte]));
+		}
+		const run = await child.nextRun();
+		const result = encodeFrame({
+			type: "result",
+			requestId: run.requestId,
+			seq: run.seq,
+			generation: run.generation,
+			stdout: "",
+			stderr: "",
+			exitCode: 0,
+			created: [],
+			modified: [],
+			deleted: [],
+		});
+		for (const byte of result) child.stdout.write(Buffer.from([byte]));
+
+		await expect(p).resolves.toMatchObject({ exitCode: 0 });
+		expect(child.killed).toBe(false);
 	});
 });
 
@@ -302,6 +339,15 @@ describe("PyodideSandbox — frame integrity (each violation kills the child)", 
 		expect(child.killed).toBe(true);
 	});
 
+	it("rejects an oversized declared length as soon as the fragmented header completes", async () => {
+		const { child, p } = await inFlight({ maxFrameBytes: 200 });
+		const header = Buffer.alloc(4);
+		header.writeUInt32BE(201, 0);
+		for (const byte of header) child.stdout.write(Buffer.from([byte]));
+		expect(await p).toBeInstanceOf(IpcFrameTooLargeError);
+		expect(child.killed).toBe(true);
+	});
+
 	it("a duplicate / replayed response (none in-flight) → kill", async () => {
 		const harness = makeHarness();
 		const manager = track(makeManager(harness));
@@ -383,6 +429,7 @@ describe("PyodideSandbox — spawn posture", () => {
 				runnerPath: "/dist/pyodide-runner/runner.ts",
 				spawnFn: recordingSpawn,
 				randomRequestId: () => "req-x",
+				preloadPackages: ["numpy", "pandas"],
 			}),
 		);
 
@@ -402,11 +449,44 @@ describe("PyodideSandbox — spawn posture", () => {
 			"--allow-read=/vendor/pyodide",
 			"/dist/pyodide-runner/runner.ts",
 			"/vendor/pyodide",
+			'["numpy","pandas"]',
 			"1",
 		]);
 		// Scrubbed env: ONLY the update-check suppressor — no AUTH_SECRET/DATABASE_URL.
 		expect(call.opts.env).toEqual({ DENO_NO_UPDATE_CHECK: "1" });
 		expect(call.opts.stdio).toEqual(["pipe", "pipe", "pipe"]);
+	});
+});
+
+describe("PyodideSandbox — RSS retirement", () => {
+	it("returns the completed response, then retires an over-limit child and respawns on the next run", async () => {
+		const harness = makeHarness();
+		const sampledPids: number[] = [];
+		const manager = track(
+			makeManager(harness, {
+				maxChildRssBytes: 500,
+				readChildRssBytes: async (pid) => {
+					sampledPids.push(pid);
+					return 501;
+				},
+			}),
+		);
+
+		const p1 = manager.run(INPUT, new AbortController().signal);
+		const child1 = await harness.nextChild();
+		child1.sendReady();
+		child1.sendResult(await child1.nextRun());
+		await expect(p1).resolves.toMatchObject({ exitCode: 0 });
+		expect(sampledPids).toEqual([child1.pid]);
+		expect(child1.killed).toBe(true);
+		expect(manager.state).toBe("dead");
+
+		const p2 = manager.run(INPUT, new AbortController().signal);
+		const child2 = await harness.nextChild();
+		expect(child2.generation).toBe(2);
+		child2.sendReady();
+		child2.sendResult(await child2.nextRun());
+		await expect(p2).resolves.toMatchObject({ exitCode: 0 });
 	});
 });
 

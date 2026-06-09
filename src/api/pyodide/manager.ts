@@ -26,13 +26,15 @@
  */
 
 import { Buffer } from "node:buffer";
-import { type ChildProcess, type SpawnOptions, spawn as nodeSpawn } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, execFile, spawn as nodeSpawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { Frame, RunRequest, RunResponse } from "../../pyodide-runner/protocol.js";
 import {
 	type InboundContext,
+	IpcFrameTooLargeError,
 	IpcIntegrityError,
 	PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT,
 	PYODIDE_MAX_FRAME_BYTES_DEFAULT,
@@ -74,6 +76,7 @@ export const COMMITTED_FLAGS: readonly string[] = [
 
 /** Default cap on a single owned run (init/preload + execution). */
 export const PYODIDE_RUNTIME_TIMEOUT_MS_DEFAULT = 60_000;
+export const PYODIDE_PRELOAD_PACKAGES_DEFAULT = ["numpy", "pandas"] as const;
 
 /** Injectable spawn signature (defaults to `child_process.spawn`). */
 export type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
@@ -91,10 +94,16 @@ export interface PyodideSandboxOptions {
 	readonly maxFrameBytes?: number;
 	/** Aggregate per-response wire cap (bytes). Default {@link PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT}. */
 	readonly maxAggregateBytes?: number;
+	/** Packages loaded at child init. Defaults to PYODIDE_PRELOAD_PACKAGES or numpy,pandas. */
+	readonly preloadPackages?: readonly string[];
+	/** Retire a child after a run when its RSS exceeds this threshold. Disabled by default. */
+	readonly maxChildRssBytes?: number;
 	/** Injected spawn (tests). Defaults to `child_process.spawn`. */
 	readonly spawnFn?: SpawnFn;
 	/** Injected requestId generator (tests). Defaults to `crypto.randomUUID`. */
 	readonly randomRequestId?: () => string;
+	/** Injected RSS sampler (tests). */
+	readonly readChildRssBytes?: (pid: number) => Promise<number | null>;
 }
 
 /** Thrown when an owned run exceeds {@link PyodideSandboxOptions.runtimeTimeoutMs}. */
@@ -183,11 +192,43 @@ function resolveDenoBin(bin: string): string {
 	return bin; // not found on PATH; let spawn surface ENOENT with the bare name
 }
 
+function packagesFromEnv(value: string | undefined): string[] {
+	if (value === undefined) return [...PYODIDE_PRELOAD_PACKAGES_DEFAULT];
+	return value
+		.split(",")
+		.map((name) => name.trim())
+		.filter((name) => name.length > 0);
+}
+
+async function readProcessRssBytes(pid: number): Promise<number | null> {
+	if (process.platform === "linux") {
+		try {
+			const status = await readFile(`/proc/${pid}/status`, "utf8");
+			const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status);
+			if (match?.[1]) return Number(match[1]) * 1024;
+		} catch {
+			// Fall through to ps for non-procfs Linux environments.
+		}
+	}
+	return await new Promise<number | null>((resolve) => {
+		execFile("ps", ["-o", "rss=", "-p", String(pid)], (err, stdout) => {
+			if (err) {
+				resolve(null);
+				return;
+			}
+			const rssKiB = Number(stdout.trim());
+			resolve(Number.isFinite(rssKiB) && rssKiB >= 0 ? rssKiB * 1024 : null);
+		});
+	});
+}
+
 export class PyodideSandbox {
 	#state: WorkerState = "cold";
 	#generation = 0;
 	#child: ChildProcess | null = null;
-	#readBuf: Buffer = Buffer.alloc(0);
+	#readChunks: Buffer[] = [];
+	#readBytes = 0;
+	#expectedFrameBytes = -1;
 	#aggregateBytes = 0;
 	#readyReceived = false;
 	#seqCounter = 0;
@@ -205,8 +246,11 @@ export class PyodideSandbox {
 	readonly #runtimeTimeoutMs: number;
 	readonly #maxFrameBytes: number;
 	readonly #maxAggregateBytes: number;
+	readonly #preloadPackages: readonly string[];
+	readonly #maxChildRssBytes: number | undefined;
 	readonly #spawnFn: SpawnFn;
 	readonly #randomRequestId: () => string;
+	readonly #readChildRssBytes: (pid: number) => Promise<number | null>;
 
 	constructor(opts: PyodideSandboxOptions = {}) {
 		this.#assetDir = opts.assetDir ?? process.env.PYODIDE_ASSET_DIR ?? "";
@@ -215,8 +259,12 @@ export class PyodideSandbox {
 		this.#runtimeTimeoutMs = opts.runtimeTimeoutMs ?? PYODIDE_RUNTIME_TIMEOUT_MS_DEFAULT;
 		this.#maxFrameBytes = opts.maxFrameBytes ?? PYODIDE_MAX_FRAME_BYTES_DEFAULT;
 		this.#maxAggregateBytes = opts.maxAggregateBytes ?? PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT;
+		this.#preloadPackages = opts.preloadPackages ?? packagesFromEnv(process.env.PYODIDE_PRELOAD_PACKAGES);
+		const configuredRss = opts.maxChildRssBytes ?? Number(process.env.PYODIDE_MAX_CHILD_RSS_BYTES ?? "0");
+		this.#maxChildRssBytes = Number.isFinite(configuredRss) && configuredRss > 0 ? configuredRss : undefined;
 		this.#spawnFn = opts.spawnFn ?? (nodeSpawn as SpawnFn);
 		this.#randomRequestId = opts.randomRequestId ?? randomUUID;
+		this.#readChildRssBytes = opts.readChildRssBytes ?? readProcessRssBytes;
 	}
 
 	get state(): WorkerState {
@@ -427,12 +475,11 @@ export class PyodideSandbox {
 	 * against ~41 MB resident (VmRSS) — an `RLIMIT_AS` low enough to bound RSS makes
 	 * the WASM allocation fail outright (`RangeError: could not allocate memory`).
 	 *
-	 * The **operator-set container memory limit is therefore the only real guard**;
-	 * it covers Node + every Deno child together, so a runaway child may OOM-kill
-	 * the whole container (no per-child OOM isolation). Operators size the limit as
-	 * `MAX_RESIDENT_PYODIDE × per-process ceiling` (use `MAX_RESIDENT_PYODIDE=1` on
-	 * small hosts). On OOM-kill the child exits → {@link PyodideChildExitError} →
-	 * the manager respawns a fresh generation on the next run.
+	 * The operator-set container limit remains the hard guard while
+	 * `PYODIDE_MAX_CHILD_RSS_BYTES` optionally retires a child after a completed
+	 * high-water run. The latter bounds idle retention but cannot prevent the
+	 * in-flight spike itself. Operators still size the container as
+	 * `MAX_RESIDENT_PYODIDE × per-process ceiling`.
 	 */
 	#spawnChild(): void {
 		this.#generation += 1;
@@ -443,6 +490,7 @@ export class PyodideSandbox {
 			`--allow-read=${this.#assetDir}`,
 			this.#runnerPath,
 			this.#assetDir,
+			JSON.stringify(this.#preloadPackages),
 			String(gen),
 		];
 		const child = this.#spawnFn(this.#denoBin, args, {
@@ -454,7 +502,7 @@ export class PyodideSandbox {
 		this.#child = child;
 		this.#readyReceived = false;
 		this.#pending = null;
-		this.#readBuf = Buffer.alloc(0);
+		this.#resetReadBuffer();
 		this.#aggregateBytes = 0;
 		this.#state = "starting";
 
@@ -486,7 +534,7 @@ export class PyodideSandbox {
 		this.#child = null;
 		this.#readyReceived = false;
 		this.#pending = null;
-		this.#readBuf = Buffer.alloc(0);
+		this.#resetReadBuffer();
 		this.#aggregateBytes = 0;
 		if (this.#state !== "terminating") this.#state = "dead";
 		if (child) {
@@ -517,37 +565,63 @@ export class PyodideSandbox {
 			this.#failOwned(new IpcIntegrityError("aggregate response bytes exceeded cap"), true);
 			return;
 		}
-		this.#readBuf = this.#readBuf.byteLength === 0 ? Buffer.from(chunk) : Buffer.concat([this.#readBuf, chunk]);
+		this.#readChunks.push(chunk);
+		this.#readBytes += chunk.byteLength;
 
-		let decoded: { frames: ReturnType<typeof decodeFrames>["frames"]; rest: Buffer };
-		try {
-			decoded = decodeFrames(this.#readBuf, this.#maxFrameBytes);
-		} catch (err) {
-			this.#failOwned(err instanceof Error ? err : new Error(String(err)), true);
-			return;
-		}
-		this.#readBuf = decoded.rest;
-
-		for (const frame of decoded.frames) {
-			const ctx: InboundContext = {
-				generation: this.#generation,
-				ready: this.#readyReceived,
-				pending: this.#pending ? { requestId: this.#pending.requestId, seq: this.#pending.seq } : null,
-			};
+		for (;;) {
 			try {
-				validateInbound(frame, ctx);
+				if (this.#expectedFrameBytes < 0) {
+					if (this.#readBytes < 4) return;
+					this.#expectedFrameBytes = this.#peekFrameLength();
+					if (this.#expectedFrameBytes > this.#maxFrameBytes) {
+						throw new IpcFrameTooLargeError(this.#expectedFrameBytes, this.#maxFrameBytes);
+					}
+				}
+				if (this.#readBytes < 4 + this.#expectedFrameBytes) return;
+
+				const decoded = decodeFrames(Buffer.concat(this.#readChunks, this.#readBytes), this.#maxFrameBytes);
+				this.#readChunks = decoded.rest.byteLength > 0 ? [decoded.rest] : [];
+				this.#readBytes = decoded.rest.byteLength;
+				this.#expectedFrameBytes = -1;
+
+				for (const frame of decoded.frames) {
+					const ctx: InboundContext = {
+						generation: this.#generation,
+						ready: this.#readyReceived,
+						pending: this.#pending ? { requestId: this.#pending.requestId, seq: this.#pending.seq } : null,
+					};
+					validateInbound(frame, ctx);
+					this.#dispatchFrame(frame);
+					if (this.#isTerminal()) return;
+				}
 			} catch (err) {
 				this.#failOwned(err instanceof Error ? err : new Error(String(err)), true);
 				return;
 			}
-			this.#dispatchFrame(frame);
-			if (this.#isTerminal()) return;
 		}
+	}
+
+	#peekFrameLength(): number {
+		const header = Buffer.allocUnsafe(4);
+		let offset = 0;
+		for (const chunk of this.#readChunks) {
+			const take = Math.min(chunk.byteLength, 4 - offset);
+			chunk.copy(header, offset, 0, take);
+			offset += take;
+			if (offset === 4) break;
+		}
+		return header.readUInt32BE(0);
+	}
+
+	#resetReadBuffer(): void {
+		this.#readChunks = [];
+		this.#readBytes = 0;
+		this.#expectedFrameBytes = -1;
 	}
 
 	#dispatchFrame(frame: Frame): void {
 		// Reset the aggregate window on each accepted complete frame.
-		this.#aggregateBytes = this.#readBuf.byteLength;
+		this.#aggregateBytes = this.#readBytes;
 
 		if (frame.type === "ready") {
 			this.#readyReceived = true;
@@ -569,7 +643,17 @@ export class PyodideSandbox {
 			if (op.timer !== undefined) clearTimeout(op.timer);
 			op.signal.removeEventListener("abort", op.onAbort);
 			this.#current = null;
-			op.resolve(asRunResponse(frame));
+			void this.#resolveResponse(op, asRunResponse(frame), this.#child);
 		}
+	}
+
+	async #resolveResponse(op: OwnedOp, response: RunResponse, responseChild: ChildProcess | null): Promise<void> {
+		const threshold = this.#maxChildRssBytes;
+		const pid = responseChild?.pid;
+		if (threshold !== undefined && pid !== undefined) {
+			const rss = await this.#readChildRssBytes(pid).catch(() => null);
+			if (rss !== null && rss > threshold && this.#child === responseChild && !this.#disposed) this.#killChild();
+		}
+		op.resolve(response);
 	}
 }

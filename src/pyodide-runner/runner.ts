@@ -24,7 +24,9 @@ import { Buffer } from "node:buffer";
 import { createRequire } from "node:module";
 import {
 	type Frame,
+	FrameTooLargeError,
 	type FsEntry,
+	MAX_FRAME_BYTES,
 	PYODIDE_EXT_STAGING_DIR,
 	type ReadyFrame,
 	type RunRequest,
@@ -36,14 +38,17 @@ import {
 // ── Capture host primitives BEFORE lockdown (closure-held, never on globalThis) ─
 // deno-lint-ignore no-explicit-any
 const denoRef = (globalThis as any).Deno;
+const consoleRef = (globalThis as any).console;
 const stdoutWriteSync: (b: Uint8Array) => number = denoRef.stdout.writeSync.bind(denoRef.stdout);
 const stderrWriteSync: (b: Uint8Array) => number = denoRef.stderr.writeSync.bind(denoRef.stderr);
 const stdinReadable: ReadableStream<Uint8Array> = denoRef.stdin.readable;
 const denoExit: (code: number) => never = denoRef.exit.bind(denoRef);
 const denoArgs: string[] = denoRef.args;
+const subtleDigest = crypto.subtle.digest.bind(crypto.subtle);
 
 const assetDir: string | undefined = denoArgs[0];
-const generation = Number(denoArgs[1] ?? "0");
+const preloadPackages = JSON.parse(denoArgs[1] ?? "[]") as string[];
+const generation = Number(denoArgs[2] ?? "0");
 if (!assetDir) {
 	stdoutWriteSync(new TextEncoder().encode("RUNNER FATAL: asset dir not provided as argv[0]\n"));
 	denoExit(2);
@@ -79,6 +84,7 @@ function emit(frame: Frame): void {
 let pyodide: any;
 // deno-lint-ignore no-explicit-any
 let FS: any;
+const importToPackage = new Map<string, string>();
 
 /**
  * Adversarial self-test (spike S2 hard gate). Runs AFTER realm lockdown and
@@ -123,8 +129,21 @@ try {
 		stderr: () => {},
 	});
 
-	// numpy/pandas/matplotlib loaded by name from the stock lock.
-	await pyodide.loadPackage(["numpy", "pandas", "matplotlib"]);
+	// Retain only the small import-name → package-name index from the local lock.
+	// `loadPackagesFromImports` is attempted per run, with this index providing a
+	// deterministic offline fallback in the locked-down Deno realm.
+	const lock = JSON.parse(denoRef.readTextFileSync(`${assetRoot}/pyodide-lock.json`)) as {
+		packages: Record<string, { imports?: string[] }>;
+	};
+	for (const [packageName, metadata] of Object.entries(lock.packages)) {
+		for (const importName of metadata.imports ?? []) {
+			if (!importToPackage.has(importName)) importToPackage.set(importName, packageName);
+		}
+	}
+
+	// Operators can trade cold-start latency against resident RSS. Packages not
+	// preloaded here are loaded on demand from the same offline lock per run.
+	if (preloadPackages.length > 0) await pyodide.loadPackage(preloadPackages);
 	// openpyxl + et_xmlfile are NOT in the distribution; load the vendored pure-python
 	// wheels by local file:// URL (discovered in the asset dir). loadPackage reads
 	// them via node:fs under --allow-read — no network. (Phase 0 Discoveries: the
@@ -170,11 +189,10 @@ interface TreeNode {
 	path: string;
 	kind: "file" | "dir";
 	mode: number;
-	bytes?: Uint8Array; // present only for files
+	size: number;
 }
 
-/** Walk the subtree under `root` (excluding `root` itself), returning every dir
- *  and file with its mode (and bytes for files). */
+/** Walk the subtree under `root` (excluding `root` itself), returning metadata only. */
 function walkTree(root: string): TreeNode[] {
 	const out: TreeNode[] = [];
 	const walk = (dir: string): void => {
@@ -187,12 +205,12 @@ function walkTree(root: string): TreeNode[] {
 		for (const name of names) {
 			if (name === "." || name === "..") continue;
 			const full = dir === "/" ? `/${name}` : `${dir}/${name}`;
-			const { mode } = FS.stat(full);
+			const { mode, size } = FS.stat(full);
 			if (FS.isDir(mode)) {
-				out.push({ path: full, kind: "dir", mode: mode & 0o777 });
+				out.push({ path: full, kind: "dir", mode: mode & 0o777, size: 0 });
 				walk(full);
 			} else if (FS.isFile(mode)) {
-				out.push({ path: full, kind: "file", mode: mode & 0o777, bytes: readFileBytes(full) });
+				out.push({ path: full, kind: "file", mode: mode & 0o777, size });
 			}
 		}
 	};
@@ -200,18 +218,69 @@ function walkTree(root: string): TreeNode[] {
 	return out;
 }
 
-function readFileBytes(path: string): Uint8Array {
-	return FS.readFile(path, { encoding: "binary" }) as Uint8Array;
+function readFileBytes(path: string): Uint8Array<ArrayBuffer> {
+	return FS.readFile(path, { encoding: "binary" }) as Uint8Array<ArrayBuffer>;
 }
 
 function depth(path: string): number {
 	return path.split("/").length;
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.byteLength !== b.byteLength) return false;
-	for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
-	return true;
+async function sha256(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+	const hash = new Uint8Array(await subtleDigest("SHA-256", bytes));
+	let hex = "";
+	for (const byte of hash) hex += byte.toString(16).padStart(2, "0");
+	return hex;
+}
+
+async function loadImportedPackages(code: string): Promise<void> {
+	// Parse imports structurally with Python's AST. In this Deno/Node-compat realm,
+	// loadPackagesFromImports may return without installing a known package after
+	// host globals are locked down, so explicitly load the locally-mapped packages.
+	pyodide.globals.set("__sqlfs_import_scan_code", code);
+	const importsProxy = pyodide.runPython(`
+import ast as __sqlfs_ast
+__sqlfs_import_tree = __sqlfs_ast.parse(__sqlfs_import_scan_code)
+sorted({
+    name
+    for node in __sqlfs_ast.walk(__sqlfs_import_tree)
+    for name in (
+        [alias.name.split(".")[0] for alias in node.names]
+        if isinstance(node, __sqlfs_ast.Import)
+        else [node.module.split(".")[0]]
+        if isinstance(node, __sqlfs_ast.ImportFrom) and node.module
+        else []
+    )
+})
+`);
+	let importNames: string[];
+	try {
+		importNames = importsProxy.toJs() as string[];
+	} finally {
+		importsProxy.destroy();
+		pyodide.globals.delete("__sqlfs_import_scan_code");
+	}
+	const packages = [...new Set(importNames.map((name) => importToPackage.get(name)).filter((name): name is string => !!name))];
+
+	// The package loader's Node-compat path needs host globals that realm lockdown
+	// removes from Python's `js` proxy. Restore them only around trusted vendored
+	// package installation, then prove they are unreachable before user code runs.
+	g.Deno = denoRef;
+	g.console = consoleRef;
+	g.require = createRequire(import.meta.url);
+	g.__dirname = assetRoot;
+	g.__filename = `${assetRoot}/pyodide.asm.js`;
+	try {
+		await pyodide.loadPackagesFromImports(code);
+		if (packages.length > 0) await pyodide.loadPackage(packages);
+	} finally {
+		delete g.Deno;
+		delete g.console;
+		delete g.require;
+		delete g.__dirname;
+		delete g.__filename;
+	}
+	selfTest();
 }
 
 // ── Run one request ─────────────────────────────────────────────────────────
@@ -234,14 +303,21 @@ async function runOne(req: RunRequest): Promise<RunResponse> {
 	// Snapshot the cwd subtree AFTER staging, BEFORE running user code — this is
 	// the diff baseline (excludes staging infrastructure dirs, which pre-exist
 	// from the caller's SqlFs tree).
-	const baseFiles = new Map<string, Uint8Array>();
+	const baseFiles = new Map<string, { size: number; sha256: string }>();
 	// Track KIND per path (not just presence) so a file↔dir replacement at the same
 	// path is detectable — otherwise `os.remove('x'); os.mkdir('x')` is invisible.
 	const baseKind = new Map<string, "file" | "dir">();
 	for (const node of walkTree(cwd)) {
 		baseKind.set(node.path, node.kind);
-		if (node.kind === "file" && node.bytes) baseFiles.set(node.path, node.bytes);
+		if (node.kind === "file") {
+			const bytes = readFileBytes(node.path);
+			baseFiles.set(node.path, { size: node.size, sha256: await sha256(bytes) });
+		}
 	}
+
+	// Resolve imports against the vendored lock before user code executes. This
+	// keeps the child fully offline while avoiding resident cost for unused packages.
+	await loadImportedPackages(req.code);
 
 	// Prelude: argv + cwd + stdin, plus redirect sys.stdout/sys.stderr to StringIO
 	// buffers. We read those buffers' getvalue() after the run — this captures ALL
@@ -271,6 +347,7 @@ if __sqlfs_argv0 and __sqlfs_argv0 not in ("-c", "-"):
 # os.environ key cannot leak it into the next run.
 __sqlfs_env_saved = dict(os.environ)
 os.environ.update(__json.loads(__sqlfs_env))
+os.environ.setdefault("MPLBACKEND", "Agg")
 __sqlfs_out = io.StringIO()
 __sqlfs_err = io.StringIO()
 sys.stdout = __sqlfs_out
@@ -333,10 +410,25 @@ __sqlfs_env_saved.clear()
 			if (baseKind.get(node.path) !== "dir") createdDirs.push({ path: node.path, kind: "dir", mode: node.mode, data: "" });
 			continue;
 		}
-		const bytes = node.bytes ?? new Uint8Array(0);
-		const entry: FsEntry = { path: node.path, kind: "file", mode: node.mode, data: Buffer.from(bytes).toString("base64") };
-		if (baseKind.get(node.path) !== "file") createdFiles.push(entry); // new, or dir→file replacement
-		else if (!sameBytes(baseFiles.get(node.path) ?? new Uint8Array(0), bytes)) modified.push(entry);
+		const bytes = readFileBytes(node.path);
+		if (baseKind.get(node.path) !== "file") {
+			createdFiles.push({
+				path: node.path,
+				kind: "file",
+				mode: node.mode,
+				data: Buffer.from(bytes).toString("base64"),
+			}); // new, or dir→file replacement
+			continue;
+		}
+		const baseline = baseFiles.get(node.path);
+		if (!baseline || baseline.size !== node.size || baseline.sha256 !== (await sha256(bytes))) {
+			modified.push({
+				path: node.path,
+				kind: "file",
+				mode: node.mode,
+				data: Buffer.from(bytes).toString("base64"),
+			});
+		}
 	}
 	// dirs-before-files, dirs shallow→deep, so the drain can apply created in order.
 	createdDirs.sort((a, b) => depth(a.path) - depth(b.path));
@@ -406,24 +498,53 @@ __sqlfs_env_saved.clear()
 const ready: ReadyFrame = { type: "ready", generation };
 emit(ready);
 
-// `decodeFrames` returns `rest` as a `Uint8Array<ArrayBufferLike>`; widen the
-// accumulator's type so the reassignment type-checks under `deno check`.
-let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+let chunks: Uint8Array<ArrayBufferLike>[] = [];
+let totalBytes = 0;
+let expectedBodyBytes = -1;
+
+function peekFrameLength(): number {
+	const header = new Uint8Array(4);
+	let offset = 0;
+	for (const chunk of chunks) {
+		const take = Math.min(chunk.byteLength, 4 - offset);
+		header.set(chunk.subarray(0, take), offset);
+		offset += take;
+		if (offset === 4) break;
+	}
+	return new DataView(header.buffer).getUint32(0, false);
+}
+
 const reader = stdinReadable.getReader();
 for (;;) {
 	const { value, done } = await reader.read();
 	if (done) break;
-	const merged = new Uint8Array(buf.byteLength + value.byteLength);
-	merged.set(buf, 0);
-	merged.set(value, buf.byteLength);
-	const { frames, rest } = decodeFrames(merged);
-	buf = rest;
-	for (const frame of frames) {
-		if (frame.type === "run") {
-			const resp = await runOne(frame);
-			emit(resp);
+	chunks.push(value);
+	totalBytes += value.byteLength;
+	for (;;) {
+		if (expectedBodyBytes < 0) {
+			if (totalBytes < 4) break;
+			expectedBodyBytes = peekFrameLength();
+			if (expectedBodyBytes > MAX_FRAME_BYTES) throw new FrameTooLargeError(expectedBodyBytes);
 		}
-		// Non-run inbound frames are ignored — Node only sends `run`.
+		if (totalBytes < 4 + expectedBodyBytes) break;
+
+		const merged = new Uint8Array(totalBytes);
+		let offset = 0;
+		for (const chunk of chunks) {
+			merged.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		const { frames, rest } = decodeFrames(merged);
+		chunks = rest.byteLength > 0 ? [rest] : [];
+		totalBytes = rest.byteLength;
+		expectedBodyBytes = -1;
+		for (const frame of frames) {
+			if (frame.type === "run") {
+				const resp = await runOne(frame);
+				emit(resp);
+			}
+			// Non-run inbound frames are ignored — Node only sends `run`.
+		}
 	}
 }
 

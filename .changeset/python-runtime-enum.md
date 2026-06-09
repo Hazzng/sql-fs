@@ -11,3 +11,10 @@
 `python_runtime: "stdlib"` is the air-gapped CPython-WASM runtime (the previous `python: true`). `python_runtime: "pyodide"` adds a numpy/pandas/scipy/openpyxl runtime in an OS-isolated Deno subprocess. The DB layer migrates rolling-deploy-safe (migration 0006 dual-writes/back-reads the legacy column).
 
 Clients must migrate `python: true` → `python_runtime: "stdlib"` and `python: false` → omit (or `null`).
+
+**Pyodide runtime memory & throughput tuning** (part of the same unreleased feature):
+
+- Cut combined runtime memory ~1.6 GB → ~1.1 GB on an 18.8 MB-CSV workload: O(n) chunk-list IPC framing (replaces an O(n²) per-chunk reallocation on both the Deno runner and the Node manager), and a streamed SHA-256 diff baseline (replaces holding every staged file's bytes for the whole run).
+- Lazy, offline package loading: only `PYODIDE_PRELOAD_PACKAGES` (default `numpy,pandas`) is resident at init; other distribution packages load on first import from the local lock. Lowers the idle floor and lets operators trade latency against RSS.
+- `matplotlib` now defaults to the headless `Agg` backend so `savefig()` works in the Deno child (previously failed resolving the DOM `webagg` backend).
+- New env vars `PYODIDE_PRELOAD_PACKAGES` and `PYODIDE_MAX_CHILD_RSS_BYTES` (optional RSS-based child retirement).
