@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.0
+
+### Minor Changes
+
+- [#120](https://github.com/Hazzng/sql-fs/pull/120) Thanks [@NeilMazumdar](https://github.com/NeilMazumdar)! - Add static-header (API-key) auth for the MCP endpoint so external clients that can only send fixed headers — e.g. LibreChat — can connect without minting a per-request JWT. Set `MCP_API_KEY` to accept a pre-shared `Authorization: Bearer <key>`; the sandbox owner (`sub`) is derived from a forwarded identity header (`MCP_IDENTITY_HEADER`, default `x-librechat-user-id`), giving each end-user an isolated sandbox. New env vars: `MCP_API_KEY`, `MCP_IDENTITY_HEADER`, `MCP_DEFAULT_SUB`, `MCP_STATIC_TENANT`. Static auth is additive and off unless `MCP_API_KEY` is set — JWT clients on `/mcp` and all `/v1/*` routes are unchanged.
+
+  Startup hardening: `MCP_IDENTITY_HEADER` cannot be a reserved transport header (`authorization`, `cookie`, `content-type`, `accept`, `mcp-session-id`, `mcp-protocol-version`, `last-event-id`) — otherwise every request would derive `owner` from a shared value and collapse all users into one sandbox. The `mcp_static_auth_enabled` startup log records only whether a fallback owner is configured (`hasDefaultSub`), never the `MCP_DEFAULT_SUB` value.
+
+- [#125](https://github.com/Hazzng/sql-fs/pull/125) Thanks [@Hazzng](https://github.com/Hazzng)! - feat(gc): multi-tenant orphan-blob garbage collection via `pnpm db:gc`.
+
+  Restores the `pnpm db:gc` CLI as a real, multi-tenant orphan-blob sweep for an external scheduler (cron / k8s CronJob). Orphan blobs (rows in `blobs` referenced by zero `inodes`) previously accumulated forever.
+
+  - New migration `0006` adds `blobs.last_referenced_at` (instant, catalog-only — legacy rows stay NULL and are treated as ancient/collectible). Every blob reference (insert + dedup re-adoption) now bumps it via `ON CONFLICT (sha256) DO UPDATE`, which also touches the blob so the grace window tracks real usage.
+  - `gcOrphanBlobs` rewritten to a null-safe `NOT EXISTS` anti-join with a grace window (`minAgeMs`), returning the deleted sha256s. It runs with no sandbox context (RLS escape) so the anti-join sees every inode; a blob referenced by another sandbox survives.
+  - The sweep runs at **REPEATABLE READ with bounded retries** to close the dedup re-adoption race: under READ COMMITTED a concurrent writer that re-adopts an existing orphan blob could leave its committed inode without content (the GC's `NOT EXISTS` re-check keeps a stale snapshot of `inodes`). REPEATABLE READ turns that conflict into a serialization failure that is retried, so even `--min-age-ms 0` is safe under concurrent writes.
+  - Deleted blobs are purged from the tenant-scoped Redis blob cache (`RedisBlobCache.mdel`, fail-open).
+  - New env `BLOB_GC_MIN_AGE_MS` (default 3h) sets the grace window; `pnpm db:gc -- --min-age-ms 0` collects all orphans now, `--tenant <id>` restricts to one tenant.
+
+### Patch Changes
+
+- [#122](https://github.com/Hazzng/sql-fs/pull/122) Thanks [@Hazzng](https://github.com/Hazzng)! - Fix local Postgres dev setup for the integration test suite ([#119](https://github.com/Hazzng/sql-fs/issues/119)).
+
+  - Add `docker-compose.local.yml` (Postgres 16 + Redis 7). Its `initdb` script
+    (`scripts/initdb/00-create-app-role.sql`) provisions a **non-superuser** `sqlfs_app`
+    role that owns the `sqlfs` database — required because migration `0005` enables
+    `FORCE ROW LEVEL SECURITY`, which a superuser silently bypasses (the RLS isolation
+    tests fail under the default `postgres` superuser). The file was previously
+    referenced by the README but `.gitignore`d, so it could never be committed.
+  - Document the non-superuser-owner requirement and the full local-DB workflow in
+    `CONTRIBUTING.md` (new "Local database" section).
+  - Correct the `DATABASE_DIRECT_URL` row in the README env table: it is optional and
+    used only by drizzle-kit (`pnpm db:generate`); the server's boot-time migration
+    runner uses `DATABASE_URL`.
+  - Update `.env.example` defaults to match the compose stack.
+  - Remove the broken, unused `pnpm db:migrate` script (drizzle-kit `migrate` with no
+    journal). Migrations are applied automatically on server boot.
+
+- [#125](https://github.com/Hazzng/sql-fs/pull/125) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(fs): delete inodes when their link count reaches zero (no `nlink=0` tombstones).
+
+  The Postgres `rmComposite`, `writeFileComposite`, and `mvComposite` paths decremented an inode's `nlink` and deleted it (when it hit 0) within a single CTE statement. Postgres applies **only the UPDATE** when a row is both updated and deleted in one statement, so the inode was left at `nlink=0` instead of being removed — a tombstone that still referenced `content_sha256`. This pinned the blob (defeating the new orphan-blob GC, whose anti-join saw the tombstone) and leaked inode rows on every file delete, overwrite, and move-overwrite.
+
+  Each path now splits the work into two mutually-exclusive branches against the statement snapshot — delete when `nlink <= 1`, decrement when `nlink > 1` — so each inode row is touched exactly once. `gcOrphanBlobs` additionally ignores `nlink = 0` inodes so blobs pinned by tombstones left behind by older builds become collectible. Hardlinked inodes are unaffected (still decremented, not deleted, while other links remain).
+
 ## 0.6.3
 
 ### Patch Changes
