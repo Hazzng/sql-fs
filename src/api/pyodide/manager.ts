@@ -28,6 +28,7 @@
 import { Buffer } from "node:buffer";
 import { type ChildProcess, type SpawnOptions, spawn as nodeSpawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Frame, RunRequest, RunResponse } from "../../pyodide-runner/protocol.js";
 import {
@@ -155,6 +156,33 @@ interface OwnedOp {
 
 const DEFAULT_RUNNER_PATH = fileURLToPath(new URL("../../pyodide-runner/runner.ts", import.meta.url));
 
+/**
+ * Resolve the Deno binary to an ABSOLUTE path (design D1 / review #6).
+ *
+ * The child is spawned with a minimal allowlisted env (`{ DENO_NO_UPDATE_CHECK }`)
+ * that intentionally omits `PATH`. Node's `spawn` resolves a *bare* command name
+ * (e.g. `"deno"`) against the CHILD env's `PATH` — which is absent — so a bare name
+ * would fail `ENOENT`. Production sets `DENO_BIN_PATH` to the vendored absolute
+ * path; for dev/test convenience we also resolve a bare name against the PARENT
+ * `PATH` here so what we hand to `spawn` is always absolute. A path that already
+ * contains a separator (absolute or relative) is used verbatim. If a bare name
+ * can't be found, it is returned unchanged so the spawn surfaces a clear error.
+ */
+function resolveDenoBin(bin: string): string {
+	if (bin.includes("/")) return bin; // already absolute or relative — not PATH-resolved
+	for (const dir of (process.env.PATH ?? "").split(":")) {
+		if (dir.length === 0) continue;
+		const candidate = `${dir}/${bin}`;
+		try {
+			accessSync(candidate, fsConstants.X_OK);
+			return candidate;
+		} catch {
+			// not here / not executable — keep scanning
+		}
+	}
+	return bin; // not found on PATH; let spawn surface ENOENT with the bare name
+}
+
 export class PyodideSandbox {
 	#state: WorkerState = "cold";
 	#generation = 0;
@@ -182,7 +210,7 @@ export class PyodideSandbox {
 
 	constructor(opts: PyodideSandboxOptions = {}) {
 		this.#assetDir = opts.assetDir ?? process.env.PYODIDE_ASSET_DIR ?? "";
-		this.#denoBin = opts.denoBin ?? process.env.DENO_BIN_PATH ?? "deno";
+		this.#denoBin = resolveDenoBin(opts.denoBin ?? process.env.DENO_BIN_PATH ?? "deno");
 		this.#runnerPath = opts.runnerPath ?? DEFAULT_RUNNER_PATH;
 		this.#runtimeTimeoutMs = opts.runtimeTimeoutMs ?? PYODIDE_RUNTIME_TIMEOUT_MS_DEFAULT;
 		this.#maxFrameBytes = opts.maxFrameBytes ?? PYODIDE_MAX_FRAME_BYTES_DEFAULT;
@@ -348,6 +376,7 @@ export class PyodideSandbox {
 			stdin: op.input.stdin,
 			files: op.input.files,
 			cwd: op.input.cwd,
+			env: op.input.env,
 		};
 		op.requestId = frame.requestId;
 		op.seq = frame.seq;

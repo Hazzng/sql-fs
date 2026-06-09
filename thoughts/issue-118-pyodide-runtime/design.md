@@ -110,17 +110,25 @@ not merely a thrown error.
 ## Design Decisions
 
 1. **Isolation = explicit single-layer Deno subprocess (headline; findings 1, 2, 3).** The per-session
-   `PyodideSandbox` spawns a **Deno subprocess** with a **scrubbed env** (`env:{}` plus `DENO_NO_UPDATE_CHECK=1`).
-   Flags (spike-validated against the pinned Deno version, S1): `--no-prompt` + the deny belt `--deny-net
-   --deny-run --deny-write --deny-env --deny-ffi --deny-sys --deny-import`, **plus the module-loading air-gap
-   flags `--no-remote --no-npm --cached-only --no-config`** (finding 2 — `--deny-net` alone does not gate the
-   module graph; remote registries load by default), with `--allow-read` scoped to the vendored asset dir only.
+   `PyodideSandbox` spawns a **Deno subprocess** with a **minimal allowlisted env** — Node's `child_process`
+   `env` option set to `{ DENO_NO_UPDATE_CHECK: "1" }` only (no parent env, no `AUTH_SECRET`/`DATABASE_URL`); this
+   is a Node-side env replacement, *not* Deno's `clearEnv`. Because the child env omits `PATH`, Node must spawn
+   Deno by an **absolute** path (the vendored `DENO_BIN_PATH`); a bare `deno` is resolved against the parent
+   `PATH` to an absolute path before spawn. Flags (spike-validated against the pinned Deno version, S1):
+   `--no-prompt` + the deny belt `--deny-net --deny-run --deny-write --deny-env --deny-ffi --deny-sys
+   --deny-import`, **plus the module-loading air-gap flags `--no-remote --no-npm --cached-only --no-config`**
+   (finding 2 — `--deny-net` alone does not gate the module graph; remote registries load by default), with
+   `--allow-read` scoped to the vendored asset dir only.
    Note `--deny-import` blocks *remote* imports only — **local** dynamic imports under `--allow-read` remain
    possible, contained because the read scope is read-only Pyodide assets. Deno gates the *JS layer itself*, so a
    full Python→JS escape lands capability-less.
    - **IPC is committed, not an alternative (finding 3).** Transport = **Node↔Deno over the child's stdin/stdout**,
-     with **realm-lockdown**: at startup the harness captures the writer, then deletes `Deno`/`console`/other
-     write primitives from `globalThis` **before** any untrusted Python runs. Every frame (both directions) is
+     with **realm-lockdown** in an explicit, ordered init sequence (review #2): (1) capture the writer into a
+     closure; (2) load Pyodide + preload packages; (3) delete `Deno`/`console`/`require`/`__dirname`/`__filename`
+     from `globalThis`; (4) run an **adversarial self-test** asserting the deletions took and that Pyodide's `js`
+     proxy exposes none of them; (5) only then emit `ready`. An init failure **or** a failed self-test writes a
+     diagnostic and exits non-zero → the manager retires the child and the spawning run fails. All of this runs
+     **before** any untrusted Python. Every frame (both directions) is
      **length-prefixed JSON** carrying **mandatory integrity fields**: random **requestId**, monotonic
      **sequence number**, exact **message type**, **child-generation id**; with **max per-frame and aggregate
      size caps** and **exactly one response per request**. The Node side **kills the child immediately** on any
@@ -143,14 +151,22 @@ not merely a thrown error.
    multi-second cold start for the iterative LibreChat loop), serialized by the per-subprocess mutex. Between
    execs: fresh Python `globals` + wipe staged MEMFS paths (bounds variable scope + staged files only;
    `sys.modules`/package globals persist within a session — same trust boundary). Cross-session isolation comes
-   from per-session subprocesses. Timeout/abort kills the subprocess; next exec re-inits (new generation).
+   from per-session subprocesses. Timeout/abort kills the subprocess; next exec re-inits (new generation). The
+   manager's **internal** runtime timeout throws a typed `EPYODIDE_TIMEOUT` (review #4): just-bash flattens a
+   custom-command rejection into a non-zero `ExecResult`, so the command tags a per-exec context that
+   `execWithRuntimeThrottle` re-raises as a fatal timeout (aborting the script tx — a timed-out run never commits)
+   and the routes map it consistently: **408 `EXEC_TIMEOUT`** (sync), **terminal timeout exit event** (SSE),
+   **per-script `error:"timeout"`** (batch).
 4. **Residency LRU — explicit state machine + atomic admission (findings 7, 8).** A **global registry** caps
    resident subprocesses at `MAX_RESIDENT_PYODIDE` (small default, e.g. 2), independent of `SESSION_IDLE_MS`
    (else warm subprocesses accumulate per active session); a shorter `PYODIDE_IDLE_MS` idle-kills them. Each
    worker has an explicit state: `cold → starting → idle → busy → terminating → dead`. **`starting` and `busy`
-   are never evictable.** A **registry mutex** makes admission atomic — it covers *reserve a slot → select an
-   eviction victim → spawn → roll back on failed init* as one critical section, so concurrent cold starts cannot
-   both observe a free slot and exceed the cap. **Capacity is reserved before** expensive Pyodide init.
+   are never evictable.** A **registry mutex** makes admission atomic — it covers *select an eviction victim →
+   construct the manager → register* as one critical section, so concurrent admissions cannot both observe a free
+   slot and exceed the cap. Admission is **lazy and post-semaphore** (review #5): it runs only while the admitting
+   exec holds a `pyodide` semaphore slot, and the `spawn` thunk is **cheap** (it constructs a `PyodideSandbox`,
+   nothing more). The **expensive Deno spawn + Pyodide package load happens later, inside `run()`, OUTSIDE the
+   registry mutex** — so the critical section never serializes multi-second cold starts.
 5. **Concurrency + memory — dedicated semaphore; OOM isolation NOT guaranteed (Q4 + finding 4).** New
    `MAX_CONCURRENT_PYODIDE` (low default, **2**) + queue/wait-timeout env vars mirroring the python set; routed by
    `python_runtime==="pyodide"` so `stdlib` keeps `MAX_CONCURRENT_PYTHON=5`. The semaphore caps *in-flight execs*,
@@ -163,10 +179,18 @@ not merely a thrown error.
    (`MAX_RESIDENT=1` on small hosts). The Pyodide ~2 GB WASM cap is only a per-instance heap ceiling. The manager
    reports an error + respawns (new generation) on child exit.
 6. **File staging — cwd subtree + script over IPC, diff-and-drain with explicit semantics (Q2 + finding 5/6).**
-   Before run: ship the cwd subtree **plus the resolved script path** (even if outside cwd, for `python3 FILE`
-   parity) to Deno, written into MEMFS. After a **successful** run only: Deno reports the created/modified/deleted
-   set; Node applies it to `ctx.fs` **inside the existing script transaction** (atomic rollback on failure,
-   `research.md` Q6). **Never drain from a timed-out / aborted / protocol-invalid run** (finding 6). **Semantics:**
+   Before run: ship the cwd subtree **plus the resolved script path** to Deno, written into MEMFS; a script that
+   resolves **outside cwd** is staged at a **reserved, non-drainable MEMFS path** (`/__sqlfs_ext__/…`, review #7)
+   with `argv[0]`/`__file__` pointing there — collision-free with Pyodide's own MEMFS and structurally excluded
+   from the cwd-scoped diff. After a **successful** run only: Deno reports the created/modified/deleted set; Node
+   applies it to `ctx.fs` **inside the existing script transaction** (atomic rollback on failure, `research.md` Q6).
+   **Before any `ctx.fs` mutation** the drain validates the whole manifest (review #7): every path under cwd
+   (reject `..`/absolute/null-byte/reserved-prefix), **unique**, **no write↔delete conflict**, **no
+   file-as-directory-ancestor**, per-file + aggregate decoded caps. **read-only execs (review #3):** compare the
+   reported manifest against the staged snapshot and reject with **`EREADONLY_VIOLATION` before any `ctx.fs`
+   mutation** if the run produced any persistent change (created-then-deleted temp files are not in the diff and
+   are intentionally allowed — no persistent mutation). **Never drain from a timed-out / aborted / protocol-invalid
+   run** (finding 6). **Semantics:**
    reject **symlinks** (SqlFs default-deny); files written 0644 default (`sql-fs.ts:738`), exec-bit via `chmod`
    only if needed; dirs-before-files, delete depth-first; hardlinks drained as independent copies; **cwd-scoped
    only** (keep script + inputs under cwd). Per-file + total byte caps on both directions.

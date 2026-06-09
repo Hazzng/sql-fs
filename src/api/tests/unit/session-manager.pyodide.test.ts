@@ -11,6 +11,7 @@
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PyodideTimeoutError } from "../../pyodide/manager.js";
 import type { PyodideSandbox } from "../../pyodide/manager.js";
 import { SessionManager } from "../../session-manager.js";
 
@@ -167,6 +168,20 @@ describe("session pyodide ownership", () => {
 		expect(created).toHaveLength(2); // W2 re-admitted on the next exec
 		expect(session.pyodideSandbox).toBe(created[1] as unknown as PyodideSandbox);
 		expect(session.pyodideSandbox?.disposed).toBe(false);
+	});
+
+	it("surfaces an internal runtime timeout as a fatal EPYODIDE_TIMEOUT throw (review #4)", async () => {
+		const { sm, sandbox } = makeManager();
+		active = sm;
+		const session = await sm.getOrCreate(T, "pyo", PYODIDE);
+		// The manager's internal runtime timeout: run() rejects with PyodideTimeoutError.
+		// just-bash flattens that into a non-zero ExecResult; the command tags the
+		// per-exec context and execWithRuntimeThrottle re-raises it as a fatal throw so
+		// the route layer can map it to a consistent timeout response.
+		sandbox.run = vi.fn(() => Promise.reject(new PyodideTimeoutError(25)));
+		await expect(sm.execWithRuntimeThrottle(session, "python3 -c '1'")).rejects.toMatchObject({
+			code: "EPYODIDE_TIMEOUT",
+		});
 	});
 
 	it("a getOrCreate failure builds no pyodide manager to dispose (admission is lazy)", async () => {

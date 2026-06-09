@@ -20,6 +20,18 @@
 
 export const PROTOCOL_VERSION = 1;
 
+/**
+ * Reserved MEMFS directory for staging a script file that resolves OUTSIDE the
+ * exec cwd (the `python3 /abs/elsewhere.py` parity case). Staging it here instead
+ * of at its original absolute path makes non-drainability STRUCTURAL — it lives
+ * outside the runner's cwd-scoped diff so it can never drain back — and avoids
+ * colliding with Pyodide's own MEMFS layout (`/lib`, `/usr`, `/home/pyodide`, …)
+ * if the sandbox path happened to overlap. The runner writes the script here, runs
+ * it with `argv[0]`/`__file__` pointing here, and wipes the directory after each
+ * run. The drain layer independently rejects any path under this prefix.
+ */
+export const PYODIDE_EXT_STAGING_DIR = "/__sqlfs_ext__";
+
 export type FrameType = "run" | "result" | "error" | "ready";
 
 /**
@@ -46,6 +58,10 @@ export interface RunRequest {
 	readonly stdin: string; // base64
 	readonly files: readonly FsEntry[]; // cwd subtree staged into MEMFS (files + dirs)
 	readonly cwd: string;
+	// Exported bash env vars injected into Python's `os.environ` for THIS run only
+	// (subprocess-inherit semantics), then restored — never the host/Deno env, which
+	// is separately scrubbed. Optional for backward compatibility with old callers.
+	readonly env?: Record<string, string>;
 }
 
 /** child → Node: the single response to a `run`. */

@@ -12,10 +12,14 @@
  * The startup invariant `MAX_RESIDENT_PYODIDE >= MAX_CONCURRENT_PYODIDE` (enforced
  * by the SessionManager) guarantees a busy worker never needs to be evicted.
  *
- * Atomic admission: a single `async-mutex` wraps *reserve a slot → select an
- * eviction victim → spawn (expensive init) → roll back on failed init* as one
- * critical section, so concurrent cold starts cannot both observe a free slot and
- * exceed the cap. **`starting` and `busy` workers are never evictable.**
+ * Atomic admission: a single `async-mutex` wraps *select an eviction victim →
+ * construct the manager → register* as one critical section, so concurrent
+ * admissions cannot both observe a free slot and exceed the cap. The `spawn`
+ * thunk is CHEAP — it only constructs a `PyodideSandbox` (no Deno child, no
+ * Pyodide load). The multi-second Deno spawn + package init happens LAZILY in
+ * `PyodideSandbox.run()`, OUTSIDE this mutex (lazy post-semaphore admission), so
+ * the critical section never serializes cold starts. **`starting` and `busy`
+ * workers are never evictable.**
  *
  * Eviction / idle-kill disposes a worker (terminal — its Deno child is SIGKILLed).
  * The owning session SURVIVES: it observes `worker.disposed` on its next exec and
@@ -85,8 +89,9 @@ export class PyodideResidency {
 
 	/**
 	 * Atomic admission. Inside the admission mutex: if at capacity, select an idle
-	 * LRU victim and evict it; then run the caller's `spawn` (the expensive init)
-	 * and register the new worker. If `spawn` throws (failed init), the reserved
+	 * LRU victim and evict it; then run the caller's `spawn` (a CHEAP `PyodideSandbox`
+	 * construction — NOT the Deno child / Pyodide load, which happen lazily in
+	 * `run()` outside this mutex) and register the new worker. If `spawn` throws, the
 	 * slot is rolled back — the worker is never registered — and the error is
 	 * rethrown. Returns the admitted worker.
 	 */
@@ -111,9 +116,9 @@ export class PyodideResidency {
 				// belt-and-braces fallback; the next sweep/admit reclaims the surplus
 				// once a worker goes idle.
 			}
-			// `spawn` is reserved-behind: the expensive Pyodide child init runs only
-			// after a slot is secured. Registering ONLY on success rolls the slot back
-			// on a failed init (we never added the worker).
+			// `spawn` only CONSTRUCTS the manager (cheap); the Deno child + Pyodide load
+			// happen lazily in run(), outside this mutex. Registering ONLY on success
+			// rolls the slot back if construction throws (the worker is never added).
 			const worker = await spawn();
 			this.#residents.set(worker, Date.now());
 			return worker;

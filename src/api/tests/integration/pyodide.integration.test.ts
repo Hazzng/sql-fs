@@ -122,4 +122,32 @@ describe.skipIf(SKIP)("pyodide runtime — end-to-end (real Deno + Pyodide)", ()
 		},
 		COLD,
 	);
+
+	it(
+		"injects exec env into os.environ and does not leak it across runs (reviews #6/#3)",
+		async () => {
+			const id = `pyo-env-${Date.now()}`;
+			cleanup.push(id);
+			const session = await sm.getOrCreate(TENANT, id, PYODIDE, "owner");
+			// #6: a bash-exported var is visible in Python's os.environ for the run; the
+			// script also sets a NEW os.environ key to probe cross-run leakage.
+			const r1 = await sm.execWithRuntimeThrottle(
+				session,
+				`export FOO=barvalue; python3 -c "import os; print('FOO=' + os.environ.get('FOO','none')); os.environ['LEAK']='run1'"`,
+			);
+			expect(r1.exitCode).toBe(0);
+			expect(r1.stdout).toContain("FOO=barvalue");
+
+			// #3: on the SAME warm child, neither the injected FOO nor the script-set
+			// LEAK may survive into the next run (env is strictly per-execution).
+			const r2 = await sm.execWithRuntimeThrottle(
+				session,
+				`python3 -c "import os; print('LEAK=' + os.environ.get('LEAK','clean') + ' FOO=' + os.environ.get('FOO','clean'))"`,
+			);
+			expect(r2.exitCode).toBe(0);
+			expect(r2.stdout).toContain("LEAK=clean");
+			expect(r2.stdout).toContain("FOO=clean");
+		},
+		COLD,
+	);
 });

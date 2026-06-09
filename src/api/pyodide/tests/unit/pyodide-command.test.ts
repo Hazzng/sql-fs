@@ -10,7 +10,8 @@ import { type ByteString, EMPTY_BYTES, InMemoryFs, encodeUtf8ToBytes } from "jus
 import type { CommandContext, CustomCommand, ExecResult, IFileSystem } from "just-bash";
 import { describe, expect, it } from "vitest";
 import type { FsEntry, RunResponse } from "../../../../pyodide-runner/protocol.js";
-import { PyodideDrainError, createPyodideCommands } from "../../../commands/pyodide-command.js";
+import { PyodideDrainError, createPyodideCommands, drain } from "../../../commands/pyodide-command.js";
+import { type ReadOnlyContext, readOnlyContext } from "../../../read-only-context.js";
 import type { PyodideSandbox, RunRequestInput } from "../../manager.js";
 
 function makeResponse(over: Partial<RunResponse> = {}): RunResponse {
@@ -50,12 +51,13 @@ function fakeSandbox(respond: (input: RunRequestInput) => RunResponse): {
 
 function makeCtx(
 	fs: IFileSystem,
-	opts: { cwd?: string; stdin?: ByteString; signal?: AbortSignal } = {},
+	opts: { cwd?: string; stdin?: ByteString; signal?: AbortSignal; exportedEnv?: Record<string, string> } = {},
 ): CommandContext {
 	return {
 		fs,
 		cwd: opts.cwd ?? "/home/user",
 		env: new Map<string, string>(),
+		exportedEnv: opts.exportedEnv,
 		stdin: opts.stdin ?? EMPTY_BYTES,
 		signal: opts.signal,
 	} as CommandContext;
@@ -261,7 +263,7 @@ describe("pyodide command — byte caps", () => {
 });
 
 describe("pyodide command — script resolved outside cwd (FILE parity)", () => {
-	it("stages an out-of-cwd script with its real mode, not a hardcoded 0644", async () => {
+	it("stages an out-of-cwd script at a reserved non-drainable path with its real mode", async () => {
 		const fs = await freshFs();
 		await fs.mkdir("/outside", { recursive: true });
 		await fs.writeFile("/outside/tool.py", "print('hi')");
@@ -270,9 +272,140 @@ describe("pyodide command — script resolved outside cwd (FILE parity)", () => 
 		const [python3] = createPyodideCommands(sandbox);
 		await run(python3 as CustomCommand, ["/outside/tool.py", "arg"], makeCtx(fs));
 		const input = calls[0]!;
-		expect(input.argv).toEqual(["/outside/tool.py", "arg"]);
-		const staged = input.files.find((f) => f.path === "/outside/tool.py");
+		// The out-of-cwd script is re-homed at the reserved staging path and argv[0]
+		// (→ __file__) points there, so it can't collide with Pyodide MEMFS internals
+		// and is excluded from the cwd-scoped drain.
+		expect(input.argv).toEqual(["/__sqlfs_ext__/tool.py", "arg"]);
+		const staged = input.files.find((f) => f.path === "/__sqlfs_ext__/tool.py");
 		expect(staged?.kind).toBe("file");
 		expect(staged?.mode).toBe(0o755); // real mode captured (was hardcoded 0o644 before the fix)
+		// The original absolute path is NOT staged (no MEMFS collision risk).
+		expect(input.files.find((f) => f.path === "/outside/tool.py")).toBeUndefined();
+	});
+
+	it("refuses to run a symlinked script (symlink-refused on the capped script read, review #1)", async () => {
+		const fs = await freshFs();
+		await fs.writeFile("/home/user/real.py", "print('hi')");
+		await fs.symlink("/home/user/real.py", "/home/user/link.py");
+		const { sandbox, calls } = fakeSandbox(() => makeResponse());
+		const [python3] = createPyodideCommands(sandbox);
+		const res = await run(python3 as CustomCommand, ["link.py"], makeCtx(fs));
+		expect(res.exitCode).toBe(1);
+		expect(res.stderr).toContain("symlink");
+		expect(calls).toHaveLength(0); // refused before reaching the sandbox
+	});
+});
+
+describe("pyodide command — exec env forwarding (review #6)", () => {
+	it("forwards exported bash env vars to the run request (→ os.environ)", async () => {
+		const { sandbox, calls } = fakeSandbox(() => makeResponse());
+		const [python3] = createPyodideCommands(sandbox);
+		const ctx = makeCtx(await freshFs(), { exportedEnv: { FOO: "bar", API_BASE: "http://x" } });
+		await run(python3 as CustomCommand, ["-c", "print(1)"], ctx);
+		expect(calls[0]?.env).toEqual({ FOO: "bar", API_BASE: "http://x" });
+	});
+
+	it("omits env when nothing is exported", async () => {
+		const { sandbox, calls } = fakeSandbox(() => makeResponse());
+		const [python3] = createPyodideCommands(sandbox);
+		await run(python3 as CustomCommand, ["-c", "print(1)"], makeCtx(await freshFs()));
+		expect(calls[0]?.env).toBeUndefined();
+	});
+});
+
+describe("pyodide command — explicit read-only enforcement (review #3)", () => {
+	it("rejects a readOnly run that reported any mutation, before touching ctx.fs", async () => {
+		const fs = await freshFs();
+		// The run reports a created file → a persistent mutation.
+		const { sandbox, calls } = fakeSandbox(() => makeResponse({ created: [fileEntry("/home/user/out.txt", "x")] }));
+		const [python3] = createPyodideCommands(sandbox);
+		const roCtx: ReadOnlyContext = { violated: false };
+		const res = await readOnlyContext.run(roCtx, () =>
+			run(python3 as CustomCommand, ["-c", "open('out.txt','w').write('x')"], makeCtx(fs)),
+		);
+		expect(res.exitCode).toBe(1);
+		expect(roCtx.violated).toBe(true); // the session layer maps this to EREADONLY_VIOLATION
+		expect(calls).toHaveLength(1); // the run happened…
+		expect(await fs.exists("/home/user/out.txt")).toBe(false); // …but nothing drained
+	});
+
+	it("allows a readOnly run that reported no mutation", async () => {
+		const fs = await freshFs();
+		const { sandbox } = fakeSandbox(() => makeResponse({ stdout: Buffer.from("ok").toString("base64") }));
+		const [python3] = createPyodideCommands(sandbox);
+		const roCtx: ReadOnlyContext = { violated: false };
+		const res = await readOnlyContext.run(roCtx, () =>
+			run(python3 as CustomCommand, ["-c", "print('ok')"], makeCtx(fs)),
+		);
+		expect(res.exitCode).toBe(0);
+		expect(roCtx.violated).toBe(false);
+	});
+});
+
+describe("pyodide drain — manifest validation (review #7)", () => {
+	const caps = { maxFileBytes: 1 << 20, maxTotalBytes: 1 << 20 };
+	async function fsAt(cwd: string): Promise<IFileSystem> {
+		const fs = new InMemoryFs();
+		await fs.mkdir(cwd, { recursive: true });
+		return fs;
+	}
+
+	it("rejects a duplicate drain path", async () => {
+		const fs = await fsAt("/home/user");
+		const resp = makeResponse({
+			created: [fileEntry("/home/user/a.txt", "1"), fileEntry("/home/user/a.txt", "2")],
+		});
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+	});
+
+	it("rejects a path that is both written and deleted", async () => {
+		const fs = await fsAt("/home/user");
+		const resp = makeResponse({
+			created: [fileEntry("/home/user/a.txt", "1")],
+			deleted: ["/home/user/a.txt"],
+		});
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+	});
+
+	it("rejects a delete that is an ancestor of a written path (would erase the write)", async () => {
+		const fs = await fsAt("/home/user");
+		const resp = makeResponse({
+			created: [fileEntry("/home/user/d/x.txt", "child")],
+			deleted: ["/home/user/d"],
+		});
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+		expect(await fs.exists("/home/user/d/x.txt")).toBe(false); // nothing applied
+	});
+
+	it("rejects duplicate deleted paths (not silently collapsed)", async () => {
+		const fs = await fsAt("/home/user");
+		await fs.writeFile("/home/user/gone.txt", "x");
+		const resp = makeResponse({ deleted: ["/home/user/gone.txt", "/home/user/gone.txt"] });
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+		expect(await fs.exists("/home/user/gone.txt")).toBe(true); // not deleted (rejected pre-mutation)
+	});
+
+	it("rejects a written file used as a directory ancestor", async () => {
+		const fs = await fsAt("/home/user");
+		const resp = makeResponse({
+			created: [fileEntry("/home/user/a", "file"), fileEntry("/home/user/a/b.txt", "child")],
+		});
+		await expect(drain(fs, "/home/user", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+	});
+
+	it("rejects a drain path targeting the reserved staging area (cwd = root)", async () => {
+		const fs = new InMemoryFs();
+		const resp = makeResponse({ created: [fileEntry("/__sqlfs_ext__/evil.py", "x")] });
+		await expect(drain(fs, "/", resp, caps)).rejects.toBeInstanceOf(PyodideDrainError);
+		expect(await fs.exists("/__sqlfs_ext__/evil.py")).toBe(false);
+	});
+
+	it("applies a valid (dirs-before-files) manifest", async () => {
+		const fs = await fsAt("/home/user");
+		const resp = makeResponse({
+			created: [{ path: "/home/user/d", kind: "dir", mode: 0o755, data: "" }, fileEntry("/home/user/d/x.txt", "hi")],
+		});
+		await drain(fs, "/home/user", resp, caps);
+		expect(await fs.readFile("/home/user/d/x.txt", "utf8")).toBe("hi");
 	});
 });

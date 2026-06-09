@@ -33,6 +33,7 @@ import { createPyodideCommands } from "./commands/pyodide-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { type PyodideRuntimeContext, pyodideRuntimeContext } from "./pyodide-runtime-context.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
@@ -1392,11 +1393,20 @@ export class SessionManager {
 		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
 		// would race across concurrent parallel readers.
 		const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
+		// A pyodide INTERNAL runtime timeout is flattened by just-bash into a non-zero
+		// ExecResult; the pyodide command records the typed error on this per-exec
+		// context. Recover it here and treat it as FATAL so the script tx is aborted
+		// (a timed-out run never commits) and the typed timeout escapes to the route.
+		const assertNoPyodideTimeout = (): void => {
+			const pyTimeout = pyodideRuntimeContext.getStore()?.timeoutError;
+			if (pyTimeout !== undefined) throw pyTimeout;
+		};
 		const execFn = async (): Promise<BashExecResult> => {
 			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
 					const result = await session.bash.exec(script, resolvedOpts);
+					assertNoPyodideTimeout();
 					await session.scriptTx.endScope();
 					return result;
 				} catch (err) {
@@ -1404,7 +1414,9 @@ export class SessionManager {
 					throw err;
 				}
 			}
-			return session.bash.exec(script, resolvedOpts);
+			const result = await session.bash.exec(script, resolvedOpts);
+			assertNoPyodideTimeout();
+			return result;
 		};
 
 		const updateCwd = (result: BashExecResult): BashExecResult => {
@@ -1459,7 +1471,13 @@ export class SessionManager {
 			// idle eviction victim always exists and resident subprocesses can never
 			// exceed MAX_RESIDENT. Also re-admits (single-flight) after a residency
 			// eviction / idle-kill disposed the prior worker (cold-start on next exec).
-			if (usesPyodide) await this.ensurePyodideAdmitted(session);
+			if (usesPyodide) {
+				await this.ensurePyodideAdmitted(session);
+				// Run inside the per-exec pyodide context so the command can record an
+				// internal runtime timeout that `execFn` re-raises as a fatal timeout.
+				const pyCtx: PyodideRuntimeContext = {};
+				return updateCwd(await pyodideRuntimeContext.run(pyCtx, execFn));
+			}
 			return updateCwd(await execFn());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);

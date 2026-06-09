@@ -25,6 +25,7 @@ import { createRequire } from "node:module";
 import {
 	type Frame,
 	type FsEntry,
+	PYODIDE_EXT_STAGING_DIR,
 	type ReadyFrame,
 	type RunRequest,
 	type RunResponse,
@@ -36,6 +37,7 @@ import {
 // deno-lint-ignore no-explicit-any
 const denoRef = (globalThis as any).Deno;
 const stdoutWriteSync: (b: Uint8Array) => number = denoRef.stdout.writeSync.bind(denoRef.stdout);
+const stderrWriteSync: (b: Uint8Array) => number = denoRef.stderr.writeSync.bind(denoRef.stderr);
 const stdinReadable: ReadableStream<Uint8Array> = denoRef.stdin.readable;
 const denoExit: (code: number) => never = denoRef.exit.bind(denoRef);
 const denoArgs: string[] = denoRef.args;
@@ -72,48 +74,90 @@ function emit(frame: Frame): void {
 	}
 }
 
-// ── Load Pyodide + packages (spike S1 proven, fully offline) ────────────────
-// deno-lint-ignore no-explicit-any
-const pyodideModule = await import(`file://${indexURL}pyodide.mjs`);
-const loadPyodide = pyodideModule.loadPyodide;
+// ── Pyodide instance + MEMFS handle (assigned by the init sequence below) ────
+let pyodide;
+let FS;
 
-const pyodide = await loadPyodide({
-	indexURL,
-	lockFileURL: `${indexURL}pyodide-lock.json`,
-	// Discard Pyodide's own load-time banner/print; per-run capture is wired below.
-	stdout: () => {},
-	stderr: () => {},
-});
-
-// numpy/pandas/scipy ship in the distribution → load by name.
-await pyodide.loadPackage(["numpy", "pandas", "scipy"]);
-// openpyxl + et_xmlfile are NOT in the distribution; load the vendored pure-python
-// wheels by local file:// URL (discovered in the asset dir). loadPackage reads
-// them via node:fs under --allow-read — no network. (Phase 0 Discoveries: the
-// stock lock has no openpyxl, so loadPackage-by-name would throw; file:// wheels
-// are the S1-proven offline path. The supplementary custom lock from
-// build-pyodide-lock.mjs is not required by this runner.)
-const wheelNames: string[] = [];
-for (const entry of denoRef.readDirSync(assetRoot)) {
-	if (entry.isFile && (/^openpyxl-.*\.whl$/.test(entry.name) || /^et_xmlfile-.*\.whl$/.test(entry.name))) {
-		wheelNames.push(entry.name);
+/**
+ * Adversarial self-test (spike S2 hard gate). Runs AFTER realm lockdown and
+ * BEFORE `ready`: proves the deletable host primitives are actually gone and that
+ * Pyodide's `js` proxy retains no reachable reference to them. Deleted globals +
+ * closure privacy do NOT by themselves prove no usable writer survived, so we
+ * verify it directly here. A failure throws → the init sequence kills the child
+ * and the run that triggered the spawn fails (admission fails).
+ */
+function selfTest() {
+	const gg = globalThis as any;
+	for (const name of ["Deno", "console", "require", "__dirname", "__filename"]) {
+		if (gg[name] !== undefined) throw new Error(`realm lockdown self-test failed: globalThis.${name} survived`);
+	}
+	// Pyodide's `js` foreign module proxies globalThis; confirm the deleted host
+	// primitives are unreachable through it.
+	const probe = pyodide.runPython("import js\n[hasattr(js, _n) for _n in ('Deno', 'console', 'require')]");
+	let reachable;
+	try {
+		reachable = probe && typeof probe.toJs === "function" ? probe.toJs() : probe;
+	} finally {
+		if (probe && typeof probe.destroy === "function") probe.destroy();
+	}
+	if (Array.isArray(reachable) && reachable.some(Boolean)) {
+		throw new Error("realm lockdown self-test failed: js proxy still exposes a deleted host primitive");
 	}
 }
-// et_xmlfile before openpyxl (dependency order).
-wheelNames.sort((a, b) => (a.startsWith("et_xmlfile") ? -1 : b.startsWith("et_xmlfile") ? 1 : 0));
-await pyodide.loadPackage(wheelNames.map((w) => `file://${indexURL}${w}`));
 
-const FS = pyodide.FS;
+// ── INIT SEQUENCE (spike S1 + S2) ───────────────────────────────────────────
+// Load offline Pyodide + packages, lock down the realm, run the adversarial
+// self-test — ALL before announcing `ready`. Any failure here is fatal: write a
+// diagnostic to stderr and exit non-zero so the Node manager retires the child
+// and fails the run that triggered the spawn.
+try {
+	// deno-lint-ignore no-explicit-any
+	const pyodideModule = await import(`file://${indexURL}pyodide.mjs`);
+	pyodide = await pyodideModule.loadPyodide({
+		indexURL,
+		lockFileURL: `${indexURL}pyodide-lock.json`,
+		// Discard Pyodide's own load-time banner/print; per-run capture is wired below.
+		stdout: () => {},
+		stderr: () => {},
+	});
 
-// ── REALM LOCKDOWN — before any untrusted runPythonAsync (spike S2) ─────────
-// Delete every deletable host / Node-compat write primitive. import("node:fs")
-// cannot be deleted (it is syntax), so this is hardening, not containment — the
-// Node-side validator is the real guarantee (see file header).
-delete g.Deno;
-delete g.console;
-delete g.require;
-delete g.__dirname;
-delete g.__filename;
+	// numpy/pandas/scipy ship in the distribution → load by name.
+	await pyodide.loadPackage(["numpy", "pandas", "scipy"]);
+	// openpyxl + et_xmlfile are NOT in the distribution; load the vendored pure-python
+	// wheels by local file:// URL (discovered in the asset dir). loadPackage reads
+	// them via node:fs under --allow-read — no network. (Phase 0 Discoveries: the
+	// stock lock has no openpyxl, so loadPackage-by-name would throw; file:// wheels
+	// are the S1-proven offline path. The supplementary custom lock from
+	// build-pyodide-lock.mjs is not required by this runner.)
+	const wheelNames: string[] = [];
+	for (const entry of denoRef.readDirSync(assetRoot)) {
+		if (entry.isFile && (/^openpyxl-.*\.whl$/.test(entry.name) || /^et_xmlfile-.*\.whl$/.test(entry.name))) {
+			wheelNames.push(entry.name);
+		}
+	}
+	// et_xmlfile before openpyxl (dependency order).
+	wheelNames.sort((a, b) => (a.startsWith("et_xmlfile") ? -1 : b.startsWith("et_xmlfile") ? 1 : 0));
+	await pyodide.loadPackage(wheelNames.map((w) => `file://${indexURL}${w}`));
+
+	FS = pyodide.FS;
+
+	// ── REALM LOCKDOWN — before any untrusted runPythonAsync (spike S2) ─────────
+	// Delete every deletable host / Node-compat write primitive. import("node:fs")
+	// cannot be deleted (it is syntax), so this is hardening, not containment — the
+	// Node-side validator is the real guarantee (see file header).
+	delete g.Deno;
+	delete g.console;
+	delete g.require;
+	delete g.__dirname;
+	delete g.__filename;
+
+	// ── ADVERSARIAL SELF-TEST — must pass before any untrusted code runs ─────────
+	selfTest();
+} catch (err) {
+	const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+	stderrWriteSync(new TextEncoder().encode(`RUNNER FATAL: pyodide init / lockdown self-test failed: ${msg}\n`));
+	denoExit(3);
+}
 
 // ── MEMFS helpers ───────────────────────────────────────────────────────────
 function mkdirTree(dir: string): void {
@@ -204,11 +248,18 @@ async function runOne(req: RunRequest): Promise<RunResponse> {
 	pyodide.globals.set("__sqlfs_argv", JSON.stringify(req.argv ?? []));
 	pyodide.globals.set("__sqlfs_stdin", req.stdin ? Buffer.from(req.stdin, "base64").toString("utf-8") : "");
 	pyodide.globals.set("__sqlfs_cwd", cwd);
+	pyodide.globals.set("__sqlfs_env", JSON.stringify(req.env ?? {}));
 	await pyodide.runPythonAsync(`
 import sys, os, io, json as __json
 sys.argv = __json.loads(__sqlfs_argv) or [""]
 os.chdir(__sqlfs_cwd)
 sys.stdin = io.StringIO(__sqlfs_stdin)
+# Snapshot the FULL os.environ, then apply the exec's exported env. The warm child
+# persists os.environ across runs, so we snapshot/restore the WHOLE mapping (not just
+# injected keys) to keep env strictly per-execution — a script that sets a NEW
+# os.environ key cannot leak it into the next run.
+__sqlfs_env_saved = dict(os.environ)
+os.environ.update(__json.loads(__sqlfs_env))
 __sqlfs_out = io.StringIO()
 __sqlfs_err = io.StringIO()
 sys.stdout = __sqlfs_out
@@ -245,7 +296,14 @@ sys.stderr = __sqlfs_err
 	let capturedErr = (errProxy.getvalue() as string) ?? "";
 	outProxy.destroy();
 	errProxy.destroy();
-	await pyodide.runPythonAsync("sys.stdout = sys.__stdout__\nsys.stderr = sys.__stderr__");
+	// Restore the real streams AND the prior os.environ (undo this run's env injection).
+	await pyodide.runPythonAsync(`
+sys.stdout = sys.__stdout__
+sys.stderr = sys.__stderr__
+os.environ.clear()
+os.environ.update(__sqlfs_env_saved)
+__sqlfs_env_saved.clear()
+`);
 	if (jsError) capturedErr = capturedErr && !capturedErr.endsWith("\n") ? `${capturedErr}\n${jsError}` : capturedErr + jsError;
 
 	// ── Diff the cwd subtree (dirs + files) against the staged baseline ───────
@@ -282,6 +340,22 @@ sys.stderr = __sqlfs_err
 		} catch {
 			/* already gone */
 		}
+	}
+
+	// Also wipe the reserved out-of-cwd staging dir (a `python3 FILE` resolved
+	// outside cwd was staged there) so it never leaks across execs in the warm child.
+	for (const node of walkTree(PYODIDE_EXT_STAGING_DIR).sort((a, b) => depth(b.path) - depth(a.path))) {
+		try {
+			if (node.kind === "file") FS.unlink(node.path);
+			else FS.rmdir(node.path);
+		} catch {
+			/* already gone */
+		}
+	}
+	try {
+		FS.rmdir(PYODIDE_EXT_STAGING_DIR);
+	} catch {
+		/* not created this run */
 	}
 
 	return {

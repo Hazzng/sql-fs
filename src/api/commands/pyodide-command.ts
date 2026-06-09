@@ -30,8 +30,12 @@ import {
 	latin1FromBytes,
 } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { PYODIDE_EXT_STAGING_DIR } from "../../pyodide-runner/protocol.js";
 import type { FsEntry, RunResponse } from "../../pyodide-runner/protocol.js";
+import { pyodideRuntimeContext } from "../pyodide-runtime-context.js";
+import { PyodideTimeoutError } from "../pyodide/manager.js";
 import type { PyodideSandbox, RunRequestInput } from "../pyodide/manager.js";
+import { readOnlyContext } from "../read-only-context.js";
 
 /** Default per-file cap on staged-in / drained-out file bytes (32 MiB). */
 export const PYODIDE_MAX_FILE_BYTES_DEFAULT = 32 * 1024 * 1024;
@@ -119,9 +123,16 @@ interface Parsed {
 	readonly argv: string[];
 	/** base64 of the program's own stdin ("" when stdin was consumed as the program). */
 	readonly stdin: string;
-	/** Absolute path of a FILE script resolved OUTSIDE cwd that must also be staged
-	 *  (python3 FILE parity). Staged in `runPython` under the same caps as the cwd walk. */
-	readonly scriptPathOutsideCwd?: string;
+	/** When the FILE script resolved OUTSIDE cwd (python3 FILE parity): stage its
+	 *  bytes at a reserved, non-drainable MEMFS path (collision-free, excluded from
+	 *  the cwd-scoped diff). `argv[0]` / `__file__` point at `stagePath`. Carries the
+	 *  ALREADY-read+capped bytes + mode so staging never re-reads the file. */
+	readonly extScript?: {
+		readonly srcPath: string;
+		readonly stagePath: string;
+		readonly bytes: Uint8Array;
+		readonly mode: number;
+	};
 }
 
 async function runPython(
@@ -138,7 +149,7 @@ async function runPython(
 	if (first === "-h" || first === "--help") return { stdout: "", stderr: HINT, exitCode: 0 };
 	if (first === "-m") return errResult("python3: the -m option is not supported in the pyodide runtime", 2);
 
-	const parsed = await parseProgram(args, ctx);
+	const parsed = await parseProgram(args, ctx, caps);
 	if ("error" in parsed) return parsed.error;
 
 	// Stage the cwd subtree (+ a script file outside cwd) into the request, under
@@ -147,24 +158,67 @@ async function runPython(
 	try {
 		const staged = await stageCwd(ctx.fs, ctx.cwd, caps);
 		files = staged.files;
-		if (parsed.scriptPathOutsideCwd !== undefined) {
-			const { entry } = await stageFile(ctx.fs, parsed.scriptPathOutsideCwd, caps, staged.total);
-			files.push(entry);
+		if (parsed.extScript !== undefined) {
+			// The out-of-cwd script was already read + symlink-refused + per-file-capped
+			// in parseProgram; here we only enforce the shared TOTAL budget and stage the
+			// already-read bytes at the reserved path (no second read).
+			enforceStageCaps(parsed.extScript.bytes.byteLength, parsed.extScript.srcPath, caps, staged.total);
+			files.push({
+				path: parsed.extScript.stagePath,
+				kind: "file",
+				mode: parsed.extScript.mode,
+				data: Buffer.from(parsed.extScript.bytes).toString("base64"),
+			});
 		}
 	} catch (err) {
 		if (err instanceof PyodideDrainError) return errResult(err.message, 1);
 		throw err;
 	}
 
-	const input: RunRequestInput = { code: parsed.code, argv: parsed.argv, stdin: parsed.stdin, files, cwd: ctx.cwd };
+	const input: RunRequestInput = {
+		code: parsed.code,
+		argv: parsed.argv,
+		stdin: parsed.stdin,
+		files,
+		cwd: ctx.cwd,
+		// Exported bash env vars → Python os.environ for THIS run only (subprocess
+		// inherit semantics). The Deno/host env is separately scrubbed; this is the
+		// sandbox's own bash environment, safe to surface to the script.
+		env: ctx.exportedEnv,
+	};
 
 	// Resolve the sandbox only now (an actual run is required). Manager THROWS on
-	// timeout/abort/integrity/child-exit — let it propagate so bash.exec rejects and
-	// the script transaction rolls back (drains nothing).
-	const resp = await getSandbox().run(input, ctx.signal ?? NEVER_ABORT);
+	// timeout/abort/integrity/child-exit; we let those propagate so bash.exec fails
+	// and nothing drains. For the INTERNAL runtime timeout we ALSO tag the per-exec
+	// context so execWithRuntimeThrottle can re-raise it as a fatal timeout (mapped
+	// to a consistent HTTP timeout) instead of just-bash flattening it to a generic
+	// non-zero exit.
+	let resp: RunResponse;
+	try {
+		resp = await getSandbox().run(input, ctx.signal ?? NEVER_ABORT);
+	} catch (err) {
+		if (err instanceof PyodideTimeoutError) {
+			const store = pyodideRuntimeContext.getStore();
+			if (store !== undefined) store.timeoutError = err;
+		}
+		throw err;
+	}
 
 	// Abort that landed after the response but before the drain → drain nothing.
 	if (ctx.signal?.aborted) throw makeAbortError();
+
+	// Explicit read-only enforcement (Decision 6): compare the run's reported MEMFS
+	// manifest against the staged snapshot and reject BEFORE any ctx.fs mutation if
+	// the run produced ANY persistent change. Created-then-deleted temp files are
+	// not in the final diff and are intentionally allowed (no persistent mutation).
+	// This fails closed one step earlier than relying on SqlFs to throw mid-drain;
+	// marking the shared read-only context lets the session layer surface a uniform
+	// EREADONLY_VIOLATION.
+	const roStore = readOnlyContext.getStore();
+	if (roStore !== undefined && (resp.created.length > 0 || resp.modified.length > 0 || resp.deleted.length > 0)) {
+		roStore.violated = true;
+		return errResult("python3: readOnly script attempted to mutate the filesystem", 1);
+	}
 
 	await drain(ctx.fs, ctx.cwd, resp, caps);
 
@@ -175,7 +229,7 @@ async function runPython(
 	};
 }
 
-async function parseProgram(args: string[], ctx: CommandContext): Promise<Parsed | { error: ExecResult }> {
+async function parseProgram(args: string[], ctx: CommandContext, caps: Caps): Promise<Parsed | { error: ExecResult }> {
 	const first = args[0];
 
 	if (first === "-c") {
@@ -200,18 +254,62 @@ async function parseProgram(args: string[], ctx: CommandContext): Promise<Parsed
 	// FILE [args…]
 	if (first.includes("\0")) return { error: errResult("python3: invalid file path", 2) };
 	const resolved = ctx.fs.resolvePath(ctx.cwd, first);
-	let code: string;
+	// Read the script through the SAME guarantees as staging — symlink-refused +
+	// per-file capped — BEFORE decoding its source (so a `python3 FILE` is never read
+	// uncapped or through a symlink). The bytes are reused to stage an out-of-cwd
+	// script without a second read.
+	let read: { code: string; bytes: Uint8Array; mode: number };
 	try {
-		code = await ctx.fs.readFile(resolved, "utf8");
-	} catch {
+		read = await readScriptCapped(ctx.fs, resolved, caps);
+	} catch (err) {
+		// Symlink refusal / over-cap surface as a clear policy error (exit 1); a
+		// missing/unreadable file is the usual can't-open (exit 2).
+		if (err instanceof PyodideDrainError) return { error: errResult(err.message, 1) };
 		return { error: errResult(`python3: can't open file '${first}': [Errno 2] No such file or directory`, 2) };
 	}
+	if (isUnderCwd(resolved, ctx.cwd)) {
+		// Common case: the script lives under cwd → staged by the cwd walk; argv[0]
+		// is the user's literal arg.
+		return { code: read.code, argv: [first, ...args.slice(1)], stdin: stdinBase64(ctx) };
+	}
+	// Out-of-cwd script: stage at a reserved non-drainable path and point argv[0] at
+	// it so `__file__` / `open(__file__)` resolve to where it was staged (rather than
+	// at its original absolute path, which could collide with Pyodide's own MEMFS).
+	const stagePath = `${PYODIDE_EXT_STAGING_DIR}/${baseName(resolved)}`;
 	return {
-		code,
-		argv: [first, ...args.slice(1)],
+		code: read.code,
+		argv: [stagePath, ...args.slice(1)],
 		stdin: stdinBase64(ctx),
-		scriptPathOutsideCwd: isUnderCwd(resolved, ctx.cwd) ? undefined : resolved,
+		extScript: { srcPath: resolved, stagePath, bytes: read.bytes, mode: read.mode },
 	};
+}
+
+/**
+ * Read a script FILE under the SAME guarantees as staging — refuse symlinks
+ * (default-deny) and enforce the per-file cap — BEFORE decoding its source. Used by
+ * {@link parseProgram} so a `python3 FILE` is never read uncapped or through a
+ * symlink. Returns the decoded source plus the raw bytes + mode (reused to stage an
+ * out-of-cwd script without a second read). A missing/unreadable file throws the
+ * underlying fs error, which the caller maps to the usual can't-open message.
+ */
+async function readScriptCapped(
+	fs: IFileSystem,
+	path: string,
+	caps: Caps,
+): Promise<{ code: string; bytes: Uint8Array; mode: number }> {
+	const st = await fs.lstat(path);
+	if (st.isSymbolicLink) throw new PyodideDrainError(`refusing to run a symlink: ${path}`);
+	const bytes = await fs.readFileBuffer(path);
+	if (bytes.byteLength > caps.maxFileBytes) {
+		throw new PyodideDrainError(`'${path}' (${bytes.byteLength} bytes) exceeds the per-file stage cap`);
+	}
+	return { code: Buffer.from(bytes).toString("utf8"), bytes, mode: st.mode & 0o777 };
+}
+
+/** Final path segment (basename) of an absolute MEMFS/SqlFs path. */
+function baseName(path: string): string {
+	const i = path.lastIndexOf("/");
+	return i >= 0 ? path.slice(i + 1) : path;
 }
 
 function stdinBase64(ctx: CommandContext): string {
@@ -298,25 +396,62 @@ async function stageCwd(fs: IFileSystem, cwd: string, caps: Caps): Promise<{ fil
  * which rolls the transaction back.
  */
 export async function drain(fs: IFileSystem, cwd: string, resp: RunResponse, caps: Caps): Promise<void> {
-	const assertUnderCwd = (path: string, label: string): string => {
+	const assertSafePath = (path: string, label: string): string => {
 		if (path.includes("\0")) throw new PyodideDrainError(`${label} path contains a null byte`);
 		const resolved = fs.resolvePath(cwd, path);
 		if (!isUnderCwd(resolved, cwd)) throw new PyodideDrainError(`${label} path escapes cwd: ${path}`);
+		// Defense-in-depth: never drain into the reserved out-of-cwd staging area.
+		// (Already excluded by the cwd check since it lives outside cwd — asserted
+		// explicitly so a forged frame can't target it even if cwd ever overlapped.)
+		if (resolved === PYODIDE_EXT_STAGING_DIR || resolved.startsWith(`${PYODIDE_EXT_STAGING_DIR}/`)) {
+			throw new PyodideDrainError(`${label} path targets the reserved staging area: ${path}`);
+		}
 		return resolved;
 	};
 
-	// 1. Validate paths + caps for everything before writing anything.
+	// 1. Validate paths + caps + manifest consistency before writing anything.
 	let total = 0;
+	const writes = new Set<string>(); // resolved created+modified paths (uniqueness)
+	const writeFiles: string[] = []; // resolved written-FILE paths (ancestor check)
 	for (const e of [...resp.created, ...resp.modified]) {
-		assertUnderCwd(e.path, "drain");
+		const resolved = assertSafePath(e.path, "drain");
+		if (writes.has(resolved)) throw new PyodideDrainError(`duplicate drain path: ${e.path}`);
+		writes.add(resolved);
 		if (e.kind === "file") {
+			writeFiles.push(resolved);
 			const n = base64ByteLength(e.data);
 			if (n > caps.maxFileBytes) throw new PyodideDrainError(`'${e.path}' (${n} bytes) exceeds the per-file drain cap`);
 			total += n;
 		}
 	}
 	if (total > caps.maxTotalBytes) throw new PyodideDrainError("drained files exceed the total byte cap");
-	for (const p of resp.deleted) assertUnderCwd(p, "deleted");
+
+	// Deletes: reject duplicates (a plain Set would silently collapse them).
+	const deletes = new Set<string>();
+	for (const p of resp.deleted) {
+		const resolved = assertSafePath(p, "deleted");
+		if (deletes.has(resolved)) throw new PyodideDrainError(`duplicate deleted path: ${p}`);
+		deletes.add(resolved);
+	}
+
+	// No write may equal, contain, or be contained by a delete: deleting an ancestor
+	// directory would silently remove a "written" path (and vice versa). The real
+	// diff never produces such a manifest — reject it before any mutation.
+	for (const w of writes) {
+		for (const d of deletes) {
+			if (w === d || w.startsWith(`${d}/`) || d.startsWith(`${w}/`)) {
+				throw new PyodideDrainError(`drain path conflicts with a deletion: '${w}' vs '${d}'`);
+			}
+		}
+	}
+	// A written FILE cannot also be a directory ancestor of another written path
+	// (would require treating a file as a directory).
+	for (const f of writeFiles) {
+		const prefix = `${f}/`;
+		for (const w of writes) {
+			if (w.startsWith(prefix)) throw new PyodideDrainError(`drain path uses a file as a directory: ${f}`);
+		}
+	}
 
 	// 2. Apply created (dirs shallow→deep, then files), then modified files.
 	for (const e of resp.created) await applyEntry(fs, cwd, e);

@@ -93,10 +93,12 @@ async function runSequential(
 					durationMs: Date.now() - scriptStart,
 				});
 			}
-		} catch {
+		} catch (err) {
 			clearTimeout(timer);
 			outerSignal?.removeEventListener("abort", abortFromOuter);
-			if (timedOut) {
+			// The script's own timer (timedOut) OR the manager's internal pyodide
+			// runtime timeout both surface as a per-script timeout result.
+			if (timedOut || (err as Error & { code?: string }).code === "EPYODIDE_TIMEOUT") {
 				results.push({
 					id: entry.id,
 					stdout: "",
@@ -199,7 +201,8 @@ async function runParallel(
 						exitCode: execResult.exitCode,
 						durationMs: Date.now() - scriptStart,
 					};
-				} catch {
+				} catch (err) {
+					const isPyodideTimeout = (err as Error & { code?: string }).code === "EPYODIDE_TIMEOUT";
 					results[idx] = {
 						id: entry.id,
 						stdout: "",
@@ -207,7 +210,7 @@ async function runParallel(
 						exitCode: -1,
 						durationMs: Date.now() - scriptStart,
 						error:
-							timedOut || perScriptTimedOut
+							timedOut || perScriptTimedOut || isPyodideTimeout
 								? "timeout"
 								: sharedController.signal.aborted
 									? "aborted"
