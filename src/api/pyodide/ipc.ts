@@ -26,18 +26,23 @@ const HEADER_BYTES = 4;
 /**
  * Default per-frame wire cap (the declared JSON-body byte length). Because file
  * payloads are base64 in the body, this naturally measures the ~33%-expanded
- * size. Generous default; Phase 6 wires the `PYODIDE_MAX_FRAME_BYTES` env var.
- * Stays well below the protocol-level {@link protocol.MAX_FRAME_BYTES} ceiling.
+ * size. Set ABOVE the staging total cap (`PYODIDE_MAX_TOTAL_BYTES`, 128 MiB) ×
+ * ~1.33 base64 expansion so a single monolithic drain response carrying the full
+ * 128 MiB total is reachable rather than killed mid-drain — the response is still
+ * one frame today (see thoughts/.../streaming-staging-plan.md Phase 1 for the
+ * per-file streaming that removes this coupling). Overridable via
+ * `PYODIDE_MAX_FRAME_BYTES`. Stays below the protocol-level
+ * {@link protocol.MAX_FRAME_BYTES} (256 MiB) ceiling.
  */
-export const PYODIDE_MAX_FRAME_BYTES_DEFAULT = 64 * 1024 * 1024;
+export const PYODIDE_MAX_FRAME_BYTES_DEFAULT = 192 * 1024 * 1024;
 
 /**
  * Default aggregate cap: total bytes the manager will buffer from the child for a
  * single response (reset on each accepted `ready`/`result`/`error`). Bounds a
  * slowloris-style stream that never forms a complete/valid frame. Must be ≥ the
- * per-frame cap. Phase 6 wires the `PYODIDE_MAX_AGGREGATE_BYTES` env var.
+ * per-frame cap. Overridable via `PYODIDE_MAX_AGGREGATE_BYTES`.
  */
-export const PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT = 96 * 1024 * 1024;
+export const PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT = 256 * 1024 * 1024;
 
 /** A framing / integrity violation. The manager turns this into kill-the-child. */
 export class IpcIntegrityError extends Error {

@@ -192,6 +192,13 @@ function resolveDenoBin(bin: string): string {
 	return bin; // not found on PATH; let spawn surface ENOENT with the bare name
 }
 
+/** Parse a positive-integer byte cap from an env var; fall back to `fallback` on absent/invalid. */
+function byteCapFromEnv(value: string | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+	const n = Number(value);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 function packagesFromEnv(value: string | undefined): string[] {
 	if (value === undefined) return [...PYODIDE_PRELOAD_PACKAGES_DEFAULT];
 	return value
@@ -257,8 +264,11 @@ export class PyodideSandbox {
 		this.#denoBin = resolveDenoBin(opts.denoBin ?? process.env.DENO_BIN_PATH ?? "deno");
 		this.#runnerPath = opts.runnerPath ?? DEFAULT_RUNNER_PATH;
 		this.#runtimeTimeoutMs = opts.runtimeTimeoutMs ?? PYODIDE_RUNTIME_TIMEOUT_MS_DEFAULT;
-		this.#maxFrameBytes = opts.maxFrameBytes ?? PYODIDE_MAX_FRAME_BYTES_DEFAULT;
-		this.#maxAggregateBytes = opts.maxAggregateBytes ?? PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT;
+		this.#maxFrameBytes =
+			opts.maxFrameBytes ?? byteCapFromEnv(process.env.PYODIDE_MAX_FRAME_BYTES, PYODIDE_MAX_FRAME_BYTES_DEFAULT);
+		this.#maxAggregateBytes =
+			opts.maxAggregateBytes ??
+			byteCapFromEnv(process.env.PYODIDE_MAX_AGGREGATE_BYTES, PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT);
 		this.#preloadPackages = opts.preloadPackages ?? packagesFromEnv(process.env.PYODIDE_PRELOAD_PACKAGES);
 		const configuredRss = opts.maxChildRssBytes ?? Number(process.env.PYODIDE_MAX_CHILD_RSS_BYTES ?? "0");
 		this.#maxChildRssBytes = Number.isFinite(configuredRss) && configuredRss > 0 ? configuredRss : undefined;

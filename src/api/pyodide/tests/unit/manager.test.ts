@@ -10,7 +10,13 @@
 import { Buffer } from "node:buffer";
 import type { SpawnOptions } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { IpcFrameTooLargeError, IpcIntegrityError, encodeFrame } from "../../ipc.js";
+import {
+	IpcFrameTooLargeError,
+	IpcIntegrityError,
+	PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT,
+	PYODIDE_MAX_FRAME_BYTES_DEFAULT,
+	encodeFrame,
+} from "../../ipc.js";
 import type { RunRequestInput } from "../../manager.js";
 import {
 	COMMITTED_FLAGS,
@@ -411,6 +417,37 @@ describe("PyodideSandbox — frame integrity (each violation kills the child)", 
 		for (let i = 0; i < 10; i++) child.stdout.write(Buffer.alloc(900, 0x20));
 		expect(await p).toBeInstanceOf(IpcIntegrityError);
 		expect(child.killed).toBe(true);
+	});
+});
+
+describe("PyodideSandbox — wire caps (defaults + env overrides)", () => {
+	it("raises the default frame/aggregate caps above the 128 MiB staging total", () => {
+		// A monolithic drain response carries the full PYODIDE_MAX_TOTAL_BYTES (128 MiB)
+		// base64-expanded (~1.33x); the frame cap MUST clear that or large drains die.
+		expect(PYODIDE_MAX_FRAME_BYTES_DEFAULT).toBe(192 * 1024 * 1024);
+		expect(PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT).toBe(256 * 1024 * 1024);
+		expect(PYODIDE_MAX_AGGREGATE_BYTES_DEFAULT).toBeGreaterThanOrEqual(PYODIDE_MAX_FRAME_BYTES_DEFAULT);
+	});
+
+	it("honors PYODIDE_MAX_FRAME_BYTES when no explicit option is given", async () => {
+		const saved = process.env.PYODIDE_MAX_FRAME_BYTES;
+		process.env.PYODIDE_MAX_FRAME_BYTES = "200";
+		try {
+			const harness = makeHarness();
+			// makeManager passes maxFrameBytes: undefined → constructor falls back to env.
+			const manager = track(makeManager(harness));
+			const p = manager.run(INPUT, new AbortController().signal).catch((e) => e);
+			const child = await harness.nextChild();
+			child.sendReady();
+			const run = await child.nextRun();
+			// 1 KiB raw → ~1368 base64 chars, well over the 200-byte env cap.
+			child.sendResult(run, { stdout: Buffer.alloc(1024, 0x41).toString("base64") });
+			expect(await p).toBeInstanceOf(IpcFrameTooLargeError);
+			expect(child.killed).toBe(true);
+		} finally {
+			if (saved === undefined) Reflect.deleteProperty(process.env, "PYODIDE_MAX_FRAME_BYTES");
+			else process.env.PYODIDE_MAX_FRAME_BYTES = saved;
+		}
 	});
 });
 
