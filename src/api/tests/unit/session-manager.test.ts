@@ -335,15 +335,23 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("warm session ignores subsequent runtimeOptions (cache-hit path)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs() });
-		const first = await sm.getOrCreate(T, "sandbox-warm", { python: true, javascript: false, network: false });
-		const second = await sm.getOrCreate(T, "sandbox-warm", { python: false, javascript: true, network: false });
+		const first = await sm.getOrCreate(T, "sandbox-warm", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
+		const second = await sm.getOrCreate(T, "sandbox-warm", { pythonRuntime: null, javascript: true, network: false });
 		expect(second).toBe(first);
-		expect(second.runtimeOptions).toEqual({ python: true, javascript: false, network: false });
+		expect(second.runtimeOptions).toEqual({ pythonRuntime: "stdlib", javascript: false, network: false });
 	});
 
 	it("non-Python script bypasses semaphore entirely", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-no-py", { python: true, javascript: false, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-no-py", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
 		stubBashExec(session, async () => ({ stdout: "hi", stderr: "", exitCode: 0, env: {} }));
 
 		await sm.execWithRuntimeThrottle(session, "echo hi");
@@ -376,7 +384,11 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("regex does not match mypython_script or python-config (word boundary)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-regex", { python: true, javascript: false, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-regex", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
 
 		let running = 0;
 		let peak = 0;
@@ -400,7 +412,11 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 2 });
-		const session = await sm.getOrCreate(T, "sandbox-sem", { python: true, javascript: false, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-sem", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -433,7 +449,11 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 
 	it("slot is released even when bash.exec throws", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-throw", { python: true, javascript: false, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-throw", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -481,7 +501,11 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("JS regex does not match mynode/nodejs_tool/js-exec-helper etc (word boundary)", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-js-regex", { python: false, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-js-regex", {
+			pythonRuntime: null,
+			javascript: true,
+			network: false,
+		});
 
 		let running = 0;
 		let peak = 0;
@@ -503,7 +527,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("12 parallel js-exec scripts with cap=4 run in 3 batches of 4", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 4 });
-		const session = await sm.getOrCreate(T, "sandbox-js-12", { python: false, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-js-12", { pythonRuntime: null, javascript: true, network: false });
 
 		let running = 0;
 		let peak = 0;
@@ -528,7 +552,11 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("semaphore allows up to N concurrent JS executions, queues the (N+1)th until a slot frees", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 2 });
-		const session = await sm.getOrCreate(T, "sandbox-js-sem", { python: false, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-js-sem", {
+			pythonRuntime: null,
+			javascript: true,
+			network: false,
+		});
 
 		const releasers: Array<() => void> = [];
 		let started = 0;
@@ -558,7 +586,11 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 
 	it("JS slot is released even when bash.exec throws", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
-		const session = await sm.getOrCreate(T, "sandbox-js-throw", { python: false, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-js-throw", {
+			pythonRuntime: null,
+			javascript: true,
+			network: false,
+		});
 
 		let execCount = 0;
 		stubBashExec(session, async () => {
@@ -591,7 +623,11 @@ describe("SessionManager combined python + js semaphores", () => {
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate(T, "sandbox-both", { python: true, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-both", {
+			pythonRuntime: "stdlib",
+			javascript: true,
+			network: false,
+		});
 
 		const releasers: Array<() => void> = [];
 		stubBashExec(session, async () => {
@@ -630,7 +666,11 @@ describe("SessionManager combined python + js semaphores", () => {
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,
 		});
-		const session = await sm.getOrCreate(T, "sandbox-deadlock", { python: true, javascript: true, network: false });
+		const session = await sm.getOrCreate(T, "sandbox-deadlock", {
+			pythonRuntime: "stdlib",
+			javascript: true,
+			network: false,
+		});
 
 		let peak = 0;
 		let running = 0;
@@ -691,6 +731,178 @@ describe("SessionManager idle eviction (US-075)", () => {
 		expect(sm.getSession(T, "sandbox-busy")).toBeDefined();
 
 		sm.stopReaper();
+	});
+});
+
+describe("SessionManager Pyodide semaphore (MAX_CONCURRENT_PYODIDE) — Phase 6", () => {
+	type ExecImpl = (
+		script: string,
+	) => Promise<{ stdout: string; stderr: string; exitCode: number; env: Record<string, string> }>;
+
+	function stubBashExec(session: { bash: unknown }, impl: ExecImpl): void {
+		// biome-ignore lint/suspicious/noExplicitAny: deliberately overwriting a readonly method for test control
+		(session.bash as any).exec = impl;
+	}
+
+	const PYODIDE = { pythonRuntime: "pyodide", javascript: false, network: false } as const;
+
+	let active: SessionManager | undefined;
+	const savedEnv: Record<string, string | undefined> = {};
+	afterEach(async () => {
+		if (active) {
+			await active.shutdown({ drainTimeoutMs: 100 }).catch(() => {});
+			active = undefined;
+		}
+		for (const [k, v] of Object.entries(savedEnv)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	});
+
+	function setEnv(key: string, value: string): void {
+		savedEnv[key] = process.env[key];
+		process.env[key] = value;
+	}
+
+	it("allows up to MAX_CONCURRENT_PYODIDE concurrent execs, queues the (N+1)th until a slot frees", async () => {
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 2 });
+		active = sm;
+		const session = await sm.getOrCreate(T, "sandbox-pyo-sem", PYODIDE);
+
+		const releasers: Array<() => void> = [];
+		let started = 0;
+		stubBashExec(session, async () => {
+			started++;
+			await new Promise<void>((resolve) => {
+				releasers.push(resolve);
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const p1 = sm.execWithRuntimeThrottle(session, "python3 -c 'a'");
+		const p2 = sm.execWithRuntimeThrottle(session, "python3 -c 'b'");
+		const p3 = sm.execWithRuntimeThrottle(session, "python3 -c 'c'");
+
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(2);
+
+		releasers[0]?.();
+		await new Promise((r) => setTimeout(r, 10));
+		expect(started).toBe(3);
+
+		releasers[1]?.();
+		releasers[2]?.();
+		await Promise.all([p1, p2, p3]);
+	});
+
+	it("rejects with ERUNTIME_BUSY (queue_full) when the pyodide queue is saturated", async () => {
+		setEnv("MAX_PYODIDE_QUEUE", "0");
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 1 });
+		active = sm;
+		const session = await sm.getOrCreate(T, "sandbox-pyo-full", PYODIDE);
+
+		let release!: () => void;
+		stubBashExec(session, async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const p1 = sm.execWithRuntimeThrottle(session, "python3 -c 'a'");
+		await new Promise((r) => setTimeout(r, 10)); // p1 holds the only slot
+		await expect(sm.execWithRuntimeThrottle(session, "python3 -c 'b'")).rejects.toMatchObject({
+			code: "ERUNTIME_BUSY",
+		});
+		release();
+		await p1;
+	});
+
+	it("rejects with ERUNTIME_BUSY (wait_timeout) when a queued pyodide exec waits too long", async () => {
+		setEnv("PYODIDE_QUEUE_TIMEOUT_MS", "30");
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 1 });
+		active = sm;
+		const session = await sm.getOrCreate(T, "sandbox-pyo-timeout", PYODIDE);
+
+		let release!: () => void;
+		stubBashExec(session, async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		const p1 = sm.execWithRuntimeThrottle(session, "python3 -c 'a'");
+		await new Promise((r) => setTimeout(r, 10));
+		// p2 queues, then times out after PYODIDE_QUEUE_TIMEOUT_MS=30ms.
+		await expect(sm.execWithRuntimeThrottle(session, "python3 -c 'b'")).rejects.toMatchObject({
+			code: "ERUNTIME_BUSY",
+		});
+		release();
+		await p1;
+	});
+
+	it("stdlib python routes through pythonSem, NOT pyodideSem (independent caps)", async () => {
+		// pyodideSem cap = 1; pythonSem cap = 5. A stdlib session running 3 python3
+		// scripts must NOT be gated by the pyodide cap — they run concurrently.
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 1, maxConcurrentPython: 5 });
+		active = sm;
+		const session = await sm.getOrCreate(T, "sandbox-stdlib-route", {
+			pythonRuntime: "stdlib",
+			javascript: false,
+			network: false,
+		});
+
+		let running = 0;
+		let peak = 0;
+		stubBashExec(session, async () => {
+			running++;
+			peak = Math.max(peak, running);
+			await new Promise((r) => setTimeout(r, 20));
+			running--;
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		await Promise.all([
+			sm.execWithRuntimeThrottle(session, "python3 -c 'a'"),
+			sm.execWithRuntimeThrottle(session, "python3 -c 'b'"),
+			sm.execWithRuntimeThrottle(session, "python3 -c 'c'"),
+		]);
+		expect(peak).toBe(3); // not throttled to 1 by the pyodide cap
+	});
+
+	it("pyodide slot is released even when bash.exec throws", async () => {
+		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 1 });
+		active = sm;
+		const session = await sm.getOrCreate(T, "sandbox-pyo-throw", PYODIDE);
+
+		let execCount = 0;
+		stubBashExec(session, async () => {
+			execCount++;
+			if (execCount === 1) throw new Error("boom");
+			return { stdout: "", stderr: "", exitCode: 0, env: {} };
+		});
+
+		await expect(sm.execWithRuntimeThrottle(session, "python3 -c '1'")).rejects.toThrow("boom");
+
+		// If the slot leaked, this would hang (cap 1).
+		const second = sm.execWithRuntimeThrottle(session, "python3 -c '2'");
+		const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("slot not released")), 500));
+		await expect(Promise.race([second, timeout])).resolves.toMatchObject({ exitCode: 0 });
+	});
+});
+
+describe("SessionManager Pyodide residency startup invariant — Phase 6", () => {
+	it("throws when MAX_RESIDENT_PYODIDE < MAX_CONCURRENT_PYODIDE", () => {
+		expect(
+			() => new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 3, maxResidentPyodide: 2 }),
+		).toThrow(/MAX_RESIDENT_PYODIDE/);
+	});
+
+	it("accepts MAX_RESIDENT_PYODIDE == MAX_CONCURRENT_PYODIDE", () => {
+		expect(
+			() => new SessionManager({ createFs: makeCreateFs(), maxConcurrentPyodide: 2, maxResidentPyodide: 2 }),
+		).not.toThrow();
 	});
 });
 

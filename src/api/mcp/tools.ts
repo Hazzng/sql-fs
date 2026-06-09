@@ -31,17 +31,17 @@ const MAX_EXPORT_CONCURRENCY = positiveIntEnv(process.env.MAX_EXPORT_CONCURRENCY
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
 		"sandbox_create",
-		"Create an isolated bash sandbox with a virtual filesystem. Optional runtime flags opt in to python3/python (CPython WASM, stdlib only) and js-exec/node (QuickJS WASM) commands. Optional name for human-readable identification.",
+		'Create an isolated bash sandbox with a virtual filesystem. `python_runtime` opts into python3/python: "stdlib" = CPython WASM (stdlib only, air-gapped) or "pyodide" = numpy/pandas/scipy/openpyxl in an OS-isolated Deno subprocess. `javascript` opts into js-exec/node (QuickJS WASM). Optional name for human-readable identification.',
 		{
 			name: z.string().max(255).optional().describe("Human-readable name for the sandbox"),
-			python: z.boolean().optional(),
+			python_runtime: z.enum(["stdlib", "pyodide"]).nullable().optional(),
 			javascript: z.boolean().optional(),
 		},
 		async (args) => {
 			const id = randomUUID();
 			const name = args.name ?? null;
 			const runtimeOptions = {
-				python: args.python ?? false,
+				pythonRuntime: args.python_runtime ?? null,
 				javascript: args.javascript ?? false,
 				network: false,
 			};
@@ -51,7 +51,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				await sessionManager.persistSandboxMeta(tenant, id, {
 					owner,
 					name,
-					python: runtimeOptions.python,
+					python_runtime: runtimeOptions.pythonRuntime,
 					javascript: runtimeOptions.javascript,
 					network: runtimeOptions.network,
 				});
@@ -59,7 +59,12 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					content: [
 						{
 							type: "text" as const,
-							text: JSON.stringify({ id, name, python: runtimeOptions.python, javascript: runtimeOptions.javascript }),
+							text: JSON.stringify({
+								id,
+								name,
+								python_runtime: runtimeOptions.pythonRuntime,
+								javascript: runtimeOptions.javascript,
+							}),
 						},
 					],
 				};
@@ -95,7 +100,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 									name: s.name,
 									owner: s.owner,
 									createdAt: s.createdAt.toISOString(),
-									python: s.python,
+									python_runtime: s.python_runtime,
 									javascript: s.javascript,
 								})),
 							}),
@@ -172,8 +177,10 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"/proc /sys /dev (no special filesystems), ln -s (symlinks off by default),",
 		"gcc/make/rustc (no compilers), network access of any kind.",
 		"",
-		"Optional runtimes (only if sandbox was created with python:true or javascript:true):",
-		"- python3 / python — CPython WASM, stdlib only (no pip, no network, no os.system).",
+		"Optional runtimes (only if the sandbox was created with python_runtime set or javascript:true):",
+		'- python3 / python (python_runtime: "stdlib") — CPython WASM, stdlib only (no pip, no network, no os.system).',
+		'- python3 / python (python_runtime: "pyodide") — numpy/pandas/scipy/openpyxl available, runs in an',
+		"  OS-isolated Deno subprocess (no network, no host FS). Use for data-analysis workloads.",
 		"  Concurrent python3 executions across the server are capped to prevent OOM; excess",
 		"  scripts queue until a slot frees.",
 		"- js-exec / node — QuickJS WASM. TypeScript supported. No npm, no network.",

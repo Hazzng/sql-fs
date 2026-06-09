@@ -22,20 +22,21 @@ from sqlfs import (
 | `name` | `str \| None` | Human label, optional at creation |
 | `owner` | `str` | The `sub` claim of the creating token |
 | `created_at` | `str` | ISO-8601 UTC |
-| `python` | `bool` | CPython WASM runtime enabled? |
+| `python_runtime` | `"stdlib" \| "pyodide" \| None` | Python runtime: `stdlib` (CPython WASM), `pyodide` (numpy/pandas/scipy/openpyxl), or `None` |
 | `javascript` | `bool` | QuickJS runtime enabled? |
+| `network` | `bool` | Outbound `fetch()` from `js-exec` enabled? |
 
 ```python
-sb = fs.sandboxes.create(name="demo", python=True)
-print(sb.record.id, sb.record.python)
+sb = fs.sandboxes.create(name="demo", python_runtime="stdlib")
+print(sb.record.id, sb.record.python_runtime)
 ```
 
 ---
 
 ## `SandboxInfo` — returned by `sandboxes.get()`
 
-Same as `SandboxRecord` minus the `python`/`javascript` flags, plus
-`last_used_at`.
+Same as `SandboxRecord` minus the `python_runtime`/`javascript`/`network` flags,
+plus `last_used_at`.
 
 | Field | Type | Notes |
 |---|---|---|

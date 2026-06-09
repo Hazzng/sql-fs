@@ -7,7 +7,7 @@ const client = new Client({
 	sub: process.env.SQLFS_SUB ?? "typescript-quickstart",
 });
 
-const sandbox = await client.sandboxes.create({ name: "typescript-quickstart", python: true });
+const sandbox = await client.sandboxes.create({ name: "typescript-quickstart", python_runtime: "stdlib" });
 try {
 	const result = await sandbox.exec("echo hello from sql-fs && pwd");
 	console.log(result.stdout);

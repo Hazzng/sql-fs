@@ -8,19 +8,24 @@
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
+import type { PythonRuntime } from "../../sql-fs/types.js";
 import type { AuthVariables } from "../auth.js";
 import { forbiddenResponse, isForbiddenError, isOwnedBy, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
-const createBodySchema = z.object({
-	name: z.string().max(255).optional(),
-	env: z.record(z.string()).optional(),
-	files: z.record(z.string()).optional(),
-	python: z.boolean().optional(),
-	javascript: z.boolean().optional(),
-	/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */
-	network: z.boolean().optional(),
-});
+const createBodySchema = z
+	.object({
+		name: z.string().max(255).optional(),
+		env: z.record(z.string()).optional(),
+		files: z.record(z.string()).optional(),
+		/** Python runtime: "stdlib" (CPython WASM) or "pyodide" (numpy/pandas/scipy/openpyxl). */
+		python_runtime: z.enum(["stdlib", "pyodide"]).nullable().optional(),
+		javascript: z.boolean().optional(),
+		/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */
+		network: z.boolean().optional(),
+	})
+	// Reject the legacy `python: bool` field (and any other unknown key) with a 400.
+	.strict();
 
 // Audit H11 (#2): bound the optional initial-files map so a single create can't
 // buffer an unbounded number of files / bytes. Shares the bulk-write env knobs.
@@ -33,7 +38,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 	router.post("/", async (c) => {
 		let name: string | null = null;
 		let files: Record<string, string> | undefined;
-		let python = false;
+		let pythonRuntime: PythonRuntime = null;
 		let javascript = false;
 		let network = false;
 
@@ -47,7 +52,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			}
 			name = result.data.name ?? null;
 			files = result.data.files;
-			python = result.data.python ?? false;
+			pythonRuntime = result.data.python_runtime ?? null;
 			javascript = result.data.javascript ?? false;
 			network = result.data.network ?? false;
 		} catch {
@@ -104,7 +109,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				await sessionManager.persistSandboxMeta(tenant, sandboxId, {
 					owner,
 					name,
-					python,
+					python_runtime: pythonRuntime,
 					javascript,
 					network,
 					createdAt,
@@ -127,11 +132,14 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					}
 				}
 			},
-			{ python, javascript, network },
+			{ pythonRuntime, javascript, network },
 			owner,
 		);
 
-		return c.json({ id: sandboxId, name, owner, createdAt, python, javascript, network }, 201 as ContentfulStatusCode);
+		return c.json(
+			{ id: sandboxId, name, owner, createdAt, python_runtime: pythonRuntime, javascript, network },
+			201 as ContentfulStatusCode,
+		);
 	});
 
 	router.get("/", async (c) => {
@@ -145,7 +153,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					name: s.name,
 					owner: s.owner,
 					createdAt: s.createdAt.toISOString(),
-					python: s.python,
+					python_runtime: s.python_runtime,
 					javascript: s.javascript,
 					network: s.network,
 				})),
@@ -182,6 +190,9 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				owner: meta.owner,
 				createdAt: meta.createdAt ?? null,
 				lastUsedAt: null,
+				python_runtime: meta.python_runtime,
+				javascript: meta.javascript,
+				network: meta.network,
 			});
 		}
 		if (!isOwnedBy(session.owner, caller)) {
@@ -193,6 +204,9 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			owner: session.owner,
 			createdAt: session.createdAt,
 			lastUsedAt: new Date(session.lastUsed).toISOString(),
+			python_runtime: session.runtimeOptions.pythonRuntime,
+			javascript: session.runtimeOptions.javascript,
+			network: session.runtimeOptions.network,
 		});
 	});
 

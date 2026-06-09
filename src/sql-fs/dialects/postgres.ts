@@ -17,6 +17,7 @@ import {
 	type InodeKind,
 	type InodeRow,
 	type PathCacheEntry,
+	type PythonRuntime,
 	type SandboxListEntry,
 	type SandboxMeta,
 	type SqlDialect,
@@ -332,24 +333,30 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
 		try {
+			// Rolling-safe read: an old replica may have written python=true with
+			// python_runtime still NULL. COALESCE the legacy column so such a row
+			// reads back as 'stdlib' until the N+1 release drops `python`.
 			const rows = await tx<
 				{
 					owner: string | null;
 					name: string | null;
-					python: boolean;
+					python_runtime: string | null;
 					javascript: boolean;
 					network: boolean;
 					created_at: Date;
 				}[]
 			>`
-				SELECT owner, name, python, javascript, network, created_at FROM sandboxes WHERE id = ${sandboxId}
+				SELECT owner, name,
+				       COALESCE(python_runtime, CASE WHEN python THEN 'stdlib' END) AS python_runtime,
+				       javascript, network, created_at
+				FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
 			return {
 				owner: r.owner,
 				name: r.name,
-				python: r.python,
+				python_runtime: r.python_runtime as PythonRuntime,
 				javascript: r.javascript,
 				network: r.network,
 				createdAt: r.created_at.toISOString(),
@@ -362,9 +369,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
 		let rows: Array<{ id: string }>;
 		try {
+			// Dual-write both columns so old replicas (which still read `python`)
+			// keep working until the N+1 release. stdlib → python=true;
+			// pyodide/null → python=false.
 			rows = await tx<{ id: string }[]>`
 				UPDATE sandboxes
-				SET owner = ${meta.owner}, name = ${meta.name}, python = ${meta.python}, javascript = ${meta.javascript}, network = ${meta.network ?? false}
+				SET owner = ${meta.owner}, name = ${meta.name},
+				    python_runtime = ${meta.python_runtime},
+				    python = ${meta.python_runtime === "stdlib"},
+				    javascript = ${meta.javascript}, network = ${meta.network ?? false}
 				WHERE id = ${sandboxId}
 				RETURNING id
 			`;
@@ -380,6 +393,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	async listSandboxes(tx: PgTx, owner?: string): Promise<SandboxListEntry[]> {
 		try {
+			// Same rolling-safe COALESCE as getSandboxMeta: an old replica's
+			// python=true / python_runtime NULL row lists as 'stdlib'.
 			const rows =
 				owner !== undefined
 					? await tx<
@@ -388,28 +403,34 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 								name: string | null;
 								owner: string | null;
 								created_at: Date;
-								python: boolean;
+								python_runtime: string | null;
 								javascript: boolean;
 								network: boolean;
 							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
+						>`SELECT id, name, owner, created_at,
+						         COALESCE(python_runtime, CASE WHEN python THEN 'stdlib' END) AS python_runtime,
+						         javascript, network
+						  FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
 					: await tx<
 							{
 								id: string;
 								name: string | null;
 								owner: string | null;
 								created_at: Date;
-								python: boolean;
+								python_runtime: string | null;
 								javascript: boolean;
 								network: boolean;
 							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes ORDER BY created_at DESC`;
+						>`SELECT id, name, owner, created_at,
+						         COALESCE(python_runtime, CASE WHEN python THEN 'stdlib' END) AS python_runtime,
+						         javascript, network
+						  FROM sandboxes ORDER BY created_at DESC`;
 			return rows.map((r) => ({
 				id: r.id,
 				name: r.name,
 				owner: r.owner,
 				createdAt: r.created_at,
-				python: r.python,
+				python_runtime: r.python_runtime as PythonRuntime,
 				javascript: r.javascript,
 				network: r.network,
 			}));

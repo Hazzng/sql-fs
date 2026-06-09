@@ -189,7 +189,7 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
 				owner: "agent-1",
 				name: null,
-				python: false,
+				python_runtime: null,
 				javascript: false,
 				network: false,
 			});

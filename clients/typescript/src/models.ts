@@ -1,13 +1,17 @@
 export type FileKind = "file" | "dir" | "symlink";
 export type StreamEventType = "stdout" | "stderr" | "exit";
 
+/** Python runtime selection. null = no Python. */
+export type PythonRuntime = "stdlib" | "pyodide" | null;
+
 export interface SandboxRecord {
 	id: string;
 	name: string | null;
 	owner: string;
 	createdAt: string;
-	python: boolean;
+	python_runtime: PythonRuntime;
 	javascript: boolean;
+	network: boolean;
 }
 
 export interface SandboxInfo {
@@ -78,14 +82,24 @@ export class ReadResult {
 
 type ApiObject = Record<string, unknown>;
 
+/** Validate the server's python_runtime instead of blindly asserting the type. */
+function toPythonRuntime(value: unknown): PythonRuntime {
+	if (value == null) return null;
+	if (value === "stdlib" || value === "pyodide") return value;
+	throw Object.assign(new Error(`unexpected python_runtime from server: ${JSON.stringify(value)}`), {
+		code: "EINVALID_PYTHON_RUNTIME",
+	});
+}
+
 export function sandboxRecordFromApi(payload: ApiObject): SandboxRecord {
 	return {
 		id: String(payload.id),
 		name: payload.name == null ? null : String(payload.name),
 		owner: String(payload.owner),
 		createdAt: String(payload.createdAt),
-		python: Boolean(payload.python),
+		python_runtime: toPythonRuntime(payload.python_runtime),
 		javascript: Boolean(payload.javascript),
+		network: Boolean(payload.network),
 	};
 }
 
@@ -162,5 +176,5 @@ export function streamEventFromSse(eventName: string, payload: ApiObject): Strea
 			t: typeof payload.t === "number" ? payload.t : undefined,
 		};
 	}
-	throw new Error(`unknown SSE event: ${eventName}`);
+	throw Object.assign(new Error(`unknown SSE event: ${eventName}`), { code: "EUNKNOWN_SSE_EVENT" });
 }

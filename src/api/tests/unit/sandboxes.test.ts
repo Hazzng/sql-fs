@@ -267,7 +267,7 @@ describe("GET /v1/sandboxes/:id", () => {
 		meta.set(sandboxId, {
 			owner: "owner-evict",
 			name: null,
-			python: false,
+			python_runtime: null,
 			javascript: false,
 			network: false,
 			createdAt: knownCreatedAt,

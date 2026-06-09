@@ -12,8 +12,9 @@ describe("TypeScript SQL-FS SDK sandboxes", () => {
 						name: "a",
 						owner: "alice",
 						createdAt: "2026-01-01T00:00:00Z",
-						python: true,
+						python_runtime: "stdlib",
 						javascript: false,
+						network: false,
 					},
 				],
 			}),
@@ -22,20 +23,23 @@ describe("TypeScript SQL-FS SDK sandboxes", () => {
 				name: null,
 				owner: "alice",
 				createdAt: "2026-01-01T00:00:00Z",
-				python: false,
+				python_runtime: "pyodide",
 				javascript: false,
+				network: true,
 			}),
 		]);
 		const client = makeClient(fetchMock);
 
 		const sandboxes = await client.sandboxes.list();
 		expect(sandboxes[0]?.id).toBe("id-1");
-		expect(sandboxes[0]?.python).toBe(true);
+		expect(sandboxes[0]?.python_runtime).toBe("stdlib");
+		expect(sandboxes[0]?.network).toBe(false);
 
-		const sandbox = await client.sandboxes.create({ python: false, javascript: false, network: false });
+		const sandbox = await client.sandboxes.create({ python_runtime: "pyodide", javascript: false, network: true });
 		expect(sandbox.id).toBe("sb-net");
-		expect(sandbox.record?.javascript).toBe(false);
-		expect(captured[1]?.body).toEqual({ python: false, javascript: false, network: false });
+		expect(sandbox.record?.python_runtime).toBe("pyodide");
+		expect(sandbox.record?.network).toBe(true);
+		expect(captured[1]?.body).toEqual({ python_runtime: "pyodide", javascript: false, network: true });
 	});
 
 	it("sends an empty object when creating a default sandbox", async () => {

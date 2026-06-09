@@ -106,3 +106,60 @@ describe("MCP tool — bash_exec_batch disconnect signal", () => {
 		}
 	});
 });
+
+describe("MCP tools — python_runtime echo", () => {
+	beforeEach(() => {
+		process.env.AUTH_SECRET = "test-secret-mcp-tools-at-least-32bytes!!";
+	});
+
+	afterEach(() => {
+		process.env.AUTH_SECRET = "";
+		vi.restoreAllMocks();
+	});
+
+	it("sandbox_create echoes the python_runtime it was given", async () => {
+		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const { server, getHandler } = captureToolHandler("sandbox_create");
+		registerTools(server, sessionManager, "test-owner", "default");
+
+		const result = (await getHandler()({ python_runtime: "pyodide" }, {})) as { content: { text: string }[] };
+		const body = JSON.parse(result.content[0]!.text);
+		// Assert the capability echo present in the MCP record (python_runtime +
+		// javascript; `network` is intentionally not surfaced in MCP records) plus the
+		// dynamic id.
+		expect(body).toMatchObject({ python_runtime: "pyodide", javascript: false });
+		expect(typeof body.id).toBe("string");
+	});
+
+	it("sandbox_list echoes python_runtime per sandbox", async () => {
+		const sessionManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			listSandboxesFn: async () => [
+				{
+					id: "sb-1",
+					name: null,
+					owner: "test-owner",
+					createdAt: new Date("2026-01-01T00:00:00Z"),
+					python_runtime: "stdlib",
+					javascript: false,
+					network: false,
+				},
+			],
+		});
+		const { server, getHandler } = captureToolHandler("sandbox_list");
+		registerTools(server, sessionManager, "test-owner", "default");
+
+		const result = (await getHandler()({}, {})) as { content: { text: string }[] };
+		const body = JSON.parse(result.content[0]!.text);
+		// Assert the whole per-sandbox MCP record (not just python_runtime); `network`
+		// is intentionally not surfaced in MCP records.
+		expect(body.sandboxes).toHaveLength(1);
+		expect(body.sandboxes[0]).toMatchObject({
+			id: "sb-1",
+			name: null,
+			owner: "test-owner",
+			python_runtime: "stdlib",
+			javascript: false,
+		});
+	});
+});

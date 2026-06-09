@@ -45,9 +45,12 @@ It is NOT a real Linux shell. The following is the authoritative list of what wo
 
 ## Optional runtimes (must be enabled at sandbox creation)
 
-### Python — `python: true`
+### Python — `python_runtime: "stdlib"` or `"pyodide"`
 
-Runs **CPython compiled to WASM** as `python3` (also aliased as `python`). Stdlib only — no `pip`, no network, no `os.system`/`subprocess`. Each invocation is a fresh, isolated interpreter (clean globals, clean `sys.modules`); interpreter state does **not** persist across calls.
+Enabled by setting `python_runtime` at sandbox creation (`null` = no Python):
+
+- **`"stdlib"`** — runs **CPython compiled to WASM** as `python3` (also aliased as `python`). Stdlib only — no `pip`, no network, no `os.system`/`subprocess`. Each invocation is a fresh, isolated interpreter (clean globals, clean `sys.modules`); interpreter state does **not** persist across calls. Air-gapped.
+- **`"pyodide"`** — runs Python with **numpy / pandas / scipy / openpyxl** preloaded, inside an **OS-isolated Deno subprocess** (zero network, no host filesystem reach). Use this for data-analysis workloads (e.g. read a CSV, write an `.xlsx`). Files written under the cwd are drained back into the sandbox filesystem.
 
 ```bash
 python3 -c "print(1 + 1)"

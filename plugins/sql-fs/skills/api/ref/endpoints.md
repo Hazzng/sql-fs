@@ -116,7 +116,7 @@ SB=$(curl -s -X POST "$BASE_URL/v1/sandboxes" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "python": false,
+    "python_runtime": "stdlib",
     "javascript": false,
     "files": { "/home/user/hello.txt": "hello world" },
     "env":   { "NODE_ENV": "test" }
@@ -127,7 +127,7 @@ All body fields are **optional**:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `python` | boolean | false | Enable CPython WASM — registers `python3` (and `python` alias), stdlib only, isolated per call |
+| `python_runtime` | `"stdlib" \| "pyodide" \| null` | null | Python runtime. `stdlib` = CPython WASM (`python3`/`python`, stdlib only, isolated per call, air-gapped). `pyodide` = numpy/pandas/scipy/openpyxl in an OS-isolated Deno subprocess. `null` = no Python |
 | `javascript` | boolean | false | Enable QuickJS WASM (`js-exec`/`node`) |
 | `network` | boolean | false | Enable outbound `fetch()` from `js-exec` (see note below) |
 | `files` | `Record<absPath, string>` | — | Seed files (absolute path → plain text) |
@@ -139,13 +139,13 @@ Response `201`:
   "id": "550e8400-...",
   "owner": "admin",
   "createdAt": "2026-04-25T...",
-  "python": false,
+  "python_runtime": "stdlib",
   "javascript": false,
   "network": false
 }
 ```
 
-**Important:** `python`/`javascript`/`network` must be set at creation. They cannot be changed later.
+**Important:** `python_runtime`/`javascript`/`network` must be set at creation. They cannot be changed later.
 
 **`network: true` — outbound fetch() from js-exec**
 
@@ -165,7 +165,7 @@ Response `200`:
 ```json
 {
   "id": "...", "owner": "admin", "createdAt": "...", "lastUsedAt": "...",
-  "python": false, "javascript": false
+  "python_runtime": null, "javascript": false, "network": false
 }
 ```
 

@@ -22,6 +22,16 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python/.venv"]
+		"ignore": [
+			"node_modules",
+			"dist",
+			".tmp",
+			"*.sql",
+			"scripts",
+			"clients/python/.venv",
+			"thoughts",
+			"vendor",
+			"src/pyodide-runner/runner.ts"
+		]
 	}
 }

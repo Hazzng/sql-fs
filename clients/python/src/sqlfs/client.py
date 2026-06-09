@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import httpx
 
@@ -106,7 +106,7 @@ class SandboxesResource:
         name: Optional[str] = None,
         env: Optional[Mapping[str, str]] = None,
         files: Optional[Mapping[str, str]] = None,
-        python: bool = False,
+        python_runtime: Optional[Literal["stdlib", "pyodide"]] = None,
         javascript: bool = False,
         network: bool = False,
     ) -> Sandbox:
@@ -116,7 +116,10 @@ class SandboxesResource:
             name: Optional human-readable label for the sandbox.
             env: Environment variables exposed to processes inside the sandbox.
             files: Initial files to seed the sandbox filesystem with, keyed by path.
-            python: Enable the CPython WASM runtime.
+            python_runtime: Python runtime to enable. ``"stdlib"`` registers the
+                air-gapped CPython WASM `python3`; ``"pyodide"`` registers a
+                numpy/pandas/scipy/openpyxl-capable Python in an OS-isolated Deno
+                subprocess. ``None`` (default) means no Python.
             javascript: Enable the QuickJS / `js-exec` runtime.
             network: Opt-in to outbound network access. When enabled, `fetch()`
                 inside `js-exec` can reach external HTTP endpoints (timeout
@@ -134,8 +137,8 @@ class SandboxesResource:
             body["env"] = dict(env)
         if files is not None:
             body["files"] = dict(files)
-        if python:
-            body["python"] = True
+        if python_runtime is not None:
+            body["python_runtime"] = python_runtime
         if javascript:
             body["javascript"] = True
         if network:

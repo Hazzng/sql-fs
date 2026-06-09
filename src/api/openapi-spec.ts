@@ -20,10 +20,11 @@ const sandboxSchema = {
 		name: { type: "string", nullable: true, example: "my-project-sandbox" },
 		owner: { type: "string", example: "alice" },
 		createdAt: { type: "string", format: "date-time" },
-		python: { type: "boolean", example: false },
+		python_runtime: { type: "string", enum: ["stdlib", "pyodide"], nullable: true, example: null },
 		javascript: { type: "boolean", example: false },
+		network: { type: "boolean", example: false },
 	},
-	required: ["id", "name", "owner", "createdAt", "python", "javascript"],
+	required: ["id", "name", "owner", "createdAt", "python_runtime", "javascript", "network"],
 } as const;
 
 const sandboxInfoSchema = {
@@ -318,8 +319,19 @@ export const openapiSpec = {
 										additionalProperties: { type: "string" },
 										description: "Initial files to write (path → content)",
 									},
-									python: { type: "boolean", default: false, description: "Enable CPython WASM runtime" },
+									python_runtime: {
+										type: "string",
+										enum: ["stdlib", "pyodide"],
+										nullable: true,
+										description:
+											"Python runtime: stdlib (CPython WASM) or pyodide (numpy/pandas/scipy/openpyxl, OS-isolated)",
+									},
 									javascript: { type: "boolean", default: false, description: "Enable QuickJS runtime" },
+									network: {
+										type: "boolean",
+										default: false,
+										description: "Enable outbound fetch() from js-exec (requires javascript)",
+									},
 								},
 							},
 						},

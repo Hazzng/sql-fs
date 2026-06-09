@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, cast
 
+# Python runtime selection. None = no Python.
+PythonRuntime = Literal["stdlib", "pyodide"]
+
 
 @dataclass(frozen=True)
 class SandboxRecord:
@@ -19,8 +22,9 @@ class SandboxRecord:
     name: Optional[str]
     owner: str
     created_at: str
-    python: bool
+    python_runtime: Optional[PythonRuntime]
     javascript: bool
+    network: bool
 
     @classmethod
     def from_api(cls, payload: Dict[str, Any]) -> SandboxRecord:
@@ -29,8 +33,9 @@ class SandboxRecord:
             name=payload.get("name"),
             owner=payload["owner"],
             created_at=payload["createdAt"],
-            python=bool(payload.get("python", False)),
+            python_runtime=payload.get("python_runtime"),
             javascript=bool(payload.get("javascript", False)),
+            network=bool(payload.get("network", False)),
         )
 
 
@@ -200,6 +205,7 @@ __all__ = [
     "BatchExecResult",
     "ExecResult",
     "FileStat",
+    "PythonRuntime",
     "ReadResult",
     "SandboxInfo",
     "SandboxRecord",

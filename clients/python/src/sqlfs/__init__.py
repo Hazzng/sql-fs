@@ -5,7 +5,7 @@ Quick start:
     from sqlfs import Client
 
     with Client(base_url="https://...", auth_secret="...", sub="my-agent") as c:
-        sb = c.sandboxes.create(name="demo", python=True)
+        sb = c.sandboxes.create(name="demo", python_runtime="stdlib")
         result = sb.exec("echo hello")
         print(result.stdout, result.exit_code)
         sb.delete()
@@ -28,6 +28,7 @@ from .models import (
     BatchExecResult,
     ExecResult,
     FileStat,
+    PythonRuntime,
     ReadResult,
     SandboxInfo,
     SandboxRecord,
@@ -46,6 +47,7 @@ __all__ = [
     "FileStat",
     "FilesAPI",
     "NotFoundError",
+    "PythonRuntime",
     "RateLimitError",
     "ReadResult",
     "SQLFSError",

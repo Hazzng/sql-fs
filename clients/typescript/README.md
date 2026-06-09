@@ -25,7 +25,7 @@ const client = new Client({
 	sub: "agent-001",
 });
 
-const sandbox = await client.sandboxes.create({ name: "demo", python: true });
+const sandbox = await client.sandboxes.create({ name: "demo", python_runtime: "stdlib" });
 
 const result = await sandbox.exec("echo hello && ls /home/user");
 console.log(result.stdout, result.exitCode, result.ok);
@@ -58,7 +58,7 @@ const targetJwt = await adminClient.getToken();
 ## API Surface
 
 - `client.sandboxes.list()`
-- `client.sandboxes.create({ name, env, files, python, javascript, network })`
+- `client.sandboxes.create({ name, env, files, python_runtime, javascript, network })`
 - `client.sandboxes.get(id)`
 - `client.sandboxes.attach(id)`
 - `client.sandboxes.delete(id)`

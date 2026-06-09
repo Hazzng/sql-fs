@@ -121,6 +121,56 @@ await sandbox.delete();
 
 See [clients/typescript/README.md](clients/typescript/README.md) for the full TypeScript API.
 
+## Language runtimes
+
+Sandboxes are bash-only by default. Opt into a Python and/or JavaScript runtime at **creation** (it cannot be changed later).
+
+> ### ⚠️ Breaking change: `python` → `python_runtime`
+>
+> The boolean `python` create option has been **replaced** by the `python_runtime` enum.
+> There are now **two** Python runtimes:
+>
+> | Old (removed) | New |
+> |---|---|
+> | `python: true` | `python_runtime: "stdlib"` |
+> | `python: false` / omitted | omit `python_runtime` (no Python) |
+>
+> `SandboxRecord.python` (boolean) is likewise replaced by `SandboxRecord.python_runtime`
+> (`"stdlib" \| "pyodide" \| null`). Update SDK calls accordingly.
+
+```python
+# stdlib — lightweight CPython, stdlib only
+sb = client.sandboxes.create(python_runtime="stdlib")
+
+# pyodide — heavy, with the scientific stack
+sb = client.sandboxes.create(python_runtime="pyodide")
+
+# JavaScript (QuickJS) — unchanged
+sb = client.sandboxes.create(javascript=True)
+```
+
+### The two Python runtimes
+
+| | `stdlib` | `pyodide` |
+|---|---|---|
+| Engine | CPython → WASM (in-process worker) | Pyodide → WASM in an **OS-isolated Deno subprocess** |
+| Packages | Python **stdlib only** (no pip) | stdlib **+ offline Pyodide packages**; numpy/pandas preloaded, others loaded on first import |
+| Cold start | ~1.4 s | ~3–5 s |
+| Per-worker memory | ~80 MB | ~0.6 GB floor; ~1 GB+ with a real DataFrame |
+| File reads | **8 MiB cap** per `open()` (IPC bridge) — chunk larger files | no 8 MiB cap; bounded by `PYODIDE_MAX_FILE_BYTES` (32 MiB default) |
+| Use it for | quick scripts, glue, capability probes | CSV/Excel data analysis, plotting (charts drain back to the FS and are retrievable via `GET /files/...`) |
+
+The full Pyodide distribution (~380 packages) ships on disk. Imports are resolved from that offline lock on demand; `PYODIDE_PRELOAD_PACKAGES` controls which packages pay their memory and startup cost at child initialization. Matplotlib defaults to the headless `Agg` backend so `savefig()` works in the Deno child.
+
+### Sizing the Pyodide runtime
+
+Pyodide workers are the dominant memory cost (bash and the `stdlib` runtime are comparatively free). WASM memory does **not** shrink mid-run, so size for the worst-case single file:
+
+- **2 GB container, `MAX_CONCURRENT_PYODIDE=1`** → set `PYODIDE_MAX_FILE_BYTES=16777216` (**16 MiB**) for conservative headroom. The optimized transport measured ~0.84 GB child RSS and ~1.1 GB combined on an 18.8 MB CSV; host and workload shape still matter.
+- **`cap=2` doubles the memory** → use ~8 MiB files or a ~4 GB container.
+- A ~50 MB CSV needs the stage cap raised **and** ~3–4 GB; `chunksize`/dtype tricks do **not** help (WASM high-water + the fully-staged file dominate). Reduce columns/rows *before* upload instead.
+- The Pyodide runtime requires a vendored Deno binary + Pyodide assets (`scripts/fetch-pyodide-assets.mjs`, baked into the Docker image via `DENO_BIN_PATH` / `PYODIDE_ASSET_DIR`).
+
 ## How It Works
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
@@ -164,8 +214,16 @@ Key design choices:
 | `AUTH_SECRET` | Yes | — | Secret for Bearer token validation |
 | `PORT` | No | `8080` | HTTP server port |
 | `SESSION_IDLE_MS` | No | `600000` | Evict idle Bash instances after this many ms |
-| `MAX_CONCURRENT_PYTHON` | No | `5` | Cap on concurrent CPython WASM workers (~80 MB each) |
+| `MAX_CONCURRENT_PYTHON` | No | `5` | Cap on concurrent `stdlib` CPython WASM workers (~80 MB each) |
 | `MAX_CONCURRENT_JS` | No | `5` | Cap on concurrent QuickJS workers (~64 MB each) |
+| `MAX_CONCURRENT_PYODIDE` | No | `2` | Cap on concurrent `pyodide` workers (OS-isolated Deno; ~0.6–1 GB+ each). Keep low; **use `1` on a 2 GB host**. Routed separately from `MAX_CONCURRENT_PYTHON`. |
+| `MAX_RESIDENT_PYODIDE` | No | `2` | Resident `pyodide` workers (idle LRU). Must be `>=` `MAX_CONCURRENT_PYODIDE` or the server refuses to boot. |
+| `PYODIDE_PRELOAD_PACKAGES` | No | `numpy,pandas` | Comma-separated packages loaded at child initialization. Other packages from the vendored lock load on first import. Use an empty value for no stock-package preload. |
+| `PYODIDE_MAX_CHILD_RSS_BYTES` | No | `0` | Retire a child after a completed run when RSS exceeds this many bytes. `0` disables retirement; this bounds idle retention, not the in-flight peak. |
+| `PYODIDE_MAX_FILE_BYTES` | No | `33554432` | Per-file cap (32 MiB) on files staged into a `pyodide` exec. **Lower to `16777216` (16 MiB) on a 2 GB host.** |
+| `PYODIDE_MAX_TOTAL_BYTES` | No | `134217728` | Total staged bytes across one `pyodide` exec (128 MiB). |
+| `PYODIDE_ASSET_DIR` | `pyodide` runtime | — | Absolute path to vendored Pyodide assets (wasm + stdlib + wheels). Set in the Docker image. |
+| `DENO_BIN_PATH` | No | `deno` | Path to the vendored Deno binary that runs the `pyodide` runner. Set in the Docker image. |
 | `MAX_REQUEST_BODY_BYTES` | No | `268435456` | Hard cap on any HTTP request body (256 MB) — file write, bulk write, ingest. Applied before auth/handlers. Since base64 inflates content ~33%, this is usually the binding limit on ingest: ~190 MB of raw file bytes per call. |
 | `MAX_INGEST_BYTES` | No | `536870912` | Max total decoded bytes across one `ingest-files` manifest (512 MB). The request-body cap above normally trips first. |
 | `MAX_INGEST_FILES` | No | `10000` | Max number of entries (files + paths) in one `ingest-files` manifest. |

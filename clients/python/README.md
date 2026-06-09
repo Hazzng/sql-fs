@@ -22,7 +22,7 @@ pip install -e clients/python
 from sqlfs import Client
 
 with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001") as fs:
-    sb = fs.sandboxes.create(name="demo", python=True)
+    sb = fs.sandboxes.create(name="demo", python_runtime="stdlib")
 
     # Bash execution
     result = sb.exec("echo hello && ls /home/user")
@@ -81,7 +81,7 @@ fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=0)    
 | Method | HTTP | Notes |
 |---|---|---|
 | `client.sandboxes.list()` | `GET /v1/sandboxes` | → `list[SandboxRecord]` |
-| `client.sandboxes.create(name=, env=, files=, python=, javascript=)` | `POST /v1/sandboxes` | → `Sandbox` |
+| `client.sandboxes.create(name=, env=, files=, python_runtime=, javascript=, network=)` | `POST /v1/sandboxes` | → `Sandbox` |
 | `client.sandboxes.get(id)` | `GET /v1/sandboxes/{id}` | → `SandboxInfo` |
 | `client.sandboxes.attach(id)` | _(no network)_ | → `Sandbox` for an existing id |
 | `client.sandboxes.delete(id)` | `DELETE /v1/sandboxes/{id}` | |

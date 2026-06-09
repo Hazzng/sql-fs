@@ -79,8 +79,9 @@ def test_list_sandboxes():
                         "name": "a",
                         "owner": "alice",
                         "createdAt": "2026-01-01T00:00:00Z",
-                        "python": True,
+                        "python_runtime": "stdlib",
                         "javascript": False,
+                        "network": False,
                     }
                 ]
             },
@@ -89,12 +90,13 @@ def test_list_sandboxes():
     sandboxes = make_client().sandboxes.list()
     assert len(sandboxes) == 1
     assert sandboxes[0].id == "id-1"
-    assert sandboxes[0].python is True
+    assert sandboxes[0].python_runtime == "stdlib"
+    assert sandboxes[0].network is False
 
 
 @respx.mock
 def test_create_sandbox_returns_handle():
-    respx.post(f"{BASE_URL}/v1/sandboxes").mock(
+    route = respx.post(f"{BASE_URL}/v1/sandboxes").mock(
         return_value=httpx.Response(
             201,
             json={
@@ -102,14 +104,20 @@ def test_create_sandbox_returns_handle():
                 "name": "demo",
                 "owner": "alice",
                 "createdAt": "2026-01-01T00:00:00Z",
-                "python": False,
+                "python_runtime": "stdlib",
                 "javascript": False,
+                "network": False,
             },
         )
     )
-    sb = make_client().sandboxes.create(name="demo", env={"FOO": "bar"})
+    sb = make_client().sandboxes.create(name="demo", env={"FOO": "bar"}, python_runtime="stdlib")
     assert sb.id == "sb-9"
     assert sb.record is not None and sb.record.name == "demo"
+    # python_runtime round-trips: request body carries it, record reflects it.
+    sent = json.loads(route.calls.last.request.content)
+    assert sent.get("python_runtime") == "stdlib"
+    assert sb.record.python_runtime == "stdlib"
+    assert sb.record.network is False
 
 
 @respx.mock
@@ -123,8 +131,9 @@ def test_create_sandbox_with_network_passes_flag():
                 "name": None,
                 "owner": "alice",
                 "createdAt": "2026-01-01T00:00:00Z",
-                "python": False,
+                "python_runtime": None,
                 "javascript": True,
+                "network": True,
             },
         )
     )
@@ -146,8 +155,9 @@ def test_create_sandbox_network_default_omitted():
                 "name": None,
                 "owner": "alice",
                 "createdAt": "2026-01-01T00:00:00Z",
-                "python": False,
+                "python_runtime": None,
                 "javascript": False,
+                "network": False,
             },
         )
     )

@@ -195,7 +195,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					};
 				} catch (e) {
 					clearTimeout(timer);
-					if (timedOut) {
+					// Route-level abort (timedOut) OR the manager's internal pyodide runtime
+					// timeout both map to the same 408 EXEC_TIMEOUT response.
+					if (timedOut || (e as Error & { code?: string }).code === "EPYODIDE_TIMEOUT") {
 						return { kind: "timeout", durationMs: Date.now() - startMs };
 					}
 					throw e;
@@ -314,7 +316,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 						});
 					} catch (e) {
 						clearTimeout(timer);
-						if (timedOut) {
+						// Route-level abort (timedOut) OR the manager's internal pyodide runtime
+						// timeout both emit the same terminal timeout exit event.
+						if (timedOut || (e as Error & { code?: string }).code === "EPYODIDE_TIMEOUT") {
 							await stream.writeSSE({
 								event: "exit",
 								data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
