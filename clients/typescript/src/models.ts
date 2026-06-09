@@ -86,7 +86,9 @@ type ApiObject = Record<string, unknown>;
 function toPythonRuntime(value: unknown): PythonRuntime {
 	if (value == null) return null;
 	if (value === "stdlib" || value === "pyodide") return value;
-	throw new Error(`unexpected python_runtime from server: ${JSON.stringify(value)}`);
+	throw Object.assign(new Error(`unexpected python_runtime from server: ${JSON.stringify(value)}`), {
+		code: "EINVALID_PYTHON_RUNTIME",
+	});
 }
 
 export function sandboxRecordFromApi(payload: ApiObject): SandboxRecord {
@@ -174,5 +176,5 @@ export function streamEventFromSse(eventName: string, payload: ApiObject): Strea
 			t: typeof payload.t === "number" ? payload.t : undefined,
 		};
 	}
-	throw new Error(`unknown SSE event: ${eventName}`);
+	throw Object.assign(new Error(`unknown SSE event: ${eventName}`), { code: "EUNKNOWN_SSE_EVENT" });
 }
