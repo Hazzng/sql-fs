@@ -1165,9 +1165,13 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		const dataA = new TextEncoder().encode("AAA");
 		const dataB = new TextEncoder().encode("BBBB");
 
+		// F6: the blob is now committed in its own short tx BEFORE the composite,
+		// which no longer carries the blob_insert CTE — mirror the SqlFs write path.
+		await dialect.commitBlob(shaA, dataA);
 		const inodeA = await dialect.transaction(async (tx) =>
 			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataA.length, shaA, dataA),
 		);
+		await dialect.commitBlob(shaB, dataB);
 		const inodeB = await dialect.transaction(async (tx) =>
 			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataB.length, shaB, dataB),
 		);

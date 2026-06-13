@@ -306,6 +306,22 @@ export interface SqlDialect<Tx = unknown> {
 	upsertBlob(tx: Tx, sha256: Uint8Array, data: Uint8Array): Promise<void>;
 
 	/**
+	 * Commits a content-addressable blob in its OWN short, self-committing
+	 * transaction (own connection, NO advisory lock — `blobs` is unscoped CAS,
+	 * no `sandbox_id`, no RLS). Decouples the hot-blob `ON CONFLICT DO UPDATE`
+	 * tuple lock from the long-lived script-tx so unrelated sandboxes sharing a
+	 * hot blob (empty file, `.gitkeep`) do not serialize for the script duration
+	 * (F6). The touch (`last_referenced_at = now()`) is unconditional so the GC
+	 * grace window protects the freshly-committed-but-not-yet-referenced blob
+	 * during the gap before the referencing inode commits.
+	 *
+	 * Callers MUST invoke this BEFORE the inode/dirent composite, which runs
+	 * without the blob insert. Optional: dialects without it fall back to the
+	 * in-transaction `upsertBlob` path.
+	 */
+	commitBlob?(sha256: Uint8Array, data: Uint8Array): Promise<void>;
+
+	/**
 	 * Retrieves blob content by its SHA-256 hash.
 	 * Returns null if no blob with that hash exists.
 	 */
