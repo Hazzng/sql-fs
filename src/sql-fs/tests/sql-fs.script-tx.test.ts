@@ -318,5 +318,111 @@ describe("SqlFs script-tx — COMMIT failure recovery (H7)", () => {
 		expect(fs.getAllPaths()).toContain("/home/user/file.txt");
 		expect(fs.scriptScopeActive).toBe(false);
 		expect(fs.scriptTxOpen).toBe(false);
+		// Recovery reload succeeded, so the cache is NOT poisoned.
+		expect(fs.poisoned()).toBe(false);
+	});
+});
+
+// F1: when BOTH the COMMIT and the recovery reload fail (correlated PG outage),
+// the in-memory caches keep the uncommitted "phantom" mutations and #dirty stays
+// true. endScriptScope must mark the cache poisoned so publishVersionIfDirty
+// refuses to authenticate the lie under a fresh version stamp.
+describe("SqlFs script-tx — poisoned cache after correlated PG failure (F1)", () => {
+	/**
+	 * Both the COMMIT (via `transaction`) and the recovery reload (via
+	 * `loadAllPaths`) fail while `failPg` is set, modelling a single PG outage
+	 * that knocks out the write commit and the recovery read alike.
+	 */
+	function makePoisoningDialect(): { dialect: SqlDialect<unknown>; state: { failPg: boolean } } {
+		const dialect = makeDialect();
+		const state = { failPg: false };
+		const baseLoadAllPaths = dialect.loadAllPaths as ReturnType<typeof vi.fn>;
+		dialect.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+			const result = await fn({});
+			if (state.failPg) {
+				throw new Error("COMMIT failed");
+			}
+			return result;
+		}) as unknown as SqlDialect<unknown>["transaction"];
+		dialect.loadAllPaths = vi.fn(async (tx: unknown) => {
+			if (state.failPg) {
+				throw new Error("loadAllPaths failed");
+			}
+			return baseLoadAllPaths(tx);
+		}) as unknown as SqlDialect<unknown>["loadAllPaths"];
+		return { dialect, state };
+	}
+
+	it("poisons the cache when the recovery reload also fails", async () => {
+		const { dialect, state } = makePoisoningDialect();
+		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+		await fs.ready();
+		expect(fs.poisoned()).toBe(false);
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/phantom.txt", "ghost");
+		expect(fs.wasDirty()).toBe(true);
+		expect(fs.getAllPaths()).toContain("/home/user/phantom.txt");
+
+		// Same outage fails the COMMIT and the recovery reload.
+		state.failPg = true;
+		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
+
+		// Recovery reload threw, so the phantom mutation is still in cache and the
+		// cache is poisoned. #dirty stays true (reload that would clear it failed).
+		expect(fs.poisoned()).toBe(true);
+		expect(fs.wasDirty()).toBe(true);
+		expect(fs.getAllPaths()).toContain("/home/user/phantom.txt");
+	});
+
+	it("publishVersionIfDirty skips INCR and throws ECOHERENCE while poisoned", async () => {
+		const { dialect, state } = makePoisoningDialect();
+		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+		await fs.ready();
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/phantom.txt", "ghost");
+		state.failPg = true;
+		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
+		expect(fs.poisoned()).toBe(true);
+
+		// Mirror publishVersionIfDirty's poison guard (session-manager.ts). The
+		// guard runs BEFORE the dirty gate and BEFORE redis.incr.
+		const redis = { incr: vi.fn(async (_key: string) => 1) };
+		const session = { lastSeenVersion: 7, publishPending: true };
+
+		const publish = async (): Promise<void> => {
+			if (fs.poisoned()) {
+				session.lastSeenVersion = -1;
+				session.publishPending = false;
+				throw Object.assign(new Error("ECOHERENCE: cache poisoned by failed reload; publish suppressed"), {
+					code: "ECOHERENCE",
+				});
+			}
+			await redis.incr("vfs:t:ver:s-tx");
+		};
+
+		await expect(publish()).rejects.toMatchObject({ code: "ECOHERENCE" });
+		expect(redis.incr).not.toHaveBeenCalled();
+		expect(session.lastSeenVersion).toBe(-1);
+		expect(session.publishPending).toBe(false);
+	});
+
+	it("a successful reload clears the poison", async () => {
+		const { dialect, state } = makePoisoningDialect();
+		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+		await fs.ready();
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/phantom.txt", "ghost");
+		state.failPg = true;
+		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
+		expect(fs.poisoned()).toBe(true);
+
+		// PG recovers; the next reload succeeds and clears the poison + phantom.
+		state.failPg = false;
+		await fs.reload();
+		expect(fs.poisoned()).toBe(false);
+		expect(fs.getAllPaths()).not.toContain("/home/user/phantom.txt");
 	});
 });

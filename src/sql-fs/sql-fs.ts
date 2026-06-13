@@ -106,6 +106,13 @@ export interface ICoherentFs extends IFileSystem {
 	/** Resets the dirty flag — called after publishing a new version. */
 	clearDirty(): void;
 	/**
+	 * True iff a recovery `reload()` failed after a transaction COMMIT/abort,
+	 * leaving the in-memory caches holding mutations that never committed to the
+	 * source of truth. While poisoned the caller MUST NOT publish a new version /
+	 * snapshot — see `publishVersionIfDirty`. Cleared by a successful `reload()`.
+	 */
+	poisoned(): boolean;
+	/**
 	 * Bulk-inserts files into the sandbox in minimal DB round-trips, creating
 	 * any missing parent directories. After commit, repopulates the in-memory
 	 * pathCache via reload() and marks the FS dirty.
@@ -151,6 +158,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #pathSnapshot: RedisPathSnapshot | undefined;
 	readonly #blobCache: RedisBlobCache | undefined;
 	#dirty = false;
+	/**
+	 * Set when a recovery `reload()` fails after a COMMIT/abort, so the in-memory
+	 * caches still hold mutations that never landed in the source of truth.
+	 * Read by `publishVersionIfDirty` to suppress publishing a version/snapshot
+	 * of phantom state. Cleared on every successful `reload()`/`ready()`.
+	 */
+	#cachePoisoned = false;
 	/**
 	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
 	 * so a thundering herd across callers does not issue N loadAllPaths queries
@@ -207,6 +221,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	clearDirty(): void {
 		this.#dirty = false;
+	}
+
+	poisoned(): boolean {
+		return this.#cachePoisoned;
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
@@ -524,6 +542,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
 		this.#pathCache.clear();
 		for (const [p, e] of entries) this.#pathCache.set(p, e);
+		// Initial load established committed state; the cache is not poisoned (F1).
+		this.#cachePoisoned = false;
 
 		// On snapshot hit: synchronous Redis mget pre-populates contentCache before
 		// this method returns, eliminating the race window for Redis-cached blobs.
@@ -557,6 +577,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				for (const [path, entry] of entries) this.#pathCache.set(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
+				// A successful reload re-established committed state in the caches,
+				// so any prior poison is resolved (F1).
+				this.#cachePoisoned = false;
 				this.#startPrewarm(true);
 			} finally {
 				this.#pendingReload = undefined;
@@ -637,8 +660,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					await this.reload();
 					this.clearDirty();
 				} catch {
-					// Reload also failed; the next ensureFreshCache probe will reload.
+					// Reload also failed (correlated PG outage): the in-memory caches
+					// still hold this script's uncommitted mutations. Mark the cache
+					// poisoned so publishVersionIfDirty refuses to authenticate the
+					// phantom state (F1). The next ensureFreshCache probe will reload.
 					// Fall through to surface the original COMMIT error.
+					this.#cachePoisoned = true;
 				}
 			}
 			throw err;
@@ -677,6 +704,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.reload();
 				this.clearDirty();
 			} catch (reloadErr) {
+				// Reload also failed (correlated PG outage): the caches still hold
+				// uncommitted mutations. Mark poisoned so publishVersionIfDirty
+				// refuses to publish phantom state (F1). The next ensureFreshCache
+				// probe reloads the cache.
+				this.#cachePoisoned = true;
 				console.error(
 					JSON.stringify({
 						event: "abort_scope_reload_error",

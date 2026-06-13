@@ -73,7 +73,8 @@ function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	if (
 		typeof partial.reload === "function" &&
 		typeof partial.wasDirty === "function" &&
-		typeof partial.clearDirty === "function"
+		typeof partial.clearDirty === "function" &&
+		typeof partial.poisoned === "function"
 	) {
 		return fs as ICoherentFs;
 	}
@@ -788,6 +789,19 @@ export class SessionManager {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
+		// F1: a correlated PG failure (failed COMMIT + failed recovery reload) can
+		// leave the in-memory caches holding uncommitted "phantom" state. Refuse to
+		// publish a version/snapshot of it — that would authenticate the lie under a
+		// fresh stamp. Suppress INCR + snapshot, force the next ensureFreshCache to
+		// reload from Postgres (lastSeenVersion = -1), drop the pending publish, and
+		// surface ECOHERENCE so the client retries.
+		if (coherent.poisoned()) {
+			session.lastSeenVersion = -1;
+			session.publishPending = false;
+			throw Object.assign(new Error("ECOHERENCE: cache poisoned by failed reload; publish suppressed"), {
+				code: "ECOHERENCE",
+			});
+		}
 		const dirty = coherent.wasDirty();
 		if (!dirty && !session.publishPending) return;
 

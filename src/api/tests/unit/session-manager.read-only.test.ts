@@ -80,6 +80,9 @@ class CoherentInMemoryFs {
 	clearDirty(): void {
 		this.#dirty = false;
 	}
+	poisoned(): boolean {
+		return false;
+	}
 	async reload(): Promise<void> {
 		this.reloadCount++;
 	}
