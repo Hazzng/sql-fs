@@ -575,7 +575,16 @@ export class SessionManager {
 	private async withExecLockShared<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
 		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
-		if (!this.rwlockEnabled) return fn();
+		// Flag-off (rolling deploy): the distributed RW lock keyspace is disabled,
+		// so readers fall back to the SAME legacy single-key SET-NX lock that
+		// flag-off writers take (`withExecLockExclusive`). This serializes reads
+		// against writers — cross-replica AND same-replica — preventing a reader's
+		// `ensureFreshCache` → `reload()` from clobbering a writer's uncommitted
+		// in-memory cache mid-script (F4). It is intentionally less parallel than
+		// the RW lock; flag-off is a transient deploy state.
+		if (!this.rwlockEnabled) {
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+		}
 		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
 	}
 
