@@ -567,6 +567,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * share a single DB round trip.
 	 */
 	async reload(): Promise<void> {
+		// Defense-in-depth (F4): never reload while a script scope is open. A
+		// concurrent reload (e.g. a same-replica reader's `ensureFreshCache` on a
+		// Redis blip or version bump) would clear `#pathCache` / `#dirty` out from
+		// under an open writer mid-script — destroying its uncommitted in-memory
+		// view and suppressing its version publish. `endScriptScope` /
+		// `abortScriptScope` clear `#scriptScope` BEFORE their own reload(), so
+		// this guard does not block the legitimate commit/abort refresh paths.
+		if (this.#scriptScope) {
+			return;
+		}
 		if (this.#pendingReload !== undefined) {
 			return this.#pendingReload;
 		}
