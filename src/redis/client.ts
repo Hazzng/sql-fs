@@ -33,6 +33,11 @@ export function getRedisClient(): Redis | undefined {
 		lazyConnect: false,
 		maxRetriesPerRequest: 3,
 		enableReadyCheck: true,
+		// F5: bound every command so a sustained Redis outage rejects promptly
+		// instead of queueing on the offline queue / blocking through reconnect
+		// backoff (up to ~30 s). This is what lets the acquire-path error budget
+		// advance within a few seconds and the circuit breaker open.
+		commandTimeout: 2_000,
 		retryStrategy: (times) => Math.min(1000 * 2 ** times, 30_000),
 	});
 	client.on("error", (err) => {

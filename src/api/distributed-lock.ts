@@ -10,6 +10,11 @@
 
 import crypto from "node:crypto";
 import type { Redis } from "ioredis";
+import {
+	AcquireErrorBudget,
+	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	getRedisCircuitBreaker,
+} from "../redis/circuit-breaker.js";
 
 const RELEASE_SCRIPT = `
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -30,6 +35,13 @@ export interface DistributedLockOptions {
 	readonly renewMs: number;
 	readonly acquireTimeoutMs: number;
 	readonly acquireRetryMs: number;
+	/**
+	 * F5: separate, short budget (ms) for *thrown* (connection-class) acquire
+	 * errors. Genuine contention uses the full `acquireTimeoutMs`; a Redis outage
+	 * fast-fails once thrown errors persist past this budget. Distinct so a busy
+	 * lock is never cut short by the breaker.
+	 */
+	readonly errorBudgetMs: number;
 }
 
 const DEFAULTS: DistributedLockOptions = {
@@ -37,6 +49,7 @@ const DEFAULTS: DistributedLockOptions = {
 	renewMs: 20_000,
 	acquireTimeoutMs: 300_000,
 	acquireRetryMs: 50,
+	errorBudgetMs: DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
 };
 
 /** Fails fast on configs that would break mutex invariants (e.g. renewMs >= leaseMs lets the lease expire before renewal). */
@@ -57,6 +70,9 @@ function assertLockOptions(opts: DistributedLockOptions): void {
 	}
 	if (opts.acquireRetryMs <= 0) {
 		throw new Error(`DistributedLockOptions.acquireRetryMs must be > 0 (got ${opts.acquireRetryMs})`);
+	}
+	if (opts.errorBudgetMs < 0) {
+		throw new Error(`DistributedLockOptions.errorBudgetMs must be >= 0 (got ${opts.errorBudgetMs})`);
 	}
 }
 
@@ -95,25 +111,31 @@ export async function withDistributedLock<T>(
 ): Promise<T> {
 	const merged: DistributedLockOptions = { ...DEFAULTS, ...opts };
 	assertLockOptions(merged);
-	const { leaseMs, renewMs, acquireTimeoutMs, acquireRetryMs } = merged;
+	const { leaseMs, renewMs, acquireTimeoutMs, acquireRetryMs, errorBudgetMs } = merged;
 	const token = crypto.randomUUID();
 	const deadline = Date.now() + acquireTimeoutMs;
 
 	// ── Acquire ──
-	// Redis errors (connection refused, timeouts, etc.) are treated like a
-	// busy lock: we retry until the acquire deadline, then surface
-	// LockAcquireTimeoutError. This keeps the caller-visible contract
-	// consistent whether the contention is real or infrastructural — routes
-	// translate ELOCKTIMEOUT into 503 Service Unavailable and let the client
-	// retry. Without this, a Redis outage would leak a 500 with whatever the
-	// driver happened to throw.
+	// F5: distinguish *contention* (set → non-OK; Redis healthy) from a *thrown*
+	// connection-class error. Contention retries on the full `acquireTimeoutMs`
+	// window. Thrown errors advance a short `errorBudgetMs` and feed a
+	// process-wide circuit breaker: after enough consecutive failures the breaker
+	// opens and acquire fast-fails immediately (instead of spinning to the 300 s
+	// deadline). Both failure modes surface as LockAcquireTimeoutError →
+	// ELOCKTIMEOUT → 503, so the caller contract is unchanged.
+	const breaker = getRedisCircuitBreaker();
+	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 	while (true) {
+		if (breaker.isOpen()) throw new LockAcquireTimeoutError(key);
 		let acquired = false;
 		try {
 			const ok = await redis.set(key, token, "PX", leaseMs, "NX");
 			acquired = ok === "OK";
+			breaker.recordSuccess();
+			errorBudget.reset();
 		} catch {
-			acquired = false;
+			breaker.recordFailure();
+			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(key);
 		}
 		if (acquired) break;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(key);

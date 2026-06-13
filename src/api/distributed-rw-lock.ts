@@ -11,6 +11,12 @@
 
 import crypto from "node:crypto";
 import type { Redis } from "ioredis";
+import {
+	AcquireErrorBudget,
+	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	type RedisCircuitBreaker,
+	getRedisCircuitBreaker,
+} from "../redis/circuit-breaker.js";
 export { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
 import { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
 
@@ -93,6 +99,13 @@ export interface DistributedRWLockOptions {
 	readonly acquireTimeoutMs: number;
 	readonly acquireRetryMs: number;
 	readonly readerLeaseMs: number;
+	/**
+	 * F5: short budget (ms) for *thrown* (connection-class) acquire errors,
+	 * separate from `acquireTimeoutMs`. Contention spins on the full window; a
+	 * Redis outage fast-fails once thrown errors persist past this budget (and
+	 * the process-wide breaker opens after enough consecutive failures).
+	 */
+	readonly errorBudgetMs: number;
 }
 
 const DEFAULTS: DistributedRWLockOptions = {
@@ -101,6 +114,7 @@ const DEFAULTS: DistributedRWLockOptions = {
 	acquireTimeoutMs: 300_000,
 	acquireRetryMs: 50,
 	readerLeaseMs: 60_000,
+	errorBudgetMs: DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
 };
 
 export interface RWLockKeys {
@@ -133,6 +147,8 @@ function assertOptions(opts: DistributedRWLockOptions): void {
 		throw new Error(`DistributedRWLockOptions.acquireRetryMs must be > 0 (got ${opts.acquireRetryMs})`);
 	if (opts.readerLeaseMs <= 0)
 		throw new Error(`DistributedRWLockOptions.readerLeaseMs must be > 0 (got ${opts.readerLeaseMs})`);
+	if (opts.errorBudgetMs < 0)
+		throw new Error(`DistributedRWLockOptions.errorBudgetMs must be >= 0 (got ${opts.errorBudgetMs})`);
 	if (opts.renewMs >= opts.readerLeaseMs)
 		throw new Error(
 			`DistributedRWLockOptions.renewMs (${opts.renewMs}) must be strictly less than readerLeaseMs (${opts.readerLeaseMs}); otherwise a live reader's ZSET entry can be reaped between heartbeats and a writer could enter while the read is still in flight`,
@@ -151,10 +167,16 @@ async function acquireShared(
 	token: string,
 	opts: DistributedRWLockOptions,
 ): Promise<void> {
-	const { acquireTimeoutMs, acquireRetryMs, readerLeaseMs } = opts;
+	const { acquireTimeoutMs, acquireRetryMs, readerLeaseMs, errorBudgetMs } = opts;
 	const deadline = Date.now() + acquireTimeoutMs;
+	// F5: see distributed-lock.ts — contention spins to `deadline`; thrown errors
+	// advance `errorBudget` and drive the process-wide breaker so a Redis outage
+	// fast-fails instead of hanging for the full window.
+	const breaker = getRedisCircuitBreaker();
+	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 
 	while (true) {
+		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.readers);
 		const now = Date.now();
 		const expireAt = now + readerLeaseMs;
 		let acquired = false;
@@ -169,8 +191,11 @@ async function acquireShared(
 				String(expireAt),
 			);
 			acquired = res === 1;
+			breaker.recordSuccess();
+			errorBudget.reset();
 		} catch {
-			acquired = false;
+			breaker.recordFailure();
+			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.readers);
 		}
 		if (acquired) return;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(keys.readers);
@@ -239,18 +264,27 @@ async function acquireExclusive(
 	keys: RWLockKeys,
 	token: string,
 	opts: DistributedRWLockOptions,
+	breaker: RedisCircuitBreaker,
+	errorBudget: AcquireErrorBudget,
 ): Promise<void> {
 	const { leaseMs, acquireTimeoutMs, acquireRetryMs } = opts;
 	const deadline = Date.now() + acquireTimeoutMs;
 
-	// Phase A — set writer flag (blocks new readers immediately)
+	// Phase A — set writer flag (blocks new readers immediately).
+	// F5: contention (flag held by another writer → non-OK) spins to `deadline`;
+	// thrown connection-class errors advance the shared `errorBudget` and the
+	// breaker so a Redis outage fast-fails instead of hanging for the full window.
 	while (true) {
+		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.writer);
 		let flagAcquired = false;
 		try {
 			const res = await redis.eval(ACQUIRE_EXCLUSIVE_FLAG_SCRIPT, 1, keys.writer, token, String(leaseMs));
 			flagAcquired = res === "OK";
+			breaker.recordSuccess();
+			errorBudget.reset();
 		} catch {
-			flagAcquired = false;
+			breaker.recordFailure();
+			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.writer);
 		}
 		if (flagAcquired) break;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(keys.writer);
@@ -264,15 +298,26 @@ async function waitReadersDrained(
 	token: string,
 	opts: DistributedRWLockOptions,
 	deadline: number,
+	breaker: RedisCircuitBreaker,
+	errorBudget: AcquireErrorBudget,
 ): Promise<void> {
 	const { acquireRetryMs } = opts;
+	// F5: second conflation site — runs after the writer flag is set. A live
+	// reader (count > 0) is genuine contention and spins to `deadline`; a thrown
+	// Redis error advances the shared error budget and breaker so a mid-acquire
+	// outage fast-fails rather than hanging until the 300 s deadline.
 	while (true) {
+		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.writer);
 		const now = Date.now();
 		let count: number;
 		try {
 			const res = await redis.eval(CHECK_READERS_DRAINED_SCRIPT, 2, keys.writer, keys.readers, token, String(now));
 			count = res as number;
+			breaker.recordSuccess();
+			errorBudget.reset();
 		} catch {
+			breaker.recordFailure();
+			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.writer);
 			// Treat Redis error like readers still present; will surface timeout if deadline exceeded
 			count = 1;
 		}
@@ -405,7 +450,13 @@ async function runExclusive<T>(
 ): Promise<T> {
 	const deadline = Date.now() + opts.acquireTimeoutMs;
 
-	await acquireExclusive(redis, keys, token, opts);
+	// One breaker (process-wide) and one error budget shared across both acquire
+	// phases (set-flag + wait-readers-drained) so a mid-acquire outage doesn't get
+	// a fresh budget at the second phase.
+	const breaker = getRedisCircuitBreaker();
+	const errorBudget = new AcquireErrorBudget(opts.errorBudgetMs);
+
+	await acquireExclusive(redis, keys, token, opts, breaker, errorBudget);
 
 	// Start heartbeat immediately after acquiring flag so it doesn't expire
 	// while we wait for readers to drain.
@@ -415,7 +466,7 @@ async function runExclusive<T>(
 	});
 
 	try {
-		await waitReadersDrained(redis, keys, token, opts, deadline);
+		await waitReadersDrained(redis, keys, token, opts, deadline, breaker, errorBudget);
 		if (lost) throw new LockLostError(keys.writer);
 
 		const result = await fn();

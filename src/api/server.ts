@@ -240,7 +240,26 @@ app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"
 // ── Health endpoints ───────────────────────────────────────────────────────────
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
-app.get("/readyz", (c) => c.json({ status: "ok" }));
+app.get("/readyz", async (c) => {
+	// F5: reflect Redis health. When Redis is configured but unreachable, the
+	// service is degraded (lock acquire will fast-fail 503), so /readyz must not
+	// report ready. The PING is bounded by the client's commandTimeout (2 s) and
+	// races a local timeout so a hung socket cannot stall the probe.
+	if (redisClient !== undefined) {
+		try {
+			const pong = await Promise.race([
+				redisClient.ping(),
+				new Promise<never>((_, reject) => setTimeout(() => reject(new Error("ping_timeout")), 2_000)),
+			]);
+			if (pong !== "PONG") {
+				return c.json({ status: "degraded", redis: "unexpected_reply" }, 503);
+			}
+		} catch (err) {
+			return c.json({ status: "degraded", redis: (err as Error).message }, 503);
+		}
+	}
+	return c.json({ status: "ok" });
+});
 
 // ── OpenAPI / Swagger ──────────────────────────────────────────────────────────
 
