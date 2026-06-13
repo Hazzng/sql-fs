@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { SessionManager } from "../session-manager.js";
+import { type SessionManager, assertIdleBelowVersionTtl } from "../session-manager.js";
 import { registerTools } from "./tools.js";
 
 // Map from MCP session ID to active transport + the principal that initiated it.
@@ -23,6 +23,10 @@ interface SessionEntry {
 const sessions = new Map<string, SessionEntry>();
 
 const MCP_SESSION_IDLE_MS = Number(process.env.MCP_SESSION_IDLE_MS ?? "1800000"); // 30 min
+// Audit F9b: the MCP idle window is a separate env-tunable that must obey the
+// same version-key TTL invariant as SESSION_IDLE_MS. Redis presence is keyed off
+// REDIS_URL here (this module has no live Redis handle at load time).
+assertIdleBelowVersionTtl(MCP_SESSION_IDLE_MS, Boolean(process.env.REDIS_URL));
 const MCP_SESSION_MAX = Number(process.env.MCP_SESSION_MAX ?? "1000");
 const MCP_SWEEP_INTERVAL_MS = Number(process.env.MCP_SWEEP_INTERVAL_MS ?? "60000");
 

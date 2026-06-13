@@ -68,6 +68,39 @@ function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
  */
 const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/**
+ * Boot-time coherence guard (audit F9b).
+ *
+ * The version-counter coherence proof requires the session idle-eviction
+ * window to be comfortably shorter than the Redis version-key TTL: once a
+ * sandbox has been idle past the TTL its `vfs:{tenant}:ver:*` key expires and
+ * the counter resets to 1, which is only safe if no replica still holds a
+ * `lastSeenVersion` for it — i.e. every replica has already evicted the
+ * session. If an operator raises `SESSION_IDLE_MS` (or `MCP_SESSION_IDLE_MS`)
+ * at or above the TTL, an idle session can outlive its counter and observe a
+ * post-reset low value, silently re-opening the reset wrap.
+ *
+ * We enforce the MARGIN variant — `idleMs <= TTL/2` — to leave headroom for
+ * the reaper tick and clock skew between replicas. The check only fires when
+ * Redis is in play; memory-only deployments have no version counter and are
+ * unaffected.
+ *
+ * NOTE: `VERSION_KEY_TTL_SECONDS` is in SECONDS and `idleMs` is in
+ * MILLISECONDS — the `* 1000` conversion is load-bearing, do not drop it.
+ */
+export function assertIdleBelowVersionTtl(idleMs: number, hasRedis: boolean): void {
+	if (!hasRedis) return;
+	const maxIdleMs = (VERSION_KEY_TTL_SECONDS * 1000) / 2;
+	if (idleMs > maxIdleMs) {
+		throw Object.assign(
+			new Error(
+				`Session idle window (${idleMs}ms) must not exceed half the Redis version-key TTL (${maxIdleMs}ms = ${VERSION_KEY_TTL_SECONDS}s / 2) when Redis is enabled. A session that outlives its version counter can observe a post-reset low value and break cache coherence (audit F9b). Lower SESSION_IDLE_MS / MCP_SESSION_IDLE_MS, or disable Redis.`,
+			),
+			{ code: "ERR_IDLE_TTL_INVARIANT" },
+		);
+	}
+}
+
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
 	if (
@@ -346,8 +379,10 @@ export class SessionManager {
 				return destroyPostgresSandbox(backend.connectionString, sandboxId);
 			});
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
-		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.redis = redis;
+		// Audit F9b: fail fast if the idle window could outlive the Redis version key.
+		assertIdleBelowVersionTtl(this.idleMs, this.redis !== undefined);
+		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.execLockOptions = execLockOptions;
 		this.rwlockEnabled = rwlockEnabled ?? true;
 		this.pathSnapshot = pathSnapshot;
