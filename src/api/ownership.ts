@@ -59,8 +59,10 @@ export async function withOwnedSessionOrRehydrate<T>(
 
 /**
  * readOnly variant of withOwnedSessionOrRehydrate. Routes through
- * `SessionManager.withSessionRead` (shared RWLock, no distributed exec
- * lock, FS in read-only scope). The owner check still runs inside the
+ * `SessionManager.withSessionRead`, which takes a SHARED distributed exec lock
+ * (`withExecLockShared` → RW lock shared mode, or the legacy single-key lock
+ * when `REDIS_RWLOCK_ENABLED=false`) in addition to the in-process shared
+ * RWLock, with the FS in read-only scope. The owner check still runs inside the
  * session's shared scope so cold sandboxes restored from Postgres are
  * authorized under lock rather than via a racy in-memory snapshot.
  */
