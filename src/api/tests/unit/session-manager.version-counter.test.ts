@@ -192,6 +192,9 @@ class StubCoherentFs {
 		this.clearDirtyCount++;
 		this.dirty = false;
 	}
+	poisoned(): boolean {
+		return false;
+	}
 }
 
 function makeFsFactory(instance: StubCoherentFs): (_tenantId: string, _sandboxId: string) => Promise<IFileSystem> {
