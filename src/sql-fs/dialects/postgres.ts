@@ -167,19 +167,17 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		sha256: Uint8Array,
 		data: Uint8Array,
 	): Promise<bigint> {
+		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
+		// this composite runs, so there is no `blob_insert` CTE here — the
+		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
 		const rows = await tx<{ new_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
-			blob_insert AS (
-				INSERT INTO blobs (sha256, data, size)
-				SELECT ${sha256}, ${data}, ${size} FROM ctx
-				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
-			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				VALUES (${sandboxId}, 1, ${mode}, ${size}, ${sha256})
+				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx
 				RETURNING id
 			),
 			old_dirent AS (
@@ -613,6 +611,28 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 	}
 
+	// F6
+	async commitBlob(sha256: Uint8Array, data: Uint8Array): Promise<void> {
+		// Self-committing single-statement INSERT on its OWN pool connection — no
+		// surrounding BEGIN, no advisory lock, no sandbox context (`blobs` is
+		// unscoped CAS). The `ON CONFLICT DO UPDATE` tuple lock on a hot blob is
+		// thus released at statement COMMIT instead of being pinned to the
+		// long-lived script-tx, which is the F6 fix. The touch is unconditional so
+		// the GC grace window protects this blob until its referencing inode
+		// commits in the following composite tx.
+		await runTrustedDbAsync(
+			() => this.db()`
+				INSERT INTO blobs (sha256, data, size)
+				VALUES (${sha256}, ${data}, ${data.length})
+				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
+			`,
+		);
+		// Fire-and-forget Redis backfill — see upsertBlob.
+		if (this.#blobCache !== undefined) {
+			void this.#blobCache.set(sha256, data);
+		}
+	}
+
 	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
 		if (this.#blobCache !== undefined) {
 			const cached = await this.#blobCache.get(sha256);
@@ -984,6 +1004,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 
 		// ── Phase C: bulk insert blobs ────────────────────────────────────────────
+		// F6: commit the CAS blobs in their OWN short tx (own pool connection, no
+		// advisory lock — `blobs` is unscoped CAS) BEFORE the inode/dirent work in
+		// the script-tx, so the hot-blob `ON CONFLICT DO UPDATE` tuple lock is
+		// released at this statement's COMMIT instead of being pinned to the
+		// long-lived script-tx. The touch is unconditional so the GC grace window
+		// protects these blobs until their referencing inodes commit below.
 
 		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
 		for (const f of filesWithHash) {
@@ -998,7 +1024,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 		if (uniqueBlobs.size > 0) {
 			const blobRows = [...uniqueBlobs.values()];
-			await tx`INSERT INTO blobs ${tx(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`;
+			const db = this.db();
+			await runTrustedDbAsync(
+				() => db`INSERT INTO blobs ${db(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`,
+			);
+			if (this.#blobCache !== undefined) {
+				for (const b of blobRows) void this.#blobCache.set(new Uint8Array(b.sha256), b.data);
+			}
 		}
 
 		// ── Phase D: bulk insert file inodes ─────────────────────────────────────
