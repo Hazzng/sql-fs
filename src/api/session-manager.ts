@@ -22,7 +22,7 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
-import { execLockKey, withDistributedLock } from "./distributed-lock.js";
+import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
@@ -230,6 +230,16 @@ export interface Session {
 	 * settle (success or failure).
 	 */
 	freshCacheInflight?: Promise<void>;
+	/**
+	 * AbortSignal that fires when the distributed exec lock is DEFINITIVELY lost
+	 * (lease expired or ownership taken by another holder) for the currently
+	 * locked region. Set by `withExecLockExclusive` / `withExecLockShared` before
+	 * the inner `fn` runs and cleared in their `finally`. Undefined when no
+	 * distributed lock is held (single-replica / Redis disabled). The exec routes
+	 * compose this with their timeout signal so `bash.exec` aborts — and the
+	 * script-tx rolls back — BEFORE any commit on a lost lease (F2-L1).
+	 */
+	lockLostSignal?: AbortSignal;
 	/**
 	 * Set to true when a previous turn's `publishVersionIfDirty` call failed
 	 * (the write committed to Postgres but the Redis INCR errored). The next
@@ -609,7 +619,11 @@ export class SessionManager {
 		return session.state === "closing";
 	}
 
-	private async withExecLockExclusive<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+	private async withExecLockExclusive<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (lostSignal?: AbortSignal) => Promise<T>,
+	): Promise<T> {
 		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
 		if (!this.rwlockEnabled) {
@@ -618,7 +632,11 @@ export class SessionManager {
 		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "exclusive", fn, this.execLockOptions);
 	}
 
-	private async withExecLockShared<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
+	private async withExecLockShared<T>(
+		tenantId: string,
+		sandboxId: string,
+		fn: (lostSignal?: AbortSignal) => Promise<T>,
+	): Promise<T> {
 		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
 		// Flag-off (rolling deploy): the distributed RW lock keyspace is disabled,
@@ -640,6 +658,7 @@ export class SessionManager {
 		sandboxId: string,
 		session: Session,
 		fn: (session: Session) => Promise<T>,
+		lostSignal?: AbortSignal,
 	): Promise<T> {
 		if (session.state === "closing") {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
@@ -663,49 +682,60 @@ export class SessionManager {
 			throw err;
 		}
 
-		return session.lock.runExclusive(async () => {
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-			session.inFlight++;
-			session.lastUsed = Date.now();
-			let primaryError: unknown;
-			let result: T | undefined;
-			let succeeded = false;
-			try {
-				result = await fn(session);
-				succeeded = true;
-			} catch (err) {
-				primaryError = err;
-			}
-			const coherent = asCoherentFs(session.fs);
-			const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
-			let publishError: unknown;
-			try {
-				await this.publishVersionIfDirty(tenantId, sandboxId, session);
-			} catch (err) {
-				publishError = err;
-				console.error(
-					JSON.stringify({
-						event: "publish_version_finally_error",
-						sandboxId,
-						error: (err as Error).message,
-					}),
-				);
-			}
-			session.inFlight--;
-			if (shouldRefreshPathBudget) {
-				session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-				session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-			}
-			// Order of precedence:
-			// 1. The handler's own error (most specific) takes priority.
-			// 2. Otherwise, surface the publish failure so the client knows the
-			//    write committed but cross-replica coherence did not (503).
-			if (primaryError !== undefined) throw primaryError;
-			if (publishError !== undefined && succeeded) throw publishError;
-			return result as T;
-		});
+		// F2-L1: expose the distributed lock's definitive-loss signal to the exec
+		// routes (which compose it into bash.exec's abort signal) for the duration
+		// of this locked region. Cleared in finally so a stale signal never leaks
+		// into a later turn that re-uses the warm session.
+		session.lockLostSignal = lostSignal;
+		try {
+			return await session.lock.runExclusive(async () => {
+				if (session.state === "closing") {
+					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), {
+						code: "ESESSIONCLOSING",
+					});
+				}
+				session.inFlight++;
+				session.lastUsed = Date.now();
+				let primaryError: unknown;
+				let result: T | undefined;
+				let succeeded = false;
+				try {
+					result = await fn(session);
+					succeeded = true;
+				} catch (err) {
+					primaryError = err;
+				}
+				const coherent = asCoherentFs(session.fs);
+				const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
+				let publishError: unknown;
+				try {
+					await this.publishVersionIfDirty(tenantId, sandboxId, session);
+				} catch (err) {
+					publishError = err;
+					console.error(
+						JSON.stringify({
+							event: "publish_version_finally_error",
+							sandboxId,
+							error: (err as Error).message,
+						}),
+					);
+				}
+				session.inFlight--;
+				if (shouldRefreshPathBudget) {
+					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+				}
+				// Order of precedence:
+				// 1. The handler's own error (most specific) takes priority.
+				// 2. Otherwise, surface the publish failure so the client knows the
+				//    write committed but cross-replica coherence did not (503).
+				if (primaryError !== undefined) throw primaryError;
+				if (publishError !== undefined && succeeded) throw publishError;
+				return result as T;
+			});
+		} finally {
+			session.lockLostSignal = undefined;
+		}
 	}
 
 	/**
@@ -721,6 +751,7 @@ export class SessionManager {
 		sandboxId: string,
 		session: Session,
 		fn: (session: Session) => Promise<T>,
+		lostSignal?: AbortSignal,
 	): Promise<T> {
 		if (session.state === "closing") {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
@@ -741,87 +772,100 @@ export class SessionManager {
 			throw err;
 		}
 
-		return session.lock.runShared(async () => {
-			if (session.state === "closing") {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
-			}
-			const roFs = asReadOnlyFs(session.fs);
-			const ctx: ReadOnlyContext = { violated: false };
-
-			session.inFlight++;
-			session.lastUsed = Date.now();
-			let scopeOpened = false;
-			try {
-				if (roFs !== undefined) {
-					roFs.beginReadOnlyScope();
-					scopeOpened = true;
+		// F2-L1: expose the distributed shared lock's definitive-loss signal to the
+		// exec routes for this locked region (see withSessionEntry). Cleared in
+		// finally so it never leaks into a later turn reusing this warm session.
+		// NOTE: multiple readers share one warm session; they all observe the same
+		// lockLostSignal, which is correct — a shared-lock loss invalidates them all.
+		session.lockLostSignal = lostSignal;
+		try {
+			return await session.lock.runShared(async () => {
+				if (session.state === "closing") {
+					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 				}
-				// `readOnlyContext.run` propagates `ctx` down the async stack into
-				// `bash.exec` → `SqlFs.#assertWritable`, which marks *this* call's
-				// context (not a shared FS flag). Innocent concurrent readers keep
-				// their own `ctx.violated === false`.
-				let result: T;
+				const roFs = asReadOnlyFs(session.fs);
+				const ctx: ReadOnlyContext = { violated: false };
+
+				session.inFlight++;
+				session.lastUsed = Date.now();
+				let scopeOpened = false;
 				try {
-					result = await readOnlyContext.run(ctx, () => fn(session));
-				} catch (err) {
-					const errCode = (err as Error & { code?: string }).code;
-					// Audit the violation even when an unrelated error (e.g. AbortError
-					// from a timeout) wins as the thrown error. Bash can record an
-					// EREADONLY rejection mid-script (ctx.violated=true) and later
-					// throw for an unrelated reason; the security event must still
-					// surface to monitoring.
-					if (ctx.violated || errCode === "EREADONLY") {
-						logAudit("read_only_violation", { tenantId, sandboxId });
+					if (roFs !== undefined) {
+						roFs.beginReadOnlyScope();
+						scopeOpened = true;
 					}
-					// Some bash builtins (e.g. shell redirections `echo x > f`) let
-					// the raw EREADONLY rejection escape bash.exec instead of
-					// normalising it to a non-zero exit. Remap to EREADONLY_VIOLATION
-					// so the route layer sees a single uniform code regardless of
-					// whether the violation surfaced via ctx-tagging (script ran to
-					// completion with a non-zero exit) or as a thrown rejection.
-					if (errCode === "EREADONLY") {
+					// `readOnlyContext.run` propagates `ctx` down the async stack into
+					// `bash.exec` → `SqlFs.#assertWritable`, which marks *this* call's
+					// context (not a shared FS flag). Innocent concurrent readers keep
+					// their own `ctx.violated === false`.
+					let result: T;
+					try {
+						result = await readOnlyContext.run(ctx, () => fn(session));
+					} catch (err) {
+						const errCode = (err as Error & { code?: string }).code;
+						// Audit the violation even when an unrelated error (e.g. AbortError
+						// from a timeout) wins as the thrown error. Bash can record an
+						// EREADONLY rejection mid-script (ctx.violated=true) and later
+						// throw for an unrelated reason; the security event must still
+						// surface to monitoring.
+						if (ctx.violated || errCode === "EREADONLY") {
+							logAudit("read_only_violation", { tenantId, sandboxId });
+						}
+						// Some bash builtins (e.g. shell redirections `echo x > f`) let
+						// the raw EREADONLY rejection escape bash.exec instead of
+						// normalising it to a non-zero exit. Remap to EREADONLY_VIOLATION
+						// so the route layer sees a single uniform code regardless of
+						// whether the violation surfaced via ctx-tagging (script ran to
+						// completion with a non-zero exit) or as a thrown rejection.
+						if (errCode === "EREADONLY") {
+							throw Object.assign(
+								new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"),
+								{
+									code: "EREADONLY_VIOLATION",
+								},
+							);
+						}
+						// Unrelated error wins; the violation was already audited above.
+						throw err;
+					}
+					if (ctx.violated) {
+						logAudit("read_only_violation", { tenantId, sandboxId });
+						// Audit M11: a readOnly batch shares one violation context, so a
+						// single mutating script fails the WHOLE batch (and its sibling
+						// reads are discarded). This is intentional fail-CLOSED behaviour —
+						// the read-only safety net must reject the request as a unit and
+						// guarantee nothing persisted; surfacing partial results from a
+						// batch that contained a rejected mutation would be a footgun.
 						throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
 							code: "EREADONLY_VIOLATION",
 						});
 					}
-					// Unrelated error wins; the violation was already audited above.
-					throw err;
-				}
-				if (ctx.violated) {
-					logAudit("read_only_violation", { tenantId, sandboxId });
-					// Audit M11: a readOnly batch shares one violation context, so a
-					// single mutating script fails the WHOLE batch (and its sibling
-					// reads are discarded). This is intentional fail-CLOSED behaviour —
-					// the read-only safety net must reject the request as a unit and
-					// guarantee nothing persisted; surfacing partial results from a
-					// batch that contained a rejected mutation would be a footgun.
-					throw Object.assign(new Error("EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem"), {
-						code: "EREADONLY_VIOLATION",
-					});
-				}
-				return result;
-			} finally {
-				if (scopeOpened && roFs !== undefined) {
-					try {
-						roFs.endReadOnlyScope();
-					} catch (err) {
-						// Scope toggle must not mask the primary error; log and continue.
-						console.error(
-							JSON.stringify({
-								event: "end_read_only_scope_error",
-								tenantId,
-								sandboxId,
-								error: (err as Error).message,
-							}),
-						);
+					return result;
+				} finally {
+					if (scopeOpened && roFs !== undefined) {
+						try {
+							roFs.endReadOnlyScope();
+						} catch (err) {
+							// Scope toggle must not mask the primary error; log and continue.
+							console.error(
+								JSON.stringify({
+									event: "end_read_only_scope_error",
+									tenantId,
+									sandboxId,
+									error: (err as Error).message,
+								}),
+							);
+						}
 					}
+					session.inFlight--;
+					// readOnly path never writes — no path-budget refresh, no version
+					// publish. The dirty flag is preserved so a subsequent writer's
+					// publishVersionIfDirty still fires (defense-in-depth).
 				}
-				session.inFlight--;
-				// readOnly path never writes — no path-budget refresh, no version
-				// publish. The dirty flag is preserved so a subsequent writer's
-				// publishVersionIfDirty still fires (defense-in-depth).
-			}
-		});
+			});
+		} finally {
+			session.lockLostSignal = undefined;
+		}
 	}
 
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
@@ -936,19 +980,19 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
 	): Promise<T> {
-		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async (lostSignal) => {
 			const session = await this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner);
-			return this.withSessionEntry(tenantId, sandboxId, session, fn);
+			return this.withSessionEntry(tenantId, sandboxId, session, fn, lostSignal);
 		});
 	}
 
 	async withExistingSession<T>(tenantId: string, sandboxId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async (lostSignal) => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session === undefined) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
-			return this.withSessionEntry(tenantId, sandboxId, session, fn);
+			return this.withSessionEntry(tenantId, sandboxId, session, fn, lostSignal);
 		});
 	}
 
@@ -968,12 +1012,12 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		return this.withExecLockShared(tenantId, sandboxId, async () => {
+		return this.withExecLockShared(tenantId, sandboxId, async (lostSignal) => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session !== undefined && session.state !== "closing") {
-				return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
+				return this.withSessionReadEntry(tenantId, sandboxId, session, fn, lostSignal);
 			}
-			return this.rehydrateAndExecRead(tenantId, sandboxId, fn, runtimeOptions);
+			return this.rehydrateAndExecRead(tenantId, sandboxId, fn, runtimeOptions, lostSignal);
 		});
 	}
 
@@ -982,6 +1026,7 @@ export class SessionManager {
 		sandboxId: string,
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
+		lostSignal?: AbortSignal,
 	): Promise<T> {
 		let meta: SandboxMeta | null | undefined;
 		if (this.getSandboxMetaFn !== undefined) {
@@ -999,7 +1044,7 @@ export class SessionManager {
 		if (meta?.owner) session.owner = meta.owner;
 		if (meta?.name !== undefined) session.name = meta.name;
 		if (meta?.createdAt !== undefined) session.createdAt = meta.createdAt;
-		return this.withSessionReadEntry(tenantId, sandboxId, session, fn);
+		return this.withSessionReadEntry(tenantId, sandboxId, session, fn, lostSignal);
 	}
 
 	/**
@@ -1015,12 +1060,12 @@ export class SessionManager {
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
 	): Promise<T> {
-		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
+		return this.withExecLockExclusive(tenantId, sandboxId, async (lostSignal) => {
 			const session = this.sessions.get(this.sessionKey(tenantId, sandboxId));
 			if (session !== undefined && session.state !== "closing") {
-				return this.withSessionEntry(tenantId, sandboxId, session, fn);
+				return this.withSessionEntry(tenantId, sandboxId, session, fn, lostSignal);
 			}
-			return this.rehydrateAndExec(tenantId, sandboxId, fn, runtimeOptions);
+			return this.rehydrateAndExec(tenantId, sandboxId, fn, runtimeOptions, lostSignal);
 		});
 	}
 
@@ -1029,6 +1074,7 @@ export class SessionManager {
 		sandboxId: string,
 		fn: (session: Session) => Promise<T>,
 		runtimeOptions?: RuntimeOptions,
+		lostSignal?: AbortSignal,
 	): Promise<T> {
 		let meta: SandboxMeta | null | undefined;
 		if (this.getSandboxMetaFn !== undefined) {
@@ -1052,7 +1098,7 @@ export class SessionManager {
 		if (meta?.createdAt !== undefined) {
 			session.createdAt = meta.createdAt;
 		}
-		return this.withSessionEntry(tenantId, sandboxId, session, fn);
+		return this.withSessionEntry(tenantId, sandboxId, session, fn, lostSignal);
 	}
 
 	async persistSandboxMeta(tenantId: string, sandboxId: string, meta: SandboxMeta): Promise<void> {
@@ -1354,6 +1400,18 @@ export class SessionManager {
 				session.scriptTx.beginScope();
 				try {
 					const result = await session.bash.exec(script, resolvedOpts);
+					// F2-L1: just-bash treats an aborted run as a RESOLVED result (exit
+					// 124), not a rejection — so a definitive lock loss would otherwise
+					// fall through to endScope() and COMMIT a partially-run script under a
+					// lease we no longer hold. If the lock's lost-signal fired, ROLL BACK
+					// instead and surface ELOCKLOST so the client retries a write that
+					// never committed (rather than getting a committed-then-failed lie).
+					// NOTE: a plain timeout abort still commits (audit L7) — we key off the
+					// dedicated lockLostSignal, not the composed exec signal.
+					if (session.lockLostSignal?.aborted === true) {
+						await session.scriptTx.abortScope();
+						throw new LockLostError("exec aborted: distributed exec lock lost mid-script");
+					}
 					await session.scriptTx.endScope();
 					return result;
 				} catch (err) {

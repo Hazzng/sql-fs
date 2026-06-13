@@ -10,6 +10,11 @@
 
 import crypto from "node:crypto";
 import type { Redis } from "ioredis";
+import {
+	AcquireErrorBudget,
+	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	getRedisCircuitBreaker,
+} from "../redis/circuit-breaker.js";
 
 const RELEASE_SCRIPT = `
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -30,6 +35,13 @@ export interface DistributedLockOptions {
 	readonly renewMs: number;
 	readonly acquireTimeoutMs: number;
 	readonly acquireRetryMs: number;
+	/**
+	 * F5: separate, short budget (ms) for *thrown* (connection-class) acquire
+	 * errors. Genuine contention uses the full `acquireTimeoutMs`; a Redis outage
+	 * fast-fails once thrown errors persist past this budget. Distinct so a busy
+	 * lock is never cut short by the breaker.
+	 */
+	readonly errorBudgetMs: number;
 }
 
 const DEFAULTS: DistributedLockOptions = {
@@ -37,6 +49,7 @@ const DEFAULTS: DistributedLockOptions = {
 	renewMs: 20_000,
 	acquireTimeoutMs: 300_000,
 	acquireRetryMs: 50,
+	errorBudgetMs: DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
 };
 
 /** Fails fast on configs that would break mutex invariants (e.g. renewMs >= leaseMs lets the lease expire before renewal). */
@@ -57,6 +70,9 @@ function assertLockOptions(opts: DistributedLockOptions): void {
 	}
 	if (opts.acquireRetryMs <= 0) {
 		throw new Error(`DistributedLockOptions.acquireRetryMs must be > 0 (got ${opts.acquireRetryMs})`);
+	}
+	if (opts.errorBudgetMs < 0) {
+		throw new Error(`DistributedLockOptions.errorBudgetMs must be >= 0 (got ${opts.errorBudgetMs})`);
 	}
 }
 
@@ -79,6 +95,12 @@ export class LockLostError extends Error {
 /**
  * Runs `fn` while holding the distributed lock identified by `key`.
  *
+ * `fn` receives a `lostSignal` (`AbortSignal`) that aborts on a DEFINITIVE
+ * ownership loss (token mismatch or lease expiry) — NOT on a transient renew
+ * blip. Callers plumb this into long-running work so a lapsed lease aborts it
+ * BEFORE it commits, rather than committing then surfacing `LockLostError` for
+ * a write that durably happened (F2-L1).
+ *
  * - Throws `LockAcquireTimeoutError` when the acquire loop exceeds
  *   `acquireTimeoutMs` without obtaining the lock.
  * - Throws `LockLostError` when the heartbeat discovers the lease is no
@@ -90,30 +112,36 @@ export class LockLostError extends Error {
 export async function withDistributedLock<T>(
 	redis: Redis,
 	key: string,
-	fn: () => Promise<T>,
+	fn: (lostSignal: AbortSignal) => Promise<T>,
 	opts: Partial<DistributedLockOptions> = {},
 ): Promise<T> {
 	const merged: DistributedLockOptions = { ...DEFAULTS, ...opts };
 	assertLockOptions(merged);
-	const { leaseMs, renewMs, acquireTimeoutMs, acquireRetryMs } = merged;
+	const { leaseMs, renewMs, acquireTimeoutMs, acquireRetryMs, errorBudgetMs } = merged;
 	const token = crypto.randomUUID();
 	const deadline = Date.now() + acquireTimeoutMs;
 
 	// ── Acquire ──
-	// Redis errors (connection refused, timeouts, etc.) are treated like a
-	// busy lock: we retry until the acquire deadline, then surface
-	// LockAcquireTimeoutError. This keeps the caller-visible contract
-	// consistent whether the contention is real or infrastructural — routes
-	// translate ELOCKTIMEOUT into 503 Service Unavailable and let the client
-	// retry. Without this, a Redis outage would leak a 500 with whatever the
-	// driver happened to throw.
+	// F5: distinguish *contention* (set → non-OK; Redis healthy) from a *thrown*
+	// connection-class error. Contention retries on the full `acquireTimeoutMs`
+	// window. Thrown errors advance a short `errorBudgetMs` and feed a
+	// process-wide circuit breaker: after enough consecutive failures the breaker
+	// opens and acquire fast-fails immediately (instead of spinning to the 300 s
+	// deadline). Both failure modes surface as LockAcquireTimeoutError →
+	// ELOCKTIMEOUT → 503, so the caller contract is unchanged.
+	const breaker = getRedisCircuitBreaker();
+	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 	while (true) {
+		if (breaker.isOpen()) throw new LockAcquireTimeoutError(key);
 		let acquired = false;
 		try {
 			const ok = await redis.set(key, token, "PX", leaseMs, "NX");
 			acquired = ok === "OK";
+			breaker.recordSuccess();
+			errorBudget.reset();
 		} catch {
-			acquired = false;
+			breaker.recordFailure();
+			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(key);
 		}
 		if (acquired) break;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(key);
@@ -130,6 +158,14 @@ export async function withDistributedLock<T>(
 	let lost = false;
 	let stopped = false;
 	let renewTimer: ReturnType<typeof setTimeout> | undefined;
+	// F2-L1: abort in-flight work the instant ownership is DEFINITIVELY lost so it
+	// rolls back BEFORE committing, instead of running to completion and then
+	// surfacing LockLostError for a write that already happened.
+	const lostController = new AbortController();
+	const markLost = (): void => {
+		lost = true;
+		if (!lostController.signal.aborted) lostController.abort(new LockLostError(key));
+	};
 	// The lock is safely held until this instant. Updated on every SUCCESSFUL
 	// renewal; a transient renew failure does NOT move it. Audit H4: a single
 	// transient renew timeout/error must NOT abandon a still-valid lease — we
@@ -168,11 +204,11 @@ export async function withDistributedLock<T>(
 				leaseExpiresAt = Date.now() + leaseMs;
 				scheduleRenew(renewMs);
 			} else if (outcome === "ownership_lost") {
-				lost = true;
+				markLost();
 			} else if (Date.now() >= leaseExpiresAt) {
 				// Transient failures persisted past the lease — we can no longer be
 				// sure we hold the lock. Relinquish.
-				lost = true;
+				markLost();
 			} else {
 				// Transient blip with lease still valid — retry soon, do not give up.
 				scheduleRenew(renewRetryMs);
@@ -183,7 +219,17 @@ export async function withDistributedLock<T>(
 
 	// ── Critical section ──
 	try {
-		const result = await fn();
+		let result: T;
+		try {
+			result = await fn(lostController.signal);
+		} catch (err) {
+			// If ownership was definitively lost, `fn` likely threw an AbortError
+			// from the lost-signal abort. Surface the canonical, retryable
+			// LockLostError instead so the client sees a single coherent code and
+			// treats it as "not committed" (the abort fired before any commit).
+			if (lost) throw new LockLostError(key);
+			throw err;
+		}
 		if (lost) throw new LockLostError(key);
 		return result;
 	} finally {

@@ -794,6 +794,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
 		const mtime = new Date();
 
+		// F6: commit the CAS blob in its own short tx FIRST, so the composite
+		// (which runs on the long-lived script-tx) no longer holds the hot-blob
+		// tuple lock for the script duration.
+		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, bytes);
+
 		const inodeId = this.#dialect.writeFileComposite
 			? await this.#withBareTx((tx) =>
 					this.#dialect.writeFileComposite!(
@@ -808,7 +813,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					),
 				)
 			: await this.#withTx(async (tx) => {
-					await this.#dialect.upsertBlob(tx, sha256, bytes);
+					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, bytes);
 					const id = await this.#dialect.createInode(tx, {
 						sandboxId: this.#sandboxId,
 						kind: INODE_KIND.FILE,
@@ -871,6 +876,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const sha256 = new Uint8Array(createHash("sha256").update(fullBytes).digest());
 		const { name, parentEntry } = this.#requireParentDir(path);
 
+		// F6: commit the CAS blob in its own short tx FIRST (see writeFile).
+		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, fullBytes);
+
 		const inodeId = this.#dialect.writeFileComposite
 			? await this.#withBareTx((tx) =>
 					this.#dialect.writeFileComposite!(
@@ -885,7 +893,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					),
 				)
 			: await this.#withTx(async (tx) => {
-					await this.#dialect.upsertBlob(tx, sha256, fullBytes);
+					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, fullBytes);
 					const id = await this.#dialect.createInode(tx, {
 						sandboxId: this.#sandboxId,
 						kind: INODE_KIND.FILE,

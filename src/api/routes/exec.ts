@@ -64,6 +64,19 @@ function contentTypeBase(header: string | undefined): string {
 	return (header ?? "application/json").split(";")[0]!.trim().toLowerCase();
 }
 
+/**
+ * Combine the per-request timeout/disconnect signal with the distributed exec
+ * lock's definitive-loss signal (F2-L1). The resulting signal aborts when
+ * EITHER fires, so a lapsed lease aborts `bash.exec` — rolling its script-tx
+ * back BEFORE any commit — without disturbing the existing timeout behaviour.
+ * When no distributed lock is held (single-replica / Redis disabled) the
+ * lock-lost signal is undefined and the primary signal is returned unchanged.
+ */
+function composeAbortSignals(primary: AbortSignal, lockLost: AbortSignal | undefined): AbortSignal {
+	if (lockLost === undefined) return primary;
+	return AbortSignal.any([primary, lockLost]);
+}
+
 function wrapDebugScript(script: string): string {
 	return `set -x\n${script}`;
 }
@@ -173,9 +186,14 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					controller.abort();
 				}, timeoutMs);
 
+				// F2-L1: abort the exec — and roll its script-tx back BEFORE any commit —
+				// the instant the distributed exec lock is definitively lost. Compose the
+				// lock-lost signal (if a distributed lock is held) with the timeout signal.
+				const execSignal = composeAbortSignals(controller.signal, session.lockLostSignal);
+
 				try {
 					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-						signal: controller.signal,
+						signal: execSignal,
 						cwd: body.cwd,
 						env,
 					});
@@ -280,9 +298,13 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			const ownerRunner = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 			try {
 				await ownerRunner(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+					// F2-L1: compose the distributed lock's definitive-loss signal with the
+					// timeout/client-disconnect signal so a lapsed lease aborts the exec and
+					// rolls its script-tx back BEFORE any commit.
+					const execSignal = composeAbortSignals(controller.signal, session.lockLostSignal);
 					try {
 						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-							signal: controller.signal,
+							signal: execSignal,
 							cwd: body.cwd,
 							env,
 						});
@@ -404,7 +426,17 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		try {
 			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 			results = await runner<BatchScriptResult[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) =>
-				executeBatch(sessionManager, session, body.scripts, totalTimeoutMs, disconnectController.signal, batchOptions),
+				// F2-L1: compose the distributed lock's definitive-loss signal with the
+				// client-disconnect signal so a lapsed lease aborts the in-flight batch
+				// script and rolls its script-tx back BEFORE any commit.
+				executeBatch(
+					sessionManager,
+					session,
+					body.scripts,
+					totalTimeoutMs,
+					composeAbortSignals(disconnectController.signal, session.lockLostSignal),
+					batchOptions,
+				),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
