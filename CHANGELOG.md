@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+### Minor Changes
+
+- [#143](https://github.com/Hazzng/sql-fs/pull/143) Thanks [@Hazzng](https://github.com/Hazzng)! - Guard `publishVersionIfDirty` with a cache-poison flag (F1): when a correlated Postgres failure fails both the script-tx COMMIT and the recovery reload, the session no longer publishes a version/snapshot of uncommitted phantom state — it suppresses the INCR, forces a reload on next use, and surfaces ECOHERENCE.
+
+- [#145](https://github.com/Hazzng/sql-fs/pull/145) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(lock): when `REDIS_RWLOCK_ENABLED=false`, readers now take the same legacy single-key lock as writers (closing the F4 reader/writer race during rolling deploys), and `SqlFs.reload()` is a no-op while a script scope is open so a concurrent reload can never clobber an open writer's in-memory cache.
+
+- [#144](https://github.com/Hazzng/sql-fs/pull/144) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(cache): writeFile now evicts the displaced inode's contentCache entry on overwrite (including empty-file overwrite), preventing orphaned LRU weight (F9a, [#138](https://github.com/Hazzng/sql-fs/issues/138)).
+
+- [#146](https://github.com/Hazzng/sql-fs/pull/146) Thanks [@Hazzng](https://github.com/Hazzng)! - Boot-assert that the session idle window (`SESSION_IDLE_MS` / `MCP_SESSION_IDLE_MS`) stays at or below half the Redis version-key TTL when Redis is enabled, failing fast on misconfiguration that would break cache coherence (audit F9b).
+
 ## 0.7.0
 
 ### Minor Changes
