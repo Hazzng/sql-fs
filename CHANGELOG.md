@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.9.0
+
+### Minor Changes
+
+- [#151](https://github.com/Hazzng/sql-fs/pull/151) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(lock): abort the exec on definitive lease loss before commit (F2-L1)
+
+  The distributed exec lock wrappers ran the critical section to completion and only
+  then checked the loss flag, so a writer whose lease lapsed mid-script still
+  committed its script-tx and bumped the version before throwing `ELOCKLOST` — a
+  write that durably happened surfaced as an error, causing retrying agents to
+  double-apply.
+
+  The lock now wires its DEFINITIVE-loss signal (lease expiry / ownership taken —
+  not transient renew blips) into an `AbortController` that is plumbed through to
+  `bash.exec`. On a definitive loss the in-flight exec is aborted, its script-tx
+  rolls back BEFORE any commit (no `INCR`), and the client receives a clean,
+  retryable `ELOCKLOST` (now mapped to 503). Because just-bash treats an aborted
+  run as a resolved result rather than a rejection, the runtime explicitly rolls
+  back and re-raises `LockLostError` when the lock-lost signal fired, instead of
+  committing the partial script. A plain timeout abort still commits (unchanged,
+  audit L7) — only the dedicated lock-lost signal triggers rollback.
+
+  This is Layer 1 of the F2 fix; the complete epoch/version fence is tracked
+  separately ([#131](https://github.com/Hazzng/sql-fs/issues/131)).
+
+- [#148](https://github.com/Hazzng/sql-fs/pull/148) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(lock): circuit-break Redis acquire to stop the 300s outage fuse (F5)
+
+  The distributed lock acquire loops conflated "lock busy" (contention) with "Redis
+  unreachable" (a thrown connection error): both retried until `acquireTimeoutMs`
+  (default 300 s), so a Redis outage hung every exec/file op for ~5 minutes on an
+  otherwise-healthy Postgres.
+
+  - New process-wide Redis circuit breaker (`src/redis/circuit-breaker.ts`) wired
+    into the lock ACQUIRE paths only (`distributed-rw-lock.ts` shared/exclusive +
+    `waitReadersDrained`, legacy `distributed-lock.ts`). After K (=5) consecutive
+    connection-class failures it opens and acquire fast-fails 503 immediately; a
+    successful eval/PING closes it. Renew/release paths are untouched (they keep
+    tolerating transient errors to avoid dropping leases / leaking keys).
+  - Separate short per-call error budget (`errorBudgetMs`, default 4 s) that
+    advances only on thrown errors, so genuine contention still uses the full
+    `acquireTimeoutMs` window.
+  - `commandTimeout: 2000` on the ioredis client so commands reject promptly during
+    an outage instead of queueing on the offline queue.
+  - `/readyz` now PINGs Redis and returns 503 when Redis is configured but
+    unreachable.
+  - Fixed the stale `ownership.ts` docstring (the readOnly path DOES take a shared
+    distributed lock).
+
+- [#149](https://github.com/Hazzng/sql-fs/pull/149) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(blob): commit the CAS blob upsert in its own short, self-committing
+  transaction (own connection, no advisory lock) BEFORE the inode/dirent composite,
+  and run the composite without its `blob_insert` CTE. This removes hot-blob
+  contention (F6): previously the `ON CONFLICT (sha256) DO UPDATE SET
+last_referenced_at = now()` tuple lock on a deduplicated hot blob (empty file,
+  `.gitkeep`, common lockfiles) was held for the whole script, serializing
+  unrelated sandboxes within one tenant DB and risking pool-exhaustion → 503. The
+  touch stays unconditional so the GC grace window protects the freshly-committed
+  blob until its inode commits; the blob-gc REPEATABLE READ + 40001 re-adoption
+  handshake is preserved. Applies to `writeFile`, `appendFile`, and `bulkIngest`.
+
+- [#150](https://github.com/Hazzng/sql-fs/pull/150) Thanks [@Hazzng](https://github.com/Hazzng)! - Surface a retryable `ESESSIONCLOSING` (HTTP 503) instead of a generic 500 when a request
+  loses the reaper-vs-straggler race (F9c). A request that captured a session reference just
+  before the idle/overBudget reaper marked it `closing` could run the pre-lock
+  `ensureFreshCache` probe against a Postgres pool being disconnected, producing an unmapped
+  error (e.g. `PostgresDialect: not connected`, which carries no `code`) that defaulted to a 500. Both pre-lock probe sites (`withSessionEntry`, `withSessionReadEntry`) now re-check the
+  session state on probe failure and convert it into a clean, retryable `ESESSIONCLOSING`
+  (already mapped to 503) so clients retry instead of seeing a non-retryable 500. No
+  concurrency-model change.
+
 ## 0.8.0
 
 ### Minor Changes
