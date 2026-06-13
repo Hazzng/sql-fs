@@ -346,6 +346,13 @@ function startExclusiveHeartbeat(
  * - `mode='exclusive'`: sets writer flag (halting new readers), then waits for
  *   all live readers to drain before entering the critical section.
  *
+ * `fn` receives a `lostSignal` (`AbortSignal`) that aborts on a DEFINITIVE
+ * ownership loss (token mismatch or lease expiry) — NOT on a transient renew
+ * blip (the heartbeat already distinguishes them). Callers should plumb this
+ * into long-running work so a lapsed lease aborts it BEFORE it commits, rather
+ * than committing and then surfacing a `LockLostError` for a write that durably
+ * happened (F2-L1).
+ *
  * Throws `LockAcquireTimeoutError` if acquisition exceeds `acquireTimeoutMs`.
  * Throws `LockLostError` if the heartbeat detects ownership was lost.
  */
@@ -353,7 +360,7 @@ export async function withDistributedRWLock<T>(
 	redis: Redis,
 	keys: RWLockKeys,
 	mode: RWLockMode,
-	fn: () => Promise<T>,
+	fn: (lostSignal: AbortSignal) => Promise<T>,
 	opts: Partial<DistributedRWLockOptions> = {},
 ): Promise<T> {
 	const merged: DistributedRWLockOptions = { ...DEFAULTS, ...opts };
@@ -371,17 +378,32 @@ async function runShared<T>(
 	keys: RWLockKeys,
 	token: string,
 	opts: DistributedRWLockOptions,
-	fn: () => Promise<T>,
+	fn: (lostSignal: AbortSignal) => Promise<T>,
 ): Promise<T> {
 	await acquireShared(redis, keys, token, opts);
 
 	let lost = false;
+	// F2-L1: abort in-flight work the instant ownership is DEFINITIVELY lost so it
+	// rolls back BEFORE committing, instead of running to completion and then
+	// surfacing LockLostError for a write that already happened.
+	const lostController = new AbortController();
 	const stopHeartbeat = startSharedHeartbeat(redis, keys, token, opts, () => {
 		lost = true;
+		if (!lostController.signal.aborted) lostController.abort(new LockLostError(keys.readers));
 	});
 
 	try {
-		const result = await fn();
+		let result: T;
+		try {
+			result = await fn(lostController.signal);
+		} catch (err) {
+			// If ownership was definitively lost, `fn` likely threw an AbortError
+			// from the lost-signal abort. Surface the canonical, retryable
+			// LockLostError instead so the client sees a single coherent code and
+			// treats it as "not committed" (the abort fired before any commit).
+			if (lost) throw new LockLostError(keys.readers);
+			throw err;
+		}
 		if (lost) throw new LockLostError(keys.readers);
 		return result;
 	} finally {
@@ -401,7 +423,7 @@ async function runExclusive<T>(
 	keys: RWLockKeys,
 	token: string,
 	opts: DistributedRWLockOptions,
-	fn: () => Promise<T>,
+	fn: (lostSignal: AbortSignal) => Promise<T>,
 ): Promise<T> {
 	const deadline = Date.now() + opts.acquireTimeoutMs;
 
@@ -410,15 +432,30 @@ async function runExclusive<T>(
 	// Start heartbeat immediately after acquiring flag so it doesn't expire
 	// while we wait for readers to drain.
 	let lost = false;
+	// F2-L1: abort in-flight work the instant ownership is DEFINITIVELY lost so it
+	// rolls back BEFORE committing, instead of running to completion and then
+	// surfacing LockLostError for a write that already committed + INCR'd.
+	const lostController = new AbortController();
 	const stopHeartbeat = startExclusiveHeartbeat(redis, keys, token, opts, () => {
 		lost = true;
+		if (!lostController.signal.aborted) lostController.abort(new LockLostError(keys.writer));
 	});
 
 	try {
 		await waitReadersDrained(redis, keys, token, opts, deadline);
 		if (lost) throw new LockLostError(keys.writer);
 
-		const result = await fn();
+		let result: T;
+		try {
+			result = await fn(lostController.signal);
+		} catch (err) {
+			// If ownership was definitively lost, `fn` likely threw an AbortError
+			// from the lost-signal abort. Surface the canonical, retryable
+			// LockLostError instead so the client sees a single coherent code and
+			// treats it as "not committed" (the abort fired before any commit).
+			if (lost) throw new LockLostError(keys.writer);
+			throw err;
+		}
 		if (lost) throw new LockLostError(keys.writer);
 		return result;
 	} finally {

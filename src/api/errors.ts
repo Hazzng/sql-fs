@@ -62,7 +62,10 @@ export function clientSafeErrorMessage(err: unknown, fallback = "Internal server
  * ELOOP          → 400  Bad Request (symlink loop)
  * EINVAL         → 400  Bad Request (invalid argument)
  * ELOCKTIMEOUT   → 503  Service Unavailable (distributed lock acquire timed out)
- * ELOCKLOST      → 500  Internal Server Error (distributed lock heartbeat failed mid-operation)
+ * ELOCKLOST      → 503  Service Unavailable, RETRYABLE. As of F2-L1 the exec is
+ *                       aborted (script-tx rolled back) BEFORE any commit when the
+ *                       lease is definitively lost, so ELOCKLOST now genuinely
+ *                       means "not committed" — safe for the client to retry.
  * others         → 500  Internal Server Error
  */
 export function mapFsErrorToStatus(err: Error): number {
@@ -94,7 +97,9 @@ export function mapFsErrorToStatus(err: Error): number {
 		case "ELOCKTIMEOUT":
 			return 503;
 		case "ELOCKLOST":
-			return 500;
+			// F2-L1: the exec is aborted + rolled back before any commit on a
+			// definitive lease loss, so ELOCKLOST is now retryable (not committed).
+			return 503;
 		case "ECOHERENCE":
 			return 503;
 		case "ERUNTIME_BUSY":
