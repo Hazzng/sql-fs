@@ -1,6 +1,6 @@
 {
 	"name": "sql-fs-api",
-	"version": "0.8.0",
+	"version": "0.9.0",
 	"description": "Persistent filesystem backend (Postgres) + HTTP/MCP API for just-bash sandboxes",
 	"type": "module",
 	"license": "MIT",
