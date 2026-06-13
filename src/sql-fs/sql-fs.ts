@@ -195,6 +195,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return this.#pathCache;
 	}
 
+	/** @internal exposed for tests asserting contentCache eviction (F9a). */
+	_getContentCache(): LRUCache<bigint, Uint8Array> {
+		return this.#contentCache;
+	}
+
 	async disconnect(): Promise<void> {
 		await this.#dialect.disconnect();
 	}
@@ -777,6 +782,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					return id;
 				});
 
+		// Evict the displaced inode's bytes from contentCache so the dead entry
+		// (ids are never reused) is not left as orphaned LRU weight. This must run
+		// before the `set` below, and crucially also when overwriting with an empty
+		// file — where there is no overwriting `set` to displace the old entry.
+		const displaced = this.#pathCache.get(path);
+		if (displaced !== undefined && displaced.inodeId !== inodeId) {
+			this.#contentCache.delete(displaced.inodeId);
+		}
 		this.#pathCache.set(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
