@@ -79,6 +79,12 @@ export class LockLostError extends Error {
 /**
  * Runs `fn` while holding the distributed lock identified by `key`.
  *
+ * `fn` receives a `lostSignal` (`AbortSignal`) that aborts on a DEFINITIVE
+ * ownership loss (token mismatch or lease expiry) — NOT on a transient renew
+ * blip. Callers plumb this into long-running work so a lapsed lease aborts it
+ * BEFORE it commits, rather than committing then surfacing `LockLostError` for
+ * a write that durably happened (F2-L1).
+ *
  * - Throws `LockAcquireTimeoutError` when the acquire loop exceeds
  *   `acquireTimeoutMs` without obtaining the lock.
  * - Throws `LockLostError` when the heartbeat discovers the lease is no
@@ -90,7 +96,7 @@ export class LockLostError extends Error {
 export async function withDistributedLock<T>(
 	redis: Redis,
 	key: string,
-	fn: () => Promise<T>,
+	fn: (lostSignal: AbortSignal) => Promise<T>,
 	opts: Partial<DistributedLockOptions> = {},
 ): Promise<T> {
 	const merged: DistributedLockOptions = { ...DEFAULTS, ...opts };
@@ -130,6 +136,14 @@ export async function withDistributedLock<T>(
 	let lost = false;
 	let stopped = false;
 	let renewTimer: ReturnType<typeof setTimeout> | undefined;
+	// F2-L1: abort in-flight work the instant ownership is DEFINITIVELY lost so it
+	// rolls back BEFORE committing, instead of running to completion and then
+	// surfacing LockLostError for a write that already happened.
+	const lostController = new AbortController();
+	const markLost = (): void => {
+		lost = true;
+		if (!lostController.signal.aborted) lostController.abort(new LockLostError(key));
+	};
 	// The lock is safely held until this instant. Updated on every SUCCESSFUL
 	// renewal; a transient renew failure does NOT move it. Audit H4: a single
 	// transient renew timeout/error must NOT abandon a still-valid lease — we
@@ -168,11 +182,11 @@ export async function withDistributedLock<T>(
 				leaseExpiresAt = Date.now() + leaseMs;
 				scheduleRenew(renewMs);
 			} else if (outcome === "ownership_lost") {
-				lost = true;
+				markLost();
 			} else if (Date.now() >= leaseExpiresAt) {
 				// Transient failures persisted past the lease — we can no longer be
 				// sure we hold the lock. Relinquish.
-				lost = true;
+				markLost();
 			} else {
 				// Transient blip with lease still valid — retry soon, do not give up.
 				scheduleRenew(renewRetryMs);
@@ -183,7 +197,17 @@ export async function withDistributedLock<T>(
 
 	// ── Critical section ──
 	try {
-		const result = await fn();
+		let result: T;
+		try {
+			result = await fn(lostController.signal);
+		} catch (err) {
+			// If ownership was definitively lost, `fn` likely threw an AbortError
+			// from the lost-signal abort. Surface the canonical, retryable
+			// LockLostError instead so the client sees a single coherent code and
+			// treats it as "not committed" (the abort fired before any commit).
+			if (lost) throw new LockLostError(key);
+			throw err;
+		}
 		if (lost) throw new LockLostError(key);
 		return result;
 	} finally {
