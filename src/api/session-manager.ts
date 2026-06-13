@@ -599,6 +599,16 @@ export class SessionManager {
 		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
 	}
 
+	/**
+	 * Reads `session.state` *live*. The reaper mutates `state` asynchronously, so
+	 * a value the control-flow analyser narrowed to `"active"` at an earlier guard
+	 * may already be `"closing"` by the time a probe rejects. Reading through a
+	 * function call defeats that stale narrowing (F9c).
+	 */
+	private isClosing(session: Session): boolean {
+		return session.state === "closing";
+	}
+
 	private async withExecLockExclusive<T>(tenantId: string, sandboxId: string, fn: () => Promise<T>): Promise<T> {
 		assertValidSandboxId(sandboxId);
 		if (this.redis === undefined) return fn();
@@ -635,7 +645,23 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		await this.ensureFreshCache(tenantId, sandboxId, session);
+		// F9c: a straggler that passed the `closing` check above can still run
+		// the pre-lock cache probe *after* the reaper begins disconnecting this
+		// session's pool. `ensureFreshCache` → `reload()` would then hit a pool
+		// being torn down (`PostgresDialect: not connected`, or driver
+		// `CONNECTION_DESTROYED`/`ENDED`) — an unmapped error that defaults to a
+		// 500. Re-check `state` and convert that into a clean, retryable
+		// ESESSIONCLOSING (503) so the client retries instead of seeing a 500.
+		try {
+			await this.ensureFreshCache(tenantId, sandboxId, session);
+		} catch (err) {
+			if (this.isClosing(session)) {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
+					code: "ESESSIONCLOSING",
+				});
+			}
+			throw err;
+		}
 
 		return session.lock.runExclusive(async () => {
 			if (session.state === "closing") {
@@ -700,7 +726,20 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		await this.ensureFreshCache(tenantId, sandboxId, session);
+		// F9c: same reaper-vs-straggler race as withSessionEntry — a reader that
+		// passed the `closing` check can still probe a pool being disconnected.
+		// Re-check `state` and surface a retryable ESESSIONCLOSING (503) instead
+		// of the unmapped error → 500.
+		try {
+			await this.ensureFreshCache(tenantId, sandboxId, session);
+		} catch (err) {
+			if (this.isClosing(session)) {
+				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
+					code: "ESESSIONCLOSING",
+				});
+			}
+			throw err;
+		}
 
 		return session.lock.runShared(async () => {
 			if (session.state === "closing") {
