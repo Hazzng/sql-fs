@@ -60,6 +60,21 @@ export function createEreadonly(path: string, op: string): Error {
 	return makeFsError("EREADONLY", `EREADONLY: read-only filesystem, ${op} '${path}'`, path);
 }
 
+/**
+ * ESANDBOXGONE: the sandbox (or its root inode) no longer exists in the DB.
+ *
+ * Raised by `SqlFs.#loadFreshPathCache` when `loadAllPaths` returns zero rows —
+ * the recursive CTE anchor joins `sandboxes` → root `inodes`, so an empty result
+ * means the sandbox/root was destroyed (F7). The caller (`ready`/`reload`) must
+ * NOT install an empty pathCache (which would serve ghost ENOENTs for every
+ * path); instead the session manager catches this, tears the warm session down,
+ * and surfaces a clean ENOENT → 404 to the client. Distinct from ENOENT so the
+ * teardown path is unambiguous and never confused with a single missing file.
+ */
+export function createEsandboxgone(sandboxId: string): Error {
+	return makeFsError("ESANDBOXGONE", `ESANDBOXGONE: sandbox no longer exists, '${sandboxId}'`);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */
