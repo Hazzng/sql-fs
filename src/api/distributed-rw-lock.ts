@@ -18,7 +18,7 @@ import {
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
 export { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
-import { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
+import { LockAcquireTimeoutError, LockLostError, jitteredDelayMs } from "./distributed-lock.js";
 
 // ── Lua scripts ──────────────────────────────────────────────────────────────
 
@@ -199,7 +199,8 @@ async function acquireShared(
 		}
 		if (acquired) return;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(keys.readers);
-		await sleep(acquireRetryMs);
+		// F9d: jittered sleep to de-synchronize cross-replica pollers.
+		await sleep(jitteredDelayMs(acquireRetryMs));
 	}
 }
 
@@ -288,7 +289,8 @@ async function acquireExclusive(
 		}
 		if (flagAcquired) break;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(keys.writer);
-		await sleep(acquireRetryMs);
+		// F9d: jittered sleep to de-synchronize cross-replica pollers.
+		await sleep(jitteredDelayMs(acquireRetryMs));
 	}
 }
 
@@ -324,7 +326,8 @@ async function waitReadersDrained(
 		if (count === -1) throw new LockLostError(keys.writer);
 		if (count === 0) return;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(keys.writer);
-		await sleep(acquireRetryMs);
+		// F9d: jittered sleep to de-synchronize cross-replica pollers.
+		await sleep(jitteredDelayMs(acquireRetryMs));
 	}
 }
 

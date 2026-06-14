@@ -211,6 +211,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `REDIS_EXEC_LOCK_LEASE_MS` | No (default: 60000) | Distributed exec lock lease duration (ms). Lock auto-expires if the holder dies. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No (default: 20000) | Heartbeat interval for exec lock renewal (ms). Must be strictly less than `REDIS_EXEC_LOCK_LEASE_MS` to guarantee renewal fires before expiry. |
 | `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No (default: 300000) | Max time to wait to acquire the exec lock before returning 503 (ms). |
+| `REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS` | No (default: 50) | Base poll interval (ms) for the distributed acquire/drain retry loops. Each sleep is jittered to `[retryMs/2, retryMs]` to de-synchronize competing replicas and reduce cross-replica writer starvation (F9d). Must be > 0. |
 | `REDIS_BLOB_CACHE_ENABLED` | No (default: true) | Set to `false` to disable the Redis blob cache. Blob reads always fall through to Postgres when disabled. |
 | `REDIS_BLOB_CACHE_TTL_MS` | No (default: 86400000) | TTL for blob cache entries (ms, default 24h). |
 | `REDIS_BLOB_MAX_BYTES` | No (default: 8388608) | Max blob size cached in Redis (bytes, default 8 MB). Blobs larger than this bypass Redis entirely. |
