@@ -473,6 +473,13 @@ export class SessionManager {
 	}
 
 	private estimatePathCacheBytes(fs: IFileSystem): number {
+		// F9e: prefer the O(1) incremental counter when the backend maintains one
+		// (SqlFs). Its value equals this full-walk exactly, so the budget is
+		// identical without re-scanning the whole pathCache on every dirty exec.
+		const withCounter = fs as Partial<{ getPathCacheBytes(): number }>;
+		if (typeof withCounter.getPathCacheBytes === "function") {
+			return withCounter.getPathCacheBytes();
+		}
 		const paths = fs.getAllPaths();
 		let total = 0;
 		for (const p of paths) {
