@@ -13,8 +13,9 @@
  */
 
 import type { Redis } from "ioredis";
-import { Bash } from "just-bash";
+import { Bash, defineCommand } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import { createGit } from "just-git";
 import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
@@ -146,15 +147,29 @@ export interface RuntimeOptions {
 	readonly python: boolean;
 	readonly javascript: boolean;
 	/**
-	 * When true, the `js-exec` runtime is given a permissive `NetworkConfig` that
-	 * allows all outbound HTTPS. Only `fetch()` inside `js-exec` benefits from this
-	 * flag — the Bash layer itself remains air-gapped (no `curl`, `wget`, DNS, or
-	 * raw sockets). Defaults to false (secure-by-default).
+	 * When true, network-capable runtimes may use outbound HTTPS: `js-exec`
+	 * gets unrestricted `fetch`, just-bash registers `curl`, and git remote
+	 * transport can clone/fetch/push. Defaults to false (secure-by-default).
 	 */
 	readonly network: boolean;
 }
 
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
+
+export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const out: Record<string, string> = Object.create(null);
+	const token = env.GITHUB_TOKEN;
+	if (token) {
+		out.GITHUB_TOKEN = token;
+		out.GIT_HTTP_USER = "x-access-token";
+		out.GIT_HTTP_PASSWORD = token;
+	}
+	for (const key of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] as const) {
+		const value = env[key];
+		if (value) out[key] = value;
+	}
+	return out;
+}
 
 /**
  * Syntactically valid sandbox id: UUIDs and dashed/underscored slugs, 1–128
@@ -377,6 +392,7 @@ export class SessionManager {
 	private readonly jsSem: Semaphore;
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
+	private readonly sandboxBaseEnv: Record<string, string>;
 	private shuttingDown = false;
 
 	constructor({
@@ -439,6 +455,7 @@ export class SessionManager {
 		};
 		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
+		this.sandboxBaseEnv = buildSandboxBaseEnv();
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -547,6 +564,14 @@ export class SessionManager {
 				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
 				// not registered (audit C1 — host sandbox escape). Python sandboxes
 				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
+				const git = createGit({
+					network: resolvedRuntime.network ? {} : false,
+				});
+				const gitCommand = defineCommand("git", (args, ctx) =>
+					// just-git shadows just-bash's CommandContext type, but only reads
+					// the structurally-compatible fs/cwd/env/stdin/exec/signal fields.
+					git.execute(args, ctx as Parameters<typeof git.execute>[1]),
+				);
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
@@ -554,6 +579,7 @@ export class SessionManager {
 					// Only registered when the javascript runtime is enabled so that
 					// non-JS sandboxes keep the default "command not found" behaviour.
 					...(resolvedRuntime.javascript ? [nodeCommand] : []),
+					gitCommand,
 				];
 
 				const bash = new Bash({
@@ -561,9 +587,10 @@ export class SessionManager {
 					python: resolvedRuntime.python || undefined,
 					javascript: resolvedRuntime.javascript || undefined,
 					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
-					// Bash itself remains air-gapped — no curl/wget/DNS — because
-					// just-bash only gates fetch() through this NetworkConfig path.
+					// just-bash also registers curl through secureFetch; git remote
+					// transport is gated separately above and uses globalThis.fetch.
 					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
+					env: Object.keys(this.sandboxBaseEnv).length > 0 ? { ...this.sandboxBaseEnv } : undefined,
 					defenseInDepth: defenseInDepthConfig,
 					customCommands: customCommands.length > 0 ? customCommands : undefined,
 				});

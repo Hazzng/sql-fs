@@ -138,6 +138,57 @@ describe("MCP tool — sandbox_create", () => {
 		await client.close();
 	});
 
+	it("sandbox_create accepts network:true and returns/persists the runtime flag", async () => {
+		const sessions = new Map<string, Session>();
+		let createdRuntime: { python?: boolean; javascript?: boolean; network?: boolean } | undefined;
+		let persistedMeta: { python?: boolean; javascript?: boolean; network?: boolean } | undefined;
+
+		const mockSessionManager = {
+			getOrCreate: async (
+				_tenantId: string,
+				id: string,
+				runtime?: { python?: boolean; javascript?: boolean; network?: boolean },
+				owner = "",
+			): Promise<Session> => {
+				createdRuntime = runtime;
+				const session = { owner } as unknown as Session;
+				sessions.set(id, session);
+				return session;
+			},
+			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
+			persistSandboxMeta: async (
+				_tenantId: string,
+				_id: string,
+				meta: { python?: boolean; javascript?: boolean; network?: boolean },
+			) => {
+				persistedMeta = meta;
+			},
+		};
+
+		const server = createMcpServer();
+		registerTools(server, mockSessionManager as never, "test-owner", "default");
+
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: "test-client", version: "1.0.0" });
+
+		await server.connect(serverTransport);
+		await client.connect(clientTransport);
+
+		const result = await client.callTool({
+			name: "sandbox_create",
+			arguments: { javascript: true, network: true },
+		});
+
+		const parsed = parseToolJson<{ id: string; javascript: boolean; network: boolean }>(result);
+		expect(typeof parsed.id).toBe("string");
+		expect(parsed.javascript).toBe(true);
+		expect(parsed.network).toBe(true);
+		expect(createdRuntime).toEqual({ python: false, javascript: true, network: true });
+		expect(persistedMeta).toMatchObject({ python: false, javascript: true, network: true });
+
+		await client.close();
+	});
+
 	it("sandbox_create sets session.owner to the caller", async () => {
 		const sessionManager = new SessionManager({
 			createFs: async () => new InMemoryFs(),
