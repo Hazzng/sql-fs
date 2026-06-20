@@ -15,9 +15,10 @@
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
-import { type RedisPathSnapshot, versionKey } from "../sql-fs/redis-path-snapshot.js";
+import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs/redis-path-snapshot.js";
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
@@ -575,7 +576,19 @@ export class SessionManager {
 					try {
 						// GETEX so rehydrating a session refreshes the counter's TTL (audit H6).
 						const raw = await this.redis.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
-						initialVersion = raw === null ? 0 : Number(raw) || 0;
+						if (raw === VERSION_TOMBSTONE) {
+							// F7: a tombstone here means the sandbox was destroyed but
+							// `buildFs` (createSandbox) just re-inserted the root — this
+							// session owns a freshly re-created sandbox. Clear the sentinel
+							// so a later `incr` does not run against the non-numeric string
+							// (which Redis rejects) and so a sibling warm session is not
+							// torn down for a sandbox that is alive again. Start at 0, the
+							// fresh-sandbox baseline.
+							await this.redis.del(versionKey(tenantId, sandboxId));
+							initialVersion = 0;
+						} else {
+							initialVersion = raw === null ? 0 : Number(raw) || 0;
+						}
 					} catch {
 						initialVersion = 0;
 					}
@@ -699,6 +712,11 @@ export class SessionManager {
 		try {
 			await this.ensureFreshCache(tenantId, sandboxId, session);
 		} catch (err) {
+			// F7: ensureFreshCache tears the session down and throws ENOENT when the
+			// sandbox is gone (tombstone or zero-row reload). That ENOENT is the
+			// definitive answer — surface it as a clean 404. Do NOT remap it to
+			// ESESSIONCLOSING below just because teardown set state="closing".
+			if ((err as Error & { code?: string }).code === "ENOENT") throw err;
 			if (this.isClosing(session)) {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
 					code: "ESESSIONCLOSING",
@@ -789,6 +807,9 @@ export class SessionManager {
 		try {
 			await this.ensureFreshCache(tenantId, sandboxId, session);
 		} catch (err) {
+			// F7: a gone-sandbox teardown surfaces ENOENT — the definitive 404
+			// answer. Don't remap it to ESESSIONCLOSING (see withSessionEntry).
+			if ((err as Error & { code?: string }).code === "ENOENT") throw err;
 			if (this.isClosing(session)) {
 				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
 					code: "ESESSIONCLOSING",
@@ -915,17 +936,28 @@ export class SessionManager {
 				// be holding a `lastSeenVersion` when the key expires and the counter
 				// resets to 1 — closing the stale-read / lost-update wrap (audit H6).
 				const raw = await this.redis!.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
+				// F7: recognise the destroy tombstone BEFORE the numeric parse —
+				// `Number("DESTROYED") || 0` would clamp to 0 and, for a
+				// never-written session (lastSeenVersion === 0), silently match
+				// (`0 === 0`) so no reload would ever fire and the warm session
+				// would serve ghost state. Tear the session down and surface a
+				// clean ENOENT → 404 instead.
+				if (raw === VERSION_TOMBSTONE) {
+					await this.tearDownGoneSession(tenantId, sandboxId, session);
+					throw createEnoent(`/${sandboxId}`);
+				}
 				current = raw === null ? 0 : Number(raw) || 0;
 			} catch (err) {
+				if ((err as Error & { code?: string }).code === "ENOENT") throw err;
 				// Redis unavailable — can't determine whether the cache is fresh.
 				// Reload from Postgres so we don't serve stale data.
 				console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
-				await coherent.reload();
+				await this.reloadOrTearDownGone(tenantId, sandboxId, session, coherent);
 				return;
 			}
 
 			if (session.lastSeenVersion !== current) {
-				await coherent.reload();
+				await this.reloadOrTearDownGone(tenantId, sandboxId, session, coherent);
 				session.lastSeenVersion = current;
 				coherent.clearDirty();
 			}
@@ -935,6 +967,48 @@ export class SessionManager {
 
 		session.freshCacheInflight = probe;
 		return probe;
+	}
+
+	/**
+	 * F7 (primary, Redis-independent): wrap `reload()` so a zero-row
+	 * `loadAllPaths` — which `SqlFs` raises as ESANDBOXGONE — tears the warm
+	 * session down and surfaces a clean ENOENT instead of installing an empty
+	 * pathCache (which would serve ghost ENOENTs / break cwd resolution inside
+	 * bash.exec). Any other reload error propagates unchanged.
+	 */
+	private async reloadOrTearDownGone(
+		tenantId: string,
+		sandboxId: string,
+		session: Session,
+		coherent: ICoherentFs,
+	): Promise<void> {
+		try {
+			await coherent.reload();
+		} catch (err) {
+			if ((err as Error & { code?: string }).code === "ESANDBOXGONE") {
+				await this.tearDownGoneSession(tenantId, sandboxId, session);
+				throw createEnoent(`/${sandboxId}`);
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * F7: tear down a warm session whose sandbox has been destroyed on another
+	 * replica. Mirrors the reaper teardown — mark `closing` so any straggler
+	 * that already captured this reference observes ESESSIONCLOSING, drop it from
+	 * the map, and disconnect the per-session Postgres pool so it cannot leak.
+	 * Idempotent: a session already `closing` (concurrent destroy/reaper) is left
+	 * for that path to finish.
+	 */
+	private async tearDownGoneSession(tenantId: string, sandboxId: string, session: Session): Promise<void> {
+		const key = this.sessionKey(tenantId, sandboxId);
+		if (session.state !== "closing") {
+			session.state = "closing";
+		}
+		this.sessions.delete(key);
+		await this.disconnectFs(session.fs);
+		console.error(JSON.stringify({ event: "session_torn_down_sandbox_gone", tenantId, sandboxId }));
 	}
 
 	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
@@ -1191,8 +1265,10 @@ export class SessionManager {
 				// rethrow at the end.
 				let cleanupError: unknown;
 				try {
+					let destroySucceeded = false;
 					try {
 						await this.destroySandboxFn(tenantId, sandboxId);
+						destroySucceeded = true;
 					} catch (e) {
 						cleanupError ??= e;
 						console.error(
@@ -1203,16 +1279,18 @@ export class SessionManager {
 							}),
 						);
 					}
-					try {
-						await this.deleteVersionKey(tenantId, sandboxId);
-					} catch (e) {
-						cleanupError ??= e;
-					}
-					if (this.pathSnapshot !== undefined) {
+					if (destroySucceeded) {
 						try {
-							await this.pathSnapshot.delete(tenantId, sandboxId);
+							await this.deleteVersionKey(tenantId, sandboxId);
 						} catch (e) {
 							cleanupError ??= e;
+						}
+						if (this.pathSnapshot !== undefined) {
+							try {
+								await this.pathSnapshot.delete(tenantId, sandboxId);
+							} catch (e) {
+								cleanupError ??= e;
+							}
 						}
 					}
 				} finally {
@@ -1227,10 +1305,22 @@ export class SessionManager {
 		});
 	}
 
+	/**
+	 * F7: tombstone the version key on destroy instead of `DEL`.
+	 *
+	 * A bare `DEL` re-introduces the "counter-absent == 0" conflation: a warm
+	 * session on another replica probes the absent key, reads `0`, and either
+	 * reloads a deleted tree (written variant) or — if it never wrote and so
+	 * holds `lastSeenVersion === 0` — sees `0 === 0` and NEVER reloads, serving
+	 * ghost state forever. Writing a distinct, non-numeric sentinel
+	 * (`VERSION_TOMBSTONE`) lets `ensureFreshCache` recognise the destroy and
+	 * tear the session down regardless of its last-seen version. The sentinel
+	 * inherits the version-key TTL so it self-cleans like any other counter.
+	 */
 	private async deleteVersionKey(tenantId: string, sandboxId: string): Promise<void> {
 		if (this.redis === undefined) return;
 		try {
-			await this.redis.del(versionKey(tenantId, sandboxId));
+			await this.redis.set(versionKey(tenantId, sandboxId), VERSION_TOMBSTONE, "EX", VERSION_KEY_TTL_SECONDS);
 		} catch {
 			// swallow — best-effort cleanup
 		}

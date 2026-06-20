@@ -19,6 +19,19 @@ export function versionKey(tenantId: string, sandboxId: string): string {
 }
 
 /**
+ * Tombstone sentinel written to the version key on `destroy` (F7) instead of
+ * `DEL`. A warm session on another replica that probes the counter sees this
+ * sentinel BEFORE the numeric parse and tears itself down, even in the
+ * never-written variant where its `lastSeenVersion` is still `0` and an absent
+ * (DEL'd) key would also read as `0` (`0 === 0` → no reload would ever fire).
+ *
+ * It is a DISTINCT string — NOT `-1`, which is the publish-failure marker
+ * (`publishVersionIfDirty`) — and NOT numeric, so `Number(raw) || 0` clamps it
+ * to `0` and must therefore be recognised explicitly at every clamp site.
+ */
+export const VERSION_TOMBSTONE = "DESTROYED";
+
+/**
  * Bump when the on-the-wire layout of `Snapshot` or `EncodedEntry` changes.
  * Old snapshots with a mismatched version are treated as a miss (Edge Case §8).
  */

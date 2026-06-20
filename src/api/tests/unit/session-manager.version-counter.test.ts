@@ -47,9 +47,12 @@ class FakeRedis {
 		return z;
 	}
 
-	async set(key: string, value: string, _px: "PX", ms: number, _nx: "NX"): Promise<"OK" | null> {
+	async set(key: string, value: string, unit: "PX" | "EX", amount: number, nx?: "NX"): Promise<"OK" | null> {
 		this.gc();
-		if (this.store.has(key)) return null;
+		const ms = unit === "EX" ? amount * 1000 : amount;
+		// SET ... NX (lock acquire) fails if the key already exists.
+		if (nx === "NX" && this.store.has(key)) return null;
+		// F7 tombstone uses unconditional SET ... EX (no NX) — always overwrites.
 		this.store.set(key, { value, expiresAt: Date.now() + ms });
 		return "OK";
 	}
@@ -319,7 +322,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		expect(stub.reloadCount).toBe(0);
 	});
 
-	it("destroy deletes the version key", async () => {
+	it("destroy tombstones the version key (F7)", async () => {
 		const redis = new FakeRedis();
 		const stub = new StubCoherentFs();
 		const sm = new SessionManager({
@@ -331,13 +334,16 @@ describe("SessionManager version counter (Phase D)", () => {
 		await sm.withSession("default", "sbx", async () => {
 			stub.dirty = true;
 		});
-		expect(redis.store.has("vfs:default:ver:sbx")).toBe(true);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 
 		await sm.destroy("default", "sbx");
-		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
+		// F7: the key is NOT deleted — it carries the DESTROYED sentinel so a warm
+		// session on another replica recognises the destroy instead of reading an
+		// absent key as version 0.
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("DESTROYED");
 	});
 
-	it("destroy on an unknown sandbox still deletes stale version key", async () => {
+	it("destroy on an unknown sandbox still tombstones the stale version key (F7)", async () => {
 		const redis = new FakeRedis();
 		// Stale key left behind by a previous incarnation
 		redis.store.set("vfs:default:ver:sbx", { value: "42", expiresAt: Date.now() + 60_000 });
@@ -349,7 +355,7 @@ describe("SessionManager version counter (Phase D)", () => {
 		});
 
 		await sm.destroy("default", "sbx");
-		expect(redis.store.has("vfs:default:ver:sbx")).toBe(false);
+		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("DESTROYED");
 	});
 
 	it("withExistingSession applies the same version check", async () => {

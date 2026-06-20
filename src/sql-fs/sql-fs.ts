@@ -23,9 +23,10 @@ import {
 	createEnotempty,
 	createEperm,
 	createEreadonly,
+	createEsandboxgone,
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
-import { type RedisPathSnapshot, versionKey } from "./redis-path-snapshot.js";
+import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
 import { type BulkIngestFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
@@ -469,7 +470,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
 			try {
 				const raw = await this.#redis.get(versionKey(this.#tenantId, this.#sandboxId));
-				const currentVersion = raw === null ? 0 : Number(raw) || 0;
+				// F7: a tombstone must never be coerced to 0 by `Number(raw) || 0`
+				// and then falsely match a `version: 0` snapshot. Treat it as a hard
+				// mismatch (`-1`, an impossible snapshot version) so we fall through
+				// to `loadAllPaths`, which throws ESANDBOXGONE for the (now absent)
+				// sandbox.
+				const currentVersion = raw === VERSION_TOMBSTONE ? -1 : raw === null ? 0 : Number(raw) || 0;
 				const snap = await this.#pathSnapshot.read(this.#tenantId, this.#sandboxId);
 				if (snap === null) {
 					missReason = "no_key";
@@ -632,6 +638,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const p = (async (): Promise<void> => {
 			try {
 				const { entries } = await this.#loadFreshPathCache();
+				// F7: a cross-replica reload that comes back EMPTY means the sandbox
+				// was destroyed on another replica — the recursive CTE anchor joins
+				// `sandboxes` → root `inode`, so a live sandbox always yields at least
+				// its root dir. Refuse to install an empty pathCache (which would
+				// serve ghost ENOENTs and break cwd resolution inside bash.exec).
+				// Throw ESANDBOXGONE WITHOUT clearing the existing caches so the
+				// session manager can tear the stale warm session down and surface a
+				// clean ENOENT → 404. (This guard lives in reload(), not ready():
+				// ready() runs immediately after createSandbox, which guarantees a
+				// root row, whereas reload() refreshes a long-lived warm session.)
+				if (entries.size === 0) {
+					throw createEsandboxgone(this.#sandboxId);
+				}
 				this.#cacheClear();
 				for (const [path, entry] of entries) this.#cacheSet(path, entry);
 				this.#contentCache.clear();
