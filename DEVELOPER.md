@@ -202,6 +202,19 @@ Bypassing the lock to write directly to `SqlFs` from elsewhere in the codebase w
 | `DELETE /sandboxes/:id` races an active exec | drains via exclusive acquire | blocks (routed through lock) | backstop |
 | Admin/test route bypasses `withSession` | — | — | still catches |
 
+### Lock observability — event-loop lag (F8)
+
+Every lease above (the exec-lock writer lease, the RW-lock writer flag, and the RW-lock reader ZSET scores) is kept alive by a `setTimeout` heartbeat that renews well before expiry (`renewMs` 20s < `leaseMs` 60s). They all assume the timer fires roughly on schedule. The GC-pause failure mode in the table above is exactly a violation of that assumption: when the event loop stalls longer than the lease, the renewal fires too late, Redis has already expired the key / reaped the reader entry, and the next renew returns 0 → `LockLostError`. Lock 3 keeps the DB consistent, so this is an **observability** concern, not a correctness one — but until F8 nothing measured how close the process ran to the lease floor.
+
+`src/api/event-loop-monitor.ts` is purely observational and emits two structured log events:
+
+| Event | Emitted by | Fields | Meaning / alert threshold |
+|---|---|---|---|
+| `event_loop_lag` | boot sampler (`startEventLoopMonitor`, every `EVENT_LOOP_MONITOR_INTERVAL_MS`, default 10s) | `p50Ms`, `p99Ms`, `maxMs`, `meanMs`, `windowMs` | Process-wide event-loop delay from `perf_hooks.monitorEventLoopDelay`. **Page** when `p99Ms`/`maxMs` approaches `renewMs` (~20s) — the lease margin is being eaten. |
+| `heartbeat_gap` | each heartbeat callback (`recordHeartbeatGap`) | `severity`, `lock` (`exec`\|`rw-writer`\|`rw-reader`), `key`, `gapMs`, `renewMs`, `leaseMs` | Actual-minus-expected fire time for one heartbeat. `severity:"warn"` at `gapMs > renewMs` (a full interval late); `severity:"critical"` at `gapMs > leaseMs` (the lease almost certainly lapsed). Silent below `renewMs`. |
+
+`warn`/`critical` go to `console.warn`/`console.error` respectively; the sampler logs at `console.log`. A `critical` `heartbeat_gap` for `exec`/`rw-writer` is the breadcrumb that explains a subsequent `LockLostError`; for `rw-reader` it flags the window during which a writer could have reaped the stale reader entry and entered mid-read. `eventLoopLagSnapshot()` exposes the live histogram for a future health endpoint without perturbing the windowed log.
+
 ---
 
 ## ReadOnly Safety Model
