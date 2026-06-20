@@ -76,6 +76,20 @@ function assertLockOptions(opts: DistributedLockOptions): void {
 	}
 }
 
+/**
+ * F9d: bounded jitter for acquire-loop sleeps. Returns a delay in
+ * `[retryMs/2, retryMs]` (`retryMs/2 + random()*retryMs/2`). A flat `retryMs`
+ * keeps competing replicas phase-aligned, so a cross-replica writer can be
+ * repeatedly passed over by a peer that polls a hair earlier each cycle.
+ * Jittering each sleep de-synchronizes the pollers, spreading acquire chances
+ * fairly without a stateful ticket queue. The lower bound stays at `retryMs/2`
+ * so we never busy-poll Redis harder than ~2x the configured rate.
+ */
+export function jitteredDelayMs(retryMs: number): number {
+	const half = retryMs / 2;
+	return half + Math.random() * half;
+}
+
 export class LockAcquireTimeoutError extends Error {
 	readonly code = "ELOCKTIMEOUT";
 	constructor(key: string) {
@@ -145,7 +159,8 @@ export async function withDistributedLock<T>(
 		}
 		if (acquired) break;
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(key);
-		await new Promise((r) => setTimeout(r, acquireRetryMs));
+		// F9d: jittered sleep to de-synchronize cross-replica pollers.
+		await new Promise((r) => setTimeout(r, jitteredDelayMs(acquireRetryMs)));
 	}
 
 	// ── Heartbeat ──
