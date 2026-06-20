@@ -9,7 +9,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
-import { parseNonNegativeInt } from "../redis/config.js";
+import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
 import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
@@ -45,7 +45,7 @@ const execLockOptions = redisClient
 			renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
 			acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
 			// F9d: tunable acquire poll interval (jittered to [retryMs/2, retryMs]).
-			acquireRetryMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS", 50),
+			acquireRetryMs: parsePositiveInt("REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS", 50),
 			readerLeaseMs: parseNonNegativeInt("REDIS_RWLOCK_READER_LEASE_MS", 60_000),
 		}
 	: undefined;

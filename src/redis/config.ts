@@ -12,3 +12,13 @@ export function parseNonNegativeInt(envVar: string, defaultValue: number): numbe
 	}
 	return parsed;
 }
+
+export function parsePositiveInt(envVar: string, defaultValue: number): number {
+	const raw = process.env[envVar];
+	if (raw === undefined || raw === "") return defaultValue;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		throw new Error(`Invalid value for ${envVar}: "${raw}" — expected a positive integer (got ${parsed}).`);
+	}
+	return parsed;
+}

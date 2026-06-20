@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { parseNonNegativeInt } from "../../config.js";
+import { parseNonNegativeInt, parsePositiveInt } from "../../config.js";
 
 const TEST_VAR = "VFS_TEST_ENV_VAR_DO_NOT_SET";
 
@@ -55,5 +55,31 @@ describe("parseNonNegativeInt", () => {
 	it("throws on NaN literal", () => {
 		process.env[TEST_VAR] = "NaN";
 		expect(() => parseNonNegativeInt(TEST_VAR, 0)).toThrow(/expected a non-negative integer/);
+	});
+});
+
+describe("parsePositiveInt", () => {
+	it("returns the default when the env var is unset", () => {
+		expect(parsePositiveInt(TEST_VAR, 50)).toBe(50);
+	});
+
+	it("parses a valid positive integer", () => {
+		process.env[TEST_VAR] = "42";
+		expect(parsePositiveInt(TEST_VAR, 1)).toBe(42);
+	});
+
+	it("rejects zero", () => {
+		process.env[TEST_VAR] = "0";
+		expect(() => parsePositiveInt(TEST_VAR, 1)).toThrow(/expected a positive integer/);
+	});
+
+	it("rejects negative numbers", () => {
+		process.env[TEST_VAR] = "-1";
+		expect(() => parsePositiveInt(TEST_VAR, 1)).toThrow(/expected a positive integer/);
+	});
+
+	it("rejects non-numeric input", () => {
+		process.env[TEST_VAR] = "abc";
+		expect(() => parsePositiveInt(TEST_VAR, 1)).toThrow(/Invalid value for VFS_TEST_ENV_VAR_DO_NOT_SET/);
 	});
 });
