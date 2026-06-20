@@ -242,10 +242,18 @@ export interface Session {
 	lockLostSignal?: AbortSignal;
 	/**
 	 * Set to true when a previous turn's `publishVersionIfDirty` call failed
-	 * (the write committed to Postgres but the Redis INCR errored). The next
-	 * successful turn must publish a version bump even if no new mutations
-	 * occurred on the FS — this is what guarantees other replicas eventually
-	 * see the prior write.
+	 * (the write committed to Postgres but the Redis INCR errored). The write is
+	 * durable in Postgres, but the cross-replica version bump is stranded: other
+	 * replicas keep serving their pre-write tree until the counter advances.
+	 *
+	 * Two mechanisms eventually flush this bump (whichever fires first):
+	 *  - The next turn on this replica calls `publishVersionIfDirty` again, which
+	 *    publishes even with no new mutation because `publishPending` is set.
+	 *  - The background publish drainer (`drainPendingPublishes`, an unref'd
+	 *    interval tied to the reaper lifecycle) retries under the session lock,
+	 *    independent of any further client traffic — so an idle session that the
+	 *    reaper would otherwise evict (discarding this in-memory flag) is healed
+	 *    first. The reaper also makes a best-effort publish before disconnect.
 	 *
 	 * Cleared after a successful publish.
 	 */
@@ -345,6 +353,16 @@ export class SessionManager {
 	private readonly idleMs: number;
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
+	private drainerTimer: ReturnType<typeof setInterval> | undefined;
+	/**
+	 * F3: sessions whose committed write could not publish its Redis version bump
+	 * (the INCR failed). Keyed by `sessionKey`, valued with the coordinates the
+	 * drainer needs to retry the publish. The background drainer
+	 * (`drainPendingPublishes`) flushes these even if no further client traffic
+	 * arrives, so a stranded bump survives an idle eviction. Entries are removed
+	 * on a successful publish, on poison-suppression, or on destroy.
+	 */
+	private readonly pendingPublishes: Map<string, { tenantId: string; sandboxId: string }> = new Map();
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedRWLockOptions> | undefined;
 	private readonly rwlockEnabled: boolean;
@@ -925,6 +943,9 @@ export class SessionManager {
 		if (coherent.poisoned()) {
 			session.lastSeenVersion = -1;
 			session.publishPending = false;
+			// The reload that follows will fetch the truth from Postgres; there is
+			// nothing valid left to publish, so drop any pending retry for this key.
+			this.pendingPublishes.delete(this.sessionKey(tenantId, sandboxId));
 			throw Object.assign(new Error("ECOHERENCE: cache poisoned by failed reload; publish suppressed"), {
 				code: "ECOHERENCE",
 			});
@@ -946,6 +967,10 @@ export class SessionManager {
 			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
 			session.lastSeenVersion = -1;
 			session.publishPending = true;
+			// F3: enqueue for the background drainer so the stranded bump is healed
+			// even if no further client traffic arrives on this replica (and before
+			// the reaper would evict the session, discarding `publishPending`).
+			this.pendingPublishes.set(this.sessionKey(tenantId, sandboxId), { tenantId, sandboxId });
 			throw Object.assign(new Error("ECOHERENCE: write committed but version publish failed; client should retry"), {
 				code: "ECOHERENCE",
 			});
@@ -971,6 +996,8 @@ export class SessionManager {
 		session.lastSeenVersion = newVersion;
 		session.publishPending = false;
 		coherent.clearDirty();
+		// F3: the bump landed — clear any pending drainer retry for this key.
+		this.pendingPublishes.delete(this.sessionKey(tenantId, sandboxId));
 	}
 
 	async withSession<T>(
@@ -1147,6 +1174,9 @@ export class SessionManager {
 
 			const p = session.lock.runExclusive(async () => {
 				this.sessions.delete(key);
+				// F3: the sandbox (and its version key) is going away — drop any
+				// stranded publish so the drainer doesn't retry against a dead key.
+				this.pendingPublishes.delete(key);
 				// Disconnect the FS unconditionally — even if destroySandboxFn,
 				// version-key deletion, or path-snapshot cleanup throws — so the
 				// per-session Postgres pool can never leak. Errors from the
@@ -1199,12 +1229,59 @@ export class SessionManager {
 		}
 	}
 
-	startReaper(intervalMs = 60_000): void {
+	startReaper(intervalMs = 60_000, drainerIntervalMs = 10_000): void {
 		if (this.reaperTimer !== undefined) return;
 		this.reaperTimer = setInterval(() => this.runReaper(), intervalMs);
 		// Reaper should never block process exit — a Node timer with `unref()`
 		// lets graceful shutdown proceed even if the reaper interval is mid-tick.
 		if (typeof this.reaperTimer.unref === "function") this.reaperTimer.unref();
+
+		// F3: background publish drainer. Heals writes whose Redis INCR failed,
+		// independent of further client traffic, so a stranded bump survives an
+		// idle eviction. No-op when Redis is disabled (nothing ever enqueues).
+		if (this.redis !== undefined && this.drainerTimer === undefined) {
+			this.drainerTimer = setInterval(() => void this.drainPendingPublishes(), drainerIntervalMs);
+			if (typeof this.drainerTimer.unref === "function") this.drainerTimer.unref();
+		}
+	}
+
+	/**
+	 * F3: retry every stranded version publish under its session lock. Re-checking
+	 * `session.publishPending` *inside* the lock is required: it serializes against
+	 * `ensureFreshCache` (which clears `#dirty` on the `-1` reload) and against a
+	 * concurrent exec turn, preventing a double INCR (V+2). A session that is
+	 * missing (evicted) or closing is dropped — the reaper already attempted a
+	 * best-effort publish before disconnecting it. A still-failing publish is left
+	 * enqueued for the next tick (fixed-interval backoff).
+	 */
+	async drainPendingPublishes(): Promise<void> {
+		if (this.redis === undefined || this.pendingPublishes.size === 0) return;
+		const snapshot = [...this.pendingPublishes.entries()];
+		for (const [key, { tenantId, sandboxId }] of snapshot) {
+			const session = this.sessions.get(key);
+			if (session === undefined || session.state === "closing") {
+				// No live session to publish from; reaper handles the in-flight case.
+				this.pendingPublishes.delete(key);
+				continue;
+			}
+			try {
+				await session.lock.runExclusive(async () => {
+					// Re-check under the lock — a racing exec or ensureFreshCache may
+					// have already flushed (or invalidated) the pending bump.
+					if (!session.publishPending) {
+						this.pendingPublishes.delete(key);
+						return;
+					}
+					await this.publishVersionIfDirty(tenantId, sandboxId, session);
+					// publishVersionIfDirty clears the map entry on success.
+				});
+			} catch (err) {
+				// Still stranded (Redis blip persists, or cache poisoned). Leave the
+				// entry for the next tick unless publishVersionIfDirty already removed
+				// it (poison-suppress path deletes the key itself).
+				console.error(JSON.stringify({ event: "publish_drain_error", sandboxId, error: (err as Error).message }));
+			}
+		}
 	}
 
 	/**
@@ -1260,6 +1337,7 @@ export class SessionManager {
 			}),
 		);
 		this.sessions.clear();
+		this.pendingPublishes.clear();
 	}
 
 	/** Alias for shutdown() — matches the plan's `closeAll()` naming. */
@@ -1271,6 +1349,10 @@ export class SessionManager {
 		if (this.reaperTimer !== undefined) {
 			clearInterval(this.reaperTimer);
 			this.reaperTimer = undefined;
+		}
+		if (this.drainerTimer !== undefined) {
+			clearInterval(this.drainerTimer);
+			this.drainerTimer = undefined;
 		}
 	}
 
@@ -1286,12 +1368,33 @@ export class SessionManager {
 				// against a disconnected filesystem.
 				session.state = "closing";
 				this.sessions.delete(key);
+				// F3: if this session has a stranded version bump, make one
+				// best-effort publish under the lock *before* disconnecting — the FS
+				// is still connected here, and once it's gone the in-memory
+				// `publishPending` flag would be lost with no way to retry.
+				const pending = this.pendingPublishes.get(key);
 				void session.lock
 					.runExclusive(async () => {
+						if (pending !== undefined && session.publishPending) {
+							try {
+								await this.publishVersionIfDirty(pending.tenantId, pending.sandboxId, session);
+							} catch (err) {
+								console.error(
+									JSON.stringify({
+										event: "publish_reap_error",
+										sandboxId: pending.sandboxId,
+										error: (err as Error).message,
+									}),
+								);
+							}
+						}
 						/* drain queued waiters; they will throw ESESSIONCLOSING */
 					})
 					.catch(() => {})
 					.finally(() => {
+						// Whether the flush succeeded or not, the session is gone — drop
+						// the drainer entry so it doesn't spin against a dead session.
+						this.pendingPublishes.delete(key);
 						void this.disconnectFs(session.fs);
 					});
 			}
