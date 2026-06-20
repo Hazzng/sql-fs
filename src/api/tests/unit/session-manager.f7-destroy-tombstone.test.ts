@@ -306,6 +306,32 @@ describe("SessionManager F7 — destroy reaches warm replicas", () => {
 		expect(redis.store.get("vfs:default:ver:sbx")?.value).toBe("1");
 	});
 
+	it("(e) tombstone is NOT written when destroySandboxFn throws (transient DB failure)", async () => {
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({
+			createFs: makeFsFactory(stub),
+			destroySandboxFn: vi.fn().mockRejectedValue(new Error("transient PG error")),
+			redis: asRedis(redis),
+		});
+
+		await sm.withSession("default", "sbx", async () => {
+			stub.dirty = true;
+		});
+		expect(sm.getSession("default", "sbx")).toBeDefined();
+
+		await expect(sm.destroy("default", "sbx")).rejects.toThrow("transient PG error");
+
+		// The sandbox still exists in Postgres (destroy rolled back). The version
+		// key must NOT contain the tombstone — otherwise warm sessions on other
+		// replicas would tear down with false 404s.
+		const raw = await redis.get("vfs:default:ver:sbx");
+		expect(raw).not.toBe("DESTROYED");
+
+		// FS must still be disconnected (pool leak prevention).
+		expect(stub.disconnectCount).toBe(1);
+	});
+
 	it("primary guard fires even without Redis: ESANDBOXGONE is not swallowed by ensureFreshCache no-op", async () => {
 		// With no Redis, ensureFreshCache is a no-op, so the gone-sandbox guard is
 		// not exercised through it. This documents that the Redis-independent

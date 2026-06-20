@@ -1228,8 +1228,10 @@ export class SessionManager {
 				// rethrow at the end.
 				let cleanupError: unknown;
 				try {
+					let destroySucceeded = false;
 					try {
 						await this.destroySandboxFn(tenantId, sandboxId);
+						destroySucceeded = true;
 					} catch (e) {
 						cleanupError ??= e;
 						console.error(
@@ -1240,16 +1242,18 @@ export class SessionManager {
 							}),
 						);
 					}
-					try {
-						await this.deleteVersionKey(tenantId, sandboxId);
-					} catch (e) {
-						cleanupError ??= e;
-					}
-					if (this.pathSnapshot !== undefined) {
+					if (destroySucceeded) {
 						try {
-							await this.pathSnapshot.delete(tenantId, sandboxId);
+							await this.deleteVersionKey(tenantId, sandboxId);
 						} catch (e) {
 							cleanupError ??= e;
+						}
+						if (this.pathSnapshot !== undefined) {
+							try {
+								await this.pathSnapshot.delete(tenantId, sandboxId);
+							} catch (e) {
+								cleanupError ??= e;
+							}
 						}
 					}
 				} finally {
