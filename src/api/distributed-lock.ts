@@ -15,6 +15,7 @@ import {
 	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
+import { recordHeartbeatGap } from "./event-loop-monitor.js";
 
 const RELEASE_SCRIPT = `
 if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -192,8 +193,13 @@ export async function withDistributedLock<T>(
 	const renewRetryMs = Math.max(50, Math.floor(renewMs / 4));
 	const scheduleRenew = (delayMs: number): void => {
 		if (stopped) return;
+		// F8: capture when this tick is *expected* to fire so the callback can
+		// measure event-loop lag (a GC pause / sync stall that delays renewal past
+		// the lease is otherwise silent until LockLostError surfaces post-hoc).
+		const expectedFireAt = Date.now() + delayMs;
 		renewTimer = setTimeout(async () => {
 			if (stopped) return;
+			recordHeartbeatGap({ lock: "exec", key, expectedFireAt, renewMs, leaseMs });
 			// Cap renewal command wait so a stalled Redis can't block release.
 			let outcome: "renewed" | "ownership_lost" | "transient";
 			// L1: track and clear the race timeout so a won race doesn't leave a
