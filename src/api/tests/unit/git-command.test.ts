@@ -67,10 +67,27 @@ describe("SessionManager git command", () => {
 		expect(result.stderr).toMatch(/network|disabled|blocked|not allowed/i);
 	});
 
-	it("injects server GitHub token env and lets per-request env override it for one exec", async () => {
+	it("does not inject server GitHub token credentials when network is disabled", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "server-token");
 		const sm = makeSessionManager();
 		const session = await sm.getOrCreate(T, "git-token-env", { python: false, javascript: false, network: false });
+
+		const result = await session.bash.exec("env");
+
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(result.stdout).not.toMatch(/^GITHUB_TOKEN=/m);
+		expect(result.stdout).not.toMatch(/^GIT_HTTP_USER=/m);
+		expect(result.stdout).not.toMatch(/^GIT_HTTP_PASSWORD=/m);
+	});
+
+	it("injects server GitHub token env for network-enabled sandboxes and lets per-request env override it", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "server-token");
+		const sm = makeSessionManager();
+		const session = await sm.getOrCreate(T, "git-token-network-env", {
+			python: false,
+			javascript: false,
+			network: true,
+		});
 
 		await expect(
 			session.bash.exec('printf \'%s:%s:%s\' "$GITHUB_TOKEN" "$GIT_HTTP_USER" "$GIT_HTTP_PASSWORD"'),

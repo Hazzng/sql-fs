@@ -171,6 +171,22 @@ export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Recor
 	return out;
 }
 
+const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
+	"GITHUB_TOKEN",
+	"GIT_HTTP_BEARER_TOKEN",
+	"GIT_HTTP_USER",
+	"GIT_HTTP_PASSWORD",
+]);
+
+function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
+	const out: Record<string, string> = Object.create(null);
+	for (const [key, value] of Object.entries(baseEnv)) {
+		if (!network && SANDBOX_NETWORK_CREDENTIAL_KEYS.has(key)) continue;
+		out[key] = value;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /**
  * Syntactically valid sandbox id: UUIDs and dashed/underscored slugs, 1–128
  * chars. Audit M2: an unvalidated sandbox id flows straight into Redis lock /
@@ -590,7 +606,7 @@ export class SessionManager {
 					// just-bash also registers curl through secureFetch; git remote
 					// transport is gated separately above and uses globalThis.fetch.
 					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
-					env: Object.keys(this.sandboxBaseEnv).length > 0 ? { ...this.sandboxBaseEnv } : undefined,
+					env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network),
 					defenseInDepth: defenseInDepthConfig,
 					customCommands: customCommands.length > 0 ? customCommands : undefined,
 				});
