@@ -189,6 +189,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
 	#readOnlyDepth = 0;
+	/**
+	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
+	 * set/delete/clear (F9e). Equals the old full-walk
+	 * `Σ (path.length + 100)` exactly, so callers can size the path-cache
+	 * memory budget without re-walking the whole Map on every dirty exec.
+	 */
+	#pathCacheBytes = 0;
 
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
@@ -361,8 +368,45 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#updateCacheByInode(inodeId: bigint, patch: Partial<PathCacheEntry>): void {
 		for (const [p, e] of this.#pathCache) {
-			if (e.inodeId === inodeId) this.#pathCache.set(p, { ...e, ...patch });
+			if (e.inodeId === inodeId) this.#cacheSet(p, { ...e, ...patch });
 		}
+	}
+
+	// ── pathCache mutation helpers (F9e: O(1) byte accounting) ──────────────────
+	//
+	// Every mutation of `#pathCache` MUST go through these so `#pathCacheBytes`
+	// stays in lockstep. The byte estimate depends only on the SET of keys
+	// (`Σ key.length + 100`), so a `set` on an existing key is a no-op for the
+	// counter — matching `#updateCacheByInode`'s in-place value patches.
+
+	/** Sets a pathCache entry, adjusting the byte counter only when the key is new. */
+	#cacheSet(key: string, entry: PathCacheEntry): void {
+		if (!this.#pathCache.has(key)) {
+			this.#pathCacheBytes += key.length + 100;
+		}
+		this.#pathCache.set(key, entry);
+	}
+
+	/** Deletes a pathCache entry, subtracting its byte contribution if present. */
+	#cacheDelete(key: string): void {
+		if (this.#pathCache.delete(key)) {
+			this.#pathCacheBytes -= key.length + 100;
+		}
+	}
+
+	/** Clears the pathCache and resets the byte counter. */
+	#cacheClear(): void {
+		this.#pathCache.clear();
+		this.#pathCacheBytes = 0;
+	}
+
+	/**
+	 * O(1) byte estimate of the pathCache, equal to the old full-walk
+	 * `Σ (path.length + 100)`. Consumed by SessionManager's path-cache memory
+	 * budget so it never re-walks the whole Map on a dirty exec (F9e).
+	 */
+	getPathCacheBytes(): number {
+		return this.#pathCacheBytes;
 	}
 
 	/** Returns all pathCache paths rooted at dirPath (inclusive). */
@@ -551,8 +595,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#startPrewarm();
 
 		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
-		this.#pathCache.clear();
-		for (const [p, e] of entries) this.#pathCache.set(p, e);
+		this.#cacheClear();
+		for (const [p, e] of entries) this.#cacheSet(p, e);
 		// Initial load established committed state; the cache is not poisoned (F1).
 		this.#cachePoisoned = false;
 
@@ -607,8 +651,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (entries.size === 0) {
 					throw createEsandboxgone(this.#sandboxId);
 				}
-				this.#pathCache.clear();
-				for (const [path, entry] of entries) this.#pathCache.set(path, entry);
+				this.#cacheClear();
+				for (const [path, entry] of entries) this.#cacheSet(path, entry);
 				this.#contentCache.clear();
 				this.#dirty = false;
 				// A successful reload re-established committed state in the caches,
@@ -784,7 +828,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			if (old !== undefined && old.inodeId !== entry.inodeId) {
 				this.#contentCache.delete(old.inodeId);
 			}
-			this.#pathCache.set(path, entry);
+			this.#cacheSet(path, entry);
 			const bytes = bytesByPath.get(path);
 			if (bytes !== undefined && bytes.byteLength > 0) {
 				this.#contentCache.set(entry.inodeId, bytes);
@@ -856,7 +900,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (displaced !== undefined && displaced.inodeId !== inodeId) {
 			this.#contentCache.delete(displaced.inodeId);
 		}
-		this.#pathCache.set(path, {
+		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
 			mode: 0o644,
@@ -930,7 +974,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		if (existing) this.#contentCache.delete(existing.inodeId);
 		if (fullBytes.byteLength > 0) this.#contentCache.set(inodeId, fullBytes);
-		this.#pathCache.set(path, {
+		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
 			mode: 0o644,
@@ -972,7 +1016,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						await this.#dialect.insertDirent(tx, parentEntry.inodeId, seg, id);
 						return id;
 					});
-					this.#pathCache.set(next, {
+					this.#cacheSet(next, {
 						inodeId,
 						kind: INODE_KIND.DIRECTORY,
 						mode: 0o755,
@@ -1008,7 +1052,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					return id;
 				});
 
-		this.#pathCache.set(path, {
+		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.DIRECTORY,
 			mode: 0o755,
@@ -1066,7 +1110,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			for (const p of subtreePaths) {
 				const e = this.#pathCache.get(p);
 				if (e) this.#contentCache.delete(e.inodeId);
-				this.#pathCache.delete(p);
+				this.#cacheDelete(p);
 			}
 			this.#dirty = true;
 			return;
@@ -1088,7 +1132,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		this.#contentCache.delete(entry.inodeId);
-		this.#pathCache.delete(path);
+		this.#cacheDelete(path);
 		this.#dirty = true;
 	}
 
@@ -1274,7 +1318,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			for (const [destPath, inodeId] of newInodeIds) {
 				const srcPath = src + destPath.slice(dest.length);
 				const srcE = this.#pathCache.get(srcPath)!;
-				this.#pathCache.set(destPath, { ...srcE, inodeId, mtime });
+				this.#cacheSet(destPath, { ...srcE, inodeId, mtime });
 			}
 			this.#dirty = true;
 			return;
@@ -1308,7 +1352,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return id;
 		});
 
-		this.#pathCache.set(dest, {
+		this.#cacheSet(dest, {
 			inodeId: newInodeId,
 			kind: srcEntry.kind,
 			mode: srcEntry.mode,
@@ -1390,15 +1434,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		// Remove src subtree and any existing dest subtree from cache
-		for (const p of srcPaths) this.#pathCache.delete(p);
+		for (const p of srcPaths) this.#cacheDelete(p);
 		const destPrefix = dest === "/" ? "/" : `${dest}/`;
 		for (const key of [...this.#pathCache.keys()]) {
-			if (key === dest || key.startsWith(destPrefix)) this.#pathCache.delete(key);
+			if (key === dest || key.startsWith(destPrefix)) this.#cacheDelete(key);
 		}
 
 		// Re-insert src entries under dest (remap prefix src → dest)
 		for (const [oldPath, entry] of snapshot) {
-			this.#pathCache.set(dest + oldPath.slice(src.length), entry);
+			this.#cacheSet(dest + oldPath.slice(src.length), entry);
 		}
 		this.#dirty = true;
 	}
@@ -1432,7 +1476,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return id;
 		});
 
-		this.#pathCache.set(linkPath, {
+		this.#cacheSet(linkPath, {
 			inodeId,
 			kind: INODE_KIND.SYMLINK,
 			mode: 0o777,
@@ -1460,7 +1504,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			await this.#dialect.incrementNlink(tx, srcEntry.inodeId);
 		});
 
-		this.#pathCache.set(newPath, { ...srcEntry });
+		this.#cacheSet(newPath, { ...srcEntry });
 		this.#dirty = true;
 	}
 
