@@ -38,6 +38,9 @@ importers:
       just-bash:
         specifier: ^3.0.1
         version: 3.0.1
+      just-git:
+        specifier: ^1.7.1
+        version: 1.7.1
       lru-cache:
         specifier: ^11.0.0
         version: 11.3.5
@@ -1971,6 +1974,9 @@ packages:
   just-bash@3.0.1:
     resolution: {integrity: sha512-YVyzCN08fKarUnwqy7rKOAcX+2MLYLnYInuowmUXn3mqhrtd4ieZNBuzdQG+qYV9DqnIWuv9Whiph0WRIWsBtw==}
     hasBin: true
+
+  just-git@1.7.1:
+    resolution: {integrity: sha512-XAxD3x+8aSo8Kx62pkcj3Jzmhw2I4mhw1xvqTNbpVcTFUMIZKak5W00hVM7/LywUFLfMj+7Riu8cEcn8JnEHHw==}
 
   jwa@2.0.1:
     resolution: {integrity: sha512-hRF04fqJIP8Abbkq5NKGN0Bbr3JxlQ+qhZufXVr0DvujKy93ZCbXZMHDL4EOtodSbCWxOqR8MS1tXA5hwqCXDg==}
@@ -4516,6 +4522,8 @@ snapshots:
       node-liblzma: 2.2.0
     transitivePeerDependencies:
       - supports-color
+
+  just-git@1.7.1: {}
 
   jwa@2.0.1:
     dependencies:

@@ -113,17 +113,21 @@ const sb = await client.sandboxes.create({
   files: { "/home/user/seed.txt": "..." },   // text-only seed (use ingestFiles for many/binary)
   python: false,                             // enable CPython WASM runtime
   javascript: false,                         // enable QuickJS runtime
-  network: false,                            // enable outbound fetch() from js-exec (opt-in)
+  network: false,                            // enable outbound HTTP/curl/git remote ops (opt-in)
 });
 ```
 
 All options are optional — `client.sandboxes.create()` is valid and creates
 an anonymous sandbox.
 
-**`network: true` — enabling outbound fetch()**
+**`network: true` — enabling outbound HTTP**
 
-Pass `network: true` together with `javascript: true` to allow `fetch()` calls
-inside `js-exec` scripts to reach external HTTP endpoints:
+Pass `network: true` at sandbox creation to allow outbound HTTP from supported
+commands. It enables:
+
+- `fetch()` inside `js-exec` scripts when `javascript: true` is also set
+- Bash `curl`
+- `git clone`, `git fetch`, and `git push`
 
 ```typescript
 const sb = await client.sandboxes.create({ javascript: true, network: true });
@@ -135,11 +139,11 @@ const r = await sb.exec(`js-exec -c '
 console.log(r.stdout);   // origin: <your-ip>
 ```
 
-- **Bash remains air-gapped.** Even with `network: true`, the Bash shell has
-  no `curl`, `wget`, DNS, or raw socket access. Only `fetch()` inside `js-exec`
-  gains outbound HTTP.
+- **Bash gains HTTP tools.** With `network: true`, `curl` is available and git
+  remote operations can reach HTTPS remotes. `wget`, raw sockets, package
+  managers, compilers, and SSH remain unsupported.
 - **Opt-in, default `false`.** Omitting `network` (or passing `network: false`)
-  produces a fully isolated sandbox.
+  blocks outbound access; local git operations still work.
 - **js-exec timeout extends to 60 s** when network is enabled.
 
 ### `client.sandboxes.get(sandboxId): Promise<SandboxInfo>`

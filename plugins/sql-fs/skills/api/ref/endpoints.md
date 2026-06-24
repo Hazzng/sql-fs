@@ -129,7 +129,7 @@ All body fields are **optional**:
 |---|---|---|---|
 | `python` | boolean | false | Enable CPython WASM — registers `python3` (and `python` alias), stdlib only, isolated per call |
 | `javascript` | boolean | false | Enable QuickJS WASM (`js-exec`/`node`) |
-| `network` | boolean | false | Enable outbound `fetch()` from `js-exec` (see note below) |
+| `network` | boolean | false | Enable outbound HTTP for `js-exec` fetch, Bash `curl`, and git clone/fetch/push (see note below) |
 | `files` | `Record<absPath, string>` | — | Seed files (absolute path → plain text) |
 | `env` | `Record<string, string>` | — | Default env vars for all exec calls |
 
@@ -147,13 +147,18 @@ Response `201`:
 
 **Important:** `python`/`javascript`/`network` must be set at creation. They cannot be changed later.
 
-**`network: true` — outbound fetch() from js-exec**
+**`network: true` — outbound HTTP**
 
-When `network: true` is set (requires `javascript: true`), `fetch()` inside
-`js-exec` scripts can reach external HTTP endpoints. The js-exec timeout
-extends to 60 s automatically. The Bash shell itself remains air-gapped — no
-`curl`, `wget`, DNS, or raw socket access — only `fetch()` inside `js-exec`
-gains outbound HTTP. Defaults to `false` (secure-by-default, no egress).
+When `network: true` is set at sandbox creation, supported commands can reach
+external HTTPS endpoints:
+
+- `fetch()` inside `js-exec` scripts when `javascript: true` is also set
+- Bash `curl`
+- `git clone`, `git fetch`, and `git push`
+
+The js-exec timeout extends to 60 s automatically. `wget`, raw sockets,
+package managers, compilers, and SSH remain unsupported. Defaults to `false`
+(secure-by-default, no egress); local git operations still work without network.
 
 ### GET /v1/sandboxes/:id — Get sandbox info
 

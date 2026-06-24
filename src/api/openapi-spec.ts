@@ -22,8 +22,9 @@ const sandboxSchema = {
 		createdAt: { type: "string", format: "date-time" },
 		python: { type: "boolean", example: false },
 		javascript: { type: "boolean", example: false },
+		network: { type: "boolean", example: false },
 	},
-	required: ["id", "name", "owner", "createdAt", "python", "javascript"],
+	required: ["id", "name", "owner", "createdAt", "python", "javascript", "network"],
 } as const;
 
 const sandboxInfoSchema = {
@@ -295,7 +296,8 @@ export const openapiSpec = {
 			post: {
 				tags: ["Sandboxes"],
 				summary: "Create sandbox",
-				description: "Create a new isolated bash sandbox. Optionally seed with files and enable Python/JS runtimes.",
+				description:
+					"Create a new isolated bash sandbox. Optionally seed with files and enable Python/JS runtimes or outbound HTTPS for curl and git clone/fetch/push.",
 				requestBody: {
 					required: false,
 					content: {
@@ -320,6 +322,11 @@ export const openapiSpec = {
 									},
 									python: { type: "boolean", default: false, description: "Enable CPython WASM runtime" },
 									javascript: { type: "boolean", default: false, description: "Enable QuickJS runtime" },
+									network: {
+										type: "boolean",
+										default: false,
+										description: "Grant outbound HTTPS for curl and git clone/fetch/push",
+									},
 								},
 							},
 						},

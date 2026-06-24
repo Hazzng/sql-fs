@@ -75,8 +75,20 @@ js-exec script.js
 node script.js    # alias for js-exec
 ```
 - QuickJS WASM — fast startup, TypeScript supported
-- No `npm`, no network, no `require('fs')` (use sandbox FS via bash instead)
+- No `npm`, no `require('fs')` (use sandbox FS via bash instead)
 - Server-wide concurrency cap: **5 concurrent js-exec calls**
+
+### Network — `network: true`
+
+Network access is opt-in at sandbox creation. With `network: true`:
+
+- `curl` can reach outbound HTTPS endpoints
+- `git clone`, `git fetch`, and `git push` can reach HTTPS remotes
+- `js-exec` `fetch()` can reach outbound HTTP(S) when `javascript: true` is also set
+
+With `network: false` (the default), outbound access is blocked. Local git
+operations such as `git init`, `git add`, `git commit`, `git status`, and
+`git log` still work.
 
 ---
 
@@ -84,7 +96,7 @@ node script.js    # alias for js-exec
 
 | Command | Why |
 |---------|-----|
-| `curl`, `wget`, `nc`, `ssh` | No network access of any kind |
+| `wget`, `nc`, `ssh` | Unsupported network tools/transports |
 | `apt`, `pip`, `npm`, `brew` | No package managers |
 | `vi`, `vim`, `nano`, `less`, `more` | No interactive/terminal-control commands |
 | `&` (background jobs) | No process control |
