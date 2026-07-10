@@ -119,14 +119,22 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number, sandboxVersion?: number): Promise<bigint> {
 		await this.#acquireSandboxWriteFence(tx, sandboxId);
 		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
+		const expectedVersion = sandboxVersion ?? null;
 		const rows = await tx<{ id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			fence AS (
+				SELECT 1
+				FROM sandboxes
+				WHERE id = ${sandboxId}
+					AND (${expectedVersion} IS NULL OR version = ${expectedVersion})
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx
+				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx, fence
 				RETURNING id
 			)
 			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -135,22 +143,29 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			RETURNING inode_id AS id
 		`;
 		const row = rows[0];
-		if (!row) throw new Error("mkdirComposite: INSERT returned no rows");
+		if (!row) throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
 		return BigInt(row.id);
 	}
 
 	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, sandboxVersion?: number): Promise<bigint> {
 		await this.#acquireSandboxWriteFence(tx, sandboxId);
-		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
+		const expectedVersion = sandboxVersion ?? null;
 		const rows = await tx<{ removed_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			fence AS (
+				SELECT 1
+				FROM sandboxes
+				WHERE id = ${sandboxId}
+					AND (${expectedVersion} IS NULL OR version = ${expectedVersion})
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+			),
 			removed_dirent AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM fence) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Delete and decrement are split into two mutually-exclusive CTEs
@@ -172,7 +187,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			SELECT inode_id AS removed_inode_id FROM removed_dirent
 		`;
 		const row = rows[0];
-		if (!row) throw createEnoent(name);
+		if (!row) throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
 		return BigInt(row.removed_inode_id);
 	}
 
@@ -191,20 +206,28 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
 		await this.#acquireSandboxWriteFence(tx, sandboxId);
-		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
+		const expectedVersion = sandboxVersion ?? null;
 		const rows = await tx<{ new_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			fence AS (
+				SELECT 1
+				FROM sandboxes
+				WHERE id = ${sandboxId}
+					AND (${expectedVersion} IS NULL OR version = ${expectedVersion})
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx
+				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx, fence
 				RETURNING id
 			),
 			old_dirent AS (
 				SELECT inode_id FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+					AND (SELECT 1 FROM fence) IS NOT NULL
 			),
 			upserted AS (
 				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -230,7 +253,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			SELECT id AS new_inode_id FROM new_inode
 		`;
 		const row = rows[0];
-		if (!row) throw new Error("writeFileComposite: INSERT returned no rows");
+		if (!row) throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
@@ -255,16 +278,23 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// the source into it. Statement 1's effects are visible to statement 2, so
 		// the rename can no longer collide. Atomicity is preserved by the tx.
 		await this.#acquireSandboxWriteFence(tx, sandboxId);
-		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
+		const expectedVersion = sandboxVersion ?? null;
 		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			fence AS (
+				SELECT 1
+				FROM sandboxes
+				WHERE id = ${sandboxId}
+					AND (${expectedVersion} IS NULL OR version = ${expectedVersion})
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+			),
 			old_dest AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM fence) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Split delete/decrement by snapshot nlink so the overwritten
@@ -282,12 +312,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				AND nlink > 1
 		`;
 		const rows = await tx<{ inode_id: string }[]>`
+			WITH fence AS (
+				SELECT 1
+				FROM sandboxes
+				WHERE id = ${sandboxId}
+					AND (${expectedVersion} IS NULL OR version = ${expectedVersion})
+			)
 			UPDATE dirents
 			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
 			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+				AND (SELECT 1 FROM fence) IS NOT NULL
 			RETURNING inode_id
 		`;
-		if (rows.length === 0) throw createEnoent(oldName);
+		if (rows.length === 0) throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
 	}
 
 	// ── Private helpers ───────────────────────────────────────────────────────────

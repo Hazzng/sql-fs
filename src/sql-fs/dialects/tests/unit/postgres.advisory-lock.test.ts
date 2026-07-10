@@ -26,6 +26,12 @@ function makeFakeTx(): { tx: postgres.TransactionSql; calls: RecordedCall[] } {
 	const fn = (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]> => {
 		const sql = strings.join("?");
 		calls.push({ sql, values });
+		if (sql.includes("SELECT id AS new_inode_id FROM new_inode")) return Promise.resolve([{ new_inode_id: "11" }]);
+		if (sql.includes("SELECT inode_id AS removed_inode_id FROM removed_dirent")) return Promise.resolve([{ removed_inode_id: "13" }]);
+		if (sql.includes("UPDATE dirents") && sql.includes("RETURNING inode_id")) return Promise.resolve([{ inode_id: "15" }]);
+		if (sql.includes("RETURNING inode_id AS id")) return Promise.resolve([{ id: "12" }]);
+		if (sql.includes("RETURNING id")) return Promise.resolve([{ id: "12" }]);
+		if (sql.includes("RETURNING inode_id")) return Promise.resolve([{ inode_id: "14" }]);
 		return Promise.resolve([]);
 	};
 	return { tx: fn as unknown as postgres.TransactionSql, calls };
@@ -117,6 +123,71 @@ describe("PostgresDialect.deleteSandbox — advisory lock", () => {
 		expect(destroyLockSql).toContain("pg_advisory_xact_lock");
 		expect(writeLockSql).toContain("hashtextextended");
 		expect(destroyLockSql).toContain("hashtextextended");
+	});
+});
+
+describe("PostgresDialect composite write fencing", () => {
+	it("threads the pinned sandbox epoch into writeFileComposite's advisory-locked SQL", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx, calls } = makeFakeTx();
+
+		await dialect.writeFileComposite(
+			tx,
+			"sandbox-fence",
+			1n,
+			"file.txt",
+			0o644,
+			4,
+			new Uint8Array([1, 2, 3, 4]),
+			new Uint8Array([1, 2, 3, 4]),
+			17,
+		);
+
+		const sql = calls.map((call) => call.sql).join("\n");
+		expect(sql).toContain("set_config('app.sandbox_id'");
+		expect(sql).toContain("pg_advisory_xact_lock");
+		expect(sql).toContain("version");
+		expect(sql).toContain("sandbox-fence");
+		expect(calls.some((call) => call.values.includes(17))).toBe(true);
+	});
+
+	it("threads the pinned sandbox epoch into mkdirComposite's advisory-locked SQL", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx, calls } = makeFakeTx();
+
+		await dialect.mkdirComposite(tx, "sandbox-fence", 1n, "dir", 0o755, 17);
+
+		const sql = calls.map((call) => call.sql).join("\n");
+		expect(sql).toContain("set_config('app.sandbox_id'");
+		expect(sql).toContain("pg_advisory_xact_lock");
+		expect(sql).toContain("version");
+		expect(calls.at(-1)?.values).toContain(17);
+	});
+
+	it("threads the pinned sandbox epoch into rmComposite's advisory-locked SQL", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx, calls } = makeFakeTx();
+
+		await dialect.rmComposite(tx, "sandbox-fence", 1n, "dir", 17);
+
+		const sql = calls.map((call) => call.sql).join("\n");
+		expect(sql).toContain("set_config('app.sandbox_id'");
+		expect(sql).toContain("pg_advisory_xact_lock");
+		expect(sql).toContain("version");
+		expect(calls.at(-1)?.values).toContain(17);
+	});
+
+	it("threads the pinned sandbox epoch into mvComposite's advisory-locked SQL", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx, calls } = makeFakeTx();
+
+		await dialect.mvComposite(tx, "sandbox-fence", 1n, "old", 2n, "new", 17);
+
+		const sql = calls.map((call) => call.sql).join("\n");
+		expect(sql).toContain("set_config('app.sandbox_id'");
+		expect(sql).toContain("pg_advisory_xact_lock");
+		expect(sql).toContain("version");
+		expect(calls.at(-1)?.values).toContain(17);
 	});
 });
 
