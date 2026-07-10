@@ -166,7 +166,7 @@ export interface SqlDialect<Tx = unknown> {
 	 * Call this from every write path. Read-only paths should use
 	 * `setSandboxContext` to avoid blocking writers unnecessarily.
 	 */
-	setSandboxContextWithLock(tx: Tx, sandboxId: string): Promise<void>;
+	setSandboxContextWithLock(tx: Tx, sandboxId: string, sandboxVersion?: number): Promise<void>;
 
 	// ── Sandbox lifecycle ─────────────────────────────────────────────────────────
 
@@ -275,9 +275,9 @@ export interface SqlDialect<Tx = unknown> {
 
 	// ── Composite write operations (optional) ────────────────────────────────────
 
-	mkdirComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint>;
+	mkdirComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, mode: number, sandboxVersion?: number): Promise<bigint>;
 
-	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string): Promise<bigint>;
+	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, sandboxVersion?: number): Promise<bigint>;
 
 	writeFileComposite?(
 		tx: Tx,
@@ -288,6 +288,7 @@ export interface SqlDialect<Tx = unknown> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		sandboxVersion?: number,
 	): Promise<bigint>;
 
 	mvComposite?(
@@ -297,6 +298,7 @@ export interface SqlDialect<Tx = unknown> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		sandboxVersion?: number,
 	): Promise<void>;
 
 	// ── Blob storage ──────────────────────────────────────────────────────────────

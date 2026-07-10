@@ -518,6 +518,8 @@ export class SessionManager {
 			};
 		}
 		const backend = this.getOrInitBackend(tenantId);
+		const meta = this.getSandboxMetaFn !== undefined ? await this.getSandboxMetaFn(tenantId, sandboxId) : null;
+		const sandboxVersion = meta?.version ?? 0;
 		const fs = await createPostgresSandboxFs(
 			{
 				connectionString: backend.connectionString,
@@ -528,13 +530,13 @@ export class SessionManager {
 			},
 			sandboxId,
 			owner,
+			sandboxVersion,
 		);
-		const meta = this.getSandboxMetaFn !== undefined ? await this.getSandboxMetaFn(tenantId, sandboxId) : null;
 		return {
 			fs,
 			resolvedOwner: owner,
 			createdAt: new Date().toISOString(),
-			version: meta?.version ?? 0,
+			version: sandboxVersion,
 		};
 	}
 

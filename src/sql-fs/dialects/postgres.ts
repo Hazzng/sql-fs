@@ -95,13 +95,30 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
 	}
 
-	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
+	async setSandboxContextWithLock(tx: PgTx, sandboxId: string, sandboxVersion?: number): Promise<void> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+		if (sandboxVersion !== undefined) await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
+	}
+
+	async #acquireSandboxWriteFence(tx: PgTx, sandboxId: string): Promise<void> {
+		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+	}
+
+	async #assertSandboxVersion(tx: PgTx, sandboxId: string, sandboxVersion?: number): Promise<void> {
+		if (sandboxVersion === undefined) return;
+		const rows = await tx<{ version: string | number }[]>`
+			SELECT version FROM sandboxes WHERE id = ${sandboxId}
+		`;
+		if (rows.length === 0 || Number(rows[0]!.version) !== sandboxVersion) {
+			throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
+		}
 	}
 
 	// ── Composite write operations ────────────────────────────────────────────────
 
-	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint> {
+	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number, sandboxVersion?: number): Promise<bigint> {
+		await this.#acquireSandboxWriteFence(tx, sandboxId);
+		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
 		const rows = await tx<{ id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -122,7 +139,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return BigInt(row.id);
 	}
 
-	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string): Promise<bigint> {
+	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, sandboxVersion?: number): Promise<bigint> {
+		await this.#acquireSandboxWriteFence(tx, sandboxId);
+		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
 		const rows = await tx<{ removed_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -166,10 +185,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		sandboxVersion?: number,
 	): Promise<bigint> {
 		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
+		await this.#acquireSandboxWriteFence(tx, sandboxId);
+		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
 		const rows = await tx<{ new_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -222,6 +244,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		sandboxVersion?: number,
 	): Promise<void> {
 		// Audit M10: a single wCTE that both DELETEs the destination dirent and
 		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
@@ -231,6 +254,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// 1 frees the destination slot (and cleans its inode), statement 2 renames
 		// the source into it. Statement 1's effects are visible to statement 2, so
 		// the rename can no longer collide. Atomicity is preserved by the tx.
+		await this.#acquireSandboxWriteFence(tx, sandboxId);
+		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
 		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -584,6 +609,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		`;
 
 		// Move the source dirent via a single UPDATE
+		await this.#acquireSandboxWriteFence(tx, sandboxId);
+		await this.#assertSandboxVersion(tx, sandboxId, sandboxVersion);
 		const rows = await tx<{ inode_id: string }[]>`
 			UPDATE dirents
 			SET parent_inode_id = ${String(newParentId)}, name = ${newName}

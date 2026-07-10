@@ -81,6 +81,8 @@ interface SqlFsOptions<Tx> {
 	 * together with `pathSnapshot` for snapshot-backed cold starts (Phase E).
 	 */
 	readonly redis?: Redis;
+	/** Pinned sandbox epoch captured when the script scope opens. */
+	readonly sandboxVersion?: number;
 	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
 	readonly pathSnapshot?: RedisPathSnapshot;
 	/**
@@ -158,6 +160,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #redis: Redis | undefined;
 	readonly #pathSnapshot: RedisPathSnapshot | undefined;
 	readonly #blobCache: RedisBlobCache | undefined;
+	readonly #sandboxVersion: number | undefined;
 	#dirty = false;
 	/**
 	 * Set when a recovery `reload()` fails after a COMMIT/abort, so the in-memory
@@ -205,6 +208,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#redis = opts.redis;
 		this.#pathSnapshot = opts.pathSnapshot;
 		this.#blobCache = opts.blobCache;
+		this.#sandboxVersion = opts.sandboxVersion;
 		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
@@ -252,7 +256,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 		return runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
-				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId, this.#sandboxVersion);
 				return await fn(tx);
 			}),
 		);
@@ -293,7 +297,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const scriptTxPromise = runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
-				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId, this.#sandboxVersion);
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -481,7 +485,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					missReason = "no_key";
 				} else if (snap.version !== currentVersion) {
 					missReason = "version_mismatch";
-				} else {
+			} else {
 					console.log(
 						JSON.stringify({
 							event: "path_snapshot_hit",
@@ -873,6 +877,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						bytes.length,
 						sha256,
 						bytes,
+						this.#sandboxVersion,
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -883,7 +888,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						mode: 0o644,
 						size: bytes.length,
 						contentSha256: sha256,
-					});
+				});
 					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
 					if (oldInodeId !== null) {
 						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
@@ -963,7 +968,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						mode: 0o644,
 						size: fullBytes.length,
 						contentSha256: sha256,
-					});
+				});
 					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
 					if (oldInodeId !== null) {
 						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
@@ -1015,7 +1020,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						});
 						await this.#dialect.insertDirent(tx, parentEntry.inodeId, seg, id);
 						return id;
-					});
+				});
 					this.#cacheSet(next, {
 						inodeId,
 						kind: INODE_KIND.DIRECTORY,
@@ -1024,7 +1029,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						mtime,
 						contentSha256: null,
 						symlinkTarget: null,
-					});
+				});
 					created = true;
 				}
 				current = next;
@@ -1039,7 +1044,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const inodeId = this.#dialect.mkdirComposite
 			? await this.#withBareTx((tx) =>
-					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755, this.#sandboxVersion),
 				)
 			: await this.#withTx(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
@@ -1047,7 +1052,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						kind: INODE_KIND.DIRECTORY,
 						mode: 0o755,
 						size: 0,
-					});
+				});
 					await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
 					return id;
 				});
@@ -1122,7 +1127,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.rmComposite) {
-			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, this.#sandboxVersion));
 		} else {
 			await this.#withTx(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
@@ -1308,7 +1313,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						size: entry.size,
 						contentSha256: entry.contentSha256,
 						symlinkTarget: entry.symlinkTarget,
-					});
+				});
 					await this.#dialect.insertDirent(tx, parentInodeId, entryName, newId);
 					newInodeIds.set(destPath, newId);
 				}
@@ -1413,6 +1418,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					srcName,
 					destParentEntry.inodeId,
 					destName,
+					this.#sandboxVersion,
 				),
 			);
 		} else {

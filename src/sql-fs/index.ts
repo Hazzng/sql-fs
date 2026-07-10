@@ -51,6 +51,7 @@ export async function createPostgresSandboxFs(
 	opts: PostgresBackendOptions,
 	sandboxId: string,
 	owner = "",
+	sandboxVersion?: number,
 ): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
 	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
 	await dialect.connect();
@@ -79,6 +80,7 @@ export async function createPostgresSandboxFs(
 			redis: opts.redis,
 			pathSnapshot: opts.pathSnapshot,
 			blobCache: opts.blobCache,
+			sandboxVersion,
 		});
 		await fs.ready();
 		return { fs, resolvedOwner, createdAt };
