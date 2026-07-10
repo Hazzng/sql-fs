@@ -337,10 +337,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 					python: boolean;
 					javascript: boolean;
 					network: boolean;
+					version: string | number;
 					created_at: Date;
 				}[]
 			>`
-				SELECT owner, name, python, javascript, network, created_at FROM sandboxes WHERE id = ${sandboxId}
+				SELECT owner, name, python, javascript, network, version, created_at FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
@@ -350,6 +351,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				python: r.python,
 				javascript: r.javascript,
 				network: r.network,
+				version: Number(r.version) || 0,
 				createdAt: r.created_at.toISOString(),
 			};
 		} catch (err) {

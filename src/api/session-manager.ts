@@ -154,6 +154,9 @@ export interface RuntimeOptions {
 	readonly network: boolean;
 }
 
+/** Sandbox metadata at open time, including the pinned epoch read from Postgres. */
+type SandboxOpenMeta = SandboxMeta & { readonly version?: number };
+
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
 
 export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
@@ -219,6 +222,8 @@ export interface Session {
 	readonly scriptTx: SessionScopedFs | undefined;
 	lastUsed: number;
 	inFlight: number;
+	/** Pinned sandbox epoch exposed at script-open time. */
+	sandboxVersion: number;
 	/**
 	 * Per-session async readers-writer lock. Writes (default exec path,
 	 * destroy, reaper, shutdown) take exclusive mode; readOnly execs take
@@ -502,16 +507,18 @@ export class SessionManager {
 		tenantId: string,
 		sandboxId: string,
 		owner = "",
-	): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
+	): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string; version: number }> {
 		if (this.createFsOverride !== undefined) {
+			const meta = this.getSandboxMetaFn !== undefined ? await this.getSandboxMetaFn(tenantId, sandboxId) : null;
 			return {
 				fs: await this.createFsOverride(tenantId, sandboxId),
 				resolvedOwner: owner,
 				createdAt: new Date().toISOString(),
+				version: meta?.version ?? 0,
 			};
 		}
 		const backend = this.getOrInitBackend(tenantId);
-		return createPostgresSandboxFs(
+		const fs = await createPostgresSandboxFs(
 			{
 				connectionString: backend.connectionString,
 				tenantId,
@@ -522,6 +529,13 @@ export class SessionManager {
 			sandboxId,
 			owner,
 		);
+		const meta = this.getSandboxMetaFn !== undefined ? await this.getSandboxMetaFn(tenantId, sandboxId) : null;
+		return {
+			fs,
+			resolvedOwner: owner,
+			createdAt: new Date().toISOString(),
+			version: meta?.version ?? 0,
+		};
 	}
 
 	private estimatePathCacheBytes(fs: IFileSystem): number {
@@ -567,7 +581,7 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			let createdFs: IFileSystem | undefined;
 			try {
-				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
+				const { fs, resolvedOwner, createdAt: fsCreatedAt, version: sandboxVersion } = await this.buildFs(tenantId, sandboxId, owner);
 				createdFs = fs;
 				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
 					? {
@@ -659,6 +673,7 @@ export class SessionManager {
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
 					lastSeenVersion: initialVersion,
+					sandboxVersion,
 					publishPending: false,
 					cwd: bash.getCwd(),
 				};
@@ -1179,9 +1194,9 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		lostSignal?: AbortSignal,
 	): Promise<T> {
-		let meta: SandboxMeta | null | undefined;
+		let meta: SandboxOpenMeta | null | undefined;
 		if (this.getSandboxMetaFn !== undefined) {
-			meta = await this.getSandboxMetaFn(tenantId, sandboxId);
+			meta = (await this.getSandboxMetaFn(tenantId, sandboxId)) as SandboxOpenMeta | null;
 			if (meta === null) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}
@@ -1195,6 +1210,7 @@ export class SessionManager {
 		if (meta?.owner) session.owner = meta.owner;
 		if (meta?.name !== undefined) session.name = meta.name;
 		if (meta?.createdAt !== undefined) session.createdAt = meta.createdAt;
+		if (meta?.version !== undefined) session.sandboxVersion = meta.version;
 		return this.withSessionReadEntry(tenantId, sandboxId, session, fn, lostSignal);
 	}
 
@@ -1227,9 +1243,9 @@ export class SessionManager {
 		runtimeOptions?: RuntimeOptions,
 		lostSignal?: AbortSignal,
 	): Promise<T> {
-		let meta: SandboxMeta | null | undefined;
+		let meta: SandboxOpenMeta | null | undefined;
 		if (this.getSandboxMetaFn !== undefined) {
-			meta = await this.getSandboxMetaFn(tenantId, sandboxId);
+			meta = (await this.getSandboxMetaFn(tenantId, sandboxId)) as SandboxOpenMeta | null;
 			if (meta === null) {
 				throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 			}

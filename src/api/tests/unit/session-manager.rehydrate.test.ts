@@ -12,7 +12,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { SessionManager } from "../../session-manager.js";
 
-let pgSandboxes: Map<string, SandboxMeta>;
+type SandboxMetaWithEpoch = SandboxMeta & { version?: number };
+
+let pgSandboxes: Map<string, SandboxMetaWithEpoch>;
 
 let createFsSpy: ReturnType<typeof vi.fn>;
 
@@ -119,6 +121,14 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 			capturedRuntime = session.runtimeOptions;
 		});
 		expect(capturedRuntime).toEqual({ python: true, javascript: false, network: false });
+	});
+
+	it("pins sandbox version from PG metadata at open time", async () => {
+		pgSandboxes.set("sb-epoch", { owner: null, name: null, python: false, javascript: false, network: false, version: 41 });
+
+		await sm.withSessionOrRehydrate("default", "sb-epoch", async (session) => {
+			expect(session.sandboxVersion).toBe(41);
+		});
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {

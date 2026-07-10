@@ -65,6 +65,8 @@ export interface SandboxMeta {
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;
+	/** Pinned sandbox epoch from the sandboxes row at open time. */
+	readonly version?: number;
 	/** ISO-8601 timestamp of when the sandbox was originally created (from DB created_at). */
 	readonly createdAt?: string;
 }
