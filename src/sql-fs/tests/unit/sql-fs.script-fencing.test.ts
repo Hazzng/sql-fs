@@ -67,29 +67,51 @@ function makeDialect() {
 	return { dialect, transaction, setSandboxContextWithLock, writeFileComposite, mkdirComposite, rmComposite, mvComposite };
 }
 
+type FencedTx = {
+	txId: number;
+	sandboxVersion?: number;
+	staged: Array<() => void>;
+};
+
 type FencedState = {
 	currentVersion: number;
 	files: Map<string, string>;
-	txs: unknown[];
+	txs: FencedTx[];
 };
 
 function makeFencedDialect(state: FencedState) {
-	const transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
-		const tx = { txId: state.txs.length + 1 };
+	const transaction = vi.fn(async (fn: (tx: FencedTx) => Promise<unknown>) => {
+		const tx: FencedTx = { txId: state.txs.length + 1, staged: [] };
 		state.txs.push(tx);
-		return fn(tx);
+		const result = await fn(tx);
+		if (tx.sandboxVersion !== state.currentVersion) {
+			throw Object.assign(new Error("ECOHERENCE: sandbox version changed; commit failed"), { code: "ECOHERENCE" });
+		}
+		for (const apply of tx.staged) apply();
+		return result;
 	});
-	const setSandboxContextWithLock = vi.fn(async () => undefined);
-	const writeFileComposite = vi.fn(async (_tx: unknown, _sandboxId: string, _parentId: bigint, name: string, _mode: number, _size: number, _sha256: Uint8Array, data: Uint8Array, sandboxVersion?: number) => {
-		if (sandboxVersion !== state.currentVersion) {
+	const setSandboxContextWithLock = vi.fn(async (tx: FencedTx, _sandboxId: string, sandboxVersion?: number) => {
+		tx.sandboxVersion = sandboxVersion;
+	});
+	const writeFileComposite = vi.fn(async (tx: FencedTx, _sandboxId: string, _parentId: bigint, name: string, _mode: number, _size: number, _sha256: Uint8Array, data: Uint8Array, sandboxVersion?: number) => {
+		if (sandboxVersion !== tx.sandboxVersion) {
 			throw Object.assign(new Error("ECOHERENCE: sandbox version changed; write suppressed"), { code: "ECOHERENCE" });
 		}
-		state.files.set(`/home/user/${name}`, new TextDecoder().decode(data));
+		tx.staged.push(() => state.files.set(`/home/user/${name}`, new TextDecoder().decode(data)));
 		return 99n;
 	});
-	const mkdirComposite = vi.fn(async () => 12n);
-	const rmComposite = vi.fn(async () => 13n);
-	const mvComposite = vi.fn(async () => undefined);
+	const mkdirComposite = vi.fn(async (tx: FencedTx) => {
+		tx.staged.push(() => undefined);
+		return 12n;
+	});
+	const rmComposite = vi.fn(async (tx: FencedTx) => {
+		tx.staged.push(() => undefined);
+		return 13n;
+	});
+	const mvComposite = vi.fn(async (tx: FencedTx) => {
+		tx.staged.push(() => undefined);
+		return undefined;
+	});
 	const dialect: SqlDialect<unknown> = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
@@ -159,21 +181,26 @@ describe("SqlFs script fencing", () => {
 		await fs.endScriptScope();
 	});
 
-	it("rejects a stale fenced write after the lease is superseded, while a fresh append survives", async () => {
+	it("fails A's commit after lease expiry before first write, while B's append survives", async () => {
 		const state: FencedState = { currentVersion: 41, files: new Map([["/home/user/file.txt", "seed"]]), txs: [] };
 		const { dialect } = makeFencedDialect(state);
-		const stale = new SqlFs({ dialect, sandboxId: "s-fence", sandboxVersion: 41 });
-		const fresh = new SqlFs({ dialect, sandboxId: "s-fence", sandboxVersion: 42 });
-		await Promise.all([stale.ready(), fresh.ready()]);
+		const writerA = new SqlFs({ dialect, sandboxId: "s-fence", sandboxVersion: 41 });
+		const writerB = new SqlFs({ dialect, sandboxId: "s-fence", sandboxVersion: 42 });
+		await Promise.all([writerA.ready(), writerB.ready()]);
 
-		stale.beginScriptScope();
-		fresh.beginScriptScope();
+		writerA.beginScriptScope();
+		writerB.beginScriptScope();
 
+		// Force the lease to expire before writer A's first write. A should be
+		// allowed to stage the write, but its script transaction must fail on
+		// epoch mismatch when the script scope commits.
 		state.currentVersion = 42;
 
-		await expect(stale.writeFile("/home/user/file.txt", "from-a")).rejects.toMatchObject({ code: "ECOHERENCE" });
-		await fresh.appendFile("/home/user/file.txt", "-from-b");
-		await Promise.all([stale.abortScriptScope(), fresh.endScriptScope()]);
+		await writerA.writeFile("/home/user/file.txt", "from-a");
+		await writerB.appendFile("/home/user/file.txt", "-from-b");
+
+		await expect(writerA.endScriptScope()).rejects.toMatchObject({ code: "ECOHERENCE" });
+		await expect(writerB.endScriptScope()).resolves.toBeUndefined();
 
 		expect(state.files.get("/home/user/file.txt")).toBe("seed-from-b");
 		expect(dialect.writeFileComposite).toHaveBeenCalledTimes(2);
