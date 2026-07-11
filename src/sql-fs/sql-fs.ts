@@ -958,6 +958,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						fullBytes.length,
 						sha256,
 						fullBytes,
+							this.#sandboxVersion,
 					),
 				)
 			: await this.#withTx(async (tx) => {
