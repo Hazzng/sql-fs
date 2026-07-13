@@ -58,10 +58,23 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 		}
 	});
 
-	it("applies migrations to an empty database and second run is a no-op", async () => {
+	it("applies migrations, backfills sandbox epochs, and second run is a no-op", async () => {
 		const cfg = loadTenantConfig({
 			TENANT_DATABASES: JSON.stringify({ default: testUrl }),
 		});
+
+		// Seed the schema and a row as it existed before migration 0007.
+		const legacy = postgres(testUrl, { prepare: false, max: 1 });
+		await legacy.unsafe(`
+			CREATE TABLE sandboxes (
+				id TEXT PRIMARY KEY,
+				root_inode BIGINT,
+				owner TEXT,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)
+		`);
+		await legacy`INSERT INTO sandboxes (id) VALUES ('legacy-sandbox')`;
+		await legacy.end({ timeout: 5 });
 
 		await runMigrations(cfg);
 
@@ -79,10 +92,43 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 				WHERE n.nspname = 'public' AND p.proname = 'fs_resolve'
 			`;
 			expect(Number(procs[0]?.n)).toBeGreaterThanOrEqual(1);
+
+			const columns = await sql<
+				{
+					dataType: string;
+					isNullable: string;
+					columnDefault: string | null;
+				}[]
+			>`
+				SELECT data_type AS "dataType", is_nullable AS "isNullable",
+				       column_default AS "columnDefault"
+				FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'sandboxes'
+				  AND column_name = 'version'
+				`;
+			expect(columns).toHaveLength(1);
+			expect(columns[0]).toMatchObject({
+				dataType: "bigint",
+				isNullable: "NO",
+			});
+			expect(columns[0]?.columnDefault).toMatch(/0/);
+
+			const legacyRows = await sql<{ versionEpoch: string }[]>`
+				SELECT version::text AS "versionEpoch"
+				FROM sandboxes WHERE id = 'legacy-sandbox'
+			`;
+			expect(legacyRows[0]?.versionEpoch).toBe("0");
+
+			await sql`INSERT INTO sandboxes (id) VALUES ('new-sandbox')`;
+			const newRows = await sql<{ versionEpoch: string }[]>`
+				SELECT version::text AS "versionEpoch"
+				FROM sandboxes WHERE id = 'new-sandbox'
+			`;
+			expect(newRows[0]?.versionEpoch).toBe("0");
 		} finally {
 			await sql.end({ timeout: 5 });
 		}
 
 		await expect(runMigrations(cfg)).resolves.toBeUndefined();
-	});
+	}, 60_000);
 });
