@@ -135,15 +135,32 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				       s.version AS epoch
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
-				  AND s.version = COALESCE(
-					${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
-					NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-					s.version
+				  AND (
+					s.version = COALESCE(
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
 				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx
+				SELECT ${sandboxId}, 2, ${mode}, 0 FROM epoch
 				RETURNING id
 			)
 			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -170,16 +187,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				       s.version AS epoch
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
-				  AND s.version = COALESCE(
-					${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
-					NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-					s.version
+				  AND (
+					s.version = COALESCE(
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
 				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			removed_dirent AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM epoch) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Delete and decrement are split into two mutually-exclusive CTEs
@@ -226,15 +260,32 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				       s.version AS epoch
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
-				  AND s.version = COALESCE(
-					${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
-					NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-					s.version
+				  AND (
+					s.version = COALESCE(
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
 				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx
+				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM epoch
 				RETURNING id
 			),
 			old_dirent AS (
@@ -297,16 +348,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				       s.version AS epoch
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
-				  AND s.version = COALESCE(
-					${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
-					NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-					s.version
+				  AND (
+					s.version = COALESCE(
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
 				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			old_dest AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM epoch) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Split delete/decrement by snapshot nlink so the overwritten
@@ -330,16 +398,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				       s.version AS epoch
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
-				  AND s.version = COALESCE(
-					${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
-					NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-					s.version
+				  AND (
+					s.version = COALESCE(
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
 				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			)
 			UPDATE dirents
 			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
 			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-			  AND (SELECT 1 FROM ctx) IS NOT NULL
+			  AND (SELECT 1 FROM epoch) IS NOT NULL
 			RETURNING inode_id
 		`;
 		if (rows.length === 0) throw createEnoent(oldName);

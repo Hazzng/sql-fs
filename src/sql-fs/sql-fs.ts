@@ -190,6 +190,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxPromise: Promise<void> | undefined;
 	/** Durable sandbox epoch pinned while the writer lock is held for this scope. */
 	#scriptEpoch: bigint | undefined;
+	/** Epoch observed after the last completed write outside a script scope. */
+	#lastKnownEpoch: bigint | undefined;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -278,7 +280,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		);
 	}
 
+	async #assertScriptEpochFresh(): Promise<void> {
+		if (!this.#scriptScope || this.#scriptEpoch !== undefined || this.#lastKnownEpoch === undefined) return;
+		const currentEpoch = await this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+			return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+		});
+		if (currentEpoch !== this.#lastKnownEpoch) {
+			throw new Error("sandbox epoch mismatch");
+		}
+	}
+
 	async #openScriptTx(): Promise<void> {
+		await this.#assertScriptEpochFresh();
 		let resolveTxReady!: () => void;
 		const txReady = new Promise<void>((r) => {
 			resolveTxReady = r;
@@ -335,8 +349,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return runTrustedDbAsync(() => fn(scriptTx));
 		}
 		// No active scope — use a fresh, self-committing transaction (original
-		// behavior, no extra round-trip).
-		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
+		// behavior, no extra round-trip for the mutation itself).
+		const result = await runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				const value = await fn(tx);
+				// Read the incremented epoch before this write transaction commits so a
+				// later lazy script scope can detect an external writer without another
+				// round trip on the normal path.
+				this.#lastKnownEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				return value;
+			}),
+		);
+		return result;
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -728,11 +752,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
+		let committed = false;
 		try {
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				await this.#scriptTxPromise;
 			}
+			committed = true;
 		} catch (err) {
 			// COMMIT failed — Postgres rolled the transaction back, but the
 			// in-memory caches still hold this script's uncommitted mutations.
@@ -755,6 +781,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			throw err;
 		} finally {
+			if (committed && this.#scriptEpoch !== undefined) this.#lastKnownEpoch = this.#scriptEpoch;
 			this.#scriptTx = undefined;
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
