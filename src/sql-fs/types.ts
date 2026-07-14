@@ -166,6 +166,12 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	setSandboxContextWithLock(tx: Tx, sandboxId: string): Promise<void>;
 
+	/** Reads the durable per-sandbox write epoch under the current RLS context. */
+	getSandboxVersion?(tx: Tx, sandboxId: string): Promise<bigint>;
+
+	/** Atomically verifies the expected epoch and increments it for a mutation. */
+	fenceSandboxWrite?(tx: Tx, sandboxId: string, expectedVersion: bigint): Promise<void>;
+
 	// ── Sandbox lifecycle ─────────────────────────────────────────────────────────
 
 	/**

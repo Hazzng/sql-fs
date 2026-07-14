@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { runTrustedDbAsync } from "../defense.js";
-import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
+import { createEisdir, createEnoent, createEnotdir, createEstale, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
 import {
 	type BulkIngestFile,
@@ -97,6 +97,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+	}
+
+	async getSandboxVersion(tx: PgTx, sandboxId: string): Promise<bigint> {
+		const rows = await tx<{ version: string }[]>`
+			SELECT version FROM sandboxes WHERE id = ${sandboxId}
+		`;
+		const row = rows[0];
+		if (!row) throw createEnoent(sandboxId);
+		return BigInt(row.version);
+	}
+
+	async fenceSandboxWrite(tx: PgTx, sandboxId: string, expectedVersion: bigint): Promise<void> {
+		const rows = await tx<{ version: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			), bumped AS (
+				UPDATE sandboxes
+				SET version = version + 1
+				WHERE id = ${sandboxId}
+				  AND version = ${String(expectedVersion)}
+				  AND (SELECT 1 FROM ctx) IS NOT NULL
+				RETURNING version
+			)
+			SELECT version FROM bumped
+		`;
+		if (rows.length === 0) throw createEstale(sandboxId);
 	}
 
 	// ── Composite write operations ────────────────────────────────────────────────

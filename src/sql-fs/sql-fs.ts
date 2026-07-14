@@ -188,6 +188,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	#scriptExpectedVersion: bigint | undefined;
+	#scriptEpochPromise: Promise<void> | undefined;
+	#scriptTxFenced = false;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -242,17 +245,52 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
-	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+	#startScriptEpochCapture(): void {
+		const getVersion = this.#dialect.getSandboxVersion;
+		if (getVersion === undefined || this.#dialect.fenceSandboxWrite === undefined) return;
+		this.#scriptEpochPromise = runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+				this.#scriptExpectedVersion = await getVersion(tx, this.#sandboxId);
+			}),
+		);
+		this.#scriptEpochPromise.catch(() => {});
+	}
+
+	async #fenceWrite(tx: Tx): Promise<void> {
+		const getVersion = this.#dialect.getSandboxVersion;
+		const fence = this.#dialect.fenceSandboxWrite;
+		if (getVersion === undefined || fence === undefined) return;
+
+		if (this.#scriptScope) {
+			if (this.#scriptEpochPromise !== undefined) await this.#scriptEpochPromise;
+			if (this.#scriptTxFenced) return;
+			const expectedVersion = this.#scriptExpectedVersion;
+			if (expectedVersion === undefined) return;
+			await fence(tx, this.#sandboxId, expectedVersion);
+			this.#scriptTxFenced = true;
+			return;
+		}
+
+		const expectedVersion = await getVersion(tx, this.#sandboxId);
+		await fence(tx, this.#sandboxId, expectedVersion);
+	}
+
+	async #withTx<T>(fn: (tx: Tx) => Promise<T>, fence = true): Promise<T> {
 		if (this.#scriptScope) {
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
 			const tx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(tx));
+			return runTrustedDbAsync(async () => {
+				if (fence) await this.#fenceWrite(tx);
+				return await fn(tx);
+			});
 		}
 		return runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				if (fence) await this.#fenceWrite(tx);
 				return await fn(tx);
 			}),
 		);
@@ -325,11 +363,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.#openScriptTx();
 			}
 			const scriptTx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(scriptTx));
+			return runTrustedDbAsync(async () => {
+				await this.#fenceWrite(scriptTx);
+				return await fn(scriptTx);
+			});
 		}
-		// No active scope — use a fresh, self-committing transaction (original
-		// behavior, no extra round-trip).
-		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
+		// No active scope — use a fresh, self-committing transaction.
+		return runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#fenceWrite(tx);
+				return await fn(tx);
+			}),
+		);
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -682,6 +727,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
 		this.#scriptScope = true;
+		this.#scriptExpectedVersion = undefined;
+		this.#scriptTxFenced = false;
+		this.#startScriptEpochCapture();
 	}
 
 	// ── Read-only scope (parallel readOnly bash exec) ────────────────────────────
@@ -721,7 +769,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
+		const epochPromise = this.#scriptEpochPromise;
 		try {
+			if (epochPromise !== undefined) await epochPromise;
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				await this.#scriptTxPromise;
@@ -752,6 +802,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
 			this.#scriptTxPromise = undefined;
+			this.#scriptExpectedVersion = undefined;
+			this.#scriptEpochPromise = undefined;
+			this.#scriptTxFenced = false;
 		}
 	}
 
@@ -762,6 +815,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const hadTx = this.#scriptTx !== undefined;
 		const abort = this.#scriptTxAbort;
 		const txPromise = this.#scriptTxPromise;
+		const epochPromise = this.#scriptEpochPromise;
 		this.#scriptTx = undefined;
 		this.#scriptTxEnd = undefined;
 		this.#scriptTxAbort = undefined;
@@ -772,6 +826,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// endPromise forever and the connection leaks until Postgres' idle timeout fires.
 		if (abort !== undefined) abort(new Error("script-tx aborted"));
 		if (txPromise !== undefined) txPromise.catch(() => {});
+		if (epochPromise !== undefined) await epochPromise.catch(() => {});
+		this.#scriptExpectedVersion = undefined;
+		this.#scriptEpochPromise = undefined;
+		this.#scriptTxFenced = false;
 
 		if (hadTx) {
 			// Audit L3: abortScriptScope runs from the exec error path
@@ -926,7 +984,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		let fullBytes: Uint8Array;
 
 		if (existing && existing.kind === INODE_KIND.FILE && existing.contentSha256 !== null) {
-			const oldContent = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, existing.contentSha256!));
+			const oldContent = await this.#withTx(async (tx) => this.#dialect.getBlob(tx, existing.contentSha256!), false);
 			const base = oldContent ?? new Uint8Array(0);
 			const merged = new Uint8Array(base.length + bytes.length);
 			merged.set(base, 0);

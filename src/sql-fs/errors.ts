@@ -45,6 +45,11 @@ export function createEperm(path: string, op: string): Error {
 	return makeFsError("EPERM", `EPERM: operation not permitted, ${op} '${path}'`, path);
 }
 
+/** ESTALE: a script scope's pinned sandbox epoch is no longer current. */
+export function createEstale(sandboxId: string): Error {
+	return makeFsError("ESTALE", `ESTALE: script scope is stale for sandbox '${sandboxId}'`);
+}
+
 /** EINVAL: invalid argument (e.g. readlink on a non-symlink) */
 export function createEinval(path: string): Error {
 	return makeFsError("EINVAL", `EINVAL: invalid argument, '${path}'`, path);
