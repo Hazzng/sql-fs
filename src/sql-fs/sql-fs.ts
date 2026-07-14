@@ -188,6 +188,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	/** Durable sandbox epoch pinned while the writer lock is held for this scope. */
+	#scriptEpoch: bigint | undefined;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -294,6 +296,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const scriptTxPromise = runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				this.#scriptEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -309,6 +312,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
 		// immediately rather than leaving this call hanging forever.
 		await Promise.race([txReady, this.#scriptTxPromise]);
+	}
+
+	#expectedEpochArgs(): [bigint] | [] {
+		return this.#scriptEpoch === undefined ? [] : [this.#scriptEpoch];
 	}
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
@@ -752,6 +759,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
 			this.#scriptTxPromise = undefined;
+			this.#scriptEpoch = undefined;
 		}
 	}
 
@@ -766,6 +774,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptTxEnd = undefined;
 		this.#scriptTxAbort = undefined;
 		this.#scriptTxPromise = undefined;
+		this.#scriptEpoch = undefined;
 
 		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
 		// and releases the connection/advisory lock. Without this the callback awaits
@@ -873,6 +882,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						bytes.length,
 						sha256,
 						bytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -953,6 +963,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						fullBytes.length,
 						sha256,
 						fullBytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1039,7 +1050,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const inodeId = this.#dialect.mkdirComposite
 			? await this.#withBareTx((tx) =>
-					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+					this.#dialect.mkdirComposite!(
+						tx,
+						this.#sandboxId,
+						parentEntry.inodeId,
+						name,
+						0o755,
+						...this.#expectedEpochArgs(),
+					),
 				)
 			: await this.#withTx(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
@@ -1122,7 +1140,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.rmComposite) {
-			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+			await this.#withBareTx((tx) =>
+				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, ...this.#expectedEpochArgs()),
+			);
 		} else {
 			await this.#withTx(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
@@ -1413,6 +1433,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					srcName,
 					destParentEntry.inodeId,
 					destName,
+					...this.#expectedEpochArgs(),
 				),
 			);
 		} else {
