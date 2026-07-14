@@ -60,7 +60,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 		}
 	});
 
-	function makeSm(): SessionManager {
+	function makeSm(execLockOptions: { leaseMs?: number; renewMs?: number } = {}): SessionManager {
 		return new SessionManager({
 			tenantConfig: loadTenantConfig(),
 			redis,
@@ -69,6 +69,7 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 				renewMs: 1_500,
 				acquireTimeoutMs: 8_000,
 				acquireRetryMs: 50,
+				...execLockOptions,
 			},
 		});
 	}
@@ -115,6 +116,61 @@ describe.skipIf(SKIP)("Phase C — multi-replica exec lock", () => {
 			expect(String(a).trim()).toBe("A");
 			expect(String(b).trim()).toBe("B");
 		});
+	});
+
+	it("fences a zombie writer after A's lease expires before its first write", async () => {
+		const sandboxId = newId();
+		const smA = makeSm({ leaseMs: 10_000, renewMs: 9_000 });
+		const smB = makeSm();
+		const { writer } = rwLockKeys(TENANT, sandboxId);
+
+		// Create the sandbox and warm both replica-local caches before racing writes.
+		await smA.withSession(TENANT, sandboxId, async () => {
+			/* create + warm A */
+		});
+		await smB.withSession(TENANT, sandboxId, async () => {
+			/* warm B */
+		});
+
+		let aEntered!: () => void;
+		const aIsReady = new Promise<void>((resolve) => {
+			aEntered = resolve;
+		});
+
+		// A starts its script scope immediately, but its first filesystem write is
+		// delayed by sleep. The short PEXPIRE below models a stalled/crashed
+		// heartbeat without needing to stop the test process's event loop.
+		const writerA = smA.withSession(TENANT, sandboxId, async (s) => {
+			aEntered();
+			await s.bash.exec("sleep 1 && echo stale-from-a > /from-a.txt");
+		});
+		await timed("A-entered", aIsReady);
+		// Allow the script scope and its asynchronous epoch capture to start.
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await expect(redis.pexpire(writer, 200)).resolves.toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 350));
+		expect(await redis.exists(writer)).toBe(0);
+
+		// B acquires after A's real lease has expired and commits the only valid write.
+		await timed(
+			"B-write",
+			smB.withSession(TENANT, sandboxId, async (s) => {
+				await s.bash.exec("echo committed-from-b > /from-b.txt");
+			}),
+		);
+
+		await expect(timed("A-zombie", writerA)).rejects.toMatchObject({ code: "ESTALE" });
+
+		// A's stale transaction must not overwrite B or publish a second version.
+		expect(await redis.get(`vfs:${TENANT}:ver:${sandboxId}`)).toBe("1");
+		await timed(
+			"verify-zombie-fence",
+			smB.withSession(TENANT, sandboxId, async (s) => {
+				const fromB = await s.fs.readFile("/from-b.txt");
+				expect(String(fromB).trim()).toBe("committed-from-b");
+				await expect(s.fs.readFile("/from-a.txt")).rejects.toMatchObject({ code: "ENOENT" });
+			}),
+		);
 	});
 
 	it("destroy on replica B waits for an in-flight exec on replica A", async () => {
