@@ -73,6 +73,30 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			`;
 			expect(tables[0]?.n).toBe("4");
 
+			const versionColumn = await sql<
+				{
+					data_type: string;
+					is_nullable: string;
+					column_default: string | null;
+				}[]
+			>`
+				SELECT data_type, is_nullable, column_default
+				FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
+			`;
+			expect(versionColumn).toHaveLength(1);
+			expect(versionColumn[0]).toMatchObject({
+				data_type: "bigint",
+				is_nullable: "NO",
+			});
+			expect(versionColumn[0]?.column_default).toMatch(/0/);
+
+			const inserted = await sql<{ version: string | number }[]>`
+				INSERT INTO sandboxes (id, owner) VALUES ('migration-version-default', 'test')
+				RETURNING version
+			`;
+			expect(String(inserted[0]?.version)).toBe("0");
+
 			const procs = await sql<{ n: string }[]>`
 				SELECT count(*)::text AS n FROM pg_proc p
 				JOIN pg_namespace n ON n.oid = p.pronamespace
