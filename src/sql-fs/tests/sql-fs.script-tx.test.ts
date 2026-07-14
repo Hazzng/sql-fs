@@ -38,6 +38,7 @@ function makeDialect(): SqlDialect<unknown> {
 		]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async () => {
 			nextInodeId += 1n;
 			return nextInodeId;

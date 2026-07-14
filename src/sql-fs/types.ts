@@ -174,13 +174,21 @@ export interface SqlDialect<Tx = unknown> {
 	 * (/home, /home/user, /tmp, /bin).
 	 * Returns the root inode ID and the DB-generated creation timestamp (ISO-8601).
 	 */
-	createSandbox(tx: Tx, sandboxId: string, owner?: string): Promise<{ rootInodeId: bigint; createdAt: string }>;
+	createSandbox(
+		tx: Tx,
+		sandboxId: string,
+		owner?: string,
+	): Promise<{ rootInodeId: bigint; createdAt: string; epoch: bigint }>;
 
 	/**
 	 * Deletes a sandbox and all associated inodes, dirents, and blobs
-	 * by deleting the sandbox row (CASCADE removes child rows).
+	 * by deleting the sandbox row (CASCADE removes child rows). The returned
+	 * epoch is persisted in the tombstone and fences stale writers.
 	 */
-	deleteSandbox(tx: Tx, sandboxId: string): Promise<void>;
+	deleteSandbox(tx: Tx, sandboxId: string): Promise<bigint>;
+
+	/** Reads the live fencing epoch at script-entry time. */
+	getSandboxEpoch(tx: Tx, sandboxId: string): Promise<bigint>;
 
 	/**
 	 * Returns true if a sandbox row with the given ID exists in the database.
@@ -273,9 +281,16 @@ export interface SqlDialect<Tx = unknown> {
 
 	// ── Composite write operations (optional) ────────────────────────────────────
 
-	mkdirComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint>;
+	mkdirComposite?(
+		tx: Tx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		expectedEpoch?: bigint,
+	): Promise<bigint>;
 
-	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string): Promise<bigint>;
+	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, expectedEpoch?: bigint): Promise<bigint>;
 
 	writeFileComposite?(
 		tx: Tx,
@@ -286,6 +301,7 @@ export interface SqlDialect<Tx = unknown> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		expectedEpoch?: bigint,
 	): Promise<bigint>;
 
 	mvComposite?(
@@ -295,6 +311,7 @@ export interface SqlDialect<Tx = unknown> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		expectedEpoch?: bigint,
 	): Promise<void>;
 
 	// ── Blob storage ──────────────────────────────────────────────────────────────
