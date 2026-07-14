@@ -188,6 +188,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	/** Durable sandbox epoch pinned while the writer lock is held for this scope. */
+	#scriptEpoch: bigint | undefined;
+	/** Epoch observed after the last completed write outside a script scope. */
+	#lastKnownEpoch: bigint | undefined;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -276,7 +280,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		);
 	}
 
+	async #assertScriptEpochFresh(): Promise<void> {
+		if (!this.#scriptScope || this.#scriptEpoch !== undefined || this.#lastKnownEpoch === undefined) return;
+		const currentEpoch = await this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+			return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+		});
+		if (currentEpoch !== this.#lastKnownEpoch) {
+			throw new Error("sandbox epoch mismatch");
+		}
+	}
+
 	async #openScriptTx(): Promise<void> {
+		await this.#assertScriptEpochFresh();
 		let resolveTxReady!: () => void;
 		const txReady = new Promise<void>((r) => {
 			resolveTxReady = r;
@@ -294,6 +310,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const scriptTxPromise = runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				this.#scriptEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -309,6 +326,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
 		// immediately rather than leaving this call hanging forever.
 		await Promise.race([txReady, this.#scriptTxPromise]);
+	}
+
+	#expectedEpochArgs(): [bigint] | [] {
+		return this.#scriptEpoch === undefined ? [] : [this.#scriptEpoch];
 	}
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
@@ -328,8 +349,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return runTrustedDbAsync(() => fn(scriptTx));
 		}
 		// No active scope — use a fresh, self-committing transaction (original
-		// behavior, no extra round-trip).
-		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
+		// behavior, no extra round-trip for the mutation itself).
+		const result = await runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				const value = await fn(tx);
+				// Read the incremented epoch before this write transaction commits so a
+				// later lazy script scope can detect an external writer without another
+				// round trip on the normal path.
+				this.#lastKnownEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				return value;
+			}),
+		);
+		return result;
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -721,11 +752,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
+		let committed = false;
 		try {
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				await this.#scriptTxPromise;
 			}
+			committed = true;
 		} catch (err) {
 			// COMMIT failed — Postgres rolled the transaction back, but the
 			// in-memory caches still hold this script's uncommitted mutations.
@@ -748,10 +781,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			throw err;
 		} finally {
+			if (committed && this.#scriptEpoch !== undefined) this.#lastKnownEpoch = this.#scriptEpoch;
 			this.#scriptTx = undefined;
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
 			this.#scriptTxPromise = undefined;
+			this.#scriptEpoch = undefined;
 		}
 	}
 
@@ -766,6 +801,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptTxEnd = undefined;
 		this.#scriptTxAbort = undefined;
 		this.#scriptTxPromise = undefined;
+		this.#scriptEpoch = undefined;
 
 		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
 		// and releases the connection/advisory lock. Without this the callback awaits
@@ -873,6 +909,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						bytes.length,
 						sha256,
 						bytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -953,6 +990,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						fullBytes.length,
 						sha256,
 						fullBytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1039,7 +1077,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const inodeId = this.#dialect.mkdirComposite
 			? await this.#withBareTx((tx) =>
-					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+					this.#dialect.mkdirComposite!(
+						tx,
+						this.#sandboxId,
+						parentEntry.inodeId,
+						name,
+						0o755,
+						...this.#expectedEpochArgs(),
+					),
 				)
 			: await this.#withTx(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
@@ -1122,7 +1167,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.rmComposite) {
-			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+			await this.#withBareTx((tx) =>
+				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, ...this.#expectedEpochArgs()),
+			);
 		} else {
 			await this.#withTx(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
@@ -1413,6 +1460,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					srcName,
 					destParentEntry.inodeId,
 					destName,
+					...this.#expectedEpochArgs(),
 				),
 			);
 		} else {

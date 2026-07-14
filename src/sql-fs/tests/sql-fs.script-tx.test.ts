@@ -38,6 +38,7 @@ function makeDialect(): SqlDialect<unknown> {
 		]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async () => {
 			nextInodeId += 1n;
 			return nextInodeId;
@@ -60,6 +61,8 @@ function makeDialect(): SqlDialect<unknown> {
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n, 5n]),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),
+		writeFileComposite: vi.fn(async () => 101n),
+		mkdirComposite: vi.fn(async () => 102n),
 	} as unknown as SqlDialect<unknown>;
 }
 
@@ -84,6 +87,24 @@ describe("SqlFs script-tx — lazy activation", () => {
 	it("after beginScriptScope, scriptTxOpen is false (no tx yet)", () => {
 		fs.beginScriptScope();
 		expect(fs.scriptTxOpen).toBe(false);
+	});
+
+	it("pins the writer epoch and passes it to every composite in the scope", async () => {
+		const getSandboxEpoch = dialect.getSandboxEpoch as ReturnType<typeof vi.fn>;
+		getSandboxEpoch.mockResolvedValue(7n);
+		const writeFileComposite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
+		const mkdirComposite = dialect.mkdirComposite as ReturnType<typeof vi.fn>;
+
+		fs.beginScriptScope();
+		expect(getSandboxEpoch).not.toHaveBeenCalled();
+		await fs.writeFile("/home/user/epoch-a.txt", "a");
+		await fs.mkdir("/home/user/epoch-dir");
+
+		expect(getSandboxEpoch).toHaveBeenCalledOnce();
+		expect(getSandboxEpoch).toHaveBeenCalledWith(expect.anything(), "s-tx");
+		expect(writeFileComposite.mock.calls[0]?.at(-1)).toBe(7n);
+		expect(mkdirComposite.mock.calls[0]?.at(-1)).toBe(7n);
+		await fs.endScriptScope();
 	});
 
 	it("read-only ops during scope do not open a tx", async () => {
@@ -242,6 +263,28 @@ describe("SqlFs script-tx — abort path (rollback recovery)", () => {
 		(dialect.transaction as ReturnType<typeof vi.fn>).mockClear();
 		await fs.writeFile("/home/user/b.txt", "y");
 		expect(dialect.transaction).toHaveBeenCalledOnce();
+	});
+});
+
+describe("SqlFs script-tx — epoch mismatch recovery", () => {
+	it("aborts, reloads, and clears dirty cache after a conditional fence failure", async () => {
+		const dialect = makeDialect();
+		const writeFileComposite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
+		writeFileComposite.mockResolvedValueOnce(101n).mockRejectedValueOnce(new Error("sandbox epoch mismatch"));
+		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+		await fs.ready();
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/phantom.txt", "ghost");
+		expect(fs.wasDirty()).toBe(true);
+		expect(fs.getAllPaths()).toContain("/home/user/phantom.txt");
+		await expect(fs.writeFile("/home/user/rejected.txt", "nope")).rejects.toThrow("sandbox epoch mismatch");
+
+		await fs.abortScriptScope();
+		expect(fs.wasDirty()).toBe(false);
+		expect(fs.poisoned()).toBe(false);
+		expect(fs.getAllPaths()).not.toContain("/home/user/phantom.txt");
+		expect(fs.getAllPaths()).not.toContain("/home/user/rejected.txt");
 	});
 });
 
