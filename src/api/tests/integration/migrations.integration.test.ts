@@ -1,17 +1,22 @@
 /**
  * Integration tests for startup Postgres migrations (Phase 4).
  *
- * Creates an ephemeral database on the same server as DATABASE_URL so the test
+ * Creates ephemeral databases on the same server as DATABASE_URL so the test
  * does not drop tables on a shared dev database. Skips when DATABASE_URL is unset.
  */
 
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../migrations.js";
 import { loadTenantConfig } from "../../tenants.js";
 
 const SKIP = !process.env.DATABASE_URL;
+const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 
 function withDatabase(connectionString: string, database: string): string {
 	const u = new URL(connectionString);
@@ -25,9 +30,24 @@ function adminConnectionString(connectionString: string): string {
 	return u.toString();
 }
 
+describe("built Postgres migrations", () => {
+	it("contains the version migration in the runtime migration directory", () => {
+		execFileSync(process.execPath, ["scripts/copy-postgres-migrations.mjs"], {
+			cwd: REPO_ROOT,
+			stdio: "pipe",
+		});
+
+		const builtMigration = join(REPO_ROOT, "dist/sql-fs/migrations/postgres/0007_sandboxes_version.sql");
+		expect(existsSync(builtMigration)).toBe(true);
+		expect(readFileSync(builtMigration, "utf8")).toContain("version BIGINT NOT NULL DEFAULT 0");
+	});
+});
+
 describe.skipIf(SKIP)("runMigrations (integration)", () => {
 	let dbName: string;
+	let legacyDbName: string;
 	let testUrl: string;
+	let legacyUrl: string;
 	let admin: postgres.Sql | undefined;
 
 	beforeAll(async () => {
@@ -36,10 +56,13 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			throw new Error("DATABASE_URL required for this suite");
 		}
 		dbName = `vfs_mig_${randomBytes(8).toString("hex")}`;
+		legacyDbName = `vfs_mig_legacy_${randomBytes(8).toString("hex")}`;
 		const adminUrl = adminConnectionString(base);
 		testUrl = withDatabase(base, dbName);
+		legacyUrl = withDatabase(base, legacyDbName);
 		admin = postgres(adminUrl, { prepare: false, max: 1 });
 		await admin.unsafe(`CREATE DATABASE ${dbName}`);
+		await admin.unsafe(`CREATE DATABASE ${legacyDbName}`);
 	});
 
 	afterAll(async () => {
@@ -47,18 +70,20 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			return;
 		}
 		try {
-			await admin`
-				SELECT pg_terminate_backend(pid)
-				FROM pg_stat_activity
-				WHERE datname = ${dbName} AND pid <> pg_backend_pid()
-			`;
-			await admin.unsafe(`DROP DATABASE IF EXISTS ${dbName}`);
+			for (const database of [dbName, legacyDbName]) {
+				await admin`
+					SELECT pg_terminate_backend(pid)
+					FROM pg_stat_activity
+					WHERE datname = ${database} AND pid <> pg_backend_pid()
+				`;
+				await admin.unsafe(`DROP DATABASE IF EXISTS ${database}`);
+			}
 		} finally {
 			await admin.end({ timeout: 5 });
 		}
 	});
 
-	it("applies migrations to an empty database and second run is a no-op", async () => {
+	it("applies migrations to an empty database with the durable version schema", async () => {
 		const cfg = loadTenantConfig({
 			TENANT_DATABASES: JSON.stringify({ default: testUrl }),
 		});
@@ -79,10 +104,59 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 				WHERE n.nspname = 'public' AND p.proname = 'fs_resolve'
 			`;
 			expect(Number(procs[0]?.n)).toBeGreaterThanOrEqual(1);
+
+			const columns = await sql<
+				{ dataType: string; udtName: string; isNullable: string; columnDefault: string | null }[]
+			>`
+				SELECT data_type AS "dataType", udt_name AS "udtName", is_nullable AS "isNullable",
+				       column_default AS "columnDefault"
+				FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
+			`;
+			expect(columns).toEqual([
+				{
+					dataType: "bigint",
+					udtName: "int8",
+					isNullable: "NO",
+					columnDefault: "0",
+				},
+			]);
 		} finally {
 			await sql.end({ timeout: 5 });
 		}
 
 		await expect(runMigrations(cfg)).resolves.toBeUndefined();
+	});
+
+	it("backfills an existing sandbox row with version zero", async () => {
+		const legacy = postgres(legacyUrl, { prepare: false, max: 1 });
+		try {
+			await legacy.unsafe(`
+				CREATE TABLE sandboxes (
+					id TEXT PRIMARY KEY,
+					root_inode BIGINT,
+					owner TEXT,
+					created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				)
+			`);
+			await legacy.unsafe(`INSERT INTO sandboxes (id) VALUES ('legacy-sandbox')`);
+		} finally {
+			await legacy.end({ timeout: 5 });
+		}
+
+		const cfg = loadTenantConfig({
+			TENANT_DATABASES: JSON.stringify({ default: legacyUrl }),
+		});
+		await runMigrations(cfg);
+
+		const sql = postgres(legacyUrl, { prepare: false, max: 1 });
+		try {
+			const rows = await sql<{ version: string }[]>`
+				SELECT version::text FROM sandboxes WHERE id = 'legacy-sandbox'
+			`;
+			expect(rows).toEqual([{ version: "0" }]);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
 	});
 });
