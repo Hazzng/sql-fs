@@ -1,8 +1,46 @@
+import type { Redis } from "ioredis";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "../../api/session-manager.js";
+import { versionKey } from "../redis-path-snapshot.js";
 import { SqlFs } from "../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../types.js";
 
 const now = new Date("2026-01-01T00:00:00Z");
+
+class VersionRedis {
+	readonly values = new Map<string, string>();
+
+	async set(key: string, value: string, ..._args: unknown[]): Promise<"OK"> {
+		this.values.set(key, value);
+		return "OK";
+	}
+
+	async getex(key: string, ..._args: unknown[]): Promise<string | null> {
+		return this.values.get(key) ?? null;
+	}
+
+	async incr(key: string): Promise<number> {
+		const next = Number(this.values.get(key) ?? "0") + 1;
+		this.values.set(key, String(next));
+		return next;
+	}
+
+	async expire(_key: string, _seconds: number): Promise<number> {
+		return 1;
+	}
+
+	async del(key: string): Promise<number> {
+		return this.values.delete(key) ? 1 : 0;
+	}
+
+	async eval(_script: string, _numKeys: number, ..._args: string[]): Promise<number> {
+		return 1;
+	}
+}
+
+function asRedis(redis: VersionRedis): Redis {
+	return redis as unknown as Redis;
+}
 
 function dirEntry(path: string, inodeId: bigint): { path: string } & PathCacheEntry {
 	return { path, inodeId, kind: 2, mode: 0o755, size: 0, mtime: now, contentSha256: null, symlinkTarget: null };
@@ -202,6 +240,57 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 			expect(calls.length).toBeGreaterThan(0);
 			expect(calls.flat()).toContain(40n);
 		}
+	});
+
+	it("keeps the Postgres epoch separate from SessionManager's Redis version", async () => {
+		const m = makeDialect();
+		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
+		await fs.ready();
+		const redis = new VersionRedis();
+		const manager = new SessionManager({
+			createFs: vi.fn(async () => fs as never),
+			redis: asRedis(redis),
+			rwlockEnabled: false,
+		});
+
+		await manager.withSession("default", "s1", async () => {
+			await fs.writeFile("/home/user/redis-separation.txt", "content");
+		});
+
+		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
+		expect(m.writeFileCompositeMock.mock.calls[0]).toContain(40n);
+		expect(redis.values.get(versionKey("default", "s1"))).toBe("1");
+		expect(redis.values.get(versionKey("default", "s1"))).not.toBe("40");
+	});
+
+	it("preserves reset-on-recreate cache semantics without an incarnation token", async () => {
+		const redis = new VersionRedis();
+		const makeFs = (): object => ({
+			getAllPaths: () => [],
+			reload: async () => undefined,
+			wasDirty: () => false,
+			clearDirty: () => undefined,
+			poisoned: () => false,
+		});
+		let createCount = 0;
+		const manager = new SessionManager({
+			createFs: vi.fn(async () => {
+				createCount++;
+				return makeFs() as never;
+			}),
+			destroySandboxFn: vi.fn(async () => undefined),
+			redis: asRedis(redis),
+			rwlockEnabled: false,
+		});
+
+		await manager.withSession("default", "recreated", async () => undefined);
+		await manager.destroy("default", "recreated");
+		expect(redis.values.get(versionKey("default", "recreated"))).toBe("DESTROYED");
+
+		await manager.withSession("default", "recreated", async () => undefined);
+		expect(createCount).toBe(2);
+		expect(redis.values.has(versionKey("default", "recreated"))).toBe(false);
+		expect(manager.getSession("default", "recreated")?.lastSeenVersion).toBe(0);
 	});
 });
 

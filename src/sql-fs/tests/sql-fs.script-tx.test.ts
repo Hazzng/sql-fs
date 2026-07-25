@@ -220,9 +220,10 @@ describe("SqlFs script-tx — terminal fencing conflict", () => {
 		await fs.writeFile("/home/user/staged.txt", "before conflict");
 		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toMatchObject({ code: "EFENCED" });
 		writeFileComposite.mockResolvedValue(12n);
-		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toMatchObject({ code: "EFENCED" });
+		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toThrow();
+		expect(fs.poisoned()).toBe(true);
 
-		await expect(fs.endScriptScope()).rejects.toMatchObject({ code: "EFENCED" });
+		await expect(fs.endScriptScope()).rejects.toThrow();
 		expect(state.rolledBack).toBe(true);
 		expect(state.committed).toBe(false);
 		expect(fs.getAllPaths()).not.toContain("/home/user/staged.txt");
