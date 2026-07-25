@@ -46,7 +46,18 @@ describe("built Postgres migrations", () => {
 		const sourceDirectory = join(REPO_ROOT, "src/sql-fs/migrations/postgres");
 		const runtimeDirectory = join(REPO_ROOT, "dist/sql-fs/migrations/postgres");
 		const sourceNames = migrationNames(sourceDirectory);
-		const versionMigration = "0007_sandboxes_version.sql";
+		const laterVersionMigrations = sourceNames.filter((name) => {
+			if (name <= "0006_blob_last_referenced_at.sql") {
+				return false;
+			}
+			const body = readFileSync(join(sourceDirectory, name), "utf8");
+			return /ALTER\s+TABLE\s+['\"]?sandboxes['\"]?[\s\S]*?version\s+BIGINT\s+NOT\s+NULL\s+DEFAULT\s+0/i.test(body);
+		});
+		expect(laterVersionMigrations).toHaveLength(1);
+		const versionMigration = laterVersionMigrations[0];
+		if (versionMigration === undefined) {
+			throw new Error("No later sandbox version migration found");
+		}
 		const previousMigration = "0006_blob_last_referenced_at.sql";
 		const runtimeNames = migrationNames(runtimeDirectory);
 
