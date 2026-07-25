@@ -7,7 +7,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
@@ -30,16 +30,34 @@ function adminConnectionString(connectionString: string): string {
 	return u.toString();
 }
 
+function migrationNames(directory: string): string[] {
+	return readdirSync(directory)
+		.filter((name) => name.endsWith(".sql"))
+		.sort();
+}
+
 describe("built Postgres migrations", () => {
-	it("contains the version migration in the runtime migration directory", () => {
+	it("retains the later version migration in the runtime migration directory", () => {
 		execFileSync(process.execPath, ["scripts/copy-postgres-migrations.mjs"], {
 			cwd: REPO_ROOT,
 			stdio: "pipe",
 		});
 
-		const builtMigration = join(REPO_ROOT, "dist/sql-fs/migrations/postgres/0007_sandboxes_version.sql");
-		expect(existsSync(builtMigration)).toBe(true);
-		expect(readFileSync(builtMigration, "utf8")).toContain("version BIGINT NOT NULL DEFAULT 0");
+		const sourceDirectory = join(REPO_ROOT, "src/sql-fs/migrations/postgres");
+		const runtimeDirectory = join(REPO_ROOT, "dist/sql-fs/migrations/postgres");
+		const sourceNames = migrationNames(sourceDirectory);
+		const laterNames = sourceNames.filter((name) => name > "0006_blob_last_referenced_at.sql");
+		const runtimeNames = migrationNames(runtimeDirectory);
+		const versionMigration = laterNames.find((name) => {
+			const body = readFileSync(join(sourceDirectory, name), "utf8").replace(/\s+/g, " ").toLowerCase();
+			return body.includes("version bigint not null default 0");
+		});
+
+		expect(versionMigration).toBeDefined();
+		expect(runtimeNames).toContain(versionMigration);
+		expect(readFileSync(join(runtimeDirectory, versionMigration as string), "utf8")).toMatch(
+			/version\s+bigint\s+not\s+null\s+default\s+0/i,
+		);
 	});
 });
 
