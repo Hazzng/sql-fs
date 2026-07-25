@@ -60,6 +60,7 @@ function makeDialect(): SqlDialect<unknown> {
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n, 5n]),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),
+		writeFileComposite: vi.fn(async () => 100n),
 	} as unknown as SqlDialect<unknown>;
 }
 
@@ -192,6 +193,39 @@ describe("SqlFs script-tx — commit path", () => {
 		await fs.writeFile("/home/user/new.txt", "hello");
 		await fs.endScriptScope();
 		expect(fs.getAllPaths()).toContain("/home/user/new.txt");
+	});
+});
+
+describe("SqlFs script-tx — terminal fencing conflict", () => {
+	it("rolls back staged work, poisons the scope, and suppresses commit", async () => {
+		const dialect = makeDialect();
+		const state = { committed: false, rolledBack: false };
+		const fencingError = Object.assign(new Error("sandbox fencing conflict"), { code: "EFENCED" });
+		const writeFileComposite = vi.fn().mockResolvedValueOnce(10n).mockRejectedValue(fencingError);
+		dialect.writeFileComposite = writeFileComposite;
+		dialect.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+			try {
+				const result = await fn({});
+				state.committed = true;
+				return result;
+			} catch (error) {
+				state.rolledBack = true;
+				throw error;
+			}
+		}) as unknown as SqlDialect<unknown>["transaction"];
+
+		const fs = new SqlFs({ dialect, sandboxId: "s-fence" });
+		await fs.ready();
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/staged.txt", "before conflict");
+		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toMatchObject({ code: "EFENCED" });
+		writeFileComposite.mockResolvedValue(12n);
+		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toMatchObject({ code: "EFENCED" });
+
+		await expect(fs.endScriptScope()).rejects.toMatchObject({ code: "EFENCED" });
+		expect(state.rolledBack).toBe(true);
+		expect(state.committed).toBe(false);
+		expect(fs.getAllPaths()).not.toContain("/home/user/staged.txt");
 	});
 });
 

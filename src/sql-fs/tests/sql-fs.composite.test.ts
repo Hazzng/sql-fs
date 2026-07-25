@@ -37,8 +37,12 @@ function makeDialect(): {
 	deleteInodeMock: ReturnType<typeof vi.fn>;
 	moveDirentMock: ReturnType<typeof vi.fn>;
 	getBlobMock: ReturnType<typeof vi.fn>;
+	getSandboxVersionMock: ReturnType<typeof vi.fn>;
+	bulkIngestMock: ReturnType<typeof vi.fn>;
 } {
 	const setSandboxContextWithLockMock = vi.fn();
+	const getSandboxVersionMock = vi.fn(async () => 40n);
+	const bulkIngestMock = vi.fn(async () => new Map<string, PathCacheEntry>());
 	const writeFileCompositeMock = vi.fn(async () => 10n);
 	const mkdirCompositeMock = vi.fn(async () => 10n);
 	const rmCompositeMock = vi.fn(async () => 10n);
@@ -53,12 +57,13 @@ function makeDialect(): {
 	const moveDirentMock = vi.fn(async () => undefined);
 	const getBlobMock = vi.fn(async () => null as Uint8Array | null);
 
-	const dialect: SqlDialect<unknown> = {
+	const dialect = {
 		connect: vi.fn(),
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
 		setSandboxContextWithLock: setSandboxContextWithLockMock,
+		getSandboxVersion: getSandboxVersionMock,
 		loadAllPaths: vi.fn(async () => [
 			dirEntry("/", 1n),
 			dirEntry("/home", 2n),
@@ -84,7 +89,7 @@ function makeDialect(): {
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
 		loadSubtreeInodes: vi.fn(async () => [3n, 4n]),
-		bulkIngest: vi.fn(),
+		bulkIngest: bulkIngestMock,
 		resolvePath: vi.fn(),
 		writeFileComposite: writeFileCompositeMock,
 		mkdirComposite: mkdirCompositeMock,
@@ -108,8 +113,97 @@ function makeDialect(): {
 		deleteInodeMock,
 		moveDirentMock,
 		getBlobMock,
+		getSandboxVersionMock,
+		bulkIngestMock,
 	};
 }
+
+describe("SqlFs mutation scope — database epoch plumbing", () => {
+	it("captures the leased epoch once and threads each successful next epoch", async () => {
+		const m = makeDialect();
+		const events: string[] = [];
+		m.getSandboxVersionMock.mockImplementation(async () => {
+			events.push("capture");
+			return 40n;
+		});
+		m.getBlobMock.mockImplementation(async () => {
+			events.push("blob-read");
+			return new Uint8Array(0);
+		});
+		m.writeFileCompositeMock
+			.mockImplementationOnce(async () => ({ inodeId: 10n, nextEpoch: 41n }) as never)
+			.mockImplementationOnce(async () => ({ inodeId: 11n, nextEpoch: 42n }) as never);
+		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
+		await fs.ready();
+
+		fs.beginScriptScope();
+		await fs.appendFile("/home/user/existing.txt", "one");
+		await fs.writeFile("/home/user/second.txt", "two");
+		await fs.endScriptScope();
+
+		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
+		expect(events.indexOf("capture")).toBeGreaterThanOrEqual(0);
+		expect(events.indexOf("capture")).toBeLessThan(events.indexOf("blob-read"));
+		expect(m.writeFileCompositeMock.mock.calls[0]).toContain(40n);
+		expect(m.writeFileCompositeMock.mock.calls[1]).toContain(41n);
+	});
+
+	it("threads the scope epoch through every composite writer and bulk ingest", async () => {
+		const m = makeDialect();
+		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
+		await fs.ready();
+		fs.beginScriptScope();
+
+		await fs.writeFile("/home/user/epoch-write.txt", "one");
+		await fs.appendFile("/home/user/epoch-write.txt", "two");
+		await fs.mkdir("/home/user/epoch-dir");
+		await fs.rm("/home/user/existing.txt");
+		await fs.mv("/home/user/epoch-write.txt", "/other/epoch-move.txt");
+		await fs.bulkIngest([{ path: "/home/user/epoch-bulk.txt", content: new Uint8Array([1]), mode: 0o644 }]);
+		await fs.endScriptScope();
+
+		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
+		for (const calls of [
+			m.writeFileCompositeMock.mock.calls,
+			m.mkdirCompositeMock.mock.calls,
+			m.rmCompositeMock.mock.calls,
+			m.mvCompositeMock.mock.calls,
+			m.bulkIngestMock.mock.calls,
+		]) {
+			expect(calls.length).toBeGreaterThan(0);
+			expect(calls.flat()).toContain(40n);
+		}
+	});
+
+	it("threads the epoch through every sequential fallback when composites are unavailable", async () => {
+		const m = makeDialect();
+		m.dialect.writeFileComposite = undefined;
+		m.dialect.mkdirComposite = undefined;
+		m.dialect.rmComposite = undefined;
+		m.dialect.mvComposite = undefined;
+		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
+		await fs.ready();
+		fs.beginScriptScope();
+
+		await fs.writeFile("/home/user/fallback-write.txt", "one");
+		await fs.mkdir("/home/user/fallback-dir");
+		await fs.rm("/home/user/existing.txt");
+		await fs.mv("/home/user/fallback-write.txt", "/other/fallback-move.txt");
+		await fs.endScriptScope();
+
+		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
+		for (const calls of [
+			m.createInodeMock.mock.calls,
+			m.upsertDirentMock.mock.calls,
+			m.insertDirentMock.mock.calls,
+			m.deleteDirentMock.mock.calls,
+			m.moveDirentMock.mock.calls,
+		]) {
+			expect(calls.length).toBeGreaterThan(0);
+			expect(calls.flat()).toContain(40n);
+		}
+	});
+});
 
 // ── writeFile composite ──────────────────────────────────────────────────────
 
