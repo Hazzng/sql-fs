@@ -46,18 +46,16 @@ describe("built Postgres migrations", () => {
 		const sourceDirectory = join(REPO_ROOT, "src/sql-fs/migrations/postgres");
 		const runtimeDirectory = join(REPO_ROOT, "dist/sql-fs/migrations/postgres");
 		const sourceNames = migrationNames(sourceDirectory);
-		const laterNames = sourceNames.filter((name) => name > "0006_blob_last_referenced_at.sql");
+		const versionMigration = "0007_sandboxes_version.sql";
+		const previousMigration = "0006_blob_last_referenced_at.sql";
 		const runtimeNames = migrationNames(runtimeDirectory);
-		const versionMigration = laterNames.find((name) => {
-			const body = readFileSync(join(sourceDirectory, name), "utf8").replace(/\s+/g, " ").toLowerCase();
-			return body.includes("version bigint not null default 0");
-		});
 
-		expect(versionMigration).toBeDefined();
+		expect(sourceNames.indexOf(versionMigration)).toBeGreaterThan(sourceNames.indexOf(previousMigration));
 		expect(runtimeNames).toContain(versionMigration);
-		expect(readFileSync(join(runtimeDirectory, versionMigration as string), "utf8")).toMatch(
-			/version\s+bigint\s+not\s+null\s+default\s+0/i,
-		);
+
+		const sourceBody = readFileSync(join(sourceDirectory, versionMigration), "utf8");
+		const builtBody = readFileSync(join(runtimeDirectory, versionMigration), "utf8");
+		expect(builtBody).toBe(sourceBody);
 	});
 });
 
@@ -123,11 +121,8 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			`;
 			expect(Number(procs[0]?.n)).toBeGreaterThanOrEqual(1);
 
-			const columns = await sql<
-				{ dataType: string; udtName: string; isNullable: string; columnDefault: string | null }[]
-			>`
-				SELECT data_type AS "dataType", udt_name AS "udtName", is_nullable AS "isNullable",
-				       column_default AS "columnDefault"
+			const columns = await sql<{ dataType: string; udtName: string; isNullable: string }[]>`
+				SELECT data_type AS "dataType", udt_name AS "udtName", is_nullable AS "isNullable"
 				FROM information_schema.columns
 				WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
 			`;
@@ -136,9 +131,14 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 					dataType: "bigint",
 					udtName: "int8",
 					isNullable: "NO",
-					columnDefault: "0",
 				},
 			]);
+
+			await sql`INSERT INTO sandboxes (id) VALUES ('fresh-version-sandbox')`;
+			const defaults = await sql<{ version: string }[]>`
+				SELECT version::text FROM sandboxes WHERE id = 'fresh-version-sandbox'
+			`;
+			expect(defaults).toEqual([{ version: "0" }]);
 		} finally {
 			await sql.end({ timeout: 5 });
 		}
