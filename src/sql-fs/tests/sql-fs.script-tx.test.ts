@@ -29,6 +29,7 @@ function makeDialect(): SqlDialect<unknown> {
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
 		setSandboxContextWithLock: vi.fn(),
+		getSandboxVersion: vi.fn(async () => 0n),
 		loadAllPaths: vi.fn(async () => [
 			dirEntry("/", 1n),
 			dirEntry("/home", 2n),
@@ -200,8 +201,12 @@ describe("SqlFs script-tx — terminal fencing conflict", () => {
 	it("rolls back staged work, poisons the scope, and suppresses commit", async () => {
 		const dialect = makeDialect();
 		const state = { committed: false, rolledBack: false };
-		const fencingError = new Error("sandbox fencing conflict");
-		const writeFileComposite = vi.fn().mockResolvedValueOnce(10n).mockRejectedValue(fencingError);
+		const fencingError = Object.assign(new Error("sandbox fencing conflict"), { code: "EFENCED" });
+		const writeFileComposite = vi
+			.fn()
+			.mockResolvedValueOnce({ inodeId: 10n, nextEpoch: 1n })
+			.mockResolvedValueOnce(null)
+			.mockRejectedValue(fencingError);
 		dialect.writeFileComposite = writeFileComposite;
 		dialect.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
 			try {
@@ -218,12 +223,12 @@ describe("SqlFs script-tx — terminal fencing conflict", () => {
 		await fs.ready();
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/staged.txt", "before conflict");
-		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toThrow();
+		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toMatchObject({ code: "EFENCED" });
 		writeFileComposite.mockResolvedValue(12n);
-		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toThrow();
+		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toMatchObject({ code: "EFENCED" });
 		expect(fs.poisoned()).toBe(true);
 
-		await expect(fs.endScriptScope()).rejects.toThrow();
+		await expect(fs.endScriptScope()).rejects.toMatchObject({ code: "EFENCED" });
 		expect(state.rolledBack).toBe(true);
 		expect(state.committed).toBe(false);
 		expect(fs.getAllPaths()).not.toContain("/home/user/staged.txt");

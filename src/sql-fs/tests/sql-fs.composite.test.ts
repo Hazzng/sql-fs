@@ -75,9 +75,11 @@ function makeDialect(): {
 	deleteInodeMock: ReturnType<typeof vi.fn>;
 	moveDirentMock: ReturnType<typeof vi.fn>;
 	getBlobMock: ReturnType<typeof vi.fn>;
+	getSandboxVersionMock: ReturnType<typeof vi.fn>;
 	bulkIngestMock: ReturnType<typeof vi.fn>;
 } {
 	const setSandboxContextWithLockMock = vi.fn();
+	const getSandboxVersionMock = vi.fn(async () => 0n);
 	const bulkIngestMock = vi.fn(async () => new Map<string, PathCacheEntry>());
 	const writeFileCompositeMock = vi.fn(async () => 10n);
 	const mkdirCompositeMock = vi.fn(async () => 10n);
@@ -99,6 +101,7 @@ function makeDialect(): {
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
 		setSandboxContextWithLock: setSandboxContextWithLockMock,
+		getSandboxVersion: getSandboxVersionMock,
 		loadAllPaths: vi.fn(async () => [
 			dirEntry("/", 1n),
 			dirEntry("/home", 2n),
@@ -148,52 +151,89 @@ function makeDialect(): {
 		deleteInodeMock,
 		moveDirentMock,
 		getBlobMock,
+		getSandboxVersionMock,
 		bulkIngestMock,
 	};
 }
 
-function findEpochs(value: unknown, result: bigint[] = [], seen = new Set<object>()): bigint[] {
-	if (typeof value === "bigint") {
-		if (value >= 40n && value <= 50n) result.push(value);
-		return result;
-	}
-	if (value === null || typeof value !== "object" || seen.has(value)) return result;
+type GuardedPublication<T> = { value: T; nextEpoch: bigint };
+type GuardedEntries = Map<string, PathCacheEntry> & { nextEpoch: bigint };
+
+function findExpectedEpoch(value: unknown, expected: bigint, seen = new Set<object>()): bigint | undefined {
+	if (value === expected) return expected;
+	if (value === null || typeof value !== "object" || seen.has(value)) return undefined;
 	seen.add(value);
-	for (const item of Array.isArray(value) ? value : Object.values(value)) findEpochs(item, result, seen);
-	return result;
+	for (const item of Array.isArray(value) ? value : Object.values(value)) {
+		const found = findExpectedEpoch(item, expected, seen);
+		if (found !== undefined) return found;
+	}
+	return undefined;
 }
 
 function makeEpochDialect(): ReturnType<typeof makeDialect> & {
-	state: { expected: bigint; calls: bigint[]; missing: number; events: string[] };
+	state: {
+		expected: bigint;
+		captures: number;
+		calls: bigint[];
+		returned: bigint[];
+		missing: number;
+		events: string[];
+	};
 } {
 	const m = makeDialect();
-	const state = { expected: 40n, calls: [] as bigint[], missing: 0, events: [] as string[] };
+	const state = {
+		expected: 40n,
+		captures: 0,
+		calls: [] as bigint[],
+		returned: [] as bigint[],
+		missing: 0,
+		events: [] as string[],
+	};
+	m.getSandboxVersionMock.mockImplementation(async () => {
+		state.captures++;
+		state.events.push("capture");
+		return 40n;
+	});
 	m.setSandboxContextWithLockMock.mockImplementation(async () => {
 		state.events.push("lease");
 	});
-	const observe = (result: unknown): ReturnType<typeof vi.fn> =>
-		vi.fn(async (...args: unknown[]) => {
-			const token = args.flatMap((arg) => findEpochs(arg)).at(-1);
-			if (token === undefined) state.missing++;
-			else {
+	const observe = <T>(makeValue: () => T): ReturnType<typeof vi.fn> =>
+		vi.fn(async (...args: unknown[]): Promise<GuardedPublication<T>> => {
+			const nextEpoch = state.expected + 1n;
+			const token = findExpectedEpoch(args, state.expected);
+			if (token === undefined) {
+				state.missing++;
+			} else {
 				state.calls.push(token);
-				if (token === state.expected) state.expected++;
+				state.returned.push(nextEpoch);
+				state.expected = nextEpoch;
 			}
-			return result;
+			return { value: makeValue(), nextEpoch };
 		});
-	m.writeFileCompositeMock.mockImplementation(observe(10n));
-	m.mkdirCompositeMock.mockImplementation(observe(11n));
-	m.rmCompositeMock.mockImplementation(observe(4n));
-	m.mvCompositeMock.mockImplementation(observe(undefined));
-	m.bulkIngestMock.mockImplementation(observe(new Map<string, PathCacheEntry>()));
-	m.createInodeMock.mockImplementation(observe(10n));
-	m.upsertBlobMock.mockImplementation(observe(undefined));
-	m.upsertDirentMock.mockImplementation(observe(null));
-	m.insertDirentMock.mockImplementation(observe(undefined));
-	m.deleteDirentMock.mockImplementation(observe(undefined));
-	m.decrementNlinkMock.mockImplementation(observe(0));
-	m.deleteInodeMock.mockImplementation(observe(undefined));
-	m.moveDirentMock.mockImplementation(observe(undefined));
+	const observeBulk = vi.fn(async (...args: unknown[]): Promise<GuardedEntries> => {
+		const nextEpoch = state.expected + 1n;
+		const token = findExpectedEpoch(args, state.expected);
+		if (token === undefined) state.missing++;
+		else {
+			state.calls.push(token);
+			state.returned.push(nextEpoch);
+			state.expected = nextEpoch;
+		}
+		return Object.assign(new Map<string, PathCacheEntry>(), { nextEpoch });
+	});
+	m.writeFileCompositeMock.mockImplementation(observe(() => 10n) as never);
+	m.mkdirCompositeMock.mockImplementation(observe(() => 11n) as never);
+	m.rmCompositeMock.mockImplementation(observe(() => 4n) as never);
+	m.mvCompositeMock.mockImplementation(observe(() => undefined) as never);
+	m.bulkIngestMock.mockImplementation(observeBulk);
+	m.createInodeMock.mockImplementation(observe(() => 10n) as never);
+	m.upsertBlobMock.mockImplementation(observe(() => undefined) as never);
+	m.upsertDirentMock.mockImplementation(observe(() => null) as never);
+	m.insertDirentMock.mockImplementation(observe(() => undefined) as never);
+	m.deleteDirentMock.mockImplementation(observe(() => 4n) as never);
+	m.decrementNlinkMock.mockImplementation(observe(() => 0) as never);
+	m.deleteInodeMock.mockImplementation(observe(() => undefined) as never);
+	m.moveDirentMock.mockImplementation(observe(() => undefined) as never);
 	return Object.assign(m, { state });
 }
 
@@ -210,8 +250,12 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 		await fs.appendFile("/home/user/existing.txt", "one");
 		await fs.writeFile("/home/user/second.txt", "two");
 		await fs.endScriptScope();
-		expect(m.state.events.indexOf("lease")).toBeLessThan(m.state.events.indexOf("base-read"));
+		expect(m.state.captures).toBe(1);
+		expect(m.state.events.indexOf("lease")).toBeLessThan(m.state.events.indexOf("capture"));
+		expect(m.state.events.indexOf("capture")).toBeLessThan(m.state.events.indexOf("base-read"));
 		expect(m.state.calls).toEqual([40n, 41n]);
+		expect(m.state.returned).toEqual([41n, 42n]);
+		expect(m.state.missing).toBe(0);
 	});
 
 	it("threads the current epoch through composite and bulk publication routes", async () => {
@@ -227,6 +271,8 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 		await fs.bulkIngest([{ path: "/home/user/epoch-bulk.txt", content: new Uint8Array([1]), mode: 0o644 }]);
 		await fs.endScriptScope();
 		expect(m.state.calls).toEqual([40n, 41n, 42n, 43n, 44n, 45n]);
+		expect(m.state.returned).toEqual([41n, 42n, 43n, 44n, 45n, 46n]);
+		expect(m.state.missing).toBe(0);
 	});
 
 	it("threads the current epoch through every sequential fallback route", async () => {
@@ -245,6 +291,8 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 		await fs.endScriptScope();
 		expect(m.state.calls.length).toBeGreaterThanOrEqual(4);
 		expect(m.state.calls).toEqual([...m.state.calls].sort((a, b) => Number(a - b)));
+		expect(m.state.missing).toBe(0);
+		expect(m.state.captures).toBe(1);
 	});
 
 	it("keeps the Postgres epoch separate from SessionManager's Redis version", async () => {
