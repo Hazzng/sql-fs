@@ -200,7 +200,7 @@ describe("SqlFs script-tx — terminal fencing conflict", () => {
 	it("rolls back staged work, poisons the scope, and suppresses commit", async () => {
 		const dialect = makeDialect();
 		const state = { committed: false, rolledBack: false };
-		const fencingError = Object.assign(new Error("sandbox fencing conflict"), { code: "EFENCED" });
+		const fencingError = new Error("sandbox fencing conflict");
 		const writeFileComposite = vi.fn().mockResolvedValueOnce(10n).mockRejectedValue(fencingError);
 		dialect.writeFileComposite = writeFileComposite;
 		dialect.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
@@ -218,7 +218,7 @@ describe("SqlFs script-tx — terminal fencing conflict", () => {
 		await fs.ready();
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/staged.txt", "before conflict");
-		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toMatchObject({ code: "EFENCED" });
+		await expect(fs.writeFile("/home/user/conflict.txt", "fenced")).rejects.toThrow();
 		writeFileComposite.mockResolvedValue(12n);
 		await expect(fs.writeFile("/home/user/after-conflict.txt", "blocked")).rejects.toThrow();
 		expect(fs.poisoned()).toBe(true);

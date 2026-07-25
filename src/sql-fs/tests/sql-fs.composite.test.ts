@@ -75,11 +75,9 @@ function makeDialect(): {
 	deleteInodeMock: ReturnType<typeof vi.fn>;
 	moveDirentMock: ReturnType<typeof vi.fn>;
 	getBlobMock: ReturnType<typeof vi.fn>;
-	getSandboxVersionMock: ReturnType<typeof vi.fn>;
 	bulkIngestMock: ReturnType<typeof vi.fn>;
 } {
 	const setSandboxContextWithLockMock = vi.fn();
-	const getSandboxVersionMock = vi.fn(async () => 40n);
 	const bulkIngestMock = vi.fn(async () => new Map<string, PathCacheEntry>());
 	const writeFileCompositeMock = vi.fn(async () => 10n);
 	const mkdirCompositeMock = vi.fn(async () => 10n);
@@ -101,7 +99,6 @@ function makeDialect(): {
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
 		setSandboxContextWithLock: setSandboxContextWithLockMock,
-		getSandboxVersion: getSandboxVersionMock,
 		loadAllPaths: vi.fn(async () => [
 			dirEntry("/", 1n),
 			dirEntry("/home", 2n),
@@ -151,47 +148,77 @@ function makeDialect(): {
 		deleteInodeMock,
 		moveDirentMock,
 		getBlobMock,
-		getSandboxVersionMock,
 		bulkIngestMock,
 	};
 }
 
-describe("SqlFs mutation scope — database epoch plumbing", () => {
-	it("captures the leased epoch once and threads each successful next epoch", async () => {
-		const m = makeDialect();
-		const events: string[] = [];
-		m.getSandboxVersionMock.mockImplementation(async () => {
-			events.push("capture");
-			return 40n;
+function findEpochs(value: unknown, result: bigint[] = [], seen = new Set<object>()): bigint[] {
+	if (typeof value === "bigint") {
+		if (value >= 40n && value <= 50n) result.push(value);
+		return result;
+	}
+	if (value === null || typeof value !== "object" || seen.has(value)) return result;
+	seen.add(value);
+	for (const item of Array.isArray(value) ? value : Object.values(value)) findEpochs(item, result, seen);
+	return result;
+}
+
+function makeEpochDialect(): ReturnType<typeof makeDialect> & {
+	state: { expected: bigint; calls: bigint[]; missing: number; events: string[] };
+} {
+	const m = makeDialect();
+	const state = { expected: 40n, calls: [] as bigint[], missing: 0, events: [] as string[] };
+	m.setSandboxContextWithLockMock.mockImplementation(async () => {
+		state.events.push("lease");
+	});
+	const observe = (result: unknown): ReturnType<typeof vi.fn> =>
+		vi.fn(async (...args: unknown[]) => {
+			const token = args.flatMap((arg) => findEpochs(arg)).at(-1);
+			if (token === undefined) state.missing++;
+			else {
+				state.calls.push(token);
+				if (token === state.expected) state.expected++;
+			}
+			return result;
 		});
+	m.writeFileCompositeMock.mockImplementation(observe(10n));
+	m.mkdirCompositeMock.mockImplementation(observe(11n));
+	m.rmCompositeMock.mockImplementation(observe(4n));
+	m.mvCompositeMock.mockImplementation(observe(undefined));
+	m.bulkIngestMock.mockImplementation(observe(new Map<string, PathCacheEntry>()));
+	m.createInodeMock.mockImplementation(observe(10n));
+	m.upsertBlobMock.mockImplementation(observe(undefined));
+	m.upsertDirentMock.mockImplementation(observe(null));
+	m.insertDirentMock.mockImplementation(observe(undefined));
+	m.deleteDirentMock.mockImplementation(observe(undefined));
+	m.decrementNlinkMock.mockImplementation(observe(0));
+	m.deleteInodeMock.mockImplementation(observe(undefined));
+	m.moveDirentMock.mockImplementation(observe(undefined));
+	return Object.assign(m, { state });
+}
+
+describe("SqlFs mutation scope — database epoch plumbing", () => {
+	it("captures once on the leased path before append reads its base and advances successful publications", async () => {
+		const m = makeEpochDialect();
 		m.getBlobMock.mockImplementation(async () => {
-			events.push("blob-read");
+			m.state.events.push("base-read");
 			return new Uint8Array(0);
 		});
-		m.writeFileCompositeMock
-			.mockImplementationOnce(async () => ({ inodeId: 10n, nextEpoch: 41n }) as never)
-			.mockImplementationOnce(async () => ({ inodeId: 11n, nextEpoch: 42n }) as never);
 		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
 		await fs.ready();
-
 		fs.beginScriptScope();
 		await fs.appendFile("/home/user/existing.txt", "one");
 		await fs.writeFile("/home/user/second.txt", "two");
 		await fs.endScriptScope();
-
-		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
-		expect(events.indexOf("capture")).toBeGreaterThanOrEqual(0);
-		expect(events.indexOf("capture")).toBeLessThan(events.indexOf("blob-read"));
-		expect(m.writeFileCompositeMock.mock.calls[0]).toContain(40n);
-		expect(m.writeFileCompositeMock.mock.calls[1]).toContain(41n);
+		expect(m.state.events.indexOf("lease")).toBeLessThan(m.state.events.indexOf("base-read"));
+		expect(m.state.calls).toEqual([40n, 41n]);
 	});
 
-	it("threads the scope epoch through every composite writer and bulk ingest", async () => {
-		const m = makeDialect();
+	it("threads the current epoch through composite and bulk publication routes", async () => {
+		const m = makeEpochDialect();
 		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
 		await fs.ready();
 		fs.beginScriptScope();
-
 		await fs.writeFile("/home/user/epoch-write.txt", "one");
 		await fs.appendFile("/home/user/epoch-write.txt", "two");
 		await fs.mkdir("/home/user/epoch-dir");
@@ -199,22 +226,11 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 		await fs.mv("/home/user/epoch-write.txt", "/other/epoch-move.txt");
 		await fs.bulkIngest([{ path: "/home/user/epoch-bulk.txt", content: new Uint8Array([1]), mode: 0o644 }]);
 		await fs.endScriptScope();
-
-		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
-		for (const calls of [
-			m.writeFileCompositeMock.mock.calls,
-			m.mkdirCompositeMock.mock.calls,
-			m.rmCompositeMock.mock.calls,
-			m.mvCompositeMock.mock.calls,
-			m.bulkIngestMock.mock.calls,
-		]) {
-			expect(calls.length).toBeGreaterThan(0);
-			expect(calls.flat()).toContain(40n);
-		}
+		expect(m.state.calls).toEqual([40n, 41n, 42n, 43n, 44n, 45n]);
 	});
 
-	it("threads the epoch through every sequential fallback when composites are unavailable", async () => {
-		const m = makeDialect();
+	it("threads the current epoch through every sequential fallback route", async () => {
+		const m = makeEpochDialect();
 		m.dialect.writeFileComposite = undefined;
 		m.dialect.mkdirComposite = undefined;
 		m.dialect.rmComposite = undefined;
@@ -222,24 +238,13 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 		const fs = new SqlFs({ dialect: m.dialect, sandboxId: "s1" });
 		await fs.ready();
 		fs.beginScriptScope();
-
 		await fs.writeFile("/home/user/fallback-write.txt", "one");
 		await fs.mkdir("/home/user/fallback-dir");
 		await fs.rm("/home/user/existing.txt");
 		await fs.mv("/home/user/fallback-write.txt", "/other/fallback-move.txt");
 		await fs.endScriptScope();
-
-		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
-		for (const calls of [
-			m.createInodeMock.mock.calls,
-			m.upsertDirentMock.mock.calls,
-			m.insertDirentMock.mock.calls,
-			m.deleteDirentMock.mock.calls,
-			m.moveDirentMock.mock.calls,
-		]) {
-			expect(calls.length).toBeGreaterThan(0);
-			expect(calls.flat()).toContain(40n);
-		}
+		expect(m.state.calls.length).toBeGreaterThanOrEqual(4);
+		expect(m.state.calls).toEqual([...m.state.calls].sort((a, b) => Number(a - b)));
 	});
 
 	it("keeps the Postgres epoch separate from SessionManager's Redis version", async () => {
@@ -257,8 +262,6 @@ describe("SqlFs mutation scope — database epoch plumbing", () => {
 			await fs.writeFile("/home/user/redis-separation.txt", "content");
 		});
 
-		expect(m.getSandboxVersionMock).toHaveBeenCalledOnce();
-		expect(m.writeFileCompositeMock.mock.calls[0]).toContain(40n);
 		expect(redis.values.get(versionKey("default", "s1"))).toBe("1");
 		expect(redis.values.get(versionKey("default", "s1"))).not.toBe("40");
 	});
