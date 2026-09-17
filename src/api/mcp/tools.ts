@@ -5,21 +5,29 @@
  * US-080: MCP tool — bash_exec
  * US-086: MCP tool — fs_ingest
  * US-087: MCP tool — fs_export
+ * MCP tools — file_read / file_write / file_edit (file access without shell quoting)
  */
 
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { FsStat } from "just-bash";
 import { z } from "zod";
 import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
-import { clientSafeErrorMessage } from "../errors.js";
+import { clientSafeErrorMessage, extractErrCode } from "../errors.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
-import { positiveIntEnv } from "../lib/env.js";
+import { MAX_FILE_WRITE_BYTES as MAX_EDIT_BYTES, positiveIntEnv } from "../lib/env.js";
+import { editFile, ensureParentDir } from "../lib/file-ops.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
+
+/** Refuse to open a file larger than this at all; agents should page it or use bash_exec. */
+const MAX_READ_FILE_BYTES = positiveIntEnv(process.env.MAX_MCP_READ_FILE_BYTES, 16 * 1024 * 1024);
+/** Cap what one file_read returns, so a whole-file read cannot flood the client. */
+const MAX_READ_RESPONSE_BYTES = positiveIntEnv(process.env.MAX_MCP_READ_RESPONSE_BYTES, 1024 * 1024);
 
 // Audit H11 (#39, #44): bound fs_export so a large sandbox can't be materialized
 // unboundedly into one in-memory JSON map / opened all at once.
@@ -27,6 +35,16 @@ const MAX_EXPORT_FILES = Number(process.env.MAX_EXPORT_FILES ?? "10000");
 const MAX_EXPORT_BYTES = Number(process.env.MAX_EXPORT_BYTES ?? `${256 * 1024 * 1024}`);
 /** Steps the export read loop, so it must be a positive integer (0/NaN would hang or no-op). */
 const MAX_EXPORT_CONCURRENCY = positiveIntEnv(process.env.MAX_EXPORT_CONCURRENCY, 16);
+
+/** MCP tools answer with a JSON envelope; every rejection shares this shape. */
+function fail(error: string, extra: Record<string, unknown> = {}): { content: Array<{ type: "text"; text: string }> } {
+	return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error, ...extra }) }] };
+}
+
+/** Sandbox paths are absolute; accept a relative one rather than failing on a missing slash. */
+function toAbsolute(path: string): string {
+	return path.startsWith("/") ? path : `/${path}`;
+}
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
 	server.tool(
@@ -119,6 +137,222 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						},
 					],
 				};
+			}
+		},
+	);
+
+	server.tool(
+		"file_read",
+		"Read one sandbox file as text. Returns the whole file by default; pass offset/limit to page through a large one. Use this instead of `bash_exec 'cat …'` so the content comes back structured and bounded rather than through shell quoting.",
+		{
+			id: z.string(),
+			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			offset: z.number().int().positive().optional().describe("1-based line to start from"),
+			limit: z.number().int().positive().optional().describe("Maximum number of lines to return"),
+		},
+		async (args) => {
+			const filePath = toAbsolute(args.path);
+
+			try {
+				const outcome = await withOwnedSessionRead(sessionManager, tenant, args.id, owner, async (session) => {
+					let stat: FsStat;
+					try {
+						stat = await session.fs.stat(filePath);
+					} catch (e) {
+						if (extractErrCode(e) === "ENOENT") return { kind: "not_found" } as const;
+						throw e;
+					}
+					if (stat.isDirectory) return { kind: "eisdir" } as const;
+					if (stat.size > MAX_READ_FILE_BYTES) return { kind: "file_too_large", size: stat.size } as const;
+
+					const bytes = await session.fs.readFileBuffer(filePath);
+
+					let text: string;
+					try {
+						text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+					} catch {
+						return { kind: "not_text" } as const;
+					}
+
+					const paging = args.offset !== undefined || args.limit !== undefined;
+					const lines = text.length === 0 ? [] : text.split("\n");
+					const totalLines = lines.length;
+					const firstLine = args.offset ?? 1;
+					let content = paging
+						? lines.slice(firstLine - 1, args.limit === undefined ? undefined : firstLine - 1 + args.limit).join("\n")
+						: text;
+
+					// Bound what crosses the wire even when the whole file was requested. UTF-8 is never
+					// shorter than UTF-16, so an over-length string short-circuits the byte scan.
+					let truncated = false;
+					if (
+						content.length > MAX_READ_RESPONSE_BYTES ||
+						Buffer.byteLength(content, "utf8") > MAX_READ_RESPONSE_BYTES
+					) {
+						// Cut on the byte budget, then drop a codepoint split across the boundary.
+						content = Buffer.from(content, "utf8")
+							.subarray(0, MAX_READ_RESPONSE_BYTES)
+							.toString("utf8")
+							.replace(/\uFFFD$/, "");
+						truncated = true;
+					}
+					return { kind: "ok", content, size: stat.size, totalLines, firstLine, truncated } as const;
+				});
+
+				switch (outcome.kind) {
+					case "not_found":
+						return fail("file not found", { code: "ENOENT", path: filePath });
+					case "eisdir":
+						return fail("path is a directory", { code: "EISDIR", path: filePath });
+					case "not_text":
+						return fail("file is not valid UTF-8 text", { code: "NOT_TEXT", path: filePath });
+					case "file_too_large":
+						return fail(`file is ${outcome.size} bytes; exceeds the read limit (${MAX_READ_FILE_BYTES})`, {
+							code: "PAYLOAD_TOO_LARGE",
+							path: filePath,
+						});
+					default:
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: JSON.stringify({
+										ok: true,
+										path: filePath,
+										content: outcome.content,
+										size: outcome.size,
+										totalLines: outcome.totalLines,
+										firstLine: outcome.firstLine,
+										truncated: outcome.truncated,
+									}),
+								},
+							],
+						};
+				}
+			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") return fail("forbidden");
+				if (code === "ENOENT") return fail("sandbox not found");
+				return fail(clientSafeErrorMessage(err));
+			}
+		},
+	);
+
+	server.tool(
+		"file_write",
+		"Write a whole sandbox file, creating parent directories and overwriting any existing content. Use file_edit instead when changing part of an existing file — it avoids resending the whole file.",
+		{
+			id: z.string(),
+			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			content: z.string().describe("Full file content. Replaces the file entirely."),
+		},
+		async (args) => {
+			const filePath = toAbsolute(args.path);
+			// Encode once: `writeFile` would otherwise re-encode the same string internally.
+			const encoded = new TextEncoder().encode(args.content);
+			const size = encoded.byteLength;
+			if (size > MAX_EDIT_BYTES) {
+				return fail(`content is ${size} bytes; exceeds the write limit (${MAX_EDIT_BYTES})`, {
+					code: "PAYLOAD_TOO_LARGE",
+					path: filePath,
+				});
+			}
+
+			try {
+				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+					// Guard here rather than relying on the backend: SqlFs rejects a write
+					// over a directory, InMemoryFs silently clobbers it.
+					try {
+						if ((await session.fs.stat(filePath)).isDirectory) return { kind: "eisdir" } as const;
+					} catch (e) {
+						if (extractErrCode(e) !== "ENOENT") throw e;
+					}
+
+					await ensureParentDir(session.fs, filePath);
+					try {
+						await session.fs.writeFile(filePath, encoded);
+					} catch (e) {
+						const code = extractErrCode(e);
+						if (code === "EISDIR") return { kind: "eisdir" } as const;
+						throw e;
+					}
+					return { kind: "ok" } as const;
+				});
+
+				if (outcome.kind === "eisdir") return fail("path is a directory", { code: "EISDIR", path: filePath });
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify({ ok: true, path: filePath, size }) }],
+				};
+			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") return fail("forbidden");
+				if (code === "ENOENT") return fail("sandbox not found");
+				return fail(clientSafeErrorMessage(err));
+			}
+		},
+	);
+
+	server.tool(
+		"file_edit",
+		"Replace an exact string inside one existing sandbox file. Reads, patches and writes atomically, so it is the cheapest way to change code without shipping the whole file. oldString must match exactly once unless replaceAll is true — an ambiguous match is rejected rather than guessed at. Read the file first (e.g. bash_exec 'cat path') so oldString reflects current content.",
+		{
+			id: z.string(),
+			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			oldString: z.string().min(1).describe("Exact text to replace, including surrounding context to make it unique"),
+			newString: z.string().describe("Replacement text. Pass an empty string to delete the matched text."),
+			replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring a unique match"),
+		},
+		async (args) => {
+			if (args.oldString === args.newString) return fail("oldString and newString must differ");
+			const filePath = toAbsolute(args.path);
+
+			try {
+				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
+					editFile(
+						session,
+						filePath,
+						{ oldString: args.oldString, newString: args.newString, replaceAll: args.replaceAll },
+						MAX_EDIT_BYTES,
+					),
+				);
+
+				switch (outcome.kind) {
+					case "not_found":
+						return fail("file not found", { code: "ENOENT", path: filePath });
+					case "eisdir":
+						return fail("path is a directory", { code: "EISDIR", path: filePath });
+					case "binary":
+						return fail("file is not valid UTF-8 text", { code: "EDIT_BINARY", path: filePath });
+					case "no_match":
+						return fail("oldString does not appear in the file", { code: "EDIT_NO_MATCH", path: filePath });
+					case "not_unique":
+						return fail(`oldString appears ${outcome.count} times; pass replaceAll or include more context`, {
+							code: "EDIT_NOT_UNIQUE",
+							occurrences: outcome.count,
+							path: filePath,
+						});
+					case "too_large":
+						return fail("edited file exceeds the size limit", { code: "PAYLOAD_TOO_LARGE", path: filePath });
+					default:
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: JSON.stringify({
+										ok: true,
+										path: filePath,
+										replacements: outcome.replacements,
+										size: outcome.size,
+									}),
+								},
+							],
+						};
+				}
+			} catch (err) {
+				const code = (err as Error & { code?: string }).code;
+				if (code === "FORBIDDEN") return fail("forbidden");
+				if (code === "ENOENT") return fail("sandbox not found");
+				return fail(clientSafeErrorMessage(err));
 			}
 		},
 	);

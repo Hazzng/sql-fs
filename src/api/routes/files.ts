@@ -3,6 +3,7 @@
  * US-062: GET /v1/sandboxes/:id/files/*path — read file
  * US-063: PUT /v1/sandboxes/:id/files/*path — write file
  * US-064: DELETE /v1/sandboxes/:id/files/*path — delete file or dir
+ * PATCH /v1/sandboxes/:id/files/*path — replace a string inside an existing file
  * US-065: POST /v1/sandboxes/:id/mkdir — create directory
  * US-066: POST /v1/sandboxes/:id/writeFiles — bulk write
  * US-067: GET /v1/sandboxes/:id/tree — list file tree
@@ -13,6 +14,9 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { FsStat } from "just-bash";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { extractErrCode } from "../errors.js";
+import { MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES } from "../lib/env.js";
+import { type EditOutcome, editFile, ensureParentDir } from "../lib/file-ops.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -58,26 +62,6 @@ function toKind(stat: FsStat): string {
 	return "symlink";
 }
 
-/**
- * Extracts a filesystem error code from the error's .code property,
- * or falls back to parsing the POSIX error prefix from the message
- * (e.g. "ENOENT: no such file..." → "ENOENT").
- * InMemoryFs from just-bash does not set .code, so message parsing is required.
- */
-function extractErrCode(e: unknown): string | undefined {
-	if (!(e instanceof Error)) return undefined;
-	const fe = e as Error & { code?: string };
-	if (fe.code) return fe.code;
-	const match = fe.message.match(/^([A-Z]+):/);
-	return match?.[1];
-}
-
-function parentDir(filePath: string): string {
-	const lastSlash = filePath.lastIndexOf("/");
-	return lastSlash <= 0 ? "/" : filePath.slice(0, lastSlash);
-}
-
-const MAX_RAW_FILE_WRITE_BYTES = Number(process.env.MAX_FILE_WRITE_BYTES ?? `${64 * 1024 * 1024}`);
 const MAX_BULK_WRITE_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
 const MAX_BULK_WRITE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
 // Audit H11 (#27): cap the number of entries a single /tree response materializes.
@@ -207,15 +191,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				const parent = parentDir(filePath);
-				if (parent !== "/") {
-					try {
-						await session.fs.mkdir(parent, { recursive: true });
-					} catch (e) {
-						const code = extractErrCode(e);
-						if (code !== "EEXIST") throw e;
-					}
-				}
+				await ensureParentDir(session.fs, filePath);
 				await session.fs.writeFile(filePath, content);
 			});
 		} catch (err) {
@@ -224,6 +200,93 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		return c.body(null, 204);
+	});
+
+	// PATCH /v1/sandboxes/:id/files/* — replace a string inside an existing file
+	const editBodySchema = z.object({
+		oldString: z.string().min(1, "oldString is required"),
+		newString: z.string(),
+		replaceAll: z.boolean().optional(),
+	});
+
+	router.patch("/:id/files/:path{.*}", async (c) => {
+		const sandboxId = c.req.param("id");
+		const tenant = c.get("tenant");
+		const filePath = `/${c.req.param("path")}`;
+
+		let body: z.infer<typeof editBodySchema>;
+		try {
+			const result = editBodySchema.safeParse(await c.req.json());
+			if (!result.success) {
+				const details = result.error.issues.map((i) => i.message);
+				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+			}
+			body = result.data;
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		const { oldString, newString, replaceAll = false } = body;
+		if (oldString === newString) {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["oldString and newString must differ"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+
+		let result: EditOutcome;
+		try {
+			result = await withOwnedSessionOrRehydrate<EditOutcome>(
+				sessionManager,
+				tenant,
+				sandboxId,
+				c.get("owner"),
+				(session) => editFile(session, filePath, { oldString, newString, replaceAll }, MAX_RAW_FILE_WRITE_BYTES),
+			);
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			throw err;
+		}
+
+		switch (result.kind) {
+			case "not_found":
+				return c.json({ error: "not_found", code: "ENOENT" }, 404 as ContentfulStatusCode);
+			case "eisdir":
+				return c.json({ error: "path_is_a_directory", code: "EISDIR" }, 400 as ContentfulStatusCode);
+			case "binary":
+				return c.json(
+					{ error: "not_utf8_text", code: "EDIT_BINARY", details: ["File is not valid UTF-8 text"] },
+					400 as ContentfulStatusCode,
+				);
+			case "no_match":
+				return c.json(
+					{ error: "old_string_not_found", code: "EDIT_NO_MATCH", details: ["oldString does not appear in the file"] },
+					409 as ContentfulStatusCode,
+				);
+			case "not_unique":
+				return c.json(
+					{
+						error: "old_string_not_unique",
+						code: "EDIT_NOT_UNIQUE",
+						details: [`oldString appears ${result.count} times; pass replaceAll or include more context`],
+					},
+					409 as ContentfulStatusCode,
+				);
+			case "too_large":
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`Edited file would exceed limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			default:
+				return c.json({ path: filePath, replacements: result.replacements, size: result.size });
+		}
 	});
 
 	// DELETE /v1/sandboxes/:id/files/* — delete file or directory
@@ -334,15 +397,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 				const writeAll = async (): Promise<void> => {
 					for (const [filePath, content] of fileEntries) {
-						const parent = parentDir(filePath);
-						if (parent !== "/") {
-							try {
-								await session.fs.mkdir(parent, { recursive: true });
-							} catch (e) {
-								const code = extractErrCode(e);
-								if (code !== "EEXIST") throw e;
-							}
-						}
+						await ensureParentDir(session.fs, filePath);
 						await session.fs.writeFile(filePath, content);
 					}
 				};
@@ -352,18 +407,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				// instead of leaving earlier writes committed. Backends without
 				// script-tx support (e.g. in-memory) fall back to the per-entry loop.
 				const scriptTx = session.scriptTx;
-				if (scriptTx !== undefined) {
-					scriptTx.beginScope();
-					try {
-						await writeAll();
-						await scriptTx.endScope();
-					} catch (err) {
-						await scriptTx.abortScope();
-						throw err;
-					}
-				} else {
-					await writeAll();
-				}
+				if (scriptTx !== undefined) await scriptTx.run(writeAll);
+				else await writeAll();
 			});
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();

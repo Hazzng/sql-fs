@@ -18,3 +18,9 @@ export function positiveIntEnv(value: string | undefined, fallback: number): num
 	const n = Number(value);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
+
+/**
+ * Largest single file body any write surface accepts (PUT, PATCH, MCP file_write).
+ * One owner, so the HTTP and MCP limits cannot drift apart.
+ */
+export const MAX_FILE_WRITE_BYTES = positiveIntEnv(process.env.MAX_FILE_WRITE_BYTES, 64 * 1024 * 1024);

@@ -13,9 +13,8 @@
  */
 
 import type { Redis } from "ioredis";
-import { Bash, defineCommand } from "just-bash";
+import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
-import { createGit } from "just-git";
 import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
@@ -23,6 +22,7 @@ import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
+import { createGitCommand } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -580,14 +580,11 @@ export class SessionManager {
 				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
 				// not registered (audit C1 — host sandbox escape). Python sandboxes
 				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
-				const git = createGit({
-					network: resolvedRuntime.network ? {} : false,
-				});
-				const gitCommand = defineCommand("git", (args, ctx) =>
-					// just-git shadows just-bash's CommandContext type, but only reads
-					// the structurally-compatible fs/cwd/env/stdin/exec/signal fields.
-					git.execute(args, ctx as Parameters<typeof git.execute>[1]),
-				);
+				// `{}` → no allowlist → full outbound via globalThis.fetch.
+				// `false` → clone/fetch/push blocked; local git still works.
+				// The wrapper removes the destination of a clone that fails partway,
+				// so a refused symlink cannot leave a poisoned index behind.
+				const gitCommand = createGitCommand({ network: resolvedRuntime.network ? {} : false });
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and

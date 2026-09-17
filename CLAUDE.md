@@ -172,6 +172,14 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 - **Test file size:** Keep under 300 lines. Split into separate files by concern (e.g., `sql-fs.read.test.ts`, `sql-fs.write.test.ts`).
 - **Cleanup:** Every test that creates a sandbox must delete it in `afterEach`. Use `try/finally` in integration tests.
 
+### Comments
+
+- **Keep comments lean.** Explain *why*, not *what* — the code already says what it does.
+- Prefer one dense sentence over a paragraph. No restating the function signature, no narrating each step.
+- A doc comment earns its length only when it records a non-obvious constraint: a failure mode, an
+  ordering requirement, a security decision, or an upstream quirk. Cite the audit/issue id when there is one.
+- Delete commented-out code rather than leaving it in place.
+
 ### Formatting & Linting
 
 - **Biome** for both formatting and linting. Run `pnpm lint:fix` before committing.

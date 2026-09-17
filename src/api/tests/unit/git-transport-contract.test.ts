@@ -1,3 +1,12 @@
+/**
+ * Contract test for just-git's own transport: clone/commit/push against an in-process remote,
+ * with identity and bearer auth supplied per-exec.
+ *
+ * Scope note: this uses `InMemoryFs` and a bare `createGit()`, so it covers just-git's behaviour
+ * and NOT this service's wiring. Coverage of SessionManager + SqlFs + the credentials the server
+ * actually injects lives in `tests/integration/git-sqlfs.integration.test.ts`.
+ */
+
 import { Bash, InMemoryFs, defineCommand } from "just-bash";
 import { createGit } from "just-git";
 import { readCommit, resolveRef } from "just-git/repo";
@@ -14,7 +23,7 @@ function makeGitBash(network: ReturnType<ReturnType<typeof createServer<Auth>>["
 	return new Bash({ fs, customCommands: [gitCommand] });
 }
 
-describe("git network transport", () => {
+describe("just-git transport contract", () => {
 	it("clones, commits with exec env identity, rejects missing tokens, and pushes with bearer auth", async () => {
 		const seenAuthorizations: Array<string | null> = [];
 		const server = createServer({

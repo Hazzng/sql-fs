@@ -33,4 +33,22 @@ export class SessionScopedFs {
 		if (!this.#inner.scriptScopeActive) return;
 		await this.#inner.abortScriptScope();
 	}
+
+	/**
+	 * Run `fn` inside one script-tx scope: commit when it returns, roll back when it throws.
+	 *
+	 * A returned value commits even when it represents a rejected outcome — a rejection writes
+	 * nothing, and the lazily-opened transaction must still be closed rather than left open.
+	 */
+	async run<T>(fn: () => Promise<T>): Promise<T> {
+		this.beginScope();
+		try {
+			const result = await fn();
+			await this.endScope();
+			return result;
+		} catch (err) {
+			await this.abortScope();
+			throw err;
+		}
+	}
 }
