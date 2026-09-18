@@ -179,6 +179,102 @@ describe("resolver hygiene", () => {
 		expect(result.stdout).toBe("Successfully installed demo-1.0\n");
 	});
 
+	it("prunes orphaned packages after re-resolution", async () => {
+		// Package `a` v2 requires `obsolete`, v1 requires `current`.
+		// `b` requires `a<2`, forcing re-resolution from v2 to v1.
+		// `obsolete` must be pruned from the final plan.
+		const aV1 = wheel("a", "1.0", { "a.py": "" }, ["current"]);
+		const aV2 = wheel("a", "2.0", { "a.py": "" }, ["obsolete"]);
+		const bV1 = wheel("b", "1.0", { "b.py": "" }, ["a<2"]);
+		const obsV1 = wheel("obsolete", "1.0", { "obsolete.py": "" });
+		const curV1 = wheel("current", "1.0", { "current.py": "" });
+
+		const packages: Record<string, { versions: Record<string, { body: Uint8Array; requiresDist: string[] }> }> = {
+			a: {
+				versions: {
+					"1.0": { body: aV1, requiresDist: ["current"] },
+					"2.0": { body: aV2, requiresDist: ["obsolete"] },
+				},
+			},
+			b: { versions: { "1.0": { body: bV1, requiresDist: ["a<2"] } } },
+			obsolete: { versions: { "1.0": { body: obsV1, requiresDist: [] } } },
+			current: { versions: { "1.0": { body: curV1, requiresDist: [] } } },
+		};
+
+		const bash = makeBashWithFetch(async (url) => {
+			const parsed = new URL(url);
+			if (parsed.hostname === "pypi.org") {
+				const match = parsed.pathname.match(/^\/pypi\/([^/]+)(?:\/([^/]+))?\/json$/);
+				const name = match?.[1];
+				const requestedVersion = match?.[2];
+				const pkg = name ? packages[name] : undefined;
+				if (!pkg) return { status: 404, statusText: "Not Found", headers: {}, body: encoder.encode("{}"), url };
+				const latestVersion = Object.keys(pkg.versions).sort().pop()!;
+				const releases: Record<string, unknown[]> = {};
+				for (const [ver, data] of Object.entries(pkg.versions)) {
+					releases[ver] = [
+						{
+							filename: `${name}-${ver}-py3-none-any.whl`,
+							url: `https://files.pythonhosted.org/${name}-${ver}-py3-none-any.whl`,
+							packagetype: "bdist_wheel",
+							digests: { sha256: sha256(data.body) },
+						},
+					];
+				}
+				if (requestedVersion) {
+					const vData = pkg.versions[requestedVersion];
+					if (!vData) return { status: 404, statusText: "Not Found", headers: {}, body: encoder.encode("{}"), url };
+					return {
+						status: 200,
+						statusText: "OK",
+						headers: {},
+						body: encoder.encode(
+							JSON.stringify({
+								info: { version: requestedVersion, requires_dist: vData.requiresDist },
+								urls: releases[requestedVersion],
+							}),
+						),
+						url,
+					};
+				}
+				return {
+					status: 200,
+					statusText: "OK",
+					headers: {},
+					body: encoder.encode(
+						JSON.stringify({
+							info: { version: latestVersion, requires_dist: pkg.versions[latestVersion]!.requiresDist },
+							releases,
+						}),
+					),
+					url,
+				};
+			}
+			// File download
+			const filename = parsed.pathname.slice(1);
+			for (const [, pkg] of Object.entries(packages)) {
+				for (const [, data] of Object.entries(pkg.versions)) {
+					if (filename.endsWith(".whl") && sha256(data.body) === filename.split("/").pop()?.replace(".whl", "")) {
+						// fall through to hash-based lookup below
+					}
+				}
+			}
+			// Match by filename pattern
+			const nameMatch = filename.match(/^([^/]+)-([^-]+)-py3-none-any\.whl$/);
+			if (nameMatch) {
+				const pkg = packages[nameMatch[1]!];
+				const data = pkg?.versions[nameMatch[2]!];
+				if (data) return { status: 200, statusText: "OK", headers: {}, body: data.body, url };
+			}
+			return { status: 404, statusText: "Not Found", headers: {}, body: new Uint8Array(), url };
+		});
+
+		const result = await bash.exec("pip install a b");
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(result.stdout).toContain("current-1.0");
+		expect(result.stdout).not.toContain("obsolete");
+	});
+
 	it("reports the missing pure wheel rather than the candidate counter", async () => {
 		const body = wheel("native", "1.0", { "native.py": "" });
 		const releases: Record<string, unknown> = {};

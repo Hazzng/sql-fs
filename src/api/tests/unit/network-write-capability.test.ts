@@ -154,7 +154,7 @@ describe("MCP sandbox_create — networkWrite", () => {
 		});
 	});
 
-	it("treats networkWrite as boolean (non-boolean coerces or defaults)", async () => {
+	it("returns networkWrite false when explicitly passed as false", async () => {
 		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const { handler } = captureSandboxCreate(sessionManager);
 		const result = (await handler({ network: true, networkWrite: false })) as {
@@ -162,6 +162,16 @@ describe("MCP sandbox_create — networkWrite", () => {
 		};
 		const payload = JSON.parse(result.content[0].text) as { id: string; networkWrite: boolean };
 		expect(payload.networkWrite).toBe(false);
+	});
+
+	it("rejects non-boolean networkWrite at the Zod schema level", () => {
+		const { schema } = captureSandboxCreate(new SessionManager({ createFs: async () => new InMemoryFs() }));
+		const nwSchema = schema.networkWrite as { safeParse?: (v: unknown) => { success: boolean } };
+		expect(nwSchema.safeParse!(true).success).toBe(true);
+		expect(nwSchema.safeParse!(false).success).toBe(true);
+		expect(nwSchema.safeParse!(undefined).success).toBe(true);
+		expect(nwSchema.safeParse!("yes").success).toBe(false);
+		expect(nwSchema.safeParse!(1).success).toBe(false);
 	});
 });
 

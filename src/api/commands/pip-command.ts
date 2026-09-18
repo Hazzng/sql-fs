@@ -309,6 +309,10 @@ class Retry:
 	// PyJWT eagerly imports jwks_client, which imports the unavailable WASM
 	// _ssl extension. The legacy CLI only needs decode() for optional OAuth
 	// refresh-token handling; token-authenticated read-only calls do not use it.
+	// The stub raises by default so it cannot silently bypass signature
+	// verification if a sandbox also installs the real PyJWT package; callers
+	// that explicitly disable verification (as the Databricks CLI does) still
+	// get the no-op path.
 	"jwt/__init__.py": `
 class InvalidTokenError(Exception):
     pass
@@ -316,7 +320,13 @@ class InvalidTokenError(Exception):
 PyJWTError = InvalidTokenError
 
 def decode(_token, options=None, **_kwargs):
-    return {}
+    if options and options.get("verify_signature") is False:
+        return {}
+    raise InvalidTokenError(
+        "JWT verification is not available in this sandbox"
+        " (the sandbox provides only a compatibility stub;"
+        " install PyJWT for real token handling)"
+    )
 `,
 	// Keep the WASM socket restriction intact. databricks-cli only reads this
 	// constant while constructing its unused urllib3 adapter.
@@ -727,6 +737,20 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 			setDepth(dependency.name, (depths.get(name) ?? 0) + 1);
 			pending.push(dependency.name);
 		}
+	}
+
+	// Prune packages that are no longer reachable from any root after
+	// re-resolution cleared stale child edges.
+	const reachable = new Set<string>();
+	const walk = [...roots.map((r) => r.name), ...synthetic.keys()];
+	while (walk.length > 0) {
+		const n = walk.pop()!;
+		if (reachable.has(n)) continue;
+		reachable.add(n);
+		for (const child of children.get(n) ?? []) walk.push(child);
+	}
+	for (const [name] of resolved) {
+		if (!reachable.has(name)) resolved.delete(name);
 	}
 
 	return {

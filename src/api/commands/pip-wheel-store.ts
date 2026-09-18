@@ -177,6 +177,21 @@ function chargeExtracted(budget: InstallBudget, files: number, bytes: number, li
  * Reads the whole wheel, ingesting each batch of blobs as it is produced, and
  * returns the manifest file rows (metadata only — no content is retained).
  */
+const DATA_DIR_PATTERN = /^[^/]+-[^/]+\.data\/(purelib|platlib|scripts|data|headers)\//;
+
+/** Maps an archive-relative path to its sandbox-absolute install path, or `null` to skip. */
+function spreadDataPath(archivePath: string): string | null {
+	const match = archivePath.match(DATA_DIR_PATTERN);
+	if (!match) return `${SITE_PACKAGES}/${archivePath}`;
+	const scheme = match[1]!;
+	if (scheme === "purelib" || scheme === "platlib") {
+		const relative = archivePath.slice(match[0].length);
+		if (!relative) return null;
+		return `${SITE_PACKAGES}/${relative}`;
+	}
+	return null;
+}
+
 async function ingestWheel(
 	store: IPackageStore,
 	wheel: Uint8Array,
@@ -195,8 +210,10 @@ async function ingestWheel(
 		const blobs: PackageBlob[] = batch.map((file) => ({ sha256: file.sha256, data: file.content }));
 		await store.ingestBlobs(blobs);
 		for (const file of batch) {
+			const path = spreadDataPath(file.path);
+			if (path === null) continue;
 			files.push({
-				path: `${SITE_PACKAGES}/${file.path}`,
+				path,
 				sha256: file.sha256,
 				mode: file.mode,
 				size: file.size,
