@@ -16,6 +16,7 @@ import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
 import { positiveIntEnv } from "../lib/env.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
+import { NETWORK_WRITE_REQUIRES_NETWORK } from "../routes/sandboxes.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -37,6 +38,10 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			python: z.boolean().optional(),
 			javascript: z.boolean().optional(),
 			network: z.boolean().optional().describe("Grant outbound HTTPS (enables curl + git clone/fetch/push)"),
+			networkWrite: z
+				.boolean()
+				.optional()
+				.describe("Allow POST/PUT/PATCH/DELETE through the python requests shim (requires network)"),
 		},
 		async (args) => {
 			const id = randomUUID();
@@ -45,7 +50,18 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				python: args.python ?? false,
 				javascript: args.javascript ?? false,
 				network: args.network ?? false,
+				networkWrite: args.networkWrite ?? false,
 			};
+			if (runtimeOptions.networkWrite && !runtimeOptions.network) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: JSON.stringify({ ok: false, error: NETWORK_WRITE_REQUIRES_NETWORK }),
+						},
+					],
+				};
+			}
 			try {
 				const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
 				session.name = name;
@@ -55,6 +71,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					python: runtimeOptions.python,
 					javascript: runtimeOptions.javascript,
 					network: runtimeOptions.network,
+					networkWrite: runtimeOptions.networkWrite,
 				});
 				return {
 					content: [
@@ -66,6 +83,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 								python: runtimeOptions.python,
 								javascript: runtimeOptions.javascript,
 								network: runtimeOptions.network,
+								networkWrite: runtimeOptions.networkWrite,
 							}),
 						},
 					],
@@ -105,6 +123,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 									python: s.python,
 									javascript: s.javascript,
 									network: s.network,
+									networkWrite: s.networkWrite ?? false,
 								})),
 							}),
 						},
@@ -189,6 +208,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"  scripts queue until a slot frees.",
 		"- js-exec / node — QuickJS WASM. TypeScript supported. No npm. fetch is available",
 		"  only when the sandbox was created with network:true.",
+		"- The python requests compatibility shim is read-only (GET/HEAD) unless the sandbox",
+		"  was created with networkWrite:true, which also permits POST/PUT/PATCH/DELETE.",
 	].join("\n");
 
 	server.tool(

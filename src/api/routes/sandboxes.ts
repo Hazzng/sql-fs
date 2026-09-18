@@ -20,7 +20,13 @@ const createBodySchema = z.object({
 	javascript: z.boolean().optional(),
 	/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */
 	network: z.boolean().optional(),
+	/** When true, the sandbox's `requests` shim permits POST/PUT/PATCH/DELETE. */
+	networkWrite: z.boolean().optional(),
 });
+
+/** Refusal message for the one cross-field rule on the create body. */
+export const NETWORK_WRITE_REQUIRES_NETWORK =
+	"networkWrite requires network: true (the sandbox has no outbound access without it)";
 
 // Audit H11 (#2): bound the optional initial-files map so a single create can't
 // buffer an unbounded number of files / bytes. Shares the bulk-write env knobs.
@@ -36,6 +42,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		let python = false;
 		let javascript = false;
 		let network = false;
+		let networkWrite = false;
 
 		// Body is optional — parse if present, ignore if missing/empty
 		try {
@@ -50,6 +57,13 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			python = result.data.python ?? false;
 			javascript = result.data.javascript ?? false;
 			network = result.data.network ?? false;
+			networkWrite = result.data.networkWrite ?? false;
+			if (networkWrite && !network) {
+				return c.json(
+					{ error: "validation_error", code: "INVALID_INPUT", details: [NETWORK_WRITE_REQUIRES_NETWORK] },
+					400 as ContentfulStatusCode,
+				);
+			}
 		} catch {
 			// No body provided — that's fine
 		}
@@ -107,6 +121,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					python,
 					javascript,
 					network,
+					networkWrite,
 					createdAt,
 				});
 				if (files !== undefined) {
@@ -127,11 +142,14 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					}
 				}
 			},
-			{ python, javascript, network },
+			{ python, javascript, network, networkWrite },
 			owner,
 		);
 
-		return c.json({ id: sandboxId, name, owner, createdAt, python, javascript, network }, 201 as ContentfulStatusCode);
+		return c.json(
+			{ id: sandboxId, name, owner, createdAt, python, javascript, network, networkWrite },
+			201 as ContentfulStatusCode,
+		);
 	});
 
 	router.get("/", async (c) => {
@@ -148,6 +166,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 					python: s.python,
 					javascript: s.javascript,
 					network: s.network,
+					networkWrite: s.networkWrite ?? false,
 				})),
 			});
 		} catch (err) {

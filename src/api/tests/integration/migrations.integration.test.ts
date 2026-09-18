@@ -86,6 +86,34 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 		await expect(runMigrations(cfg)).resolves.toBeUndefined();
 	});
 
+	it("0008 adds sandboxes.network_write defaulting to false, and is idempotent", async () => {
+		const cfg = loadTenantConfig({
+			TENANT_DATABASES: JSON.stringify({ default: testUrl }),
+		});
+
+		// Second application must be a no-op (ADD COLUMN IF NOT EXISTS).
+		await runMigrations(cfg);
+
+		const sql = postgres(testUrl, { prepare: false, max: 1 });
+		try {
+			const columns = await sql<{ data_type: string; is_nullable: string; column_default: string | null }[]>`
+				SELECT data_type, is_nullable, column_default
+				FROM information_schema.columns
+				WHERE table_name = 'sandboxes' AND column_name = 'network_write'
+			`;
+			expect(columns).toEqual([{ data_type: "boolean", is_nullable: "NO", column_default: "false" }]);
+
+			// A row inserted without the column reads back as false, as pre-0008 rows do.
+			await sql`INSERT INTO sandboxes (id, owner) VALUES ('mig-0008', 'tester')`;
+			const rows = await sql<{ network: boolean; network_write: boolean }[]>`
+				SELECT network, network_write FROM sandboxes WHERE id = 'mig-0008'
+			`;
+			expect(rows).toEqual([{ network: false, network_write: false }]);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
+
 	it("0007 creates the package tables with RLS on the ledger only, and is idempotent", async () => {
 		const cfg = loadTenantConfig({
 			TENANT_DATABASES: JSON.stringify({ default: testUrl }),

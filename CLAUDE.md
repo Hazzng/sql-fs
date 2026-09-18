@@ -222,6 +222,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `PIP_MAX_METADATA_CACHE_ENTRIES` | No (default: 200) | Cumulative PyPI metadata documents cached per `pip install`. |
 | `PIP_MAX_METADATA_RESPONSE_BYTES` | No (default: 16777216) | Cap for a single PyPI JSON response (backstop; the per-version endpoint is tried first for a pinned requirement). |
 | `PIP_MAX_DEPENDENCY_DEPTH` | No (default: 16) | Longest dependency path a `pip install` may resolve. Depth is recomputed transitively when an edge lengthens one, so a diamond cannot bypass it. |
+| `SQLFS_HTTP_WRITE` | Never set on the host | **Exported, not configured.** The session manager puts `SQLFS_HTTP_WRITE=1` into the sandbox shell env when, and only when, the sandbox was created with `network: true` **and** `networkWrite: true` (API create body / MCP `sandbox_create`; `networkWrite` without `network` is a 400). The Python `requests` compatibility shim reads it and permits POST/PUT/PATCH/DELETE; without it those verbs raise `requests.exceptions.NetworkWriteNotPermitted`. A shim-level guardrail only — `curl`, `jb_http` and `git` are unaffected (see SECURITY.md). Persisted per sandbox in `sandboxes.network_write` (migration 0008). |
 | `GITHUB_TOKEN` | No | Optional shared GitHub token. When set, exported into `network:true` sandbox shell env as `GITHUB_TOKEN` for `curl` GitHub API calls, plus `GIT_HTTP_USER=x-access-token` and `GIT_HTTP_PASSWORD=<token>` for GitHub-compatible `git` HTTPS auth. This is a deployment-wide identity readable by network-enabled sandbox code; use only with trusted agents. Per-request `env` overrides it. |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` | No | Optional git identity values to export into every sandbox shell env so `git commit` has defaults. Per-request `env` overrides them. |
 | `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. It also backs the pip wheel lease (`vfs:{tenant}:pip:wheel:{sha256hex}`, module defaults: 60 s lease, 20 s renewal, compare-and-delete release), which makes the first install of a wheel happen once fleet-wide. Without it the lease is a per-replica in-process singleflight: two replicas can duplicate that first-install work, which is accepted and still correct, because blob inserts are content addressed and the manifest write is an upsert. |
@@ -258,7 +259,7 @@ src/
       azure-sql.ts               ← Azure SQL dialect
     package-manifest.ts          ← MANIFEST_FORMAT (package-manifest row format version)
     migrations/
-      postgres/                  ← Postgres DDL + RLS + stored procs (0000–0007; 0007 = package manifests + sandbox_packages)
+      postgres/                  ← Postgres DDL + RLS + stored procs (0000–0008; 0007 = package manifests + sandbox_packages, 0008 = sandboxes.network_write)
       mysql/                     ← MySQL DDL + stored procs
       azure-sql/                 ← T-SQL DDL + RLS + stored procs
     integration/                 ← DB integration tests (skippable)

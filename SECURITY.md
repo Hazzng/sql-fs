@@ -99,14 +99,27 @@ publish a partial package set.
 ## Network behavior
 
 The installer uses HTTPS requests to the approved PyPI hosts. It does not use
-raw sockets. The Databricks compatibility transport currently supports only the
-read-only HTTP methods needed by the experiment. It rejects unsupported methods
-instead of falling back to sockets.
+raw sockets. A network-disabled sandbox fails clearly when `pip` or
+`databricks` needs network access.
 
-A network-disabled sandbox fails clearly when `pip` or `databricks` needs
-network access. Enabling network access grants the sandbox outbound access, so
-callers must treat `network: true` as a separate capability and restrict which
-sandboxes may request it.
+`network: true` is the real capability boundary. A sandbox created with it
+runs its `Bash` with `dangerouslyAllowFullInternetAccess`, which enables every
+HTTP method — `git push` over HTTPS needs POST, so the transport cannot be
+restricted to read-only methods without breaking git. There is therefore no
+transport-level enforcement of read-only access, and none is claimed here.
+
+`networkWrite` is a second, per-sandbox flag, default off, rejected at create
+time unless `network` is also true. When it is set, the session exports
+`SQLFS_HTTP_WRITE=1` into the sandbox shell and the Python `requests`
+compatibility shim permits POST, PUT, PATCH and DELETE; without it the shim
+raises `requests.exceptions.NetworkWriteNotPermitted` and only GET and HEAD go
+out. That is a guardrail against an installed package writing to a Databricks
+workspace by accident — it is not a sandbox boundary. `jb_http`, `curl` and
+`git` are not restricted by it, and sandbox code can call them directly.
+
+Treat `network: true` as the capability to grant sparingly and restrict which
+callers may request it; treat `networkWrite` as an additional opt-in for
+workflows that genuinely need to write.
 
 ## What this feature does not protect against
 

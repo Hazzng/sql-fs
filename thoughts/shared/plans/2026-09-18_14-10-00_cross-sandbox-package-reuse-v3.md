@@ -951,6 +951,88 @@ say exactly that: the read-only default is a guardrail against accidental
 writes in the `requests` shim, `jb_http` and `curl` are not restricted, and
 `network: true` is the real capability boundary.
 
+### Phase 5 status
+
+Implemented on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`).
+
+- [x] **`networkWrite` on the runtime options**, persisted in sandbox meta by
+      migration `0008_add_network_write_flag.sql` (`ALTER TABLE sandboxes ADD
+      COLUMN IF NOT EXISTS network_write BOOLEAN NOT NULL DEFAULT false`, the
+      same idempotent shape as 0004). Read and written by the Postgres dialect
+      in `getSandboxMeta`, `updateSandboxMeta` and `listSandboxes`; carried
+      through both rehydrate paths in `session-manager.ts`.
+- [x] **Exposed on the create surfaces.** HTTP `POST /v1/sandboxes` (Zod
+      field, echoed in the 201 body), `GET /v1/sandboxes` (the listing that
+      already shows `network`), MCP `sandbox_create`, and the OpenAPI spec
+      (request property plus the `Sandbox` schema; `info.version` untouched).
+- [x] **`networkWrite: true` without `network` is a 400** naming both fields:
+      `networkWrite requires network: true (the sandbox has no outbound access
+      without it)`. The same constant is returned by the MCP tool as
+      `{ ok: false, error }`.
+- [x] **`SQLFS_HTTP_WRITE=1` exported only when both flags are set**, in
+      `buildRuntimeSandboxEnv` alongside the `network`-gated credential keys.
+- [x] **The two Python HTTP shims collapsed into one.** The bootstrap's
+      `_sqlfs_request` monkeypatch of an installed `requests` is deleted; the
+      compat module in `REQUESTS_COMPAT_FILES` is the only implementation, and
+      the bootstrap now does nothing but the two `sys.path` inserts.
+- [x] **Write methods gated in the shim.** `POST`/`PUT`/`PATCH`/`DELETE` raise
+      `requests.exceptions.NetworkWriteNotPermitted` (a `RequestException`
+      subclass) unless `os.environ.get("SQLFS_HTTP_WRITE") == "1"`; `GET` and
+      `HEAD` are unchanged; any other verb is refused as unsupported.
+- [x] **`files=` rejected** with `requests.exceptions.InvalidRequest` and the
+      message pointing at the JSON-string body and base64-in-JSON. Surface is
+      Phase 0's plus `post`, `put`, `patch`, `delete`; version stays `2.31.0`.
+- [x] **SECURITY.md network section rewritten** to say that transport-level
+      enforcement is impossible (`dangerouslyAllowFullInternetAccess`, and
+      `git push` needs POST), that the read-only default is a guardrail in the
+      `requests` shim only, that `jb_http`, `curl` and `git` are unrestricted,
+      that `network: true` is the real capability boundary, and that
+      `networkWrite` is per-sandbox and off by default.
+- [x] **CLAUDE.md**: an env-table row for `SQLFS_HTTP_WRITE` marked exported,
+      not configured, and 0008 in the migrations file-layout line.
+- [x] **Tests.** Unit: `src/api/tests/unit/network-write-capability.test.ts`
+      (route accept / default / 400 / type error, MCP schema + handler, env
+      export matrix), `src/api/tests/unit/pip-requests-shim.test.ts` (module
+      source assertions plus the shim run under the built-in WASM python),
+      `src/sql-fs/dialects/tests/unit/postgres.network-write-meta.test.ts`
+      (fake-pool meta round trip). Integration:
+      `src/api/tests/integration/network-write.integration.test.ts` and a 0008
+      case in `migrations.integration.test.ts`.
+
+### Discoveries and Notable Information
+
+- **The bootstrap monkeypatch was already dead code.** The bootstrap inserts
+  `/site-packages` then `_sqlfs_compat` at `sys.path[0]`, so the compat
+  package always shadows anything in `/site-packages`; and since `requests` is
+  always satisfied by the synthetic provider, no real `requests` wheel is ever
+  installed for it to patch. Deleting it removed a second implementation that
+  could only ever disagree with the one that actually gets imported.
+- **`networkWrite` is optional (`boolean | undefined`) on `RuntimeOptions`,
+  `SandboxMeta` and `SandboxListEntry`**, not required. Making it required
+  would have forced edits to ~60 object literals in tests for no behavioural
+  gain; the dialect and the env builder both normalise `undefined` to false,
+  which mirrors the existing `meta.network ?? false` write. Three existing
+  exact-equality assertions (mcp, rehydrate x2) still had to gain
+  `networkWrite: false` because the resolved runtime object now carries it.
+- **The shim gained `json=` handling** while the write verbs were added: the
+  old signature swallowed it in `**_kwargs`, which for a POST would have sent
+  an empty body silently. `json=` is serialised and `Content-Type:
+  application/json` is defaulted. This does not change the declared module
+  surface.
+- **`jb_http` is importable in the WASM worker even with network off**, and
+  fails at call time with `Network access not configured. Enable network in
+  Bash options.` That is what the unit test asserts to prove the gate was
+  passed rather than mocking a fetch.
+- **Env reaches `os.environ`.** Shell env set on `bash.exec` flows through
+  `ctx.env` → `inheritedEnvironment` → the sibling `Bash` (`replaceEnv: true`)
+  → the CPython worker's `os.environ`, so the shim reads the flag the session
+  manager exported with no extra plumbing.
+- **`GET /v1/sandboxes/:id` still shows no runtime flags** (it returns id,
+  name, owner, createdAt, lastUsedAt only), so `networkWrite` is surfaced on
+  the create response and the list route, as `network` is. Changing the single
+  sandbox GET shape was out of scope.
+
 ## Phase 6: docs and changeset
 
 - `deleteSandbox` doc comment (`types.ts:179-183`) drops "blobs".

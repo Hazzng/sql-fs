@@ -98,28 +98,62 @@ export function readPipLimits(): PipLimits {
  * charset-normalizer, idna, certifi) is never followed, because none of it is
  * importable in the WASM runtime and none of it is reachable through the shim.
  *
- * The shim implements `request`, `get`, `head`, `Session`, `Response`,
- * `HTTPBasicAuth` and `exceptions` over `jb_http`. A package that reaches for
- * anything else in `requests` (streaming, adapters, cookies, `post`) fails at
- * import or at call time, exactly as it does today; that is the documented
+ * The shim implements `request`, `get`, `head`, `post`, `put`, `patch`,
+ * `delete`, `Session`, `Response`, `HTTPBasicAuth` and `exceptions` over
+ * `jb_http`. The four write methods are refused unless the sandbox was created
+ * with `networkWrite` (`SQLFS_HTTP_WRITE=1` in the shell env). A package that
+ * reaches for anything else in `requests` (streaming, adapters, cookies) fails
+ * at import or at call time, exactly as it does today; that is the documented
  * limit of the experiment, not something the resolver can detect.
  */
 export const SYNTHETIC_REQUESTS_VERSION = "2.31.0";
 
 /**
+ * Env var the shim reads to decide whether write methods are permitted. The
+ * session manager exports it as "1" only for a sandbox created with
+ * `networkWrite`.
+ */
+export const HTTP_WRITE_ENV_VAR = "SQLFS_HTTP_WRITE";
+
+/** `%METHOD%` is substituted with the refused HTTP verb. */
+const WRITE_DENIED_TEMPLATE =
+	"requests shim: %METHOD% requires a sandbox created with networkWrite: true; without it only GET and HEAD are permitted";
+
+/** The message the shim raises for a write method on a read-only sandbox. */
+export function requestsWriteDeniedMessage(method: string): string {
+	return WRITE_DENIED_TEMPLATE.replace("%METHOD%", method);
+}
+
+/** The message the shim raises for a `files=` argument. */
+export const REQUESTS_FILES_UNSUPPORTED_MESSAGE =
+	"requests shim: files= is not supported; send the body as a JSON string via data= and base64-encode any binary field inside that JSON";
+
+/**
  * The current PyPI requests wheel imports urllib3 during module import. That
  * wheel's Emscripten support imports the unavailable `js` module before the
  * normal requests adapter can be installed. This small compatibility package
- * shadows requests only inside the sandbox and routes GET/HEAD through jb_http.
+ * shadows requests only inside the sandbox and routes every request through
+ * jb_http. It is the only HTTP shim: the python bootstrap no longer patches a
+ * second implementation onto an installed requests, because this package
+ * precedes `/site-packages` on `sys.path` and therefore always wins.
  */
-const REQUESTS_COMPAT_FILES: Readonly<Record<string, string>> = {
+export const REQUESTS_COMPAT_FILES: Readonly<Record<string, string>> = {
 	"requests/__init__.py": `
+import json as _json
+import os
 from urllib.parse import urlencode
 import jb_http
 from . import exceptions
 from .auth import AuthBase, HTTPBasicAuth
 
 __version__ = ${JSON.stringify(SYNTHETIC_REQUESTS_VERSION)}
+
+READ_METHODS = ('GET', 'HEAD')
+WRITE_METHODS = ('POST', 'PUT', 'PATCH', 'DELETE')
+WRITE_ENV_VAR = ${JSON.stringify(HTTP_WRITE_ENV_VAR)}
+
+def _writes_permitted():
+    return os.environ.get(WRITE_ENV_VAR) == '1'
 
 class Request:
     def __init__(self, method, url, headers=None):
@@ -156,8 +190,7 @@ class Response:
         return 200 <= self.status_code < 400
 
     def json(self):
-        import json
-        return json.loads(self.text)
+        return _json.loads(self.text)
 
     def raise_for_status(self):
         if not self.ok:
@@ -170,15 +203,25 @@ class Session:
     def mount(self, _prefix, _adapter):
         return None
 
-    def request(self, method, url, params=None, data=None, headers=None, files=None, auth=None, **_kwargs):
+    def request(self, method, url, params=None, data=None, json=None, headers=None, files=None, auth=None, **_kwargs):
         method = method.upper()
-        if method not in ('GET', 'HEAD'):
-            raise exceptions.RequestException('SQL-FS Databricks transport permits only GET/HEAD requests')
+        if method in WRITE_METHODS:
+            if not _writes_permitted():
+                raise exceptions.NetworkWriteNotPermitted(
+                    ${JSON.stringify(WRITE_DENIED_TEMPLATE)}.replace('%METHOD%', method))
+        elif method not in READ_METHODS:
+            raise exceptions.RequestException('requests shim: unsupported HTTP method {}'.format(method))
         if files:
-            raise exceptions.RequestException('multipart requests are unsupported by the WASM HTTP adapter')
+            raise exceptions.InvalidRequest(${JSON.stringify(REQUESTS_FILES_UNSUPPORTED_MESSAGE)})
         if params:
             query = urlencode(params, doseq=True)
             url = url + ('&' if '?' in url else '?') + query
+        headers = dict(headers or {})
+        if json is not None and data is None:
+            data = _json.dumps(json)
+            headers.setdefault('Content-Type', 'application/json')
+        elif isinstance(data, dict):
+            data = urlencode(data, doseq=True)
         request_obj = Request(method, url, headers)
         selected_auth = auth if auth is not None else self.auth
         if selected_auth is not None:
@@ -193,6 +236,18 @@ class Session:
     def head(self, url, **kwargs):
         return self.request('HEAD', url, **kwargs)
 
+    def post(self, url, **kwargs):
+        return self.request('POST', url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request('PUT', url, **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self.request('PATCH', url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request('DELETE', url, **kwargs)
+
     def close(self):
         return None
 
@@ -204,6 +259,18 @@ def get(url, **kwargs):
 
 def head(url, **kwargs):
     return request('HEAD', url, **kwargs)
+
+def post(url, **kwargs):
+    return request('POST', url, **kwargs)
+
+def put(url, **kwargs):
+    return request('PUT', url, **kwargs)
+
+def patch(url, **kwargs):
+    return request('PATCH', url, **kwargs)
+
+def delete(url, **kwargs):
+    return request('DELETE', url, **kwargs)
 `,
 	"requests/exceptions.py": `
 class RequestException(Exception):
@@ -213,6 +280,13 @@ class HTTPError(RequestException):
     def __init__(self, message='', response=None):
         super().__init__(message)
         self.response = response
+
+class InvalidRequest(RequestException):
+    pass
+
+class NetworkWriteNotPermitted(RequestException):
+    """Raised for POST/PUT/PATCH/DELETE on a sandbox created without networkWrite."""
+    pass
 `,
 	"requests/auth.py": `
 import base64
@@ -283,51 +357,20 @@ def decode(_token, options=None, **_kwargs):
 	"ssl.py": "PROTOCOL_TLSv1_2 = 5\n",
 };
 
-/** Prefix added to every package-enabled python3 invocation. */
+/**
+ * Prefix added to every package-enabled python3 invocation.
+ *
+ * The compat overlay is inserted ahead of `/site-packages`, so the single
+ * `requests` implementation in `REQUESTS_COMPAT_FILES` shadows anything an
+ * install could put there. There is deliberately no second, bootstrap-level
+ * HTTP shim: the v1 review asked for one implementation, and a monkeypatch
+ * here could only ever disagree with the module that actually gets imported.
+ */
 const PYTHON_PACKAGE_BOOTSTRAP = `
 import sys as _sqlfs_sys
 for _sqlfs_path in (${JSON.stringify(PYTHON_SITE_PACKAGES)}, ${JSON.stringify(PYTHON_COMPAT_PACKAGES)}):
     if _sqlfs_path not in _sqlfs_sys.path:
         _sqlfs_sys.path.insert(0, _sqlfs_path)
-
-# requests uses urllib3 sockets, which are deliberately unavailable in the
-# WASM runtime. Keep the socket restriction and adapt requests to jb_http.
-try:
-    import os as _sqlfs_os
-    # Nothing has been installed, so there is no requests to adapt. Bail out
-    # before paying a failed sys.path search on every python3 invocation.
-    if not _sqlfs_os.path.isdir(${JSON.stringify(PYTHON_SITE_PACKAGES)}):
-        raise ImportError("no installed packages")
-    import requests as _sqlfs_requests
-    import requests.models as _sqlfs_models
-    import requests.sessions as _sqlfs_sessions
-    from requests.structures import CaseInsensitiveDict as _sqlfs_case_insensitive
-    import jb_http as _sqlfs_http
-    from urllib.parse import urlencode as _sqlfs_urlencode
-
-    def _sqlfs_request(session, method, url, params=None, data=None, headers=None, files=None, **kwargs):
-        if method.upper() not in ("GET", "HEAD"):
-            raise RuntimeError("SQL-FS Databricks transport permits only read-only GET/HEAD requests")
-        if files:
-            raise RuntimeError("SQL-FS Databricks transport does not support multipart requests")
-        if params:
-            _sqlfs_query = _sqlfs_urlencode(params, doseq=True)
-            url = url + ("&" if "?" in url else "?") + _sqlfs_query
-        if isinstance(data, dict):
-            data = _sqlfs_urlencode(data, doseq=True)
-        _sqlfs_response = _sqlfs_http.request(method.upper(), url, headers=headers, data=data)
-        _sqlfs_result = _sqlfs_models.Response()
-        _sqlfs_result.status_code = _sqlfs_response.status_code
-        _sqlfs_result.reason = _sqlfs_response.reason
-        _sqlfs_result.url = _sqlfs_response.url or url
-        _sqlfs_result.headers = _sqlfs_case_insensitive(_sqlfs_response.headers)
-        _sqlfs_result._content = _sqlfs_response.content
-        _sqlfs_result.encoding = "utf-8"
-        return _sqlfs_result
-
-    _sqlfs_sessions.Session.request = _sqlfs_request
-except ImportError:
-    pass
 `;
 
 interface PyPIFile {

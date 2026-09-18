@@ -118,7 +118,7 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 		await sm.withSessionOrRehydrate("default", "sb-py", async (session) => {
 			capturedRuntime = session.runtimeOptions;
 		});
-		expect(capturedRuntime).toEqual({ python: true, javascript: false, network: false });
+		expect(capturedRuntime).toEqual({ python: true, javascript: false, network: false, networkWrite: false });
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
@@ -146,6 +146,6 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 			runtime = session.runtimeOptions;
 		});
 		expect(owner).toBe("creator");
-		expect(runtime).toEqual({ python: true, javascript: false, network: false });
+		expect(runtime).toEqual({ python: true, javascript: false, network: false, networkWrite: false });
 	});
 });

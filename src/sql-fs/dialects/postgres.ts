@@ -382,10 +382,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 					python: boolean;
 					javascript: boolean;
 					network: boolean;
+					network_write: boolean;
 					created_at: Date;
 				}[]
 			>`
-				SELECT owner, name, python, javascript, network, created_at FROM sandboxes WHERE id = ${sandboxId}
+				SELECT owner, name, python, javascript, network, network_write, created_at FROM sandboxes WHERE id = ${sandboxId}
 			`;
 			if (rows.length === 0) return null;
 			const r = rows[0]!;
@@ -395,6 +396,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				python: r.python,
 				javascript: r.javascript,
 				network: r.network,
+				networkWrite: r.network_write,
 				createdAt: r.created_at.toISOString(),
 			};
 		} catch (err) {
@@ -407,7 +409,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		try {
 			rows = await tx<{ id: string }[]>`
 				UPDATE sandboxes
-				SET owner = ${meta.owner}, name = ${meta.name}, python = ${meta.python}, javascript = ${meta.javascript}, network = ${meta.network ?? false}
+				SET owner = ${meta.owner}, name = ${meta.name}, python = ${meta.python}, javascript = ${meta.javascript}, network = ${meta.network ?? false}, network_write = ${meta.networkWrite ?? false}
 				WHERE id = ${sandboxId}
 				RETURNING id
 			`;
@@ -434,8 +436,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 								python: boolean;
 								javascript: boolean;
 								network: boolean;
+								network_write: boolean;
 							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
+						>`SELECT id, name, owner, created_at, python, javascript, network, network_write FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
 					: await tx<
 							{
 								id: string;
@@ -445,8 +448,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 								python: boolean;
 								javascript: boolean;
 								network: boolean;
+								network_write: boolean;
 							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes ORDER BY created_at DESC`;
+						>`SELECT id, name, owner, created_at, python, javascript, network, network_write FROM sandboxes ORDER BY created_at DESC`;
 			return rows.map((r) => ({
 				id: r.id,
 				name: r.name,
@@ -455,6 +459,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				python: r.python,
 				javascript: r.javascript,
 				network: r.network,
+				networkWrite: r.network_write,
 			}));
 		} catch (err) {
 			throw translateSqlError(err, "listSandboxes");

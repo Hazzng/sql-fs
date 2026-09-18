@@ -26,7 +26,7 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
-import { createPythonPackageCommands } from "./commands/pip-command.js";
+import { HTTP_WRITE_ENV_VAR, createPythonPackageCommands } from "./commands/pip-command.js";
 import { createRedisWheelLease } from "./commands/pip-wheel-store.js";
 import { createPypiFetch } from "./commands/pypi-fetch.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
@@ -158,6 +158,14 @@ export interface RuntimeOptions {
 	 * transport can clone/fetch/push. Defaults to false (secure-by-default).
 	 */
 	readonly network: boolean;
+	/**
+	 * When true, the sandbox's `requests` compatibility shim permits POST, PUT,
+	 * PATCH and DELETE (`SQLFS_HTTP_WRITE=1` in the shell env). Requires
+	 * `network`; defaults to false, so a network-enabled sandbox is read-only
+	 * through the shim unless the caller asked for writes. This is a guardrail
+	 * inside the shim, not a transport restriction — see SECURITY.md.
+	 */
+	readonly networkWrite?: boolean;
 }
 
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
@@ -184,12 +192,20 @@ const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
 	"GIT_HTTP_PASSWORD",
 ]);
 
-function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
+export function buildRuntimeSandboxEnv(
+	baseEnv: Record<string, string>,
+	network: boolean,
+	networkWrite = false,
+): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(baseEnv)) {
 		if (!network && SANDBOX_NETWORK_CREDENTIAL_KEYS.has(key)) continue;
 		out[key] = value;
 	}
+	// Both flags are required: `networkWrite` without `network` is refused at
+	// create time, and honouring it here would be a second, looser gate.
+	// `HTTP_WRITE_ENV_VAR` is read by the `requests` compatibility shim only.
+	if (network && networkWrite) out[HTTP_WRITE_ENV_VAR] = "1";
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -628,7 +644,7 @@ export class SessionManager {
 					// just-bash also registers curl through secureFetch; git remote
 					// transport is gated separately above and uses globalThis.fetch.
 					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
-					env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network),
+					env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network, resolvedRuntime.networkWrite),
 					defenseInDepth: defenseInDepthConfig,
 					customCommands: customCommands.length > 0 ? customCommands : undefined,
 				});
@@ -1211,7 +1227,12 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network }
+			? {
+					python: meta.python,
+					javascript: meta.javascript,
+					network: meta.network,
+					networkWrite: meta.networkWrite ?? false,
+				}
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
@@ -1259,7 +1280,12 @@ export class SessionManager {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
 		const resolvedRuntime: RuntimeOptions = meta
-			? { python: meta.python, javascript: meta.javascript, network: meta.network }
+			? {
+					python: meta.python,
+					javascript: meta.javascript,
+					network: meta.network,
+					networkWrite: meta.networkWrite ?? false,
+				}
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) {

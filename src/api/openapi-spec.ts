@@ -23,8 +23,9 @@ const sandboxSchema = {
 		python: { type: "boolean", example: false },
 		javascript: { type: "boolean", example: false },
 		network: { type: "boolean", example: false },
+		networkWrite: { type: "boolean", example: false },
 	},
-	required: ["id", "name", "owner", "createdAt", "python", "javascript", "network"],
+	required: ["id", "name", "owner", "createdAt", "python", "javascript", "network", "networkWrite"],
 } as const;
 
 const sandboxInfoSchema = {
@@ -326,6 +327,12 @@ export const openapiSpec = {
 										type: "boolean",
 										default: false,
 										description: "Grant outbound HTTPS for curl and git clone/fetch/push",
+									},
+									networkWrite: {
+										type: "boolean",
+										default: false,
+										description:
+											"Allow POST/PUT/PATCH/DELETE through the python requests compatibility shim. Requires network: true; rejected with 400 otherwise. A guardrail inside the shim, not a transport restriction (curl and jb_http are unaffected).",
 									},
 								},
 							},

@@ -65,6 +65,12 @@ export interface SandboxMeta {
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;
+	/**
+	 * When true, the sandbox's `requests` compatibility shim permits POST, PUT,
+	 * PATCH and DELETE. Optional so metadata stores written before migration
+	 * 0008 keep type-checking; absent means false (read-only shim).
+	 */
+	readonly networkWrite?: boolean;
 	/** ISO-8601 timestamp of when the sandbox was originally created (from DB created_at). */
 	readonly createdAt?: string;
 }
@@ -79,6 +85,8 @@ export interface SandboxListEntry {
 	readonly javascript: boolean;
 	/** When true, js-exec fetch() can reach external HTTP endpoints (60 s timeout). */
 	readonly network: boolean;
+	/** When true, the sandbox's `requests` shim permits POST/PUT/PATCH/DELETE. */
+	readonly networkWrite?: boolean;
 }
 
 /** Options for creating a new inode row */

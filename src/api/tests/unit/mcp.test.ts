@@ -183,7 +183,7 @@ describe("MCP tool — sandbox_create", () => {
 		expect(typeof parsed.id).toBe("string");
 		expect(parsed.javascript).toBe(true);
 		expect(parsed.network).toBe(true);
-		expect(createdRuntime).toEqual({ python: false, javascript: true, network: true });
+		expect(createdRuntime).toEqual({ python: false, javascript: true, network: true, networkWrite: false });
 		expect(persistedMeta).toMatchObject({ python: false, javascript: true, network: true });
 
 		await client.close();
