@@ -27,6 +27,7 @@ import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { posixNormalizePath } from "./lib/paths.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
@@ -34,24 +35,6 @@ import { logAudit } from "./lib/audit.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
-
-/**
- * Lightweight POSIX path normalization for session.cwd storage.
- * Resolves `.` and `..` segments and collapses consecutive slashes.
- * Does NOT require the path to exist on disk — pure string transformation.
- * Mirrors the logic in sql-fs/sql-fs.ts `normalizeFsPath`.
- */
-function posixNormalizePath(p: string): string {
-	if (!p || p === "/") return "/";
-	const s = p.startsWith("/") ? p : `/${p}`;
-	const parts = s.split("/").filter((seg) => seg !== "" && seg !== ".");
-	const stack: string[] = [];
-	for (const part of parts) {
-		if (part === "..") stack.pop();
-		else stack.push(part);
-	}
-	return `/${stack.join("/")}`;
-}
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 

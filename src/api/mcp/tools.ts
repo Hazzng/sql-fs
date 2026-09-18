@@ -18,6 +18,7 @@ import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
 import { MAX_FILE_WRITE_BYTES as MAX_EDIT_BYTES, positiveIntEnv } from "../lib/env.js";
 import { editFile, writeFileAtPath } from "../lib/file-ops.js";
+import { MAX_PATH_CHARS, posixNormalizePath } from "../lib/paths.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -59,7 +60,10 @@ function snapToCodepointStart(bytes: Buffer, offset: number): number {
 }
 
 function toAbsolute(path: string): string {
-	return path.startsWith("/") ? path : `/${path}`;
+	// Normalized, not just slash-prefixed: the backends resolve `..` and `//` themselves, so an
+	// un-normalized argument reads the right file while every echo of it — the `path` field in this
+	// tool's own reply — stays as long as the caller chose to make it.
+	return posixNormalizePath(path);
 }
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
@@ -162,7 +166,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"Read one sandbox file as text. Returns the whole file by default; pass offset/limit to page through a large one, and byteOffset to resume a response that came back truncated. Use this instead of `bash_exec 'cat …'` so the content comes back structured and bounded rather than through shell quoting.",
 		{
 			id: z.string(),
-			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			path: z.string().min(1).max(MAX_PATH_CHARS).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
 			offset: z.number().int().positive().optional().describe("1-based line to start from"),
 			limit: z.number().int().positive().optional().describe("Maximum number of lines to return"),
 			byteOffset: z
@@ -216,22 +220,38 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						args.byteOffset === undefined ? 0 : args.byteOffset - selectionStart,
 					);
 
+					// The cap describes the whole reply, so the content gets what is left after the envelope
+					// it travels in — the echoed path and the metadata cross the wire too. Priced against the
+					// widest form the envelope can take (truncated, with a resume offset) so the budget is
+					// never an underestimate of the reply actually sent.
+					const envelopeBytes = Buffer.byteLength(
+						JSON.stringify({
+							ok: true,
+							path: filePath,
+							content: "",
+							size: stat.size,
+							totalLines,
+							firstLine,
+							truncated: true,
+							nextByteOffset: Number.MAX_SAFE_INTEGER,
+						}),
+						"utf8",
+					);
+					const contentBudget = Math.max(0, MAX_READ_RESPONSE_BYTES - envelopeBytes);
+
 					// Bound what crosses the wire even when the whole file was requested. The budget is in
 					// bytes but the paging controls are in lines, so a line longer than the budget would
 					// strand its own tail — no offset can reach past the first megabyte of one line. The cut
 					// point comes back as `nextByteOffset` for the caller to resume from. Cutting on a
 					// codepoint boundary keeps a split character out of the response without having to guess
 					// afterwards whether a trailing U+FFFD was the file's own or one we made.
-					let end = snapToCodepointStart(
-						selectedBytes,
-						Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
-					);
+					let end = snapToCodepointStart(selectedBytes, Math.min(start + contentBudget, selectedBytes.byteLength));
 					let content = selectedBytes.subarray(start, end).toString("utf8");
 					// The cap describes what crosses the wire, and what crosses it is JSON: a NUL costs six
 					// characters there, not one, so a megabyte of them would serialize to six. Shrink until
 					// the escaped form fits — the ratio converges in a couple of passes.
-					while (end > start && jsonSize(content) > MAX_READ_RESPONSE_BYTES) {
-						const fit = MAX_READ_RESPONSE_BYTES / jsonSize(content);
+					while (end > start && jsonSize(content) > contentBudget) {
+						const fit = contentBudget / jsonSize(content);
 						const proposed = start + Math.max(1, Math.floor((end - start) * fit));
 						end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
 						content = selectedBytes.subarray(start, end).toString("utf8");
@@ -286,7 +306,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"Write a whole sandbox file, creating parent directories and overwriting any existing content. Use file_edit instead when changing part of an existing file — it avoids resending the whole file.",
 		{
 			id: z.string(),
-			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			path: z.string().min(1).max(MAX_PATH_CHARS).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
 			content: z.string().describe("Full file content. Replaces the file entirely."),
 		},
 		async (args) => {
@@ -324,7 +344,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"Replace an exact string inside one existing sandbox file. Reads, patches and writes atomically, so it is the cheapest way to change code without shipping the whole file. oldString must match exactly once unless replaceAll is true — an ambiguous match is rejected rather than guessed at. Read the file first with file_read so oldString reflects current content — bash_exec 'cat <shell-quoted path>' only for files past file_read's limits.",
 		{
 			id: z.string(),
-			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
+			path: z.string().min(1).max(MAX_PATH_CHARS).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
 			oldString: z.string().min(1).describe("Exact text to replace, including surrounding context to make it unique"),
 			newString: z.string().describe("Replacement text. Pass an empty string to delete the matched text."),
 			replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring a unique match"),

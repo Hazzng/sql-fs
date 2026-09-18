@@ -17,6 +17,7 @@ const OWNER = "agent-1";
 
 async function makeEnv(): Promise<{
 	call: (tool: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+	callRaw: (tool: string, args: Record<string, unknown>) => Promise<string>;
 	fs: IFileSystem;
 }> {
 	const fs = new InMemoryFs();
@@ -26,16 +27,21 @@ async function makeEnv(): Promise<{
 	const { server, handlers } = captureToolHandlers();
 	registerTools(server, sessionManager, OWNER, "default");
 
-	const call = async (tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+	const callRaw = async (tool: string, args: Record<string, unknown>): Promise<string> => {
 		const result = (await requireHandler(handlers, tool)({ id: SANDBOX_ID, ...args }, {})) as {
 			content: Array<{ text: string }>;
 		};
 		const text = result.content[0]?.text;
 		if (text === undefined) throw new Error("tool returned no text content");
-		return JSON.parse(text) as Record<string, unknown>;
+		return text;
 	};
-	return { call, fs };
+	const call = async (tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> =>
+		JSON.parse(await callRaw(tool, args)) as Record<string, unknown>;
+	return { call, callRaw, fs };
 }
+
+/** What the cap governs: the serialized reply, envelope included. */
+const MAX_READ_RESPONSE_BYTES = 1024 * 1024;
 
 describe("MCP tool — file_read", () => {
 	beforeEach(() => {
@@ -114,17 +120,44 @@ describe("MCP tool — file_read", () => {
 		expect(await call("file_read", { path: "/bin.dat" })).toMatchObject({ ok: false, code: "NOT_TEXT" });
 	});
 
-	it("truncates a response that would exceed the wire cap", async () => {
-		const { call, fs } = await makeEnv();
+	// The cap governs the reply, so it is asserted on the serialized envelope: budgeting only the
+	// content let the echoed path and metadata push the actual response past it.
+	it("keeps the whole serialized reply within the wire cap", async () => {
+		const { callRaw, fs } = await makeEnv();
 		await fs.writeFile("/big.txt", "z".repeat(2 * 1024 * 1024));
 
-		const result = await call("file_read", { path: "/big.txt" });
+		const raw = await callRaw("file_read", { path: "/big.txt" });
+		const result = JSON.parse(raw) as Record<string, unknown>;
 
+		expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
 		expect(result.ok).toBe(true);
 		expect(result.truncated).toBe(true);
-		expect((result.content as string).length).toBe(1024 * 1024);
 		expect(result.size).toBe(2 * 1024 * 1024);
-		expect(result.nextByteOffset).toBe(1024 * 1024);
+		// ASCII, so one char is one byte: the resume offset is where the content stopped.
+		expect(result.nextByteOffset).toBe((result.content as string).length);
+	});
+
+	it("keeps the reply within the cap when a long path eats into the budget", async () => {
+		const { callRaw, fs } = await makeEnv();
+		const deep = `/${"d".repeat(200)}/${"e".repeat(200)}`;
+		await fs.mkdir(deep, { recursive: true });
+		const longPath = `${deep}/${"f".repeat(200)}.txt`;
+		await fs.writeFile(longPath, "z".repeat(2 * 1024 * 1024));
+
+		const raw = await callRaw("file_read", { path: longPath });
+
+		expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
+		expect((JSON.parse(raw) as { path: string }).path).toBe(longPath);
+	});
+
+	it("normalizes the path it echoes rather than replaying the caller's string", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/f.txt", "hi");
+
+		const result = await call("file_read", { path: `/${"x/../".repeat(500)}f.txt` });
+
+		expect(result.path).toBe("/f.txt");
+		expect(result.content).toBe("hi");
 	});
 
 	// The cap is in bytes and the paging controls are in lines, so one over-long line would otherwise
@@ -134,12 +167,23 @@ describe("MCP tool — file_read", () => {
 		const line = "z".repeat(2 * 1024 * 1024);
 		await fs.writeFile("/one-line.txt", line);
 
-		const first = await call("file_read", { path: "/one-line.txt" });
-		const second = await call("file_read", { path: "/one-line.txt", byteOffset: first.nextByteOffset as number });
+		let assembled = "";
+		let offset: number | undefined;
+		let pages = 0;
+		let page: Record<string, unknown>;
+		do {
+			page = await call("file_read", {
+				path: "/one-line.txt",
+				...(offset === undefined ? {} : { byteOffset: offset }),
+			});
+			assembled += page.content as string;
+			offset = page.nextByteOffset as number | undefined;
+			pages += 1;
+		} while (page.truncated === true && pages < 10);
 
-		expect(second.truncated).toBe(false);
-		expect(second.nextByteOffset).toBeUndefined();
-		expect((first.content as string) + (second.content as string)).toBe(line);
+		expect(page.truncated).toBe(false);
+		expect(page.nextByteOffset).toBeUndefined();
+		expect(assembled).toBe(line);
 	});
 
 	it("resumes on a codepoint boundary rather than splitting a character", async () => {
@@ -182,14 +226,16 @@ describe("MCP tool — file_read", () => {
 	// character should ever cost one, and cutting on a boundary means none is ever invented.
 	it("keeps a U+FFFD the file itself contains at the cut point", async () => {
 		const { call, fs } = await makeEnv();
-		// The replacement char is 3 bytes, so it ends exactly on the 1 MiB budget.
-		const line = `${"a".repeat(1024 * 1024 - 3)}\uFFFDtail`;
+		// Every character is a replacement char, so wherever the budget falls the cut lands on one —
+		// the assertion cannot drift with the budget the way a hand-aligned offset would.
+		const line = "\uFFFD".repeat(400_000);
 		await fs.writeFile("/fffd.txt", line);
 
 		const first = await call("file_read", { path: "/fffd.txt" });
 
+		expect(first.truncated).toBe(true);
+		// A trailing U+FFFD that came from the file, not from a character we split.
 		expect((first.content as string).endsWith("\uFFFD")).toBe(true);
-		expect(first.nextByteOffset).toBe(1024 * 1024);
 		const second = await call("file_read", { path: "/fffd.txt", byteOffset: first.nextByteOffset as number });
 		expect((first.content as string) + (second.content as string)).toBe(line);
 	});
@@ -207,7 +253,8 @@ describe("MCP tool — file_read", () => {
 
 		expect(page.truncated).toBe(true);
 		expect(rest.truncated).toBe(false);
-		expect(page.nextByteOffset).toBe("first line\n".length + 1024 * 1024);
+		// Absolute: the skipped first line plus what this page returned (ASCII, one byte per char).
+		expect(page.nextByteOffset).toBe("first line\n".length + (page.content as string).length);
 		expect((page.content as string) + (rest.content as string)).toBe(`${long}\n`);
 	});
 
