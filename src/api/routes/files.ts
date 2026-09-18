@@ -19,7 +19,12 @@ import { extractErrCode } from "../errors.js";
 import { MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES } from "../lib/env.js";
 import { type EditOutcome, type WriteOutcome, editFile, ensureParentDir, writeFileAtPath } from "../lib/file-ops.js";
 import { runInScriptTx } from "../lib/script-tx.js";
-import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
+import {
+	forbiddenResponse,
+	isForbiddenError,
+	withOwnedSessionOrRehydrate,
+	withOwnedSessionRead,
+} from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
 // Simple extension → MIME type map (null-prototype to prevent prototype pollution)
@@ -148,7 +153,11 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let result: ReadResult;
 		try {
-			result = await withOwnedSessionOrRehydrate<ReadResult>(
+			// #171: a pure read takes the SHARED lock so concurrent GETs run in
+			// parallel. This does not let a GET overtake an in-flight writer —
+			// shared still excludes exclusive — it only removes reader-reader
+			// serialization.
+			result = await withOwnedSessionRead<ReadResult>(
 				sessionManager,
 				tenant,
 				sandboxId,
@@ -561,7 +570,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let entries: TreeEntry[];
 		try {
-			entries = await withOwnedSessionOrRehydrate<TreeEntry[]>(
+			entries = await withOwnedSessionRead<TreeEntry[]>(
 				sessionManager,
 				tenant,
 				sandboxId,
