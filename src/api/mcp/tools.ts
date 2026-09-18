@@ -49,6 +49,34 @@ function jsonSize(text: string): number {
 }
 
 /**
+ * Lines in `text`, counting the empty line after a trailing newline exactly as `split("\n")` would,
+ * without allocating one array slot per line — a 16 MiB file of newlines would otherwise materialize
+ * ~16M of them for a read whose reply is capped at 1 MiB.
+ */
+function countLines(text: string): number {
+	if (text.length === 0) return 0;
+	let count = 1;
+	let idx = text.indexOf("\n");
+	while (idx !== -1) {
+		count += 1;
+		idx = text.indexOf("\n", idx + 1);
+	}
+	return count;
+}
+
+/** Character offset where 1-based line `n` starts, or the end of `text` when it has fewer lines. */
+function lineStartOffset(text: string, n: number): number {
+	if (n <= 1) return 0;
+	let idx = 0;
+	for (let seen = 1; seen < n; seen += 1) {
+		const nl = text.indexOf("\n", idx);
+		if (nl === -1) return text.length;
+		idx = nl + 1;
+	}
+	return idx;
+}
+
+/**
  * Walk an offset back to the start of a UTF-8 codepoint so a resumed read never opens mid-sequence
  * (a caller that passes back our own `nextByteOffset` already lands on one; this covers a hand-written
  * offset, which would otherwise decode to a leading replacement char).
@@ -60,10 +88,11 @@ function snapToCodepointStart(bytes: Buffer, offset: number): number {
 }
 
 function toAbsolute(path: string): string {
-	// Normalized, not just slash-prefixed: the backends resolve `..` and `//` themselves, so an
-	// un-normalized argument reads the right file while every echo of it — the `path` field in this
-	// tool's own reply — stays as long as the caller chose to make it.
-	return posixNormalizePath(path);
+	// Root-relative by this tool's own documented contract ("accept a relative one rather than
+	// failing on a missing slash"), then normalized: the backends resolve `..` and `//` themselves,
+	// so an un-normalized argument reads the right file while every echo of it — the `path` field in
+	// this tool's own reply — stays as long as the caller chose to make it.
+	return posixNormalizePath(path.startsWith("/") ? path : `/${path}`);
 }
 
 export function registerTools(server: McpServer, sessionManager: SessionManager, owner: string, tenant: string): void {
@@ -203,41 +232,40 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					}
 
 					const paging = args.offset !== undefined || args.limit !== undefined;
-					const lines = text.length === 0 ? [] : text.split("\n");
-					const totalLines = lines.length;
+					const totalLines = countLines(text);
 					const firstLine = args.offset ?? 1;
-					const selected = paging
-						? lines.slice(firstLine - 1, args.limit === undefined ? undefined : firstLine - 1 + args.limit).join("\n")
-						: text;
+					const selectionStartChar = paging ? lineStartOffset(text, firstLine) : 0;
+					let selectionEndChar = text.length;
+					if (paging && args.limit !== undefined) {
+						const afterLast = lineStartOffset(text, firstLine + args.limit);
+						// `join("\n")` drops the separator before the next line; at EOF there is none to drop.
+						selectionEndChar = afterLast >= text.length ? text.length : afterLast - 1;
+					}
+					const selected = paging ? text.slice(selectionStartChar, selectionEndChar) : text;
 
 					// Byte offsets are absolute in the file, not relative to a paged selection, so a resume
 					// means the same thing whether or not the caller repeats the original offset/limit.
 					const selectionStart =
-						firstLine > 1 ? Buffer.byteLength(`${lines.slice(0, firstLine - 1).join("\n")}\n`, "utf8") : 0;
+						selectionStartChar === 0 ? 0 : Buffer.byteLength(text.slice(0, selectionStartChar), "utf8");
 					const selectedBytes = Buffer.from(selected, "utf8");
 					const start = snapToCodepointStart(
 						selectedBytes,
 						args.byteOffset === undefined ? 0 : args.byteOffset - selectionStart,
 					);
 
-					// The cap describes the whole reply, so the content gets what is left after the envelope
-					// it travels in — the echoed path and the metadata cross the wire too. Priced against the
-					// widest form the envelope can take (truncated, with a resume offset) so the budget is
-					// never an underestimate of the reply actually sent.
-					const envelopeBytes = Buffer.byteLength(
-						JSON.stringify({
+					const replyFor = (cut: number): string => {
+						const isTruncated = cut < selectedBytes.byteLength;
+						return JSON.stringify({
 							ok: true,
 							path: filePath,
-							content: "",
+							content: selectedBytes.subarray(start, cut).toString("utf8"),
 							size: stat.size,
 							totalLines,
 							firstLine,
-							truncated: true,
-							nextByteOffset: Number.MAX_SAFE_INTEGER,
-						}),
-						"utf8",
-					);
-					const contentBudget = Math.max(0, MAX_READ_RESPONSE_BYTES - envelopeBytes);
+							truncated: isTruncated,
+							...(isTruncated ? { nextByteOffset: selectionStart + cut } : {}),
+						});
+					};
 
 					// Bound what crosses the wire even when the whole file was requested. The budget is in
 					// bytes but the paging controls are in lines, so a line longer than the budget would
@@ -245,20 +273,24 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					// point comes back as `nextByteOffset` for the caller to resume from. Cutting on a
 					// codepoint boundary keeps a split character out of the response without having to guess
 					// afterwards whether a trailing U+FFFD was the file's own or one we made.
-					let end = snapToCodepointStart(selectedBytes, Math.min(start + contentBudget, selectedBytes.byteLength));
-					let content = selectedBytes.subarray(start, end).toString("utf8");
-					// The cap describes what crosses the wire, and what crosses it is JSON: a NUL costs six
-					// characters there, not one, so a megabyte of them would serialize to six. Shrink until
-					// the escaped form fits — the ratio converges in a couple of passes.
-					while (end > start && jsonSize(content) > contentBudget) {
-						const fit = contentBudget / jsonSize(content);
+					let end = snapToCodepointStart(
+						selectedBytes,
+						Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
+					);
+					let reply = replyFor(end);
+					// Measured on the whole reply in the form the wire carries it: the envelope and echoed
+					// path travel too, and this text is serialized a SECOND time inside the MCP JSON-RPC
+					// result, which re-escapes every backslash the first pass added. A NUL costs six
+					// characters here and seven there, so a page of them budgeted on the inner form alone
+					// lands well over. Shrink until the embedded form fits — the ratio converges in a couple
+					// of passes, and `end - 1` guarantees progress when it does not.
+					while (end > start && jsonSize(reply) > MAX_READ_RESPONSE_BYTES) {
+						const fit = MAX_READ_RESPONSE_BYTES / jsonSize(reply);
 						const proposed = start + Math.max(1, Math.floor((end - start) * fit));
 						end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
-						content = selectedBytes.subarray(start, end).toString("utf8");
+						reply = replyFor(end);
 					}
-					const truncated = end < selectedBytes.byteLength;
-					const nextByteOffset = truncated ? selectionStart + end : undefined;
-					return { kind: "ok", content, size: stat.size, totalLines, firstLine, truncated, nextByteOffset } as const;
+					return { kind: "ok", reply } as const;
 				});
 
 				switch (outcome.kind) {
@@ -274,23 +306,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 							path: filePath,
 						});
 					default:
-						return {
-							content: [
-								{
-									type: "text" as const,
-									text: JSON.stringify({
-										ok: true,
-										path: filePath,
-										content: outcome.content,
-										size: outcome.size,
-										totalLines: outcome.totalLines,
-										firstLine: outcome.firstLine,
-										truncated: outcome.truncated,
-										...(outcome.nextByteOffset === undefined ? {} : { nextByteOffset: outcome.nextByteOffset }),
-									}),
-								},
-							],
-						};
+						// Serialized under the budget above, not re-assembled here: rebuilding it would
+						// reintroduce the unmeasured envelope this cap exists to account for.
+						return { content: [{ type: "text" as const, text: outcome.reply }] };
 				}
 			} catch (err) {
 				const code = (err as Error & { code?: string }).code;

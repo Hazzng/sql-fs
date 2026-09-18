@@ -7,15 +7,18 @@
 export const MAX_PATH_CHARS = 4096;
 
 /**
- * Lightweight POSIX normalization: resolves `.` and `..` and collapses repeated slashes, without
- * requiring the path to exist. Mirrors `normalizeFsPath` in sql-fs, which applies the same rule one
- * layer down — the backends normalize whatever they are handed, so a caller's un-normalized string
- * reads the right file while any echo of it stays as long as the caller made it.
+ * Normalize an ALREADY-ABSOLUTE POSIX path: resolves `.` and `..` and collapses repeated slashes,
+ * without requiring the path to exist. Mirrors `normalizeFsPath` in sql-fs, which applies the same
+ * rule one layer down — the backends normalize whatever they are handed, so a caller's
+ * un-normalized string reads the right file while any echo of it stays as the caller wrote it.
+ *
+ * Rooting a relative path is deliberately NOT done here: whether `foo` means `/foo` or
+ * `<cwd>/foo` is the caller's question, and answering it here once silently gave both callers the
+ * same wrong answer.
  */
-export function posixNormalizePath(p: string): string {
-	if (!p || p === "/") return "/";
-	const s = p.startsWith("/") ? p : `/${p}`;
-	const parts = s.split("/").filter((seg) => seg !== "" && seg !== ".");
+export function posixNormalizePath(absolutePath: string): string {
+	if (!absolutePath || absolutePath === "/") return "/";
+	const parts = absolutePath.split("/").filter((seg) => seg !== "" && seg !== ".");
 	const stack: string[] = [];
 	for (const part of parts) {
 		if (part === "..") stack.pop();

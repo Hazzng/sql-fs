@@ -145,9 +145,43 @@ describe("MCP tool — file_read", () => {
 		await fs.writeFile(longPath, "z".repeat(2 * 1024 * 1024));
 
 		const raw = await callRaw("file_read", { path: longPath });
+		const result = JSON.parse(raw) as Record<string, unknown>;
 
+		// A failed read echoes `path` too and is tiny, so the size assertion alone would pass on one:
+		// pin the success and the truncation, or a long-path regression hides inside an error reply.
+		expect(result.ok).toBe(true);
+		expect(result.truncated).toBe(true);
+		expect(result.path).toBe(longPath);
 		expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
-		expect((JSON.parse(raw) as { path: string }).path).toBe(longPath);
+	});
+
+	// The reply is serialized again inside the MCP JSON-RPC result, so every backslash the first
+	// pass added is escaped a second time. NULs are the worst case: six characters here, seven there.
+	it("keeps the twice-escaped reply within the cap for content that escapes badly", async () => {
+		const { callRaw, fs } = await makeEnv();
+		await fs.writeFile("/nuls.txt", "\0".repeat(2 * 1024 * 1024));
+
+		const raw = await callRaw("file_read", { path: "/nuls.txt" });
+		const result = JSON.parse(raw) as Record<string, unknown>;
+
+		expect(result.ok).toBe(true);
+		expect(result.truncated).toBe(true);
+		// What the transport embeds: this text re-serialized as a JSON string.
+		const embedded = Buffer.byteLength(JSON.stringify(raw), "utf8") - 2;
+		expect(embedded).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
+	});
+
+	// A file that is mostly newlines used to materialize one array slot per line before the reply was
+	// truncated to 1 MiB; the counts and offsets below are what that split was providing.
+	it("counts and pages lines without splitting the whole file", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/lines.txt", "a\nb\nc\nd\n");
+
+		expect(await call("file_read", { path: "/lines.txt" })).toMatchObject({ totalLines: 5, content: "a\nb\nc\nd\n" });
+		expect(await call("file_read", { path: "/lines.txt", offset: 2, limit: 2 })).toMatchObject({ content: "b\nc" });
+		expect(await call("file_read", { path: "/lines.txt", offset: 3 })).toMatchObject({ content: "c\nd\n" });
+		// Past the end: no lines to return, and the resume offset does not run off the file.
+		expect(await call("file_read", { path: "/lines.txt", offset: 99 })).toMatchObject({ content: "" });
 	});
 
 	it("normalizes the path it echoes rather than replaying the caller's string", async () => {

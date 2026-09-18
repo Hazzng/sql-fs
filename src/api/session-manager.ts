@@ -1678,14 +1678,12 @@ export class SessionManager {
 			// lock mode and may execute concurrently with other readers.
 			if (!inReadOnlyScope) {
 				const finalCwd = result.env?.PWD;
-				// Validate before storing: reject null bytes (security) and
-				// normalize via posix.resolve so scripts that do `export PWD=…`
-				// with relative or un-normalized paths cannot corrupt session.cwd.
-				if (typeof finalCwd === "string" && finalCwd.length > 0 && !finalCwd.includes("\0")) {
-					const normalized = posixNormalizePath(finalCwd);
-					if (normalized.startsWith("/")) {
-						session.cwd = normalized;
-					}
+				// Validate before storing: reject null bytes (security) and un-normalized segments, so a
+				// script that does `export PWD=…` cannot corrupt session.cwd. A RELATIVE value is dropped
+				// rather than rooted — `foo` is not evidence that `/foo` exists, and keeping the last
+				// known-good cwd beats inventing one the next exec would start from.
+				if (typeof finalCwd === "string" && finalCwd.startsWith("/") && !finalCwd.includes("\0")) {
+					session.cwd = posixNormalizePath(finalCwd);
 				}
 			}
 			return result;
