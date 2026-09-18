@@ -5,13 +5,9 @@
  * rewritten.
  */
 
-import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
-
-function sha256(text: string): Uint8Array {
-	return new Uint8Array(createHash("sha256").update(text).digest());
-}
+import { sha256Of } from "./fixtures.js";
 
 describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.ingestBlobs", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
@@ -50,8 +46,8 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.ingestBlobs", () => 
 	});
 
 	it("inserts blobs that are not stored yet", async () => {
-		const a = sha256(`${marker}-a`);
-		const b = sha256(`${marker}-b`);
+		const a = sha256Of(`${marker}-a`);
+		const b = sha256Of(`${marker}-b`);
 		shas.push(a, b);
 
 		await dialect.ingestBlobs([
@@ -64,7 +60,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.ingestBlobs", () => 
 	});
 
 	it("bumps last_referenced_at for a blob that is already stored", async () => {
-		const c = sha256(`${marker}-c`);
+		const c = sha256Of(`${marker}-c`);
 		shas.push(c);
 		await dialect.ingestBlobs([{ sha256: c, data: Buffer.from(`${marker}-c`) }]);
 		const before = (await readRow(c))!.lastReferencedAt;
@@ -77,7 +73,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.ingestBlobs", () => 
 	});
 
 	it("stores a hash repeated within one batch exactly once", async () => {
-		const d = sha256(`${marker}-d`);
+		const d = sha256Of(`${marker}-d`);
 		shas.push(d);
 
 		await dialect.ingestBlobs([

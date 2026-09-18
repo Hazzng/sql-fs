@@ -6,21 +6,13 @@
  * here is removed in `afterEach`, so the GC suite next door sees a clean table.
  */
 
-import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import { MANIFEST_FORMAT } from "../../package-manifest.js";
 import type { GraftFile, PackageManifest } from "../../types.js";
+import { hex, sha256Of } from "./fixtures.js";
 
 const SKIP = !process.env.DATABASE_URL;
-
-function sha256Of(text: string): Uint8Array {
-	return new Uint8Array(createHash("sha256").update(text).digest());
-}
-
-function hex(hash: Uint8Array): string {
-	return Buffer.from(hash).toString("hex");
-}
 
 describe.skipIf(SKIP)("PostgresDialect — package manifests (0007)", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
@@ -31,8 +23,8 @@ describe.skipIf(SKIP)("PostgresDialect — package manifests (0007)", () => {
 	/** Blob bytes shared by the manifests below. */
 	const fileA = new TextEncoder().encode(`print("a-${suffix}")\n`);
 	const fileB = new TextEncoder().encode(`print("b-${suffix}")\n`);
-	const shaA = new Uint8Array(createHash("sha256").update(fileA).digest());
-	const shaB = new Uint8Array(createHash("sha256").update(fileB).digest());
+	const shaA = sha256Of(fileA);
+	const shaB = sha256Of(fileB);
 
 	const files: readonly GraftFile[] = [
 		{ path: "/site-packages/demo/__init__.py", sha256: shaA, mode: 0o644, size: fileA.length },

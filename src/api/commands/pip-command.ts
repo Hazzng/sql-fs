@@ -8,10 +8,10 @@ import {
 	decodeBytesToUtf8,
 	defineCommand,
 } from "just-bash";
-import { type IPackageStore, asPackageStore } from "../../sql-fs/package-store.js";
+import type { IPackageStore } from "../../sql-fs/package-store.js";
 import type { PackageManifest } from "../../sql-fs/types.js";
 import { pythonSlotAlreadyHeld } from "../python-slot-context.js";
-import { packageLimits } from "./package-limits.js";
+import { type PackageLimits, packageLimits } from "./package-limits.js";
 import {
 	compareVersions,
 	hasExplicitPrerelease,
@@ -32,6 +32,7 @@ import {
 import { COMPAT_PACKAGES, PipError, SITE_PACKAGES, fail } from "./pip-shared.js";
 import {
 	type PipLogger,
+	type PrepareWheelOptions,
 	type WheelLease,
 	createInProcessWheelLease,
 	createInstallBudget,
@@ -49,47 +50,12 @@ const RUNTIME_PYTHON_VERSION = "3.13.2";
 
 const utf8Decoder = new TextDecoder();
 
-function envNumber(name: string, fallback: number): number {
-	const raw = process.env[name];
-	if (raw === undefined || raw.trim() === "") return fallback;
-	const value = Number(raw);
-	return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-export interface PipLimits {
-	/** `PIP_MAX_WHEEL_BYTES`. */
-	readonly maxDownloadBytes: number;
-	readonly maxDependencies: number;
-	readonly maxDependencyDepth: number;
-	readonly maxRedirects: number;
-	/** Cap for a single PyPI JSON response. */
-	readonly maxMetadataBytes: number;
-	/** Cumulative metadata caps for one `pip install` invocation. */
-	readonly maxTotalMetadataBytes: number;
-	readonly maxMetadataRequests: number;
-	readonly maxMetadataCacheEntries: number;
-	readonly maxCandidateVersions: number;
-}
-
-/**
- * Resolver-only knobs. The size limits Phase W and Phase P enforce all come
- * from `packageLimits()`; the single one kept here is the per-response download
- * cap the PyPI fetch loop needs.
- */
-export function readPipLimits(): PipLimits {
-	const shared = packageLimits();
-	return {
-		maxDownloadBytes: shared.maxWheelBytes,
-		maxDependencies: 64,
-		maxDependencyDepth: envNumber("PIP_MAX_DEPENDENCY_DEPTH", 16),
-		maxRedirects: 5,
-		maxMetadataBytes: envNumber("PIP_MAX_METADATA_RESPONSE_BYTES", 16 * 1024 * 1024),
-		maxTotalMetadataBytes: envNumber("PIP_MAX_METADATA_BYTES", 32 * 1024 * 1024),
-		maxMetadataRequests: envNumber("PIP_MAX_METADATA_REQUESTS", 200),
-		maxMetadataCacheEntries: envNumber("PIP_MAX_METADATA_CACHE_ENTRIES", 200),
-		maxCandidateVersions: 64,
-	};
-}
+/** Most packages one `pip install` may resolve, and the work multiplier for it. */
+const MAX_DEPENDENCIES = 64;
+/** Redirect hops a single PyPI request may follow. */
+const MAX_REDIRECTS = 5;
+/** Releases of one project the resolver will inspect before giving up. */
+const MAX_CANDIDATE_VERSIONS = 64;
 
 /**
  * Version the synthetic `requests` provider declares. A `requests`
@@ -520,7 +486,7 @@ type AnyFetch = (url: string, options?: PypiFetchRequestOptions) => Promise<Pypi
 interface ResolveState {
 	readonly ctx: CommandContext;
 	readonly fetch: AnyFetch;
-	readonly limits: PipLimits;
+	readonly limits: PackageLimits;
 	readonly cache: Map<string, PyPIIndex>;
 	metadataBytes: number;
 	metadataRequests: number;
@@ -533,9 +499,9 @@ async function fetchPypi(
 	label: string,
 ): Promise<PypiFetchResult | undefined> {
 	if (!isPypiUrl(url)) fail("refusing a PyPI URL outside pypi.org/files.pythonhosted.org");
-	const limit = json ? state.limits.maxMetadataBytes : state.limits.maxDownloadBytes;
+	const limit = json ? state.limits.maxMetadataResponseBytes : state.limits.maxWheelBytes;
 	let current = url;
-	for (let redirect = 0; redirect <= state.limits.maxRedirects; redirect++) {
+	for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect++) {
 		let response: PypiFetchResult;
 		try {
 			response = await state.fetch(current, {
@@ -553,7 +519,7 @@ async function fetchPypi(
 			throw error;
 		}
 		if (response.status >= 300 && response.status < 400) {
-			if (redirect === state.limits.maxRedirects) fail("PyPI download exceeded the redirect limit");
+			if (redirect === MAX_REDIRECTS) fail("PyPI download exceeded the redirect limit");
 			const location = header(response.headers, "location");
 			if (!location) fail("PyPI returned a redirect without a location");
 			try {
@@ -653,7 +619,7 @@ async function selectPackage(state: ResolveState, requirement: Requirement): Pro
 	if (releases.length === 0) fail(`no PyPI release satisfies '${requirement.raw}'`);
 	let inspected = 0;
 	for (const version of releases) {
-		if (inspected >= state.limits.maxCandidateVersions) {
+		if (inspected >= MAX_CANDIDATE_VERSIONS) {
 			// Report the real reason: every inspected release was native-only or
 			// excluded by Requires-Python, which the counter would otherwise mask.
 			fail(noPureWheelMessage(requirement.name));
@@ -710,8 +676,7 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 	let processed = 0;
 	while (pending.length) {
 		const name = pending.shift()!;
-		if (++processed > limits.maxDependencies * 4)
-			fail("could not resolve the requested packages within the work limit");
+		if (++processed > MAX_DEPENDENCIES * 4) fail("could not resolve the requested packages within the work limit");
 		const requirements = constraints.get(name) ?? [];
 		const extras = [...new Set(requirements.flatMap((requirement) => requirement.extras))].sort();
 		const merged: Requirement = {
@@ -742,7 +707,7 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 		if (previous?.version === candidate.version && expandedExtras.get(name) === signature) continue;
 		resolved.set(name, candidate);
 		expandedExtras.set(name, signature);
-		if (resolved.size > limits.maxDependencies) fail(`dependency count exceeds ${limits.maxDependencies}`);
+		if (resolved.size > MAX_DEPENDENCIES) fail(`dependency count exceeds ${MAX_DEPENDENCIES}`);
 
 		const childSet = children.get(name) ?? new Set<string>();
 		children.set(name, childSet);
@@ -790,9 +755,11 @@ async function downloadWheel(state: ResolveState, packageInfo: ResolvedPackage):
 
 const NO_STORE = "pip: package management requires a SQL backend; this sandbox's filesystem has no package store";
 
-/** The injected store, or the one `ctx.fs` carries when nothing was injected. */
-function resolveStore(ctx: CommandContext, options: PythonPackageCommandOptions): IPackageStore | undefined {
-	return options.packageStore ?? asPackageStore(ctx.fs);
+/** Every pip subcommand renders a thrown error the same way. */
+function pipFailure(error: unknown, fallbackPrefix: string): ExecResult {
+	if (error instanceof PipError) return commandFailure(`pip: ${error.message}`, 1);
+	const detail = error instanceof Error && error.message ? error.message : String(error);
+	return commandFailure(`${fallbackPrefix}: ${detail}`, 1);
 }
 
 /**
@@ -808,10 +775,9 @@ async function install(
 	const fetchFn = (options.fetch ?? ctx.fetch) as AnyFetch | undefined;
 	if (!fetchFn) return commandFailure("pip: network access is required; create the sandbox with network:true", 1);
 	if (specs.length === 0) return commandFailure("pip: install requires at least one package", 2);
-	const store = resolveStore(ctx, options);
+	const store = options.packageStore;
 	if (!store) return commandFailure(NO_STORE, 1);
-	const limits = readPipLimits();
-	const sizeLimits = packageLimits();
+	const limits = packageLimits();
 	try {
 		const roots: Requirement[] = [];
 		for (const spec of specs) {
@@ -841,16 +807,19 @@ async function install(
 		const budget = createInstallBudget();
 		const incoming: IncomingWheel[] = [];
 		const manifests: PackageManifest[] = [];
-		for (const packageInfo of plan.packages) {
-			const manifest = await prepareWheel({
+		const phaseW = (packageInfo: ResolvedPackage, extra?: Partial<PrepareWheelOptions>): Promise<PackageManifest> =>
+			prepareWheel({
 				store,
 				target: { name: packageInfo.name, version: packageInfo.version, sha256: packageInfo.artifact.sha256 },
-				limits: sizeLimits,
+				limits,
 				budget,
 				lease,
 				log,
 				download: () => downloadWheel(state, packageInfo),
+				...extra,
 			});
+		for (const packageInfo of plan.packages) {
+			const manifest = await phaseW(packageInfo);
 			manifests.push(manifest);
 			incoming.push({ name: packageInfo.name, version: packageInfo.version, wheelSha256: manifest.wheelSha256 });
 		}
@@ -858,7 +827,7 @@ async function install(
 		const compatOverlay = plan.synthetic.some((item) => item.name === "requests")
 			? () => writeRequestsCompat(ctx)
 			: undefined;
-		const publishArgs = { ctx, store, incoming, limits: sizeLimits, ...(compatOverlay ? { compatOverlay } : {}) };
+		const publishArgs = { ctx, store, incoming, limits, ...(compatOverlay ? { compatOverlay } : {}) };
 		let published: Awaited<ReturnType<typeof publishInstall>>;
 		const publishStartedAt = Date.now();
 		try {
@@ -878,16 +847,7 @@ async function install(
 					// its blobs and rewrites its file rows, which is the actual repair.
 					if ((deleteError as { code?: unknown }).code !== "EMANIFESTINUSE") throw deleteError;
 				}
-				await prepareWheel({
-					store,
-					target: { name: packageInfo.name, version: packageInfo.version, sha256: packageInfo.artifact.sha256 },
-					limits: sizeLimits,
-					budget: createInstallBudget(),
-					lease,
-					log,
-					download: () => downloadWheel(state, packageInfo),
-					force: true,
-				});
+				await phaseW(packageInfo, { budget: createInstallBudget(), force: true });
 			}
 			published = await publishInstall(publishArgs);
 		}
@@ -918,9 +878,7 @@ async function install(
 		const prefix = published.notes.length > 0 ? `${published.notes.join("\n")}\n` : "";
 		return { stdout: `${prefix}Successfully installed ${reported}\n`, stderr: "", exitCode: 0 };
 	} catch (error) {
-		if (error instanceof PipError) return commandFailure(`pip: ${error.message}`, 1);
-		const detail = error instanceof Error && error.message ? error.message : String(error);
-		return commandFailure(`pip: package installation failed: ${detail}`, 1);
+		return pipFailure(error, "pip: package installation failed");
 	}
 }
 
@@ -930,7 +888,7 @@ async function uninstall(
 	args: readonly string[],
 	options: PythonPackageCommandOptions,
 ): Promise<ExecResult> {
-	const store = resolveStore(ctx, options);
+	const store = options.packageStore;
 	if (!store) return commandFailure(NO_STORE, 1);
 	const names = args.filter((arg) => arg !== "-y" && arg !== "--yes");
 	if (names.some((name) => name.startsWith("-")))
@@ -944,27 +902,20 @@ async function uninstall(
 			lines.push(...result.notes, `Successfully uninstalled ${result.removed.name}-${result.removed.version}`);
 		}
 	} catch (error) {
-		if (error instanceof PipError) return commandFailure(`pip: ${error.message}`, 1);
-		const detail = error instanceof Error && error.message ? error.message : String(error);
-		return commandFailure(`pip: uninstall failed: ${detail}`, 1);
+		return pipFailure(error, "pip: uninstall failed");
 	}
 	return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
 }
 
 /** `pip list` and `pip freeze` read the ledger and nothing else. */
-async function listInstalled(
-	ctx: CommandContext,
-	freeze: boolean,
-	options: PythonPackageCommandOptions,
-): Promise<ExecResult> {
-	const store = resolveStore(ctx, options);
+async function listInstalled(freeze: boolean, options: PythonPackageCommandOptions): Promise<ExecResult> {
+	const store = options.packageStore;
 	if (!store) return commandFailure(NO_STORE, 1);
 	try {
 		const rows = await store.listInstalledPackages();
 		return { stdout: freeze ? formatFreeze(rows) : formatPackageList(rows), stderr: "", exitCode: 0 };
 	} catch (error) {
-		const detail = error instanceof Error && error.message ? error.message : String(error);
-		return commandFailure(`pip: could not read the installed-package ledger: ${detail}`, 1);
+		return pipFailure(error, "pip: could not read the installed-package ledger");
 	}
 }
 
@@ -978,8 +929,8 @@ async function executePip(
 	if (args[0] === "--version" || args[0] === "-V")
 		return { stdout: "sql-fs experimental pip (pure-Python wheels only)\n", stderr: "", exitCode: 0 };
 	if (args[0] === "uninstall") return uninstall(ctx, args.slice(1), options);
-	if (args[0] === "list") return listInstalled(ctx, false, options);
-	if (args[0] === "freeze") return listInstalled(ctx, true, options);
+	if (args[0] === "list") return listInstalled(false, options);
+	if (args[0] === "freeze") return listInstalled(true, options);
 	if (args[0] !== "install") return commandFailure(SUPPORTED_SUBCOMMANDS, 2);
 	const packages = args.slice(1);
 	if (packages.some((item) => item.startsWith("-")))

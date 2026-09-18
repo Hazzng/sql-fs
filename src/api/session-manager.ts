@@ -26,6 +26,7 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
+import { packageLimits } from "./commands/package-limits.js";
 import { HTTP_WRITE_ENV_VAR, createPythonPackageCommands } from "./commands/pip-command.js";
 import { createRedisWheelLease } from "./commands/pip-wheel-store.js";
 import { createPypiFetch } from "./commands/pypi-fetch.js";
@@ -1210,6 +1211,23 @@ export class SessionManager {
 		});
 	}
 
+	/**
+	 * The stored sandbox's own runtime flags win over anything the caller passed;
+	 * the caller's options (or the defaults) apply only when there is no meta.
+	 */
+	private static runtimeFromMeta(
+		meta: SandboxMeta | null | undefined,
+		runtimeOptions: RuntimeOptions | undefined,
+	): RuntimeOptions {
+		if (!meta) return runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS;
+		return {
+			python: meta.python,
+			javascript: meta.javascript,
+			network: meta.network,
+			networkWrite: meta.networkWrite ?? false,
+		};
+	}
+
 	private async rehydrateAndExecRead<T>(
 		tenantId: string,
 		sandboxId: string,
@@ -1226,14 +1244,7 @@ export class SessionManager {
 		} else {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
-		const resolvedRuntime: RuntimeOptions = meta
-			? {
-					python: meta.python,
-					javascript: meta.javascript,
-					network: meta.network,
-					networkWrite: meta.networkWrite ?? false,
-				}
-			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
+		const resolvedRuntime = SessionManager.runtimeFromMeta(meta, runtimeOptions);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) session.owner = meta.owner;
 		if (meta?.name !== undefined) session.name = meta.name;
@@ -1279,14 +1290,7 @@ export class SessionManager {
 		} else {
 			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), { code: "ENOENT" });
 		}
-		const resolvedRuntime: RuntimeOptions = meta
-			? {
-					python: meta.python,
-					javascript: meta.javascript,
-					network: meta.network,
-					networkWrite: meta.networkWrite ?? false,
-				}
-			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
+		const resolvedRuntime = SessionManager.runtimeFromMeta(meta, runtimeOptions);
 		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
 		if (meta?.owner) {
 			session.owner = meta.owner;
@@ -1625,7 +1629,7 @@ export class SessionManager {
 			...(withWheelLease ? { withWheelLease } : {}),
 			fetch: network
 				? createPypiFetch({
-						maxResponseSize: Number(process.env.PIP_MAX_WHEEL_BYTES ?? String(32 * 1024 * 1024)),
+						maxResponseSize: packageLimits().maxWheelBytes,
 						timeoutMs: 30_000,
 					})
 				: undefined,
@@ -1790,7 +1794,7 @@ export class SessionManager {
 			// The flag is set ONLY here, inside the region where this exec holds a
 			// Python slot, so the custom `python3` / `databricks` commands skip
 			// their own acquire and one exec never occupies two slots.
-			const run = usesPython ? () => pythonSlotContext.run({ held: true }, execFn) : execFn;
+			const run = usesPython ? () => pythonSlotContext.run(true, execFn) : execFn;
 			return updateCwd(await run());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);

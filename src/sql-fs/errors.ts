@@ -84,8 +84,11 @@ export function createEgraftmissing(missing: readonly string[]): Error & { code:
 	const shown = missing.slice(0, 4).join(", ");
 	const suffix = missing.length > 4 ? `, and ${missing.length - 4} more` : "";
 	return Object.assign(
-		new Error(`EGRAFTMISSING: ${missing.length} referenced blob(s) are no longer stored: ${shown}${suffix}`),
-		{ code: "EGRAFTMISSING", missing },
+		makeFsError(
+			"EGRAFTMISSING",
+			`EGRAFTMISSING: ${missing.length} referenced blob(s) are no longer stored: ${shown}${suffix}`,
+		),
+		{ missing },
 	);
 }
 
@@ -96,9 +99,9 @@ export function createEgraftmissing(missing: readonly string[]): Error & { code:
  * driver error (with table names) reaches the API layer.
  */
 export function createEmanifestinuse(wheelSha256Hex: string): Error & { code: string } {
-	return Object.assign(
-		new Error(`EMANIFESTINUSE: package manifest ${wheelSha256Hex} is still installed in at least one sandbox`),
-		{ code: "EMANIFESTINUSE" },
+	return makeFsError(
+		"EMANIFESTINUSE",
+		`EMANIFESTINUSE: package manifest ${wheelSha256Hex} is still installed in at least one sandbox`,
 	);
 }
 

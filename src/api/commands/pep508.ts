@@ -10,6 +10,7 @@
  */
 
 import { type VersionSpec, compareVersions, parseSpecifierSet } from "./pep440.js";
+import { normalizePackageName } from "./pip-shared.js";
 
 export interface Requirement {
 	readonly name: string;
@@ -227,10 +228,7 @@ export function evaluateMarker(marker: string | undefined, extra: string, fail: 
 const NAME_PATTERN = /^([A-Za-z0-9](?:[-_.A-Za-z0-9]*[A-Za-z0-9])?)(?:\[([^\]]*)\])?\s*(.*)$/;
 
 export function normalizeName(name: string, fail: (message: string) => never): string {
-	const normalized = name
-		.trim()
-		.toLowerCase()
-		.replace(/[-_.]+/g, "-");
+	const normalized = normalizePackageName(name.trim());
 	if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(normalized)) {
 		fail(`invalid package name '${name.slice(0, 80)}'`);
 	}

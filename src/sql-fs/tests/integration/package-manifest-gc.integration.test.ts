@@ -10,20 +10,16 @@
  * `afterEach`, including on failure, so `manifestsDeleted` stays exact.
  */
 
-import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import { MANIFEST_FORMAT } from "../../package-manifest.js";
 import type { GraftFile, PackageManifest } from "../../types.js";
+import { sha256Of } from "./fixtures.js";
 
 const SKIP = !process.env.DATABASE_URL;
 
 /** 30 days — the production default, used wherever the TTL must not fire. */
 const LONG_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
-function sha256Of(bytes: Uint8Array | string): Uint8Array {
-	return new Uint8Array(createHash("sha256").update(bytes).digest());
-}
 
 describe.skipIf(SKIP)("gcOrphanBlobs — package manifests as a GC root", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);

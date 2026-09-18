@@ -1,5 +1,6 @@
 import type { SecureFetch } from "just-bash";
 import { afterEach, describe, expect, it } from "vitest";
+import { resetPackageLimits } from "../../commands/package-limits.js";
 import { type PackageFixture, fixtureFetch, makeBash, makeBashWithFetch, sha256, wheel } from "./pip-fixtures.js";
 
 const encoder = new TextEncoder();
@@ -17,6 +18,7 @@ const originalEnv = { ...process.env };
 
 afterEach(() => {
 	process.env = { ...originalEnv };
+	resetPackageLimits();
 });
 
 describe("synthetic requests provider", () => {
@@ -94,6 +96,7 @@ describe("resolver hygiene", () => {
 		// The short edge registers `shallow` first; only recomputing the
 		// reachable depth when the long edge lands catches the violation.
 		process.env.PIP_MAX_DEPENDENCY_DEPTH = "2";
+		resetPackageLimits();
 		const packages: Record<string, PackageFixture> = {
 			root: {
 				version: "1.0",
@@ -115,6 +118,7 @@ describe("resolver hygiene", () => {
 
 	it("caps the number of metadata requests per install", async () => {
 		process.env.PIP_MAX_METADATA_REQUESTS = "1";
+		resetPackageLimits();
 		const bash = makeBash({
 			demo: {
 				version: "1.0",
@@ -130,6 +134,7 @@ describe("resolver hygiene", () => {
 
 	it("caps the cumulative metadata bytes per install", async () => {
 		process.env.PIP_MAX_METADATA_BYTES = "10";
+		resetPackageLimits();
 		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", { "demo.py": "" }) } });
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);

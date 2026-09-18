@@ -10,16 +10,12 @@
  * Skipped when DATABASE_URL is not set.
  */
 
-import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import type { GraftFile, PackageManifest } from "../../types.js";
+import { sha256Of } from "./fixtures.js";
 
 const SKIP = !process.env.DATABASE_URL;
-
-function sha256Of(bytes: Uint8Array | string): Uint8Array {
-	return new Uint8Array(createHash("sha256").update(bytes).digest());
-}
 
 describe.skipIf(SKIP)("sandbox_packages — RLS sandbox isolation (0007)", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);

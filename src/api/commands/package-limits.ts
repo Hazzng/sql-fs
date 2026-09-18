@@ -4,6 +4,8 @@
  * `resetPackageLimits()` lets tests re-read a stubbed environment.
  */
 
+import { positiveIntEnv } from "../lib/env.js";
+
 export interface PackageLimits {
 	/** Largest single wheel accepted from PyPI. */
 	readonly maxWheelBytes: number;
@@ -19,6 +21,16 @@ export interface PackageLimits {
 	readonly sandboxQuotaBytes: number;
 	/** Total package files a single sandbox may hold. */
 	readonly sandboxMaxFiles: number;
+	/** Cap for a single PyPI JSON response. */
+	readonly maxMetadataResponseBytes: number;
+	/** Cumulative metadata bytes for one `pip install` invocation. */
+	readonly maxTotalMetadataBytes: number;
+	/** Cumulative metadata requests for one `pip install` invocation. */
+	readonly maxMetadataRequests: number;
+	/** Entries the resolver's per-install metadata cache may hold. */
+	readonly maxMetadataCacheEntries: number;
+	/** Longest dependency path the resolver will follow. */
+	readonly maxDependencyDepth: number;
 }
 
 /** Env var name for each limit, used in error messages. */
@@ -30,6 +42,11 @@ export const PACKAGE_LIMIT_ENV = {
 	maxInstallFiles: "PIP_MAX_INSTALL_FILES",
 	sandboxQuotaBytes: "PIP_SANDBOX_QUOTA_BYTES",
 	sandboxMaxFiles: "PIP_SANDBOX_MAX_FILES",
+	maxMetadataResponseBytes: "PIP_MAX_METADATA_RESPONSE_BYTES",
+	maxTotalMetadataBytes: "PIP_MAX_METADATA_BYTES",
+	maxMetadataRequests: "PIP_MAX_METADATA_REQUESTS",
+	maxMetadataCacheEntries: "PIP_MAX_METADATA_CACHE_ENTRIES",
+	maxDependencyDepth: "PIP_MAX_DEPENDENCY_DEPTH",
 } as const satisfies Record<keyof PackageLimits, string>;
 
 const DEFAULTS: PackageLimits = {
@@ -40,32 +57,24 @@ const DEFAULTS: PackageLimits = {
 	maxInstallFiles: 50_000,
 	sandboxQuotaBytes: 1024 * 1024 * 1024,
 	sandboxMaxFiles: 100_000,
+	maxMetadataResponseBytes: 16 * 1024 * 1024,
+	maxTotalMetadataBytes: 32 * 1024 * 1024,
+	maxMetadataRequests: 200,
+	maxMetadataCacheEntries: 200,
+	maxDependencyDepth: 16,
 };
-
-function envPositiveInt(name: string, fallback: number): number {
-	const raw = process.env[name];
-	if (raw === undefined || raw.trim() === "") return fallback;
-	const value = Number(raw);
-	return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
-}
 
 let cached: PackageLimits | null = null;
 
 /** Reads (once) and returns the process-wide package limits. */
 export function packageLimits(): PackageLimits {
 	if (cached === null) {
-		cached = {
-			maxWheelBytes: envPositiveInt(PACKAGE_LIMIT_ENV.maxWheelBytes, DEFAULTS.maxWheelBytes),
-			maxInstallDownloadBytes: envPositiveInt(
-				PACKAGE_LIMIT_ENV.maxInstallDownloadBytes,
-				DEFAULTS.maxInstallDownloadBytes,
-			),
-			maxFileBytes: envPositiveInt(PACKAGE_LIMIT_ENV.maxFileBytes, DEFAULTS.maxFileBytes),
-			maxInstallBytes: envPositiveInt(PACKAGE_LIMIT_ENV.maxInstallBytes, DEFAULTS.maxInstallBytes),
-			maxInstallFiles: envPositiveInt(PACKAGE_LIMIT_ENV.maxInstallFiles, DEFAULTS.maxInstallFiles),
-			sandboxQuotaBytes: envPositiveInt(PACKAGE_LIMIT_ENV.sandboxQuotaBytes, DEFAULTS.sandboxQuotaBytes),
-			sandboxMaxFiles: envPositiveInt(PACKAGE_LIMIT_ENV.sandboxMaxFiles, DEFAULTS.sandboxMaxFiles),
-		};
+		cached = Object.fromEntries(
+			Object.entries(DEFAULTS).map(([key, fallback]) => [
+				key,
+				positiveIntEnv(process.env[PACKAGE_LIMIT_ENV[key as keyof PackageLimits]], fallback),
+			]),
+		) as unknown as PackageLimits;
 	}
 	return cached;
 }

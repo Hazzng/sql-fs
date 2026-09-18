@@ -16,13 +16,10 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export interface PythonSlotState {
-	readonly held: true;
-}
-
-export const pythonSlotContext = new AsyncLocalStorage<PythonSlotState>();
+/** Present (and `true`) exactly inside the region where the throttle holds a slot. */
+export const pythonSlotContext = new AsyncLocalStorage<true>();
 
 /** True when an enclosing `execWithRuntimeThrottle` already holds a Python slot. */
 export function pythonSlotAlreadyHeld(): boolean {
-	return pythonSlotContext.getStore()?.held === true;
+	return pythonSlotContext.getStore() === true;
 }

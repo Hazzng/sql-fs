@@ -13,10 +13,11 @@ import { createHash } from "node:crypto";
 import { type IFileSystem, InMemoryFs } from "just-bash";
 import type { IPackageStore, PackageBlob } from "../../../sql-fs/package-store.js";
 import type { GraftFile, PackageManifest, SandboxPackageRow } from "../../../sql-fs/types.js";
+import { hex } from "../../commands/pip-publish.js";
 
-export function hex(hash: Uint8Array): string {
-	return Buffer.from(hash).toString("hex");
-}
+// The production hex, re-exported so the fake store and the code under test
+// agree on the map keys by construction.
+export { hex };
 
 export interface PackageStateCounters {
 	ingestCalls: number;

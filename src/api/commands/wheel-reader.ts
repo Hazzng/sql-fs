@@ -292,11 +292,16 @@ async function inflateEntry(zip: yauzl.ZipFile, item: ValidatedEntry): Promise<U
 	return new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
 }
 
-/** Locates the single `*.dist-info` directory and validates WHEEL + RECORD. */
+/**
+ * Locates the single `*.dist-info` directory and validates WHEEL + RECORD.
+ *
+ * The two entries it has to inflate are returned in `preRead`, keyed by path,
+ * so the main loop links them from this pass instead of inflating them twice.
+ */
 async function readMetadata(
 	zip: yauzl.ZipFile,
 	files: readonly ValidatedEntry[],
-): Promise<{ distInfoDir: string; record: Map<string, Uint8Array> }> {
+): Promise<{ distInfoDir: string; record: Map<string, Uint8Array>; preRead: Map<string, Uint8Array> }> {
 	const distInfoDirs = new Set<string>();
 	for (const file of files) {
 		const first = file.path.split("/")[0]!;
@@ -308,7 +313,10 @@ async function readMetadata(
 
 	const wheelEntry = files.find((f) => f.path === `${distInfoDir}/WHEEL`);
 	if (wheelEntry === undefined) fail(`wheel has no ${distInfoDir}/WHEEL`);
-	const wheelText = Buffer.from(await inflateEntry(zip, wheelEntry)).toString("utf8");
+	const preRead = new Map<string, Uint8Array>();
+	const wheelBytes = await inflateEntry(zip, wheelEntry);
+	preRead.set(wheelEntry.path, wheelBytes);
+	const wheelText = Buffer.from(wheelBytes).toString("utf8");
 	const headers = new Map<string, string>();
 	for (const line of wheelText.split("\n")) {
 		const colon = line.indexOf(":");
@@ -326,7 +334,9 @@ async function readMetadata(
 	const recordPath = `${distInfoDir}/RECORD`;
 	const recordEntry = files.find((f) => f.path === recordPath);
 	if (recordEntry === undefined) fail(`wheel has no ${recordPath}`);
-	const recordText = Buffer.from(await inflateEntry(zip, recordEntry)).toString("utf8");
+	const recordBytes = await inflateEntry(zip, recordEntry);
+	preRead.set(recordEntry.path, recordBytes);
+	const recordText = Buffer.from(recordBytes).toString("utf8");
 	const record = new Map<string, Uint8Array>();
 	for (const line of recordText.split("\n")) {
 		const parsed = parseRecordLine(line);
@@ -338,7 +348,7 @@ async function readMetadata(
 		if (file.path === recordPath) continue;
 		if (!record.has(file.path)) fail(`wheel entry '${file.path}' is missing a sha256 entry in RECORD`);
 	}
-	return { distInfoDir, record };
+	return { distInfoDir, record, preRead };
 }
 
 /**
@@ -372,9 +382,7 @@ export async function* readWheel(
 			autoClose: false,
 		});
 	} catch (err) {
-		throw new WheelError(
-			`${CORRUPT}: ${err instanceof Error && err.message.length < 120 ? err.message : "unreadable zip"}`,
-		);
+		throw new WheelError(`${CORRUPT}: ${briefly(err)}`);
 	}
 
 	try {
@@ -388,16 +396,17 @@ export async function* readWheel(
 			options.consumedFiles ?? 0,
 			options.consumedBytes ?? 0,
 		);
-		const { distInfoDir, record } = await readMetadata(zip, files);
+		const { distInfoDir, record, preRead } = await readMetadata(zip, files);
 
 		let batch: WheelFile[] = [];
 		let batchBytes = 0;
 		for (const file of files) {
 			await assertHeadersAgree(zip, file.entry, file.path);
-			const content = await inflateEntry(zip, file);
+			// WHEEL and RECORD were inflated (and CRC-checked) by `readMetadata`.
+			const content = preRead.get(file.path) ?? (await inflateEntry(zip, file));
 			const sha256 = new Uint8Array(createHash("sha256").update(content).digest());
 			const expected = record.get(file.path);
-			if (expected !== undefined && !Buffer.from(sha256).equals(Buffer.from(expected))) {
+			if (expected !== undefined && Buffer.compare(sha256, expected) !== 0) {
 				fail(`wheel entry '${file.path}' does not match its RECORD sha256`);
 			}
 			batch.push({ path: file.path, sha256, mode: file.mode, size: file.size, content });

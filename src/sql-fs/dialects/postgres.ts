@@ -65,11 +65,14 @@ interface PreparedBulkFile {
 }
 
 /** Splits an absolute path into its parent directory inode and leaf name. */
-function splitPath(path: string, dirMap: Map<string, bigint>): { name: string; parentInodeId: bigint } {
+function splitPath(
+	path: string,
+	dirMap: Map<string, bigint>,
+): { name: string; parentPath: string; parentInodeId: bigint } {
 	const parts = path.split("/").filter(Boolean);
 	const name = parts[parts.length - 1]!;
 	const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-	return { name, parentInodeId: dirMap.get(parentPath)! };
+	return { name, parentPath, parentInodeId: dirMap.get(parentPath)! };
 }
 
 /**
@@ -962,10 +965,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			}> = [];
 			for (const dirPath of dirsAtDepth) {
 				if (dirMap.has(dirPath)) continue;
-				const parts = dirPath.split("/").filter(Boolean);
-				const name = parts[parts.length - 1]!;
-				const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-				const parentInodeId = dirMap.get(parentPath);
+				const { name, parentPath, parentInodeId } = splitPath(dirPath, dirMap);
 				if (!parentInodeId) throw new Error(`${op}: parent dir ${parentPath} not found`);
 				candidates.push({ dirPath, name, parentInodeId });
 			}
@@ -1254,6 +1254,21 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return present;
 	}
 
+	/**
+	 * Presence gate for a graft or a manifest write: every hash must still be
+	 * stored before a row can point at it, or the row would read back as an empty
+	 * file. The touch also row-locks each blob, so a concurrent REPEATABLE READ GC
+	 * conflicts instead of collecting one this write is about to root.
+	 */
+	async #requireBlobs(hashes: readonly Buffer[]): Promise<void> {
+		const unique = new Map<string, Buffer>();
+		for (const sha256 of hashes) unique.set(sha256.toString("hex"), sha256);
+		if (unique.size === 0) return;
+		const present = await this.#touchBlobs([...unique.values()]);
+		const missing = [...unique.keys()].filter((hex) => !present.has(hex));
+		if (missing.length > 0) throw createEgraftmissing(missing);
+	}
+
 	async ingestBlobs(blobs: ReadonlyArray<{ sha256: Uint8Array; data: Uint8Array }>): Promise<void> {
 		if (blobs.length === 0) return;
 
@@ -1298,16 +1313,10 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 		const { sandboxId, rootInodeId } = await this.#bulkContext(tx, "bulkGraft");
 
-		// Presence is decided before a single inode exists: an inode pointing at a
-		// collected blob would read back as an empty file.
-		const uniqueHashes = new Map<string, Buffer>();
-		for (const f of files) {
-			const sha256 = Buffer.from(f.sha256);
-			uniqueHashes.set(sha256.toString("hex"), sha256);
-		}
-		const present = await this.#touchBlobs([...uniqueHashes.values()]);
-		const missing = [...uniqueHashes.keys()].filter((hex) => !present.has(hex));
-		if (missing.length > 0) throw createEgraftmissing(missing);
+		// Presence is decided before a single inode exists. The buffers built here
+		// are the ones the prepared rows below carry, so each hash is copied once.
+		const hashes = files.map((f) => Buffer.from(f.sha256));
+		await this.#requireBlobs(hashes);
 
 		const dirMap = await this.#bulkEnsureDirs(
 			tx,
@@ -1318,11 +1327,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			result,
 		);
 
-		const prepared: PreparedBulkFile[] = files.map((f) => ({
+		const prepared: PreparedBulkFile[] = files.map((f, i) => ({
 			path: f.path,
 			mode: f.mode,
 			size: f.size,
-			sha256: Buffer.from(f.sha256),
+			sha256: hashes[i]!,
 			...splitPath(f.path, dirMap),
 		}));
 
@@ -1372,23 +1381,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 		// Presence first, exactly as `bulkGraft` does it: a manifest row pointing
 		// at a collected blob would graft an empty file into every later sandbox.
-		// The touch also row-locks the blobs, so a concurrent REPEATABLE READ GC
-		// conflicts rather than collecting one this manifest is about to root.
-		const uniqueHashes = new Map<string, Buffer>();
-		for (const f of files) {
-			const sha256 = Buffer.from(f.sha256);
-			uniqueHashes.set(sha256.toString("hex"), sha256);
-		}
-		if (uniqueHashes.size > 0) {
-			const present = await this.#touchBlobs([...uniqueHashes.values()]);
-			const missing = [...uniqueHashes.keys()].filter((hex) => !present.has(hex));
-			if (missing.length > 0) throw createEgraftmissing(missing);
-		}
+		// The buffers built here are the ones the rows below carry.
+		const hashes = files.map((f) => Buffer.from(f.sha256));
+		await this.#requireBlobs(hashes);
 
-		const rows = files.map((f) => ({
+		const rows = files.map((f, i) => ({
 			wheel_sha256: wheel,
 			path: f.path,
-			blob_sha256: Buffer.from(f.sha256),
+			blob_sha256: hashes[i]!,
 			mode: f.mode,
 			size: f.size,
 		}));

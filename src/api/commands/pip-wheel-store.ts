@@ -204,8 +204,7 @@ async function ingestWheel(
 		}
 		next = await reader.next();
 	}
-	const info = next.value;
-	return { files, fileCount: info.fileCount, totalBytes: info.totalBytes };
+	return { files, ...next.value };
 }
 
 async function readOrFail<T>(target: WheelTarget, fn: () => Promise<T>): Promise<T> {

@@ -7,6 +7,15 @@
  * of an import cycle.
  */
 
+/**
+ * PEP 503 name normalisation: runs of `-`, `_` and `.` collapse to a single
+ * `-`, and the result is lowercased. Shared so the resolver's validating
+ * `normalizeName` and the ledger's lookups agree on what a name is.
+ */
+export function normalizePackageName(name: string): string {
+	return name.replace(/[-_.]+/g, "-").toLowerCase();
+}
+
 /** Where installed package trees live inside the sandbox. */
 export const SITE_PACKAGES = "/site-packages";
 

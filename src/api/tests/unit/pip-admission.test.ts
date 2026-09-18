@@ -101,7 +101,7 @@ describe("pip and python admission slots", () => {
 		const install = counter();
 		const python = counter();
 		const bash = makeBash(cliFixture, install, python);
-		const result = await pythonSlotContext.run({ held: true }, () => bash.exec(`python3 -c "print(1)"`));
+		const result = await pythonSlotContext.run(true, () => bash.exec(`python3 -c "print(1)"`));
 		expect(result.exitCode, result.stderr).toBe(0);
 		expect(result.stdout).toBe("1\n");
 		expect(python.acquired).toBe(0);

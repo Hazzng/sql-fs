@@ -40,7 +40,6 @@ export interface PypiFetchResult {
 export interface PypiFetchRequestOptions {
 	readonly method?: string;
 	readonly headers?: Headers | Record<string, string>;
-	readonly body?: string;
 	readonly followRedirects?: boolean;
 	/** Per-request timeout; clamped to the client's configured timeout. */
 	readonly timeoutMs?: number;

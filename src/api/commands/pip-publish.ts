@@ -14,7 +14,7 @@ import type { CommandContext } from "just-bash";
 import type { IPackageStore } from "../../sql-fs/package-store.js";
 import type { GraftFile, SandboxPackageRow } from "../../sql-fs/types.js";
 import { PACKAGE_LIMIT_ENV, type PackageLimits } from "./package-limits.js";
-import { SITE_PACKAGES, fail } from "./pip-shared.js";
+import { SITE_PACKAGES, fail, normalizePackageName } from "./pip-shared.js";
 
 /** One wheel this install is publishing into the sandbox. */
 export interface IncomingWheel {
@@ -56,11 +56,6 @@ export class StaleManifestError extends Error {
 
 export function hex(hash: Uint8Array): string {
 	return Buffer.from(hash).toString("hex");
-}
-
-/** PEP 503 name normalisation, used only to match what the user typed. */
-export function normaliseName(name: string): string {
-	return name.replace(/[-_.]+/g, "-").toLowerCase();
 }
 
 function sameHash(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
@@ -131,10 +126,22 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 		postInstall.set(wheel.name, { name: wheel.name, version: wheel.version, wheelSha256: wheel.wheelSha256 });
 	}
 
-	// 2. Ownership. Two packages may share a path only when the bytes are identical.
+	/** One wheel's manifest rows; the hash is hexed here and nowhere else. */
+	const filesOf = (wheelSha256: Uint8Array): readonly GraftFile[] => manifestFiles.get(hex(wheelSha256)) ?? [];
+
+	// Each post-install wheel's rows, looked up once and reused by every step below.
+	const planned = [...postInstall.values()].map((row) => ({ row, files: filesOf(row.wheelSha256) }));
+
+	// 2. Ownership (two packages may share a path only when the bytes are
+	// identical) and 3. quota, both over the post-install set. An ownership
+	// conflict is refused where it is found, the quota once the totals are in.
 	const owners = new Map<string, Owned>();
-	for (const row of postInstall.values()) {
-		for (const file of manifestFiles.get(hex(row.wheelSha256)) ?? []) {
+	let quotaFiles = 0;
+	let quotaBytes = 0;
+	for (const { row, files } of planned) {
+		for (const file of files) {
+			quotaFiles += 1;
+			quotaBytes += file.size;
 			const existing = owners.get(file.path);
 			if (existing === undefined) {
 				owners.set(file.path, { package: row.name, sha256: file.sha256 });
@@ -143,16 +150,6 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 			if (existing.package !== row.name && !sameHash(existing.sha256, file.sha256)) {
 				fail(`${existing.package} and ${row.name} both provide '${file.path}' with different contents`);
 			}
-		}
-	}
-
-	// 3. Quota over the post-install set.
-	let quotaFiles = 0;
-	let quotaBytes = 0;
-	for (const row of postInstall.values()) {
-		for (const file of manifestFiles.get(hex(row.wheelSha256)) ?? []) {
-			quotaFiles += 1;
-			quotaBytes += file.size;
 		}
 	}
 	if (quotaBytes > limits.sandboxQuotaBytes) {
@@ -172,7 +169,7 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 	for (const row of ledger) {
 		const replacement = incomingByName.get(row.name);
 		if (replacement === undefined || sameHash(replacement.wheelSha256, row.wheelSha256)) continue;
-		notes.push(...(await removeOwnedPaths(ctx, store, manifestFiles.get(hex(row.wheelSha256)) ?? [], owners)));
+		notes.push(...(await removeOwnedPaths(ctx, store, filesOf(row.wheelSha256), owners)));
 	}
 
 	// 5. Graft. An identical (name, wheel) already in the ledger is a no-op.
@@ -216,7 +213,7 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 	}
 
 	// 6. Keep every manifest in the post-install set alive for the GC TTL sweep.
-	await store.touchManifests([...postInstall.values()].map((row) => row.wheelSha256));
+	await store.touchManifests(planned.map(({ row }) => row.wheelSha256));
 
 	// 7. The compat overlay, then the ledger — written last so an interrupted
 	// publish leaves no claim on a tree that was only partly linked.
@@ -238,22 +235,35 @@ export const CONTENT_WARM_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 /** Per-file ceiling for the same warm. */
 export const CONTENT_WARM_MAX_FILE_BYTES = 64 * 1024;
 
+/** Files read concurrently per round. The byte budget is charged per chunk. */
+const CONTENT_WARM_CHUNK = 16;
+
 /**
  * Reads the small interpreted files of a fresh install back through the normal
  * `readFile` path, which fills the in-memory content cache and backfills Redis.
  * Best effort: a read that fails here must not fail the install.
+ *
+ * Reads go out a chunk at a time, so the budget is only checked between chunks
+ * and one round may overshoot it by at most a chunk's worth of small files.
  */
 export async function warmContentCache(ctx: CommandContext, files: readonly GraftFile[]): Promise<void> {
+	const wanted = files.filter(
+		(file) =>
+			file.size <= CONTENT_WARM_MAX_FILE_BYTES && (file.path.endsWith(".py") || file.path.includes(".dist-info/")),
+	);
 	let budget = CONTENT_WARM_MAX_TOTAL_BYTES;
-	for (const file of files) {
-		if (file.size > CONTENT_WARM_MAX_FILE_BYTES || file.size > budget) continue;
-		if (!file.path.endsWith(".py") && !file.path.includes(".dist-info/")) continue;
-		try {
-			await ctx.fs.readFileBuffer(file.path);
-		} catch {
-			continue;
-		}
-		budget -= file.size;
+	for (let start = 0; start < wanted.length && budget > 0; start += CONTENT_WARM_CHUNK) {
+		const chunk = wanted.slice(start, start + CONTENT_WARM_CHUNK);
+		await Promise.all(
+			chunk.map(async (file) => {
+				try {
+					await ctx.fs.readFileBuffer(file.path);
+				} catch {
+					// Best effort: a file that cannot be read is simply not warmed.
+				}
+			}),
+		);
+		for (const file of chunk) budget -= file.size;
 	}
 }
 
@@ -268,9 +278,9 @@ export async function uninstallPackage(
 	store: IPackageStore,
 	requested: string,
 ): Promise<UninstallResult> {
-	const wanted = normaliseName(requested);
+	const wanted = normalizePackageName(requested);
 	const ledger = await store.listInstalledPackages();
-	const target = ledger.find((row) => normaliseName(row.name) === wanted);
+	const target = ledger.find((row) => normalizePackageName(row.name) === wanted);
 	if (target === undefined) return { removed: undefined, notes: [] };
 
 	const remaining = ledger.filter((row) => row !== target);
@@ -289,7 +299,7 @@ export async function uninstallPackage(
 /** `pip list` — the same two-column table real pip prints. */
 export function formatPackageList(rows: readonly SandboxPackageRow[]): string {
 	if (rows.length === 0) return "";
-	const sorted = [...rows].sort((a, b) => normaliseName(a.name).localeCompare(normaliseName(b.name)));
+	const sorted = [...rows].sort((a, b) => normalizePackageName(a.name).localeCompare(normalizePackageName(b.name)));
 	const nameWidth = Math.max(7, ...sorted.map((row) => row.name.length));
 	const versionWidth = Math.max(7, ...sorted.map((row) => row.version.length));
 	const lines = [
@@ -304,7 +314,7 @@ export function formatPackageList(rows: readonly SandboxPackageRow[]): string {
 export function formatFreeze(rows: readonly SandboxPackageRow[]): string {
 	if (rows.length === 0) return "";
 	return `${[...rows]
-		.sort((a, b) => normaliseName(a.name).localeCompare(normaliseName(b.name)))
+		.sort((a, b) => normalizePackageName(a.name).localeCompare(normalizePackageName(b.name)))
 		.map((row) => `${row.name}==${row.version}`)
 		.join("\n")}\n`;
 }
