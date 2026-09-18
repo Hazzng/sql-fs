@@ -6,3 +6,4 @@ dist/
 *.tsbuildinfo
 .claude/worktrees/
 docs/
+scripts/loadtest/.run/

@@ -1,5 +1,9 @@
 # Production-readiness harness — setup and per-finding reproductions
 
+> **The harness is now runnable code: `scripts/loadtest/` (see its README).** This document
+> remains the record of what each fault does and what was measured; the scripts are the way
+> to actually run it.
+
 Built to validate PR #162 before merge. It found the issues filed as #164-#175. Keep it: every
 one of those issues needs a way to prove the fix, and several are invisible to unit tests.
 
