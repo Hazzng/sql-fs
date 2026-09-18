@@ -6,8 +6,8 @@ branch: main
 repository: virtualFS
 task: "Integrate just-git as a sandbox git custom command"
 tags: [implementation-plan, session-manager, custom-commands, just-git, mcp, network]
-status: draft
-last_updated: 2026-06-20
+status: complete
+last_updated: 2026-09-18
 last_updated_by: quangnguyentechno@gmail.com
 ---
 
@@ -109,7 +109,7 @@ const customCommands = [
 
 #### 3. Inject the server `GITHUB_TOKEN` into the sandbox base env
 **File**: `src/api/session-manager.ts` (a new small helper + the `new Bash({...})` call at `:558`)
-**Changes**: build a base-env record from server config (read once, e.g. a module-level const or `SessionManager` field), and pass it as `env` to `new Bash`. Only include keys that are actually set, so behavior is unchanged when `GITHUB_TOKEN` is absent. `GITHUB_TOKEN` is aliased to `GIT_HTTP_BEARER_TOKEN` so just-git's env auth path (`remote.ts:110`) authenticates `git push` without URL-embedding.
+**Changes**: build a base-env record from server config (read once, e.g. a module-level const or `SessionManager` field), and pass it as `env` to `new Bash`. Only include keys that are actually set, so behavior is unchanged when `GITHUB_TOKEN` is absent. `GITHUB_TOKEN` is aliased to git's HTTP credentials so just-git's env auth path (`remote.ts:110`) authenticates `git push` without URL-embedding. **Shipped as basic auth** (`GIT_HTTP_USER=x-access-token` + `GIT_HTTP_PASSWORD=<token>`) rather than the bearer variant this plan first assumed — see Phase 1 Discoveries.
 
 ```typescript
 // Exported builder (unit-testable — pass a fake env; defaults to process.env).
@@ -120,7 +120,8 @@ export function buildSandboxBaseEnv(
 	const token = env.GITHUB_TOKEN;
 	if (token) {
 		out.GITHUB_TOKEN = token;          // for `curl -H "Authorization: Bearer $GITHUB_TOKEN"`
-		out.GIT_HTTP_BEARER_TOKEN = token; // for just-git push/clone over HTTP (remote.ts:110)
+		out.GIT_HTTP_USER = "x-access-token"; // for just-git push/clone over HTTP (remote.ts:110)
+		out.GIT_HTTP_PASSWORD = token;
 	}
 	// Optional committer-identity passthrough (so `git commit` works out of the box);
 	// only injected when the operator sets them on the server env.
@@ -139,7 +140,7 @@ env: Object.keys(sandboxBaseEnv).length > 0 ? { ...sandboxBaseEnv } : undefined,
 ```
 
 Notes:
-- **Per-request override is automatic** — `bash.exec({ env })` merges over this base (`Bash.ts:249`), so a caller passing `GITHUB_TOKEN`/`GIT_HTTP_BEARER_TOKEN` in `body.env` wins for that exec.
+- **Per-request override is automatic** — `bash.exec({ env })` merges over this base (`Bash.ts:249`), so a caller passing `GITHUB_TOKEN` in `body.env` wins for that exec. The merge is per key, so `deriveExecGitCredentials` re-points `GIT_HTTP_USER`/`GIT_HTTP_PASSWORD` at the overriding token — see Phase 1 Discoveries.
 - **Does not require `network:true`** to be *present* in env, but is only *useful* when network is on (token is inert without outbound). Injecting it unconditionally is fine and keeps the env stable across runtime flags.
 - **No new dependency on git** — this base-env path also benefits `curl`/`js-exec`; it's logically independent but shares the same `new Bash` edit.
 - Pass a shallow copy (`{ ...SANDBOX_BASE_ENV }`) so just-bash can't mutate the shared const.
@@ -147,10 +148,10 @@ Notes:
 ### Phase 1: Success Criteria
 
 #### Phase 1: Automated Verification
-- [ ] `pnpm typecheck` passes.
-- [ ] `pnpm lint:fix` clean.
-- [ ] New unit test passes: `pnpm test -- src/api/tests/unit/git-command.test.ts`.
-- [ ] `pnpm test:unit` (full unit suite) passes.
+- [x] `pnpm typecheck` passes.
+- [x] `pnpm lint:fix` clean.
+- [x] New unit test passes: `pnpm test -- src/api/tests/unit/git-command.test.ts`.
+- [x] `pnpm test:unit` (full unit suite) passes.
 
 #### Phase 1: Manual Verification
 - [ ] In a `network:false` sandbox: `git init && echo hi > a.txt && git add . && GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@x.com GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@x.com git commit -m init && git log --oneline` succeeds.
@@ -159,7 +160,12 @@ Notes:
 - [ ] A per-request `env: { GITHUB_TOKEN: "override" }` shadows the server default for that exec only.
 
 ### Phase 1: Discoveries and Notable Information
-[Filled by the implementing agent during Phase 1 execution.]
+
+- **The type-boundary cast this plan anticipated was needed.** `git.execute(args, ctx as Parameters<typeof git.execute>[1])` in `src/api/commands/git-command.ts` bridges just-bash's `CommandContext` to just-git's structurally-compatible shadow type.
+- **Credentials shipped as basic auth, not bearer.** just-git's `GIT_HTTP_BEARER_TOKEN` path sends `Authorization: Bearer`, which GitHub-compatible HTTPS remotes reject for git transport; `GIT_HTTP_USER=x-access-token` + `GIT_HTTP_PASSWORD=<token>` is the form GitHub accepts. Every `GIT_HTTP_BEARER_TOKEN` mention elsewhere in this plan is the pre-implementation design.
+- **The key-by-key env merge leaked the deployment identity.** Because `bash.exec({ env })` merges per key, an exec overriding only `GITHUB_TOKEN` left `GIT_HTTP_PASSWORD` holding the server token and `git push` still authenticated as the server. `deriveExecGitCredentials` (`session-manager.ts`) re-derives the pair from the effective per-exec token unless the caller set a git credential explicitly.
+- **Credentials are gated to network-enabled sandboxes** (`buildRuntimeSandboxEnv`): a `network:false` sandbox never sees the token, since the transport is blocked anyway.
+- **`git` ships as a wrapper, not a bare `defineCommand`** — a clone that fails partway had to clean up its own destination (`.changeset/fix-git-clone-atomic.md`).
 
 ---
 
@@ -208,9 +214,9 @@ const runtimeOptions = {
 ### Phase 2: Success Criteria
 
 #### Phase 2: Automated Verification
-- [ ] `pnpm typecheck` passes.
-- [ ] `pnpm lint:fix` clean.
-- [ ] `pnpm test:unit` passes (incl. any MCP tool tests).
+- [x] `pnpm typecheck` passes.
+- [x] `pnpm lint:fix` clean.
+- [x] `pnpm test:unit` passes (incl. any MCP tool tests).
 
 #### Phase 2: Manual Verification
 - [ ] MCP `sandbox_create` with `{ network: true }` yields a sandbox where `curl https://api.github.com/zen` and `git clone` work.
@@ -218,7 +224,8 @@ const runtimeOptions = {
 - [ ] Tool descriptions read correctly for both network states.
 
 ### Phase 2: Discoveries and Notable Information
-[Filled by the implementing agent during Phase 2 execution.]
+
+- Shipped as planned: `network` is an optional `sandbox_create` argument in `src/api/mcp/tools.ts`, returned in the tool's JSON, and the stale "no network / no curl" wording is gone from the tool descriptions and `session-manager.ts`.
 
 ---
 
@@ -230,7 +237,7 @@ Prove the end-to-end network path (clone → commit → push with env-supplied i
 ### Phase 3: Changes Required
 
 #### 1. Integration test (hermetic, in-process remote)
-**File**: `src/api/tests/integration/git-network.integration.test.ts` (new)
+**File**: `src/api/tests/integration/git-sqlfs.integration.test.ts` (new — named for what it exercises; see Phase 3 Discoveries)
 **Changes**: stand up just-git's in-memory server (`createServer` from `just-git/server`) as the remote, and route the sandbox git instance's `network.fetch` to `server.fetch` for the test (test-only `createGit({ network: { fetch } })`). Verify, through `bash.exec`:
 - `git clone <in-proc-url> /repo` populates files.
 - a commit using `GIT_AUTHOR_*`/`GIT_COMMITTER_*` from the exec `env` records the expected author/committer.
@@ -252,15 +259,18 @@ For the bearer-token leg, set the server token via the test's `process.env.GITHU
 ### Phase 3: Success Criteria
 
 #### Phase 3: Automated Verification
-- [ ] `pnpm test -- src/api/tests/integration/git-network.integration.test.ts` passes.
-- [ ] `pnpm typecheck && pnpm lint:fix && pnpm test:unit` all pass.
-- [ ] A `.changeset/*.md` file exists and describes the change.
+- [ ] `pnpm test -- src/api/tests/integration/git-sqlfs.integration.test.ts` passes (needs `DATABASE_URL`).
+- [x] `pnpm typecheck && pnpm lint:fix && pnpm test:unit` all pass.
+- [x] A `.changeset/*.md` file exists and describes the change.
 
 #### Phase 3: Manual Verification
 - [ ] Against a real remote (e.g. a throwaway GitHub repo, `network:true`): clone → edit → commit (identity via `env`) → push (token via `GIT_HTTP_BEARER_TOKEN`) → confirm the commit lands on GitHub.
 
 ### Phase 3: Discoveries and Notable Information
-[Filled by the implementing agent during Phase 3 execution.]
+
+- **The integration test landed as `git-sqlfs.integration.test.ts`.** The planned name said what it talked to; the shipped one says what it covers — git through `SessionManager` + SqlFs + Postgres, including the injected basic-auth credentials. The earlier `git-network.integration.test.ts` used `InMemoryFs` and a bare `createGit()`, so it tested just-git rather than this service; it now lives at `src/api/tests/unit/git-transport-contract.test.ts`.
+- **Credential assertions are basic, not bearer** — the in-process server sees `Authorization: Basic base64(x-access-token:<token>)`.
+- Manual verification against a real GitHub remote (the last box below) was not run; the hermetic in-process remote covers the same clone → commit → push path.
 
 ---
 

@@ -13,9 +13,8 @@
  */
 
 import type { Redis } from "ioredis";
-import { Bash, defineCommand } from "just-bash";
+import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
-import { createGit } from "just-git";
 import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
@@ -23,10 +22,12 @@ import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
+import { createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
+import { posixNormalizePath } from "./lib/paths.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
@@ -34,24 +35,6 @@ import { logAudit } from "./lib/audit.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
-
-/**
- * Lightweight POSIX path normalization for session.cwd storage.
- * Resolves `.` and `..` segments and collapses consecutive slashes.
- * Does NOT require the path to exist on disk — pure string transformation.
- * Mirrors the logic in sql-fs/sql-fs.ts `normalizeFsPath`.
- */
-function posixNormalizePath(p: string): string {
-	if (!p || p === "/") return "/";
-	const s = p.startsWith("/") ? p : `/${p}`;
-	const parts = s.split("/").filter((seg) => seg !== "" && seg !== ".");
-	const stack: string[] = [];
-	for (const part of parts) {
-		if (part === "..") stack.pop();
-		else stack.push(part);
-	}
-	return `/${stack.join("/")}`;
-}
 
 type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
 
@@ -177,6 +160,31 @@ const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
 	"GIT_HTTP_USER",
 	"GIT_HTTP_PASSWORD",
 ]);
+
+/**
+ * Re-derive git's HTTP credentials from a per-request `GITHUB_TOKEN`.
+ *
+ * just-bash merges the exec env over the base env key by key, so an override of `GITHUB_TOKEN`
+ * alone leaves `GIT_HTTP_PASSWORD` holding the deployment token — `git clone`/`push` would keep
+ * authenticating as the server while `curl $GITHUB_TOKEN` used the caller's. Each alias is
+ * derived independently, so a request that pins only one half (`GIT_HTTP_USER: "oauth2"` for a
+ * non-GitHub host, say) keeps it and still has the other half re-derived rather than inherited.
+ * Only sandboxes that carry the credentials at all (network-enabled) are touched.
+ */
+export function deriveExecGitCredentials(
+	env: Record<string, string> | undefined,
+	network: boolean,
+): Record<string, string> | undefined {
+	if (env === undefined || !network) return env;
+	if (!Object.hasOwn(env, "GITHUB_TOKEN")) return env;
+	const out: Record<string, string> = Object.assign(Object.create(null), env);
+	// An empty override means "no credentials": just-git only sends basic auth when both halves
+	// are non-empty, so the pair below stays inert rather than falling back to the server token.
+	// A request-supplied GIT_HTTP_BEARER_TOKEN still outranks the pair inside just-git.
+	if (!Object.hasOwn(env, "GIT_HTTP_USER")) out.GIT_HTTP_USER = "x-access-token";
+	if (!Object.hasOwn(env, "GIT_HTTP_PASSWORD")) out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
+	return out;
+}
 
 function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
@@ -580,14 +588,13 @@ export class SessionManager {
 				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
 				// not registered (audit C1 — host sandbox escape). Python sandboxes
 				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
-				const git = createGit({
-					network: resolvedRuntime.network ? {} : false,
+				// `{}` → no allowlist → full outbound via globalThis.fetch.
+				// `false` → clone/fetch/push blocked; local git still works.
+				// The wrapper removes the destination of a clone that fails partway,
+				// so a refused symlink cannot leave a poisoned index behind.
+				const gitCommand = createGitCommand({
+					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
 				});
-				const gitCommand = defineCommand("git", (args, ctx) =>
-					// just-git shadows just-bash's CommandContext type, but only reads
-					// the structurally-compatible fs/cwd/env/stdin/exec/signal fields.
-					git.execute(args, ctx as Parameters<typeof git.execute>[1]),
-				);
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
@@ -1631,6 +1638,7 @@ export class SessionManager {
 		const resolvedOpts: ExecOptions = {
 			...opts,
 			cwd: opts?.cwd ?? session.cwd,
+			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
 		};
 
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
@@ -1670,14 +1678,12 @@ export class SessionManager {
 			// lock mode and may execute concurrently with other readers.
 			if (!inReadOnlyScope) {
 				const finalCwd = result.env?.PWD;
-				// Validate before storing: reject null bytes (security) and
-				// normalize via posix.resolve so scripts that do `export PWD=…`
-				// with relative or un-normalized paths cannot corrupt session.cwd.
-				if (typeof finalCwd === "string" && finalCwd.length > 0 && !finalCwd.includes("\0")) {
-					const normalized = posixNormalizePath(finalCwd);
-					if (normalized.startsWith("/")) {
-						session.cwd = normalized;
-					}
+				// Validate before storing: reject null bytes (security) and un-normalized segments, so a
+				// script that does `export PWD=…` cannot corrupt session.cwd. A RELATIVE value is dropped
+				// rather than rooted — `foo` is not evidence that `/foo` exists, and keeping the last
+				// known-good cwd beats inventing one the next exec would start from.
+				if (typeof finalCwd === "string" && finalCwd.startsWith("/") && !finalCwd.includes("\0")) {
+					session.cwd = posixNormalizePath(finalCwd);
 				}
 			}
 			return result;

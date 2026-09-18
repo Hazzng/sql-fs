@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.0.0
+
+### Major Changes
+
+- [#158](https://github.com/Hazzng/sql-fs/pull/158) Thanks [@Hazzng](https://github.com/Hazzng)! - Add a sandbox `git` command backed by just-git, export server `GITHUB_TOKEN` into sandbox GitHub-compatible Git/curl env, and let MCP-created sandboxes request network access for clone/fetch/push. A per-request `env.GITHUB_TOKEN` re-points git's HTTP credentials at that token, refusing plaintext `http://` remotes, validating each redirect hop by hand, dropping credentials on cross-origin redirects, and rewriting a redirected POST to GET on 301/302/303 the way `fetch` does — so a push packfile is never replayed at a host it was merely forwarded to.
+
+### Minor Changes
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Add file access to MCP — `file_read`, `file_write`, `file_edit` — plus `PATCH /v1/sandboxes/:id/files/*path` for exact-string edits.
+
+  `file_edit` requires `oldString` to match exactly once (`replaceAll` opts into multiple), rejecting an ambiguous match as `EDIT_NOT_UNIQUE` rather than guessing; it runs in one script-tx scope on Postgres so a concurrent reader never sees the file mid-edit, refuses non-UTF-8 content and unpaired surrogates, and preserves file mode and a leading BOM. `file_read` pages via `offset`/`limit`/`byteOffset`, bounding both the file it opens (`MAX_MCP_READ_FILE_BYTES`) and the reply it returns (`MAX_MCP_READ_RESPONSE_BYTES`). `file_write` creates parent directories and refuses to clobber a directory on every backend. HTTP and MCP share one implementation in `src/api/lib/file-ops.ts`.
+
+### Patch Changes
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Document container sizing for the write cap: a single write costs roughly 7x the file size in `external` memory above steady state, so a 50 MiB write needs on the order of 700 MB of headroom (a 512 MiB container OOM'd on one request; 768 MiB survived).
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Apply the single-file write limit to each entry of a bulk write, not just the combined total, so one oversized entry in `POST /writeFiles` can no longer land a blob the contentCache cannot hold.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Roll back a `PATCH` edit or bulk write when the distributed exec lock is definitively lost mid-request, instead of committing it and reporting a retryable `ELOCKLOST`. Both routes now go through `runInScriptTx`, which checks for lock loss before the commit.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Reject an edit whose `oldString`/`newString` carries an unpaired surrogate as `EDIT_LONE_SURROGATE`, and enforce the write limit on the encoded result rather than on a projected size that assumed one match encodes to the bytes it replaces.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Clean up the destination of a `git clone` that fails partway (e.g. on a symlink, since `allowSymlinks` defaults to false), instead of leaving a half-checked-out tree whose complete index made every missing file look like a staged deletion — an agent then following up with `git add -A && git commit && git push` turned that into a real destructive commit.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Refuse to replay a git request body across origins on a 307/308 redirect, since both preserve the method and body — for git, the packfile being pushed — and could otherwise forward a whole push to an attacker-chosen host.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Budget the whole `file_read` reply, not just the content string, against `MAX_MCP_READ_RESPONSE_BYTES`, and normalize the path MCP tools echo back instead of only prefixing a slash.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Size a `file_read` page against the reply as the transport actually serializes it (which re-escapes once more), and stop calling `split("\n")` on the whole file just to count lines — both scanning-based fixes remove a real-world 170 KiB overshoot and a multi-million-element allocation.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Enforce the file-write limit on `PUT /v1/sandboxes/:id/files/*path` as the body streams, instead of trusting `Content-Length` and buffering the whole request first.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Keep a leading UTF-8 BOM in what `file_read` and `fs_export` return, matching the `ignoreBOM` decoding `editFile` already used, so content and `stat.size` round-trip byte for byte.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Return `RESPONSE_BUDGET_TOO_SMALL` instead of a reply that can never fit any content when `MAX_MCP_READ_RESPONSE_BYTES` is configured below the size of the response envelope, which previously left a client resuming a page in an infinite loop.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Keep `file_read` paging identical to the `split`/`join` it replaced when a file ends in a newline, instead of returning a trailing newline the old implementation would have dropped.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Ignore a relative `PWD` when recording a session's working directory instead of rooting it into a path that never existed.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Build a `replaceAll` edit by assembling flushed chunks instead of `split(oldString).join(newString)`, cutting peak RSS on a worst-case near-limit file from 1184 MB to 357 MB with no regression on ordinary single-match edits.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Stop an abort that races script-tx opening from rejecting a promise with no listener, which was fatal under Node's default `--unhandled-rejections=throw`.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Stop a late-arriving transaction open from adopting into a finished scope (each open now carries a generation checked before adopting), and refuse cache-served reads (`stat`, `readFile`, `readdir`, `exists`, `getAllPaths`) once a script-tx is lost.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Fail every remaining operation in a script scope once its transaction's connection is lost, instead of letting a write silently self-commit outside the scope on a reconnected-but-transactionless connection — previously a 600-file bulk write could answer HTTP 500 with 599 of them durable.
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Write a whole file through one shared transactional path (`writeFileAtPath`) on both the MCP `file_write` tool and `PUT /v1/sandboxes/:id/files/*`, so parent directories and file content commit together and `PUT` matches MCP in refusing to clobber a directory (`400 EISDIR`).
+
+- [#162](https://github.com/Hazzng/sql-fs/pull/162) Thanks [@Hazzng](https://github.com/Hazzng)! - Default the single-file write limit to the contentCache cap (50 MiB) instead of 64 MiB — load testing found memory cost doubles just past the cache cap, so the old default pinned 256 MB per warm session for a single large read.
+
 ## 0.10.0
 
 ### Minor Changes

@@ -221,6 +221,36 @@ describe("session.cwd — stub-based unit coverage", () => {
 		expect(session.cwd).toBe("/explicit/dir");
 	});
 
+	// A script can set PWD to anything. A relative value is not evidence about where the shell is, so
+	// the last known-good cwd is kept rather than rooting it into a directory nothing created. The
+	// guard this replaces normalized first, which prefixed the missing slash and could never fail.
+	it("keeps the previous cwd when result.env.PWD is relative", async () => {
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const session = await sm.getOrCreate(T, "sb-stub-relative-pwd");
+		session.cwd = "/home/user";
+
+		stubBashExec(session, async () => {
+			return { stdout: "", stderr: "", exitCode: 0, env: { PWD: "foo" } };
+		});
+
+		await sm.execWithRuntimeThrottle(session, "export PWD=foo");
+
+		expect(session.cwd).toBe("/home/user");
+	});
+
+	it("normalizes an absolute PWD before storing it", async () => {
+		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const session = await sm.getOrCreate(T, "sb-stub-unnormalized-pwd");
+
+		stubBashExec(session, async () => {
+			return { stdout: "", stderr: "", exitCode: 0, env: { PWD: "/a/./b/../c//d" } };
+		});
+
+		await sm.execWithRuntimeThrottle(session, "echo hi");
+
+		expect(session.cwd).toBe("/a/c/d");
+	});
+
 	it("updates session.cwd from result.env.PWD after exec", async () => {
 		sm = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const session = await sm.getOrCreate(T, "sb-stub-update");
