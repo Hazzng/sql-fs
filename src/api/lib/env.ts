@@ -50,3 +50,26 @@ if (MAX_FILE_WRITE_BYTES > DEFAULT_CONTENT_CACHE_MAX_BYTES) {
 		}),
 	);
 }
+
+/**
+ * Largest total decoded byte count one `POST /writeFiles` batch may carry.
+ *
+ * #168: this defaulted to 128 MiB against a 50 MiB per-file cap, so the bulk route was a 2.5x
+ * wider door than the single-file route it batches — a 120 MiB bulk write blocked the event loop
+ * for 669 ms, stalling every other tenant on the replica. Defaulting it to
+ * {@link MAX_FILE_WRITE_BYTES} makes the batch cost no more synchronous work than the widest
+ * single write the service already accepts, and ties the two together so they cannot drift.
+ */
+export const MAX_BULK_WRITE_BYTES = positiveIntEnv(process.env.MAX_BULK_WRITE_BYTES, MAX_FILE_WRITE_BYTES);
+
+/**
+ * Wire-size ceiling for the `POST /writeFiles` request body, counted off the stream before the
+ * JSON parse (#168 — the route previously had no body cap at all, so only the 256 MiB global
+ * backstop bounded what was parsed into memory).
+ *
+ * Twice {@link MAX_BULK_WRITE_BYTES}, not equal to it: the caps above are on *decoded* bytes,
+ * while JSON string escaping roughly doubles the wire size of newline- or quote-heavy text. This
+ * is a backstop on the parse, not a second content cap — the decoded totals are what the route
+ * actually enforces.
+ */
+export const MAX_BULK_WRITE_BODY_BYTES = MAX_BULK_WRITE_BYTES * 2;

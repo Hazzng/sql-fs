@@ -16,7 +16,11 @@ import type { FsStat } from "just-bash";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import { extractErrCode } from "../errors.js";
-import { MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES } from "../lib/env.js";
+import {
+	MAX_BULK_WRITE_BODY_BYTES,
+	MAX_BULK_WRITE_BYTES,
+	MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES,
+} from "../lib/env.js";
 import { type EditOutcome, type WriteOutcome, editFile, ensureParentDir, writeFileAtPath } from "../lib/file-ops.js";
 import { runInScriptTx } from "../lib/script-tx.js";
 import {
@@ -70,32 +74,35 @@ function toKind(stat: FsStat): string {
 }
 
 const MAX_BULK_WRITE_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
-const MAX_BULK_WRITE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
 // Audit H11 (#27): cap the number of entries a single /tree response materializes.
 const MAX_TREE_ENTRIES = Number(process.env.MAX_TREE_ENTRIES ?? "50000");
 
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
-	// A write is bounded by the same limit as the file it produces, and the global body cap is four
-	// times looser. Content-Length only ever shortens the work: a request that declares too much is
-	// refused unread, but every byte is counted as it streams, so a chunked body carrying no header
-	// — or one that under-declares — is cut off rather than trusted. (hono's own `bodyLimit` skips
-	// the counting whenever the declared length fits, which is exactly the case a liar declares.)
-	const writeBodyLimit = (subject: string): MiddlewareHandler<{ Variables: AuthVariables }> => {
+	// A write is bounded by the limit on what it produces — the file for PUT/PATCH, the batch for
+	// /writeFiles (#168) — and the global body cap is looser still. Content-Length only ever
+	// shortens the work: a request that declares too much is refused unread, but every byte is
+	// counted as it streams, so a chunked body carrying no header — or one that under-declares — is
+	// cut off rather than trusted. (hono's own `bodyLimit` skips the counting whenever the declared
+	// length fits, which is exactly the case a liar declares.)
+	const writeBodyLimit = (
+		subject: string,
+		limitBytes: number = MAX_RAW_FILE_WRITE_BYTES,
+	): MiddlewareHandler<{ Variables: AuthVariables }> => {
 		const tooLarge = (c: Context<{ Variables: AuthVariables }>): Response =>
 			c.json(
 				{
 					error: "payload_too_large",
 					code: "PAYLOAD_TOO_LARGE",
-					details: [`${subject} exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+					details: [`${subject} exceeds limit (${limitBytes} bytes)`],
 				},
 				413 as ContentfulStatusCode,
 			);
 
 		return async (c, next) => {
 			const declared = Number(c.req.header("content-length"));
-			if (Number.isFinite(declared) && declared > MAX_RAW_FILE_WRITE_BYTES) return tooLarge(c);
+			if (Number.isFinite(declared) && declared > limitBytes) return tooLarge(c);
 
 			const body = c.req.raw.body;
 			if (body === null) return next();
@@ -110,7 +117,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 							const { done, value } = await reader.read();
 							if (done) break;
 							seen += value.byteLength;
-							if (seen > MAX_RAW_FILE_WRITE_BYTES) {
+							if (seen > limitBytes) {
 								overflowed = true;
 								// Error the stream so the handler cannot act on a body it only half received,
 								// and cancel the source so the rest of the upload is not left streaming into a
@@ -396,7 +403,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		files: z.record(z.string(), z.string()),
 	});
 
-	router.post("/:id/writeFiles", async (c) => {
+	router.post("/:id/writeFiles", writeBodyLimit("Bulk write body", MAX_BULK_WRITE_BODY_BYTES), async (c) => {
 		const sandboxId = c.req.param("id");
 		const tenant = c.get("tenant");
 		let body: z.infer<typeof writeFilesBodySchema>;

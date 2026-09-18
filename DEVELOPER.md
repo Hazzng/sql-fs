@@ -214,14 +214,19 @@ Bypassing the lock to write directly to `SqlFs` from elsewhere in the codebase w
 
 Every lease above (the exec-lock writer lease, the RW-lock writer flag, and the RW-lock reader ZSET scores) is kept alive by a `setTimeout` heartbeat that renews well before expiry (`renewMs` 20s < `leaseMs` 60s). They all assume the timer fires roughly on schedule. The GC-pause failure mode in the table above is exactly a violation of that assumption: when the event loop stalls longer than the lease, the renewal fires too late, Redis has already expired the key / reaped the reader entry, and the next renew returns 0 → `LockLostError`. Lock 3 keeps the DB consistent, so this is an **observability** concern, not a correctness one — but until F8 nothing measured how close the process ran to the lease floor.
 
-`src/api/event-loop-monitor.ts` is purely observational and emits two structured log events:
+`src/api/event-loop-monitor.ts` is purely observational and emits three structured log events:
 
 | Event | Emitted by | Fields | Meaning / alert threshold |
 |---|---|---|---|
-| `event_loop_lag` | boot sampler (`startEventLoopMonitor`, every `EVENT_LOOP_MONITOR_INTERVAL_MS`, default 10s) | `p50Ms`, `p99Ms`, `maxMs`, `meanMs`, `windowMs` | Process-wide event-loop delay from `perf_hooks.monitorEventLoopDelay`. **Page** when `p99Ms`/`maxMs` approaches `renewMs` (~20s) — the lease margin is being eaten. |
+| `event_loop_lag` | boot sampler (`startEventLoopMonitor`, every `EVENT_LOOP_MONITOR_INTERVAL_MS`, default 10s) | `p50Ms`, `p99Ms`, `p999Ms`, `maxMs`, `meanMs`, `windowMs` | Process-wide event-loop delay from `perf_hooks.monitorEventLoopDelay`. **Page** when `p99Ms`/`maxMs` approaches `renewMs` (~20s) — the lease margin is being eaten. |
+| `event_loop_stall` | same sampler, only when a window's `maxMs` crosses `EVENT_LOOP_STALL_THRESHOLD_MS` (default 2000) | `severity:"critical"`, `maxMs`, `p999Ms`, `thresholdMs`, `windowMs` | One window blocked long enough to time out Redis commands belonging to *other* tenants (the client's `commandTimeout` is 2s). **Page**: past this point a stall is a correctness bug, not a latency one (#168). |
 | `heartbeat_gap` | each heartbeat callback (`recordHeartbeatGap`) | `severity`, `lock` (`exec`\|`rw-writer`\|`rw-reader`), `key`, `gapMs`, `renewMs`, `leaseMs` | Actual-minus-expected fire time for one heartbeat. `severity:"warn"` at `gapMs > renewMs` (a full interval late); `severity:"critical"` at `gapMs > leaseMs` (the lease almost certainly lapsed). Silent below `renewMs`. |
 
-`warn`/`critical` go to `console.warn`/`console.error` respectively; the sampler logs at `console.log`. A `critical` `heartbeat_gap` for `exec`/`rw-writer` is the breadcrumb that explains a subsequent `LockLostError`; for `rw-reader` it flags the window during which a writer could have reaped the stale reader entry and entered mid-read. `eventLoopLagSnapshot()` exposes the live histogram for a future health endpoint without perturbing the windowed log.
+`warn`/`critical` go to `console.warn`/`console.error` respectively; the sampler logs at `console.log`. A `critical` `heartbeat_gap` for `exec`/`rw-writer` is the breadcrumb that explains a subsequent `LockLostError`; for `rw-reader` it flags the window during which a writer could have reaped the stale reader entry and entered mid-read.
+
+**Reading the percentiles (#168).** `p50Ms`/`p99Ms` sit at the histogram resolution (20ms) whenever the loop is healthy, and a *lone* multi-second stall does not move them: a 10s window holds ~400–500 readings, so one stall is a couple of tenths of a percent of the sample and falls above p99 by construction. `p999Ms` is the percentile that answers for a single outlier at that sample count; `maxMs` and the `event_loop_stall` line are the signals that always do. Lowering `DEFAULT_RESOLUTION_MS` makes the dilution worse, not better (more readings, a smaller share each), so it is deliberately left at 20ms — 50 libuv wakeups per second, order 1e-5 of a core.
+
+`GET /readyz` carries the live histogram as an `eventLoop` object (`p50Ms`, `p99Ms`, `p999Ms`, `maxMs`, `meanMs`) whenever the monitor is running, so a scraper can poll the lease margin without parsing logs. The field is **absent** — not null, not zeroed — when the monitor was never started (any embed that does not boot through the entry point), so an idle loop and an unmeasured one cannot be confused. Reading it does not reset the histogram, so scraping never erases a window the sampler is about to log.
 
 ---
 
