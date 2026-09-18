@@ -73,6 +73,7 @@ describe("POST /v1/sandboxes/:id/exec — SSE error frame", () => {
 			t: "error",
 			code: "INTERNAL_ERROR",
 			error: "internal error",
+			retryable: false,
 		});
 	});
 
@@ -82,6 +83,7 @@ describe("POST /v1/sandboxes/:id/exec — SSE error frame", () => {
 			t: "error",
 			code: "INTERNAL_ERROR",
 			error: "internal error",
+			retryable: false,
 		});
 	});
 
@@ -91,6 +93,7 @@ describe("POST /v1/sandboxes/:id/exec — SSE error frame", () => {
 			t: "error",
 			code: "EUNAVAILABLE",
 			error: "internal error",
+			retryable: true,
 		});
 	});
 
@@ -100,6 +103,7 @@ describe("POST /v1/sandboxes/:id/exec — SSE error frame", () => {
 			t: "error",
 			code: "ELOCKLOST",
 			error: "ELOCKLOST: exec lock lease lost",
+			retryable: true,
 		});
 	});
 });

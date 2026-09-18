@@ -28,6 +28,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ELOCKTIMEOUT",
 	"ELOCKLOST",
 	"ECOHERENCE",
+	"ECOHERENCE_UNAPPLIED",
 	"ERUNTIME_BUSY",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
@@ -74,6 +75,45 @@ function isConnectionClassSqlState(code: string | undefined): boolean {
 const UNAVAILABLE_ERROR_CODE = "EUNAVAILABLE";
 
 /**
+ * #175: codes for which the server *knows* the request applied nothing and the
+ * condition is transient — the breaker threw before the handler ran, or the
+ * script transaction was definitively rolled back. These are the only errors we
+ * advertise as `retryable: true`.
+ *
+ * `ECOHERENCE` is deliberately absent: the write committed to Postgres and only
+ * the cross-replica version publish failed, so a blind retry re-applies a
+ * non-idempotent script. So is the `08xxx` connection-exception class — a
+ * connection lost mid-COMMIT leaves the outcome in doubt, which is not the same
+ * as known-not-applied.
+ */
+const RETRY_SAFE_ERROR_CODES: ReadonlySet<string> = new Set([
+	"ESESSIONCLOSING",
+	"ESHUTTINGDOWN",
+	"ELOCKTIMEOUT",
+	"ELOCKLOST",
+	"ECOHERENCE_UNAPPLIED",
+	"ERUNTIME_BUSY",
+]);
+
+/**
+ * Whether a retry of this request is known to be both safe (nothing was
+ * applied) and worthwhile (the condition is transient). Surfaced to clients as
+ * the `retryable` field on every error body so a 503 no longer has to be
+ * disambiguated by enumerating `code` values (#175). `false` means "the effect
+ * may already be durable, or a retry will fail identically" — retry only when
+ * the call is idempotent.
+ */
+export function isRetryableError(err: unknown): boolean {
+	if (!(err instanceof Error)) return false;
+	const code = (err as Error & { code?: string }).code;
+	if (code === undefined) return false;
+	if (RETRY_SAFE_ERROR_CODES.has(code)) return true;
+	// Capacity refusals never got as far as running a statement. The 08xxx class
+	// is excluded on purpose — see RETRY_SAFE_ERROR_CODES.
+	return RETRYABLE_SQLSTATES.has(code);
+}
+
+/**
  * Returns a client-safe error `code`, the counterpart to `clientSafeErrorMessage`.
  * Use the two together: leaking the code while redacting the message still hands
  * clients raw driver identifiers (`ECONNRESET`, `CONNECTION_CLOSED`) and Postgres
@@ -105,9 +145,17 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  *                       aborted (script-tx rolled back) BEFORE any commit when the
  *                       lease is definitively lost, so ELOCKLOST now genuinely
  *                       means "not committed" — safe for the client to retry.
- * 08xxx/53300/  → 503  Service Unavailable, RETRYABLE — the DB refused the
- * 53400/57P03          connection or is out of capacity, not a caller bug (#174).
+ * ECOHERENCE     → 503  Service Unavailable, NOT retryable. The write COMMITTED;
+ *                       only the cross-replica version publish failed (#175).
+ * ECOHERENCE_    → 503  Service Unavailable, RETRYABLE. Coherence is broken but
+ *   UNAPPLIED           the transaction was rolled back, so nothing was applied.
+ * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
+ * 53400/57P03          out of capacity, not a caller bug (#174). Only the
+ *                      capacity SQLSTATEs are advertised retryable (#175).
  * others         → 500  Internal Server Error
+ *
+ * Status alone never answers "is a retry safe?" — six distinct codes share 503.
+ * `isRetryableError` is the discriminator, surfaced as the `retryable` field.
  */
 export function mapFsErrorToStatus(err: Error): number {
 	const code = (err as Error & { code?: string }).code;
@@ -142,6 +190,8 @@ export function mapFsErrorToStatus(err: Error): number {
 			// definitive lease loss, so ELOCKLOST is now retryable (not committed).
 			return 503;
 		case "ECOHERENCE":
+			return 503;
+		case "ECOHERENCE_UNAPPLIED":
 			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;

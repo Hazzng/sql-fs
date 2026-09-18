@@ -375,7 +375,13 @@ describe("SqlFs script-tx — poisoned cache after correlated PG failure (F1)", 
 		expect(fs.getAllPaths()).toContain("/home/user/phantom.txt");
 	});
 
-	it("publishVersionIfDirty skips INCR and throws ECOHERENCE while poisoned", async () => {
+	// The poison flag stays set across an aborted scope, so a later turn's
+	// publish guard still sees it. What the guard then does — suppress the INCR
+	// and throw ECOHERENCE_UNAPPLIED — belongs to SessionManager and is asserted
+	// against the real implementation in
+	// src/api/tests/unit/session-manager.ecoherence-contract.test.ts (#175). This
+	// test used to re-implement the guard inline, which proved nothing about it.
+	it("keeps the poison set after a subsequent aborted scope", async () => {
 		const { dialect, state } = makePoisoningDialect();
 		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
 		await fs.ready();
@@ -386,26 +392,9 @@ describe("SqlFs script-tx — poisoned cache after correlated PG failure (F1)", 
 		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
 		expect(fs.poisoned()).toBe(true);
 
-		// Mirror publishVersionIfDirty's poison guard (session-manager.ts). The
-		// guard runs BEFORE the dirty gate and BEFORE redis.incr.
-		const redis = { incr: vi.fn(async (_key: string) => 1) };
-		const session = { lastSeenVersion: 7, publishPending: true };
-
-		const publish = async (): Promise<void> => {
-			if (fs.poisoned()) {
-				session.lastSeenVersion = -1;
-				session.publishPending = false;
-				throw Object.assign(new Error("ECOHERENCE: cache poisoned by failed reload; publish suppressed"), {
-					code: "ECOHERENCE",
-				});
-			}
-			await redis.incr("vfs:t:ver:s-tx");
-		};
-
-		await expect(publish()).rejects.toMatchObject({ code: "ECOHERENCE" });
-		expect(redis.incr).not.toHaveBeenCalled();
-		expect(session.lastSeenVersion).toBe(-1);
-		expect(session.publishPending).toBe(false);
+		fs.beginScriptScope();
+		await fs.abortScriptScope();
+		expect(fs.poisoned()).toBe(true);
 	});
 
 	it("a successful reload clears the poison", async () => {
