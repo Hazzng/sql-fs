@@ -283,6 +283,21 @@ Always the source of truth. Every mutation writes here first before any cache is
 
 ---
 
+## Orphan Blob and Manifest GC
+
+`pnpm db:gc` (`src/api/cli/gc.ts` → `runBlobGc` → `PostgresDialect.gcOrphanBlobs`) runs one sweep per tenant on a dedicated, context-less connection, at REPEATABLE READ with retry on 40001/40P01. One pass is two DELETEs in **one** transaction, in this order:
+
+1. **Package manifests.** `package_manifests` rows whose `last_used_at` is older than `PIP_MANIFEST_TTL_MS` (default 30 days, `--manifest-ttl-ms`) and that **no `sandbox_packages` row references**. Their `package_manifest_files` rows cascade. The `NOT EXISTS` is required, not an optimisation: `sandbox_packages.wheel_sha256` references manifests `ON DELETE RESTRICT`, so deleting an installed sandbox's manifest would raise 23503 and abort the whole pass.
+2. **Orphan blobs.** Blobs referenced by no inode's `content_sha256` (`nlink > 0`) **and by no surviving `package_manifest_files` row**, older than `BLOB_GC_MIN_AGE_MS` (`--min-age-ms`). A NULL `last_referenced_at` counts as ancient.
+
+**GC roots are therefore inodes *and* manifests.** A wheel extracted for one sandbox keeps its blobs alive for the whole tenant even after every sandbox that installed it is gone — that is the point of the cross-sandbox cache — until the manifest itself expires. Because step 1 precedes step 2 in the same transaction, a blob rooted only by a manifest that expires in this pass is collected in the same pass.
+
+`package_manifest_files.blob_sha256 REFERENCES blobs(sha256) ON DELETE RESTRICT` is the safety net behind the anti-join: if the clause is ever wrong, the blob DELETE fails loudly (23503) instead of silently dropping bytes a manifest still promises. The `ingestBlobs` / `recordManifest` touch-then-insert protocol row-locks the blobs before any manifest row exists, so the two orderings that could race (manifest first, GC first) are rare and both harmless — one retries, the other re-ingests.
+
+The per-tenant report and the `blob_gc_tenant_ok` / `blob_gc_complete` log lines carry `manifestsDeleted` alongside `deleted`.
+
+---
+
 ## Cross-Replica Cache Coherence
 
 No pub/sub. Coherence is solved with a single version counter in Redis, feasible because exec serialization (Lock 2) collapses the requirement from continuous to exec-boundary only.

@@ -26,6 +26,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import type { BulkIngestFile } from "../../types.js";
 
+/**
+ * Manifest TTL used by the pre-existing GC cases: 30 days, the production
+ * default, so no manifest these tests create or share is swept while they run.
+ * The manifest-specific sweep has its own suite (package-manifests.integration).
+ */
+const MANIFEST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — connection and sandbox context", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
 
@@ -842,7 +849,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx, 0);
+			await dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS });
 		});
 
 		// Blob should still exist (referenced by the inode)
@@ -877,7 +884,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — should delete the orphan blob
 		const deleted = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx, 0);
+			return (await dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS })).deletedBlobs;
 		});
 
 		expect(deleted.length).toBeGreaterThanOrEqual(1);
@@ -924,7 +931,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Run GC — blob should survive (still referenced by inodeId2)
 		await dialect.transaction(async (tx) => {
-			await dialect.gcOrphanBlobs(tx, 0);
+			await dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS });
 		});
 
 		const result = await dialect.transaction(async (tx) => {
@@ -1008,7 +1015,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// 1h grace window: the orphan is fresh, so it must survive.
 		const survived = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+			return (await dialect.gcOrphanBlobs(tx, { minAgeMs: 3_600_000, manifestTtlMs: MANIFEST_TTL_MS })).deletedBlobs;
 		});
 		expect(includesSha(survived, sha256)).toBe(false);
 		const stillThere = await dialect.transaction(async (tx) => {
@@ -1018,7 +1025,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Zero grace window: the orphan is now eligible and gets collected.
 		const collected = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx, 0);
+			return (await dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS })).deletedBlobs;
 		});
 		expect(includesSha(collected, sha256)).toBe(true);
 		const gone = await dialect.transaction(async (tx) => {
@@ -1041,7 +1048,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 
 		// Long grace window — NULL is treated as ancient, so it is still collected.
 		const collected = await dialect.transaction(async (tx) => {
-			return await dialect.gcOrphanBlobs(tx, 3_600_000);
+			return (await dialect.gcOrphanBlobs(tx, { minAgeMs: 3_600_000, manifestTtlMs: MANIFEST_TTL_MS })).deletedBlobs;
 		});
 		expect(includesSha(collected, sha256)).toBe(true);
 
@@ -1080,7 +1087,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — gcOrphanBlobs", 
 			// context-less tx see the other sandbox's inode, so the anti-join
 			// keeps this blob alive.
 			const deleted = await dialect.transaction(async (tx) => {
-				return await dialect.gcOrphanBlobs(tx, 0);
+				return (await dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS })).deletedBlobs;
 			});
 			expect(includesSha(deleted, sha256)).toBe(false);
 
@@ -1180,7 +1187,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		expect(await countInode(inodeA)).toBe(0);
 
 		// Old blob is now a true orphan → collected; the new blob survives.
-		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS }));
 		const blobA = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaA));
 		const blobB = await dialect.transaction(async (tx) => dialect.getBlob(tx, shaB));
 		expect(blobA).toBeNull();
@@ -1205,7 +1212,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 			await tx`UPDATE inodes SET nlink = 0 WHERE id = ${String(inodeId)}`;
 		});
 
-		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS }));
 
 		const blob = await dialect.transaction(async (tx) => dialect.getBlob(tx, sha));
 		expect(blob).toBeNull(); // collected despite the tombstone reference
@@ -1257,7 +1264,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		expect(await countInode(srcInode)).toBe(1); // src inode now lives at mvdst.txt
 
 		// The dest's old blob is freed for GC; the moved src blob survives.
-		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, 0));
+		await dialect.transaction(async (tx) => dialect.gcOrphanBlobs(tx, { minAgeMs: 0, manifestTtlMs: MANIFEST_TTL_MS }));
 		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaDst))).toBeNull();
 		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaSrc))).toEqual(dataSrc);
 

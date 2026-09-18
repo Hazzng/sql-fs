@@ -89,6 +89,19 @@ export function createEgraftmissing(missing: readonly string[]): Error & { code:
 	);
 }
 
+/**
+ * EMANIFESTINUSE: a `deleteManifest` was refused because a `sandbox_packages`
+ * row still references the wheel. The ledger FK is ON DELETE RESTRICT, so the
+ * raw failure is a Postgres 23503; this is the FS-shaped form of it, so no
+ * driver error (with table names) reaches the API layer.
+ */
+export function createEmanifestinuse(wheelSha256Hex: string): Error & { code: string } {
+	return Object.assign(
+		new Error(`EMANIFESTINUSE: package manifest ${wheelSha256Hex} is still installed in at least one sandbox`),
+		{ code: "EMANIFESTINUSE" },
+	);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */

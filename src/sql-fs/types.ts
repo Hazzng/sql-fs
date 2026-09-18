@@ -114,6 +114,49 @@ export interface GraftFile {
 	readonly size: number;
 }
 
+/** A row of `package_manifests`: the tenant-global extraction record of one wheel. */
+export interface PackageManifest {
+	/** sha256 of the downloaded `.whl`, the manifest's primary key. */
+	readonly wheelSha256: Uint8Array;
+	/** Format version of the extraction rules that produced the file rows. */
+	readonly manifestFormat: number;
+	readonly name: string;
+	readonly version: string;
+	readonly fileCount: number;
+	readonly totalBytes: number;
+}
+
+/** A row of `sandbox_packages`: one installed package in the current sandbox. */
+export interface SandboxPackageRow {
+	readonly name: string;
+	readonly version: string;
+	readonly wheelSha256: Uint8Array;
+}
+
+/** Inputs to one orphan-GC pass. */
+export interface GcOptions {
+	/**
+	 * Grace window (ms) for orphan blobs: an orphan whose `last_referenced_at`
+	 * is younger than this is kept. `0` collects every orphan immediately.
+	 */
+	readonly minAgeMs: number;
+	/**
+	 * TTL (ms) for package manifests: a manifest no sandbox has installed and
+	 * whose `last_used_at` is older than this is deleted (and its blobs then
+	 * become collectible in the same pass). `0` collects every unreferenced
+	 * manifest immediately.
+	 */
+	readonly manifestTtlMs: number;
+}
+
+/** What one orphan-GC pass removed. */
+export interface GcResult {
+	/** sha256 of every deleted blob, for cache invalidation. */
+	readonly deletedBlobs: Uint8Array[];
+	/** Number of `package_manifests` rows deleted (their file rows cascade). */
+	readonly manifestsDeleted: number;
+}
+
 /** Options for a transaction. */
 export interface TransactionOptions {
 	/**
@@ -380,18 +423,23 @@ export interface SqlDialect<Tx = unknown> {
 	getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>>;
 
 	/**
-	 * Deletes orphan blobs — those whose sha256 is not referenced by any inode's
-	 * content_sha256 — that are older than the `minAgeMs` grace window.
+	 * One orphan-collection pass, in two statements in the caller's transaction,
+	 * manifests first and blobs second:
 	 *
-	 * `minAgeMs` is the grace window in milliseconds: orphans whose
-	 * `last_referenced_at` is younger than this are kept (they may be re-adopted
-	 * by an in-flight dedup upsert). A NULL `last_referenced_at` is treated as
-	 * ancient and is always eligible for collection. Pass `0` to collect every
-	 * orphan immediately.
+	 * 1. `package_manifests` rows older than `opts.manifestTtlMs` that no
+	 *    `sandbox_packages` row references (the ledger FK is ON DELETE RESTRICT,
+	 *    so the anti-join is required, not an optimisation). File rows cascade.
+	 * 2. Orphan blobs — those referenced by no inode's `content_sha256` and by no
+	 *    surviving `package_manifest_files` row — older than `opts.minAgeMs`.
+	 *    A NULL `last_referenced_at` is treated as ancient and always eligible.
 	 *
-	 * Returns the sha256s of the deleted blobs (for later cache invalidation).
+	 * Because step 1 precedes step 2 in the same transaction, a blob rooted only
+	 * by a just-expired manifest is collected in the same pass.
+	 *
+	 * Returns the deleted blob hashes (for later cache invalidation) and the
+	 * number of manifests deleted.
 	 */
-	gcOrphanBlobs(tx: Tx, minAgeMs: number): Promise<Uint8Array[]>;
+	gcOrphanBlobs(tx: Tx, opts: GcOptions): Promise<GcResult>;
 
 	// ── Bulk / tree operations ────────────────────────────────────────────────────
 
@@ -429,6 +477,54 @@ export interface SqlDialect<Tx = unknown> {
 	 * come from the database, not from this writer.
 	 */
 	bulkGraft(tx: Tx, files: readonly GraftFile[]): Promise<Map<string, PathCacheEntry>>;
+
+	// ── Package manifests (tenant-global) ─────────────────────────────────────────
+
+	/**
+	 * Returns the manifest for `wheelSha256`, or undefined when there is none or
+	 * the stored row was written by a different `manifestFormat` (an old-format
+	 * row is a miss, and the next `recordManifest` replaces it).
+	 *
+	 * Tenant-global: runs on the pool with no sandbox context.
+	 */
+	lookupManifest(wheelSha256: Uint8Array, manifestFormat: number): Promise<PackageManifest | undefined>;
+
+	/**
+	 * Records (or replaces) the manifest of one wheel in its own short
+	 * transaction on the pool — no sandbox context, `package_manifests` is
+	 * tenant-global CAS like `blobs`.
+	 *
+	 * Every file hash is touch-RETURNING'd first; a hash that is not stored
+	 * throws `code: "EGRAFTMISSING"` and nothing is written, so the caller
+	 * re-ingests the wheel's blobs and retries. The touch also row-locks the
+	 * blobs, so a concurrent REPEATABLE READ GC conflicts instead of collecting
+	 * a blob this manifest is about to reference.
+	 */
+	recordManifest(manifest: PackageManifest, files: readonly GraftFile[]): Promise<void>;
+
+	/**
+	 * Deletes a manifest and its file rows (the stale-manifest path after an
+	 * `EGRAFTMISSING`). Throws `code: "EMANIFESTINUSE"` if a `sandbox_packages`
+	 * row still references it (the ledger FK is ON DELETE RESTRICT).
+	 */
+	deleteManifest(wheelSha256: Uint8Array): Promise<void>;
+
+	/** Loads the file rows of each wheel, keyed by the wheel hash as lowercase hex. */
+	loadManifestFiles(wheelSha256s: readonly Uint8Array[]): Promise<Map<string, GraftFile[]>>;
+
+	/** Bumps `last_used_at` on each manifest so the GC TTL sweep keeps it. */
+	touchManifests(wheelSha256s: readonly Uint8Array[]): Promise<void>;
+
+	// ── Installed-package ledger (sandbox-scoped, RLS) ────────────────────────────
+
+	/** Lists the current sandbox's installed packages. Runs inside the script tx. */
+	listSandboxPackages(tx: Tx): Promise<SandboxPackageRow[]>;
+
+	/** Inserts or replaces ledger rows for the current sandbox. Runs inside the script tx. */
+	upsertSandboxPackages(tx: Tx, rows: readonly SandboxPackageRow[]): Promise<void>;
+
+	/** Removes one ledger row by package name. Runs inside the script tx. */
+	deleteSandboxPackage(tx: Tx, name: string): Promise<void>;
 
 	// ── Path resolution ───────────────────────────────────────────────────────────
 

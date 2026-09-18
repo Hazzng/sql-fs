@@ -83,7 +83,7 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 - `routes/files.ts` — File ops: read, write, delete, mkdir, bulk write, tree listing
 - `routes/exec.ts` — Bash execution: sync (JSON) and streaming (SSE)
 - `routes/ingest.ts` — Ingest (tar.gz / JSON manifest) and export (tar.gz download)
-- `blob-gc.ts` — Multi-tenant orphan-blob GC orchestrator (`runBlobGc`); invoked by `cli/gc.ts`
+- `blob-gc.ts` — Multi-tenant orphan-blob + package-manifest GC orchestrator (`runBlobGc`); invoked by `cli/gc.ts`
 - `commands/pip-command.ts` — Experimental pure-Python package support: `pip`, the `python3` / `python` overrides (path translation, stdin, interpreter-option parsing) and `databricks`. Built by `createPythonPackageCommands({ fetch, acquireInstall, acquirePython })`; the built-in WASM python is reached through a sibling `Bash` per filesystem, because a custom command shadows the built-in of the same name for `ctx.exec` too.
 - `cli/gc.ts` — Blob GC CLI (`pnpm db:gc`), for an external cron / k8s CronJob
 - `mcp/server.ts` — MCP server setup with streamable HTTP transport
@@ -98,7 +98,14 @@ inodes (id, sandbox_id, kind[file|dir|symlink], mode, size, mtime, nlink, conten
     ↓
 dirents (parent_inode_id, name, inode_id, sandbox_id)  — PK: (parent_inode_id, name)
     ↓
-blobs (sha256, data, size)  — content-addressable, global dedup
+blobs (sha256, data, size, last_referenced_at)  — content-addressable, global dedup
+
+package_manifests (wheel_sha256, manifest_format, name, version, file_count, total_bytes, last_used_at)
+    ↓                                  — tenant-global wheel extraction record, no RLS (like blobs)
+package_manifest_files (wheel_sha256, path, blob_sha256 → blobs ON DELETE RESTRICT, mode, size)
+    ↑
+sandbox_packages (sandbox_id, name, version, wheel_sha256 → package_manifests ON DELETE RESTRICT)
+                                       — per-sandbox installed-package ledger, under RLS
 ```
 
 ### Caching Strategy
@@ -232,6 +239,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `EVENT_LOOP_MONITOR_INTERVAL_MS` | No (default: 10000) | Sampling interval (ms) for the F8 event-loop lag monitor. Each window logs `event:"event_loop_lag"` (`p50Ms`/`p99Ms`/`maxMs`/`meanMs`) then resets the histogram. Purely observational; pairs with per-heartbeat `event:"heartbeat_gap"` warn/critical events that flag a stall eating into a Redis lease (see DEVELOPER.md "Lock observability"). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
+| `PIP_MANIFEST_TTL_MS` | No (default: 2592000000) | TTL (ms, default 30 days) after which a package manifest that no `sandbox_packages` row references becomes collectible by `pnpm db:gc`. Manifests are a GC root: a wheel's blobs survive as long as its manifest does, so this is how long an unused wheel stays instantly re-installable tenant-wide. The sweep runs before the blob anti-join in the same transaction, so an expired manifest's blobs go in the same pass. Override per-run with `--manifest-ttl-ms`. |
 | `BLOB_GC_MIN_AGE_MS` | No (default: 10800000) | Grace window (ms, default 3h) before an orphan blob becomes collectible by `pnpm db:gc`. Orphans whose `last_referenced_at` is newer than this are kept; the `ON CONFLICT DO UPDATE` row lock on blob writes is the actual dedup re-adoption race guard — this window is churn/margin control. Rows with NULL `last_referenced_at` (legacy, pre-migration-0006) are treated as ancient and always collectible. Override per-run with `--min-age-ms`. |
 
 ## File Layout
@@ -248,8 +256,9 @@ src/
       postgres.ts                ← Postgres/Neon dialect
       mysql.ts                   ← MySQL 8+ dialect
       azure-sql.ts               ← Azure SQL dialect
+    package-manifest.ts          ← MANIFEST_FORMAT (package-manifest row format version)
     migrations/
-      postgres/                  ← Postgres DDL + RLS + stored procs
+      postgres/                  ← Postgres DDL + RLS + stored procs (0000–0007; 0007 = package manifests + sandbox_packages)
       mysql/                     ← MySQL DDL + stored procs
       azure-sql/                 ← T-SQL DDL + RLS + stored procs
     integration/                 ← DB integration tests (skippable)
@@ -276,7 +285,8 @@ src/
       server.ts                  ← MCP server
       tools.ts                   ← Tool definitions + handlers
     cli/
-      gc.ts                      ← Blob GC CLI (pnpm db:gc)
+      gc.ts                      ← Blob + manifest GC CLI (pnpm db:gc)
+      gc-args.ts                 ← GC CLI flag/duration parsing (unit-testable)
     tests/                       ← API unit + e2e tests (integration/ inside)
 ```
 

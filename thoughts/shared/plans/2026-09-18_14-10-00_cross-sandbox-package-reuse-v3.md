@@ -585,6 +585,87 @@ Because step 1 precedes step 2 in the same transaction, blobs rooted only by an
 expired manifest are collectible in the same pass. `runBlobGc` reports
 manifests deleted alongside blobs deleted.
 
+### Phase 2 status
+
+- [x] **Migration `0007_package_manifests.sql`**: `package_manifests`,
+      `package_manifest_files` (FK to `package_manifests` CASCADE, FK to
+      `blobs(sha256)` RESTRICT) and `sandbox_packages` (FK to `sandboxes(id)`
+      CASCADE, FK to `package_manifests` RESTRICT), all indexes, every statement
+      idempotent. RLS ENABLE + FORCE + `DROP POLICY IF EXISTS` / `CREATE POLICY
+      sandbox_isolation` on `sandbox_packages` with 0005's exact predicate;
+      `COMMENT ON TABLE` on both manifest tables saying why they carry no
+      `sandbox_id` and no RLS. `sandbox_id` is `TEXT`, matching 0000.
+- [x] **Dialect methods** on `SqlDialect` and `PostgresDialect`, all wrapped in
+      `runTrustedDbAsync`, all parameterised: `lookupManifest` (format-aware,
+      an old-format row is a miss), `recordManifest` (touch-then-write in its
+      own pool transaction, `EGRAFTMISSING` before anything is written, file
+      rows deleted and re-inserted 1000 per statement), `deleteManifest`
+      (23503 → `EMANIFESTINUSE`), `loadManifestFiles`, `touchManifests`, and the
+      script-tx ledger trio `listSandboxPackages` / `upsertSandboxPackages` /
+      `deleteSandboxPackage`.
+- [x] **`MANIFEST_FORMAT = 1`** in a new `src/sql-fs/package-manifest.ts` (not
+      `package-limits.ts`): it describes a stored row read and written by the
+      dialect, and `src/sql-fs` cannot import from `src/api` without inverting
+      the layering.
+- [x] **GC**: `gcOrphanBlobs` deletes expired unreferenced manifests first, then
+      blobs, in the same REPEATABLE READ transaction; the blob anti-join gained
+      the `package_manifest_files` clause. Signature is now
+      `(tx, { minAgeMs, manifestTtlMs }) → { deletedBlobs, manifestsDeleted }`.
+- [x] **Plumbing**: `BlobGcOptions.manifestTtlMs`, `BlobGcTenantResult.manifestsDeleted`,
+      `blob_gc_tenant_ok` / `blob_gc_complete` log fields, CLI flag
+      `--manifest-ttl-ms`, env var `PIP_MANIFEST_TTL_MS` (default 30 days).
+- [x] **Docs**: DEVELOPER.md gained an "Orphan Blob and Manifest GC" section
+      (manifests as a GC root, the TTL, the RESTRICT FK, the two-step order);
+      CLAUDE.md gained `PIP_MANIFEST_TTL_MS`, the new schema rows and the new
+      files in the layout.
+- [x] **Tests**: unit — GC option plumbing and `manifestsDeleted` reporting
+      (`blob-gc.test.ts`), CLI flag/duration parsing (`gc-args.test.ts`, 12
+      cases), `lookupManifest` format miss against a fake pool
+      (`postgres.manifests.test.ts`); integration — 0007 applies and re-applies
+      as a no-op with the expected RLS/FK catalog state
+      (`migrations.integration.test.ts`), manifest CRUD + `EGRAFTMISSING` +
+      `EMANIFESTINUSE` + ledger round trip
+      (`package-manifests.integration.test.ts`, 8), manifest-as-GC-root
+      behaviour (`package-manifest-gc.integration.test.ts`, 4), ledger RLS
+      (`sandbox-packages-rls.integration.test.ts`, 5).
+
+### Discoveries and Notable Information
+
+- **There is no `src/sql-fs/schema.ts`.** The plan's Phase 6 item about
+  `drizzle.config.ts` pointing at a missing schema file is accurate today: the
+  file does not exist, `pnpm db:generate` cannot run, and migrations are
+  hand-written. 0007 is therefore hand-written too and nothing was mirrored into
+  Drizzle. Phase 6 should either delete `drizzle.config.ts` or create
+  `schema.ts` covering all seven tables at once.
+- **`gcOrphanBlobs` had to change shape, not just gain a clause.** Reporting
+  `manifestsDeleted` means returning an object, and passing a second duration
+  means an options argument; both call styles were updated at 10 call sites in
+  `postgres.test.ts` (which now wrap the call as
+  `(await …).deletedBlobs` so the existing assertions are untouched) and in the
+  `blob-gc.test.ts` mock.
+- **The GC CLI's parsing moved to `src/api/cli/gc-args.ts`.** `gc.ts` runs
+  `main()` on import, so its flag parsing was untestable; the new module is pure
+  (it throws `EINVAL` instead of calling `process.exit`, which `main().catch`
+  already renders identically) and is covered by 12 unit tests.
+- **The ledger statements filter on `current_setting('app.sandbox_id')` in
+  addition to RLS.** 0005's policy permits every row when no context is set —
+  that escape exists for the context-less GC connection, and the ledger must not
+  inherit it. The strict (two-argument-less) form of `current_setting` errors
+  when unset, so a ledger statement issued without a context fails closed.
+- **`manifestTtlMs: 0` compares against the GC transaction's `now()`**, which is
+  the transaction start time, so a manifest inserted by an earlier transaction is
+  always older and is collected. That is what the "one pass" integration test
+  relies on; nothing needs to sleep.
+- **`recordManifest` replaces the file list wholesale** (DELETE then INSERT
+  inside its own transaction) rather than upserting rows: an old-format row's
+  file list is not a subset of the new one, and leftover paths would root blobs
+  forever.
+- **Integration suite is now 17 files / 115 tests** under
+  `--no-file-parallelism` (was 14 / 97). The Phase 1 `rls.integration.test.ts`
+  deadlock flake under file parallelism is unchanged and untouched; the new RLS
+  suite deliberately runs no DDL, relying on the migration runner, so it does not
+  add to that hazard.
+
 ## Phase 3: publish, ledger, uninstall
 
 ### Publish (`publishInstall`, in the installer, inside the script tx)

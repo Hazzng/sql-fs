@@ -11,6 +11,7 @@ import {
 	createEgraftmissing,
 	createEinval,
 	createEisdir,
+	createEmanifestinuse,
 	createEnoent,
 	createEnotdir,
 	translateSqlError,
@@ -21,13 +22,17 @@ import {
 	type BulkIngestFile,
 	type CreateInodeOpts,
 	type DirentRow,
+	type GcOptions,
+	type GcResult,
 	type GraftFile,
 	INODE_KIND,
 	type InodeKind,
 	type InodeRow,
+	type PackageManifest,
 	type PathCacheEntry,
 	type SandboxListEntry,
 	type SandboxMeta,
+	type SandboxPackageRow,
 	type SqlDialect,
 	type TransactionOptions,
 	type UpdateInodeOpts,
@@ -38,6 +43,16 @@ type PgTx = postgres.TransactionSql;
 
 /** Postgres OID of `bytea[]`, for the explicitly typed hash-array parameter. */
 const BYTEA_ARRAY_OID = 1001;
+
+/** Postgres OID of `text[]`, for the explicitly typed ledger-row arrays. */
+const TEXT_ARRAY_OID = 1009;
+
+/**
+ * Rows per multi-row INSERT of manifest file rows. A large wheel (scipy, torch)
+ * has tens of thousands of entries; one statement per 1000 keeps each parameter
+ * list well under Postgres's 65535-parameter limit (5 columns → 5000 params).
+ */
+const MANIFEST_FILE_BATCH = 1000;
 
 /** What the inode/dirent phases need, from either `bulkIngest` or `bulkGraft`. */
 interface PreparedBulkFile {
@@ -781,19 +796,39 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// `i.nlink > 0` excludes nlink=0 inode tombstones: the composite write/delete
 	// paths no longer create them, but rows left by older buggy builds would
 	// otherwise pin their blobs forever — this lets GC clear that backlog.
-	async gcOrphanBlobs(tx: PgTx, minAgeMs: number): Promise<Uint8Array[]> {
+	//
+	// Manifests are swept FIRST, in the same transaction: `package_manifest_files`
+	// roots blobs through an ON DELETE RESTRICT FK, so a blob kept alive only by a
+	// manifest that expires in this pass must lose that root before the blob
+	// anti-join runs, or it would survive until the next pass. The manifest sweep
+	// needs its own NOT EXISTS against `sandbox_packages` because that FK is also
+	// RESTRICT — deleting an installed sandbox's manifest would raise 23503 and
+	// abort the whole pass.
+	async gcOrphanBlobs(tx: PgTx, opts: GcOptions): Promise<GcResult> {
+		const manifests = await tx<{ wheel_sha256: Buffer }[]>`
+			DELETE FROM package_manifests m
+			WHERE m.last_used_at < now() - (${opts.manifestTtlMs} * interval '1 millisecond')
+			AND NOT EXISTS (
+				SELECT 1 FROM sandbox_packages p WHERE p.wheel_sha256 = m.wheel_sha256
+			)
+			RETURNING m.wheel_sha256
+		`;
+
 		const rows = await tx<{ sha256: Buffer }[]>`
 			DELETE FROM blobs b
 			WHERE NOT EXISTS (
 				SELECT 1 FROM inodes i WHERE i.content_sha256 = b.sha256 AND i.nlink > 0
 			)
+			AND NOT EXISTS (
+				SELECT 1 FROM package_manifest_files f WHERE f.blob_sha256 = b.sha256
+			)
 			AND (
 				b.last_referenced_at IS NULL
-				OR b.last_referenced_at < now() - (${minAgeMs} * interval '1 millisecond')
+				OR b.last_referenced_at < now() - (${opts.minAgeMs} * interval '1 millisecond')
 			)
 			RETURNING b.sha256
 		`;
-		return rows.map((r) => new Uint8Array(r.sha256));
+		return { deletedBlobs: rows.map((r) => new Uint8Array(r.sha256)), manifestsDeleted: manifests.length };
 	}
 
 	// US-015
@@ -1290,6 +1325,218 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await this.#bulkLinkFiles(tx, sandboxId, prepared, existingFileMap, result);
 
 		return result;
+	}
+
+	// ── Package manifests (tenant-global, no sandbox context) ─────────────────────
+
+	async lookupManifest(wheelSha256: Uint8Array, manifestFormat: number): Promise<PackageManifest | undefined> {
+		const db = this.db();
+		const wheel = Buffer.from(wheelSha256);
+		// The format is part of the predicate, so a row written by older
+		// extraction rules is a miss and `recordManifest` replaces it.
+		const rows = await runTrustedDbAsync(
+			() => db<
+				{
+					wheel_sha256: Buffer;
+					manifest_format: number;
+					name: string;
+					version: string;
+					file_count: number;
+					total_bytes: string;
+				}[]
+			>`
+				SELECT wheel_sha256, manifest_format, name, version, file_count, total_bytes
+				FROM package_manifests
+				WHERE wheel_sha256 = ${wheel} AND manifest_format = ${manifestFormat}
+			`,
+		);
+		const row = rows[0];
+		if (row === undefined) return undefined;
+		return {
+			wheelSha256: new Uint8Array(row.wheel_sha256),
+			manifestFormat: row.manifest_format,
+			name: row.name,
+			version: row.version,
+			fileCount: row.file_count,
+			totalBytes: Number(row.total_bytes),
+		};
+	}
+
+	async recordManifest(manifest: PackageManifest, files: readonly GraftFile[]): Promise<void> {
+		const wheel = Buffer.from(manifest.wheelSha256);
+
+		// Presence first, exactly as `bulkGraft` does it: a manifest row pointing
+		// at a collected blob would graft an empty file into every later sandbox.
+		// The touch also row-locks the blobs, so a concurrent REPEATABLE READ GC
+		// conflicts rather than collecting one this manifest is about to root.
+		const uniqueHashes = new Map<string, Buffer>();
+		for (const f of files) {
+			const sha256 = Buffer.from(f.sha256);
+			uniqueHashes.set(sha256.toString("hex"), sha256);
+		}
+		if (uniqueHashes.size > 0) {
+			const present = await this.#touchBlobs([...uniqueHashes.values()]);
+			const missing = [...uniqueHashes.keys()].filter((hex) => !present.has(hex));
+			if (missing.length > 0) throw createEgraftmissing(missing);
+		}
+
+		const rows = files.map((f) => ({
+			wheel_sha256: wheel,
+			path: f.path,
+			blob_sha256: Buffer.from(f.sha256),
+			mode: f.mode,
+			size: f.size,
+		}));
+
+		const db = this.db();
+		try {
+			// Own short transaction on the pool: `package_manifests` is
+			// tenant-global CAS like `blobs`, so no sandbox context and no
+			// advisory lock, and the rows commit independently of any script tx.
+			await runTrustedDbAsync(() =>
+				db.begin(async (tx) => {
+					await tx`
+						INSERT INTO package_manifests (wheel_sha256, manifest_format, name, version, file_count, total_bytes)
+						VALUES (
+							${wheel},
+							${manifest.manifestFormat},
+							${manifest.name},
+							${manifest.version},
+							${manifest.fileCount},
+							${manifest.totalBytes}
+						)
+						ON CONFLICT (wheel_sha256) DO UPDATE SET
+							manifest_format = EXCLUDED.manifest_format,
+							name = EXCLUDED.name,
+							version = EXCLUDED.version,
+							file_count = EXCLUDED.file_count,
+							total_bytes = EXCLUDED.total_bytes,
+							last_used_at = now()
+					`;
+					// Replace wholesale: an old-format row's file list is not a
+					// subset of the new one, so a partial update would leave stale
+					// paths rooting blobs forever.
+					await tx`DELETE FROM package_manifest_files WHERE wheel_sha256 = ${wheel}`;
+					for (let i = 0; i < rows.length; i += MANIFEST_FILE_BATCH) {
+						const batch = rows.slice(i, i + MANIFEST_FILE_BATCH);
+						await tx`INSERT INTO package_manifest_files ${tx(batch)}`;
+					}
+				}),
+			);
+		} catch (err) {
+			throw translateSqlError(err, `wheel ${wheel.toString("hex")}`);
+		}
+	}
+
+	async deleteManifest(wheelSha256: Uint8Array): Promise<void> {
+		const db = this.db();
+		const wheel = Buffer.from(wheelSha256);
+		try {
+			await runTrustedDbAsync(() => db`DELETE FROM package_manifests WHERE wheel_sha256 = ${wheel}`);
+		} catch (err) {
+			// 23503: `sandbox_packages.wheel_sha256` is ON DELETE RESTRICT, so a
+			// manifest some sandbox still has installed refuses deletion. Surface
+			// it as an FS-shaped error rather than a driver error naming tables.
+			if ((err as { code?: unknown }).code === "23503") throw createEmanifestinuse(wheel.toString("hex"));
+			throw translateSqlError(err, `wheel ${wheel.toString("hex")}`);
+		}
+	}
+
+	async loadManifestFiles(wheelSha256s: readonly Uint8Array[]): Promise<Map<string, GraftFile[]>> {
+		const result = new Map<string, GraftFile[]>();
+		if (wheelSha256s.length === 0) return result;
+
+		const db = this.db();
+		const keys = wheelSha256s.map((h) => Buffer.from(h));
+		const rows = await runTrustedDbAsync(
+			() => db<{ wheel_sha256: Buffer; path: string; blob_sha256: Buffer; mode: number; size: string }[]>`
+				SELECT wheel_sha256, path, blob_sha256, mode, size
+				FROM package_manifest_files
+				WHERE wheel_sha256 = ANY(${db.array(keys, BYTEA_ARRAY_OID)})
+				ORDER BY wheel_sha256, path
+			`,
+		);
+		for (const row of rows) {
+			const hex = Buffer.from(row.wheel_sha256).toString("hex");
+			let list = result.get(hex);
+			if (list === undefined) {
+				list = [];
+				result.set(hex, list);
+			}
+			list.push({
+				path: row.path,
+				sha256: new Uint8Array(row.blob_sha256),
+				mode: row.mode,
+				size: Number(row.size),
+			});
+		}
+		return result;
+	}
+
+	async touchManifests(wheelSha256s: readonly Uint8Array[]): Promise<void> {
+		if (wheelSha256s.length === 0) return;
+		const db = this.db();
+		const keys = wheelSha256s.map((h) => Buffer.from(h));
+		await runTrustedDbAsync(
+			() => db`
+				UPDATE package_manifests SET last_used_at = now()
+				WHERE wheel_sha256 = ANY(${db.array(keys, BYTEA_ARRAY_OID)})
+			`,
+		);
+	}
+
+	// ── Installed-package ledger (sandbox-scoped, inside the script tx) ───────────
+	//
+	// Each statement also filters on `current_setting('app.sandbox_id')` — the
+	// strict form, which ERRORs when no context is set. RLS already scopes these
+	// rows, but its no-context escape (0005) permits every row, and that escape
+	// exists for the context-less GC connection, not for the ledger.
+
+	async listSandboxPackages(tx: PgTx): Promise<SandboxPackageRow[]> {
+		const rows = await runTrustedDbAsync(
+			() => tx<{ name: string; version: string; wheel_sha256: Buffer }[]>`
+				SELECT name, version, wheel_sha256
+				FROM sandbox_packages
+				WHERE sandbox_id = current_setting('app.sandbox_id')
+				ORDER BY name
+			`,
+		);
+		return rows.map((r) => ({
+			name: r.name,
+			version: r.version,
+			wheelSha256: new Uint8Array(r.wheel_sha256),
+		}));
+	}
+
+	async upsertSandboxPackages(tx: PgTx, rows: readonly SandboxPackageRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		const names = rows.map((r) => r.name);
+		const versions = rows.map((r) => r.version);
+		const wheels = rows.map((r) => Buffer.from(r.wheelSha256));
+		await runTrustedDbAsync(
+			() => tx`
+				INSERT INTO sandbox_packages (sandbox_id, name, version, wheel_sha256)
+				SELECT current_setting('app.sandbox_id'), x.name, x.version, x.wheel_sha256
+				FROM unnest(
+					${tx.array(names, TEXT_ARRAY_OID)},
+					${tx.array(versions, TEXT_ARRAY_OID)},
+					${tx.array(wheels, BYTEA_ARRAY_OID)}
+				) AS x(name, version, wheel_sha256)
+				ON CONFLICT (sandbox_id, name) DO UPDATE SET
+					version = EXCLUDED.version,
+					wheel_sha256 = EXCLUDED.wheel_sha256,
+					installed_at = now()
+			`,
+		);
+	}
+
+	async deleteSandboxPackage(tx: PgTx, name: string): Promise<void> {
+		await runTrustedDbAsync(
+			() => tx`
+				DELETE FROM sandbox_packages
+				WHERE sandbox_id = current_setting('app.sandbox_id') AND name = ${name}
+			`,
+		);
 	}
 
 	// US-018

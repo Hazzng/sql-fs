@@ -1,10 +1,18 @@
 import type { Redis } from "ioredis";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
+import type { GcOptions, GcResult } from "../sql-fs/types.js";
 import type { TenantConfig } from "./tenants.js";
 
 export interface BlobGcOptions {
 	readonly minAgeMs: number;
+	/**
+	 * TTL (ms) for package manifests: a manifest no `sandbox_packages` row
+	 * references and whose `last_used_at` is older than this is deleted in the
+	 * same pass, before the blob anti-join, so the blobs it rooted become
+	 * collectible immediately.
+	 */
+	readonly manifestTtlMs: number;
 	readonly redis?: Redis;
 	readonly blobCacheEnabled?: boolean;
 	/** Restrict to these tenant ids; defaults to all configured tenants. */
@@ -14,6 +22,8 @@ export interface BlobGcOptions {
 export interface BlobGcTenantResult {
 	readonly tenantId: string;
 	readonly deleted: number;
+	/** `package_manifests` rows deleted by the TTL sweep (their file rows cascade). */
+	readonly manifestsDeleted: number;
 	readonly error?: string;
 }
 
@@ -45,11 +55,11 @@ function isRetryable(err: unknown): boolean {
  * REPEATABLE READ that conflict raises 40001 and we retry, by which point the
  * inode is committed and the blob is correctly kept.
  */
-async function gcOrphanBlobsRetrying(dialect: PostgresDialect, minAgeMs: number): Promise<Uint8Array[]> {
+async function gcOrphanBlobsRetrying(dialect: PostgresDialect, opts: GcOptions): Promise<GcResult> {
 	let lastErr: unknown;
 	for (let attempt = 1; attempt <= MAX_GC_ATTEMPTS; attempt++) {
 		try {
-			return await dialect.transaction((tx) => dialect.gcOrphanBlobs(tx, minAgeMs), {
+			return await dialect.transaction((tx) => dialect.gcOrphanBlobs(tx, opts), {
 				isolationLevel: "repeatable read",
 			});
 		} catch (err) {
@@ -74,16 +84,26 @@ export async function runBlobGc(tenantConfig: TenantConfig, opts: BlobGcOptions)
 		const dialect = new PostgresDialect(url);
 		try {
 			await dialect.connect();
-			const deleted = await gcOrphanBlobsRetrying(dialect, opts.minAgeMs);
-			if (deleted.length > 0 && opts.redis && opts.blobCacheEnabled !== false) {
-				await new RedisBlobCache(opts.redis, tenantId).mdel(deleted);
+			const { deletedBlobs, manifestsDeleted } = await gcOrphanBlobsRetrying(dialect, {
+				minAgeMs: opts.minAgeMs,
+				manifestTtlMs: opts.manifestTtlMs,
+			});
+			if (deletedBlobs.length > 0 && opts.redis && opts.blobCacheEnabled !== false) {
+				await new RedisBlobCache(opts.redis, tenantId).mdel(deletedBlobs);
 			}
-			console.log(JSON.stringify({ event: "blob_gc_tenant_ok", tenantId, deleted: deleted.length }));
-			results.push({ tenantId, deleted: deleted.length });
+			console.log(
+				JSON.stringify({
+					event: "blob_gc_tenant_ok",
+					tenantId,
+					deleted: deletedBlobs.length,
+					manifestsDeleted,
+				}),
+			);
+			results.push({ tenantId, deleted: deletedBlobs.length, manifestsDeleted });
 		} catch (err) {
 			const message = redactCredentials(err instanceof Error ? err.message : String(err));
 			console.error(JSON.stringify({ event: "blob_gc_tenant_failed", tenantId, error: message }));
-			results.push({ tenantId, deleted: 0, error: message });
+			results.push({ tenantId, deleted: 0, manifestsDeleted: 0, error: message });
 		} finally {
 			await dialect.disconnect().catch(() => {});
 		}

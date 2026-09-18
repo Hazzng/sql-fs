@@ -16,12 +16,17 @@ import type { TenantConfig } from "../../tenants.js";
 const OK_URL = "postgres://localhost/ok";
 const BOOM_URL = "postgres://localhost/boom";
 
+const DEFAULT_TTL = 2_592_000_000;
+
 const SHA_T1: Uint8Array[] = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6])];
 
 const state = vi.hoisted(() => ({
 	connected: [] as string[],
 	disconnected: [] as string[],
 	minAgeMsSeen: [] as number[],
+	manifestTtlMsSeen: [] as number[],
+	// Per-url manifest-deletion counts reported by gcOrphanBlobs.
+	manifestReturns: new Map<string, number>(),
 	mdelCalls: [] as Array<{ tenantId: string; shas: ReadonlyArray<Uint8Array> }>,
 	// Per-url configured GC return values.
 	gcReturns: new Map<string, Uint8Array[]>(),
@@ -52,15 +57,22 @@ vi.mock("../../../sql-fs/dialects/postgres.js", () => ({
 			state.isolationLevels.push(opts?.isolationLevel);
 			return fn({});
 		}
-		async gcOrphanBlobs(_tx: unknown, minAgeMs: number): Promise<Uint8Array[]> {
-			state.minAgeMsSeen.push(minAgeMs);
+		async gcOrphanBlobs(
+			_tx: unknown,
+			opts: { minAgeMs: number; manifestTtlMs: number },
+		): Promise<{ deletedBlobs: Uint8Array[]; manifestsDeleted: number }> {
+			state.minAgeMsSeen.push(opts.minAgeMs);
+			state.manifestTtlMsSeen.push(opts.manifestTtlMs);
 			state.gcAttempts.push(this.#url);
 			const fail = state.gcErrors.get(this.#url);
 			if (fail !== undefined && fail.remaining > 0) {
 				fail.remaining -= 1;
 				throw Object.assign(new Error(`serialization failure (${fail.code ?? "none"})`), { code: fail.code });
 			}
-			return state.gcReturns.get(this.#url) ?? [];
+			return {
+				deletedBlobs: state.gcReturns.get(this.#url) ?? [],
+				manifestsDeleted: state.manifestReturns.get(this.#url) ?? 0,
+			};
 		}
 	},
 }));
@@ -99,6 +111,8 @@ beforeEach(() => {
 	state.connected.length = 0;
 	state.disconnected.length = 0;
 	state.minAgeMsSeen.length = 0;
+	state.manifestTtlMsSeen.length = 0;
+	state.manifestReturns.clear();
 	state.mdelCalls.length = 0;
 	state.gcReturns.clear();
 	state.gcReturns.set(OK_URL, SHA_T1);
@@ -111,33 +125,33 @@ beforeEach(() => {
 
 describe("runBlobGc", () => {
 	it("connects and disconnects every tenant, including the failing one (finally)", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 1000, redis: fakeRedis });
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 1000, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		expect(state.connected).toEqual([OK_URL, BOOM_URL]);
 		expect(state.disconnected).toEqual([OK_URL, BOOM_URL]);
 	});
 
 	it("passes minAgeMs through to gcOrphanBlobs", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 4242, redis: fakeRedis });
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 4242, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		// Only t1 reaches gcOrphanBlobs (t2 fails at connect).
 		expect(state.minAgeMsSeen).toEqual([4242]);
 	});
 
 	it("calls mdel with the deleted sha256s for the succeeding tenant when redis is enabled", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		expect(state.mdelCalls).toEqual([{ tenantId: "t1", shas: SHA_T1 }]);
 	});
 
 	it("is resilient: one tenant failing does not abort the others", async () => {
-		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		expect(results).toHaveLength(2);
 		const t1 = results.find((r) => r.tenantId === "t1");
 		const t2 = results.find((r) => r.tenantId === "t2");
 
-		expect(t1).toEqual({ tenantId: "t1", deleted: SHA_T1.length });
+		expect(t1).toEqual({ tenantId: "t1", deleted: SHA_T1.length, manifestsDeleted: 0 });
 		expect(t2?.tenantId).toBe("t2");
 		expect(t2?.deleted).toBe(0);
 		expect(t2?.error).toBeTruthy();
@@ -145,19 +159,24 @@ describe("runBlobGc", () => {
 	});
 
 	it("does not call mdel when redis is absent", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: undefined });
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: undefined });
 
 		expect(state.mdelCalls).toEqual([]);
 	});
 
 	it("does not call mdel when blobCacheEnabled is false", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis, blobCacheEnabled: false });
+		await runBlobGc(makeTenantConfig(), {
+			minAgeMs: 0,
+			manifestTtlMs: DEFAULT_TTL,
+			redis: fakeRedis,
+			blobCacheEnabled: false,
+		});
 
 		expect(state.mdelCalls).toEqual([]);
 	});
 
 	it("runs the GC transaction at REPEATABLE READ (closes the dedup re-adoption race)", async () => {
-		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		// Only t1 reaches a transaction (t2 fails at connect).
 		expect(state.isolationLevels).toEqual(["repeatable read"]);
@@ -166,10 +185,10 @@ describe("runBlobGc", () => {
 	it("retries the GC transaction on a serialization failure (40001) and then succeeds", async () => {
 		state.gcErrors.set(OK_URL, { code: "40001", remaining: 2 }); // fail twice, succeed on the 3rd
 
-		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		const t1 = results.find((r) => r.tenantId === "t1");
-		expect(t1).toEqual({ tenantId: "t1", deleted: SHA_T1.length }); // no error — eventually succeeded
+		expect(t1).toEqual({ tenantId: "t1", deleted: SHA_T1.length, manifestsDeleted: 0 }); // no error — eventually succeeded
 		expect(state.gcAttempts.filter((u) => u === OK_URL)).toHaveLength(3);
 		expect(state.mdelCalls).toEqual([{ tenantId: "t1", shas: SHA_T1 }]); // invalidation still runs once
 	});
@@ -177,7 +196,7 @@ describe("runBlobGc", () => {
 	it("gives up after the retry cap on persistent serialization failures and records the tenant error", async () => {
 		state.gcErrors.set(OK_URL, { code: "40001", remaining: 99 }); // always fail
 
-		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		const t1 = results.find((r) => r.tenantId === "t1");
 		expect(t1?.deleted).toBe(0);
@@ -189,10 +208,35 @@ describe("runBlobGc", () => {
 	it("does not retry a non-serialization error", async () => {
 		state.gcErrors.set(OK_URL, { code: "23505", remaining: 1 }); // unique_violation — not retryable
 
-		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, redis: fakeRedis });
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: DEFAULT_TTL, redis: fakeRedis });
 
 		const t1 = results.find((r) => r.tenantId === "t1");
 		expect(t1?.error).toBeTruthy();
 		expect(state.gcAttempts.filter((u) => u === OK_URL)).toHaveLength(1); // no retry
+	});
+
+	it("passes manifestTtlMs through to gcOrphanBlobs", async () => {
+		await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: 777, redis: fakeRedis });
+
+		expect(state.manifestTtlMsSeen).toEqual([777]);
+	});
+
+	it("reports manifestsDeleted per tenant", async () => {
+		state.manifestReturns.set(OK_URL, 3);
+
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: 0, redis: fakeRedis });
+
+		expect(results.find((r) => r.tenantId === "t1")).toEqual({
+			tenantId: "t1",
+			deleted: SHA_T1.length,
+			manifestsDeleted: 3,
+		});
+	});
+
+	it("reports manifestsDeleted 0 for a tenant that failed", async () => {
+		const results = await runBlobGc(makeTenantConfig(), { minAgeMs: 0, manifestTtlMs: 0, redis: fakeRedis });
+
+		const t2 = results.find((r) => r.tenantId === "t2");
+		expect(t2?.manifestsDeleted).toBe(0);
 	});
 });

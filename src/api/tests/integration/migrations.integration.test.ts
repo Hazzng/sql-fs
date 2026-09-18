@@ -85,4 +85,59 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 
 		await expect(runMigrations(cfg)).resolves.toBeUndefined();
 	});
+
+	it("0007 creates the package tables with RLS on the ledger only, and is idempotent", async () => {
+		const cfg = loadTenantConfig({
+			TENANT_DATABASES: JSON.stringify({ default: testUrl }),
+		});
+
+		// Applied twice: the fresh-database run above plus this one, which must
+		// be a no-op (every statement is IF NOT EXISTS / DROP POLICY IF EXISTS).
+		await runMigrations(cfg);
+		await runMigrations(cfg);
+
+		const sql = postgres(testUrl, { prepare: false, max: 1 });
+		try {
+			const security = await sql<{ relname: string; rls: boolean; forced: boolean }[]>`
+				SELECT relname, relrowsecurity AS rls, relforcerowsecurity AS forced
+				FROM pg_class
+				WHERE relname IN ('package_manifests', 'package_manifest_files', 'sandbox_packages')
+				ORDER BY relname
+			`;
+			expect(security).toEqual([
+				// Tenant-global CAS, like blobs: no sandbox_id, so no policy.
+				{ relname: "package_manifest_files", rls: false, forced: false },
+				{ relname: "package_manifests", rls: false, forced: false },
+				// Sandbox-scoped ledger: enabled AND forced, as inodes in 0005.
+				{ relname: "sandbox_packages", rls: true, forced: true },
+			]);
+
+			const policies = await sql<{ n: string }[]>`
+				SELECT count(*)::text AS n FROM pg_policy
+				WHERE polrelid = 'sandbox_packages'::regclass AND polname = 'sandbox_isolation'
+			`;
+			expect(policies[0]?.n).toBe("1");
+
+			// confdeltype: 'c' = CASCADE, 'r' = RESTRICT.
+			const fks = await sql<{ tbl: string; col: string; action: string }[]>`
+				SELECT c.conrelid::regclass::text AS tbl,
+				       a.attname AS col,
+				       c.confdeltype AS action
+				FROM pg_constraint c
+				JOIN unnest(c.conkey) AS k(attnum) ON true
+				JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+				WHERE c.contype = 'f'
+				AND c.conrelid IN ('package_manifest_files'::regclass, 'sandbox_packages'::regclass)
+				ORDER BY tbl, col
+			`;
+			expect(fks).toEqual([
+				{ tbl: "package_manifest_files", col: "blob_sha256", action: "r" },
+				{ tbl: "package_manifest_files", col: "wheel_sha256", action: "c" },
+				{ tbl: "sandbox_packages", col: "sandbox_id", action: "c" },
+				{ tbl: "sandbox_packages", col: "wheel_sha256", action: "r" },
+			]);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
 });
