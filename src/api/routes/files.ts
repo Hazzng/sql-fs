@@ -18,6 +18,7 @@ import type { AuthVariables } from "../auth.js";
 import { extractErrCode } from "../errors.js";
 import { MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES } from "../lib/env.js";
 import { type EditOutcome, editFile, ensureParentDir } from "../lib/file-ops.js";
+import { runInScriptTx } from "../lib/script-tx.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -442,9 +443,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				// single script-tx scope so a mid-batch failure rolls back ALL files
 				// instead of leaving earlier writes committed. Backends without
 				// script-tx support (e.g. in-memory) fall back to the per-entry loop.
-				const scriptTx = session.scriptTx;
-				if (scriptTx !== undefined) await scriptTx.run(writeAll);
-				else await writeAll();
+				await runInScriptTx(session, writeAll);
 			});
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();

@@ -10,6 +10,7 @@
 import type { FsStat, IFileSystem } from "just-bash";
 import { extractErrCode } from "../errors.js";
 import type { Session } from "../session-manager.js";
+import { runInScriptTx } from "./script-tx.js";
 
 /** Parent directory of an absolute path ("/" for a top-level entry). */
 export function parentDir(filePath: string): string {
@@ -114,9 +115,8 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 }
 
 /**
- * Read-modify-write inside one script-tx scope, so a concurrent reader never observes the
- * file mid-edit and a failed write rolls back. Backends without script-tx (in-memory) apply
- * the edit directly.
+ * Read-modify-write inside one script-tx scope, so a concurrent reader never observes the file
+ * mid-edit, a failed write rolls back, and a lease lost mid-edit does not commit.
  */
 export async function editFile(
 	session: Session,
@@ -124,7 +124,5 @@ export async function editFile(
 	req: EditRequest,
 	maxBytes: number,
 ): Promise<EditOutcome> {
-	const scriptTx = session.scriptTx;
-	if (scriptTx === undefined) return applyEdit(session, filePath, req, maxBytes);
-	return scriptTx.run(() => applyEdit(session, filePath, req, maxBytes));
+	return runInScriptTx(session, () => applyEdit(session, filePath, req, maxBytes));
 }
