@@ -132,7 +132,7 @@ type PackageFixture = {
 
 type FetchResult = Awaited<ReturnType<SecureFetch>>;
 
-function fixtureFetch(packages: Record<string, PackageFixture>, databricksResponse?: unknown): SecureFetch {
+function fixtureFetch(packages: Record<string, PackageFixture>): SecureFetch {
 	return async (url): Promise<FetchResult> => {
 		const parsed = new URL(url);
 		if (parsed.hostname === "pypi.org") {
@@ -147,17 +147,11 @@ function fixtureFetch(packages: Record<string, PackageFixture>, databricksRespon
 				packagetype: "bdist_wheel",
 				digests: { sha256: sha256(fixture.body) },
 			};
-			const response = match?.[2]
-				? {
-						info: { version: fixture.version, requires_dist: fixture.requiresDist ?? [] },
-						releases: { [fixture.version]: [artifact] },
-						urls: [artifact],
-					}
-				: {
-						info: { version: fixture.version, requires_dist: fixture.requiresDist ?? [] },
-						releases: { [fixture.version]: [artifact] },
-						urls: [artifact],
-					};
+			const response = {
+				info: { version: fixture.version, requires_dist: fixture.requiresDist ?? [] },
+				releases: { [fixture.version]: [artifact] },
+				urls: [artifact],
+			};
 			return {
 				status: 200,
 				statusText: "OK",
@@ -185,7 +179,7 @@ function fixtureFetch(packages: Record<string, PackageFixture>, databricksRespon
 				status: 200,
 				statusText: "OK",
 				headers: { "content-type": "application/json" },
-				body: encoder.encode(JSON.stringify(databricksResponse ?? { ok: true })),
+				body: encoder.encode(JSON.stringify({ ok: true })),
 				url,
 			};
 		}
@@ -193,11 +187,11 @@ function fixtureFetch(packages: Record<string, PackageFixture>, databricksRespon
 	};
 }
 
-function makeBash(packages: Record<string, PackageFixture>, databricksResponse?: unknown): Bash {
+function makeBash(packages: Record<string, PackageFixture>): Bash {
 	return new Bash({
 		fs: new InMemoryFs(),
 		python: true,
-		fetch: fixtureFetch(packages, databricksResponse),
+		fetch: fixtureFetch(packages),
 		customCommands: pythonPackageCommands,
 	});
 }
@@ -257,58 +251,35 @@ describe("experimental SQL-FS pip commands", () => {
 		expect(await bash.fs.exists("/site-packages/demo.py")).toBe(false);
 	});
 
-	it("rejects zip traversal and unsupported native wheels", async () => {
-		const traversal = wheel("demo", "1.0", { "../escape.py": "pwned = True\n" });
-		const traversalBash = makeBash({ demo: { version: "1.0", body: traversal } });
-		const traversalResult = await traversalBash.exec("pip install demo");
-		expect(traversalResult.exitCode).toBe(1);
-		expect(traversalResult.stderr).toContain("zip path traversal");
-		expect(await traversalBash.fs.exists("/escape.py")).toBe(false);
-
-		const nativeBody = wheel("native", "1.0", { "native.py": "" });
-		const nativeBash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: async (url) => {
-				if (url.includes("pypi.org")) {
-					const artifact = {
-						filename: "native-1.0-cp313-cp313-macosx_14_0_arm64.whl",
-						url: "https://files.pythonhosted.org/native.whl",
-						packagetype: "bdist_wheel",
-						digests: { sha256: sha256(nativeBody) },
-					};
-					return {
-						status: 200,
-						statusText: "OK",
-						headers: {},
-						body: encoder.encode(
-							JSON.stringify({
-								info: { version: "1.0", requires_dist: [] },
-								releases: { "1.0": [artifact] },
-								urls: [artifact],
-							}),
-						),
-						url,
-					};
-				}
-				return { status: 200, statusText: "OK", headers: {}, body: nativeBody, url };
-			},
-			customCommands: pythonPackageCommands,
-		});
-		const nativeResult = await nativeBash.exec("pip install native");
-		expect(nativeResult.exitCode).toBe(1);
-		expect(nativeResult.stderr).toContain("pure-Python");
+	it("rejects a wheel containing a zip path traversal", async () => {
+		const body = wheel("demo", "1.0", { "../escape.py": "pwned = True\n" });
+		const bash = makeBash({ demo: { version: "1.0", body } });
+		const result = await bash.exec("pip install demo");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("zip path traversal");
+		expect(await bash.fs.exists("/escape.py")).toBe(false);
 	});
 
-	it("bounds extracted file count and PyPI redirects", async () => {
-		const manyFiles = Object.fromEntries(Array.from({ length: 10_001 }, (_, index) => [`demo_${index}.py`, ""]));
-		const tooManyFiles = wheel("demo", "1.0", manyFiles);
-		const tooManyFilesBash = makeBash({ demo: { version: "1.0", body: tooManyFiles } });
-		const tooManyFilesResult = await tooManyFilesBash.exec("pip install demo");
-		expect(tooManyFilesResult.exitCode).toBe(1);
-		expect(tooManyFilesResult.stderr).toContain("file limit");
+	it("rejects a native platform wheel", async () => {
+		const body = wheel("native", "1.0", { "native.py": "" });
+		const bash = makeBash({
+			native: { version: "1.0", body, filename: "native-1.0-cp313-cp313-macosx_14_0_arm64.whl" },
+		});
+		const result = await bash.exec("pip install native");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("pure-Python");
+	});
 
-		const redirectBash = new Bash({
+	it("rejects a wheel exceeding the extracted file limit", async () => {
+		const manyFiles = Object.fromEntries(Array.from({ length: 10_001 }, (_, index) => [`demo_${index}.py`, ""]));
+		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", manyFiles) } });
+		const result = await bash.exec("pip install demo");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("file limit");
+	});
+
+	it("fails when PyPI exceeds the redirect limit", async () => {
+		const bash = new Bash({
 			fs: new InMemoryFs(),
 			python: true,
 			fetch: async (url) => ({
@@ -320,9 +291,9 @@ describe("experimental SQL-FS pip commands", () => {
 			}),
 			customCommands: pythonPackageCommands,
 		});
-		const redirectResult = await redirectBash.exec("pip install demo");
-		expect(redirectResult.exitCode).toBe(1);
-		expect(redirectResult.stderr).toContain("redirect");
+		const result = await bash.exec("pip install demo");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("redirect");
 	});
 
 	it("resolves a dependency, invokes the installed databricks console module, and adapts requests through jb_http", async () => {
@@ -346,18 +317,15 @@ describe("experimental SQL-FS pip commands", () => {
 			["requests>=1.0"],
 			"databricks_cli.cli:main",
 		);
-		const bash = makeBash(
-			{
-				"databricks-cli": {
-					version: "0.18.0",
-					body: cli,
-					requiresDist: ["requests>=1.0"],
-					entryPoint: "databricks_cli.cli:main",
-				},
-				requests: { version: "1.0", body: requests },
+		const bash = makeBash({
+			"databricks-cli": {
+				version: "0.18.0",
+				body: cli,
+				requiresDist: ["requests>=1.0"],
+				entryPoint: "databricks_cli.cli:main",
 			},
-			{ ok: true },
-		);
+			requests: { version: "1.0", body: requests },
+		});
 		const install = await bash.exec("pip install databricks-cli");
 		expect(install.exitCode, install.stderr).toBe(0);
 		const command = await bash.exec("databricks workspace list /");

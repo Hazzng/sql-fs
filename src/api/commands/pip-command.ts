@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { type CommandContext, type ExecResult, decodeBytesToUtf8, defineCommand } from "just-bash";
 
 const PYPI_JSON_ORIGIN = "https://pypi.org";
@@ -8,8 +9,10 @@ const PYTHON_SITE_PACKAGES = `/host${SITE_PACKAGES}`;
 const PYTHON_COMPAT_PACKAGES = `/host${COMPAT_PACKAGES}`;
 const TEMP_ROOT = "/tmp/.sqlfs-pip";
 
+const utf8Decoder = new TextDecoder();
+
 /** These limits are deliberately conservative for the experiment. */
-export const PIP_LIMITS = {
+const PIP_LIMITS = {
 	maxDownloadBytes: 16 * 1024 * 1024,
 	maxTotalDownloadBytes: 64 * 1024 * 1024,
 	maxDependencies: 64,
@@ -20,13 +23,6 @@ export const PIP_LIMITS = {
 	maxMetadataBytes: 4 * 1024 * 1024,
 	maxCandidateVersions: 64,
 } as const;
-
-const HASH_CODE = `
-import hashlib
-import sys
-with open(sys.argv[1], "rb") as _f:
-    print(hashlib.sha256(_f.read()).hexdigest())
-`;
 
 /**
  * This code runs in the just-bash CPython WASM worker. It is intentionally
@@ -263,7 +259,7 @@ def decode(_token, options=None, **_kwargs):
 };
 
 /** Prefix added to every package-enabled python3 invocation. */
-export const PYTHON_PACKAGE_BOOTSTRAP = `
+const PYTHON_PACKAGE_BOOTSTRAP = `
 import sys as _sqlfs_sys
 for _sqlfs_path in (${JSON.stringify(PYTHON_SITE_PACKAGES)}, ${JSON.stringify(PYTHON_COMPAT_PACKAGES)}):
     if _sqlfs_path not in _sqlfs_sys.path:
@@ -272,6 +268,11 @@ for _sqlfs_path in (${JSON.stringify(PYTHON_SITE_PACKAGES)}, ${JSON.stringify(PY
 # requests uses urllib3 sockets, which are deliberately unavailable in the
 # WASM runtime. Keep the socket restriction and adapt requests to jb_http.
 try:
+    import os as _sqlfs_os
+    # Nothing has been installed, so there is no requests to adapt. Bail out
+    # before paying a failed sys.path search on every python3 invocation.
+    if not _sqlfs_os.path.isdir(${JSON.stringify(PYTHON_SITE_PACKAGES)}):
+        raise ImportError("no installed packages")
     import requests as _sqlfs_requests
     import requests.models as _sqlfs_models
     import requests.sessions as _sqlfs_sessions
@@ -348,12 +349,6 @@ interface ResolvedPackage {
 	readonly version: string;
 	readonly artifact: Artifact;
 	readonly requiresDist: readonly string[];
-	readonly depth: number;
-}
-
-interface InstallPlan {
-	readonly packages: readonly ResolvedPackage[];
-	readonly totalDependencies: number;
 }
 
 class PipError extends Error {
@@ -445,6 +440,19 @@ function compareMarkerValue(left: string, right: string, identifier: string): nu
 	return left.localeCompare(right);
 }
 
+/** PEP 508 marker variables as seen from the CPython WASM runtime. */
+const MARKER_VALUES = Object.assign(Object.create(null) as Record<string, string>, {
+	python_version: "3.13",
+	python_full_version: "3.13.2",
+	platform_python_implementation: "CPython",
+	implementation_name: "cpython",
+	sys_platform: "emscripten",
+	platform_system: "Emscripten",
+	os_name: "posix",
+	platform_machine: "wasm32",
+	extra: "",
+});
+
 function evaluateMarker(marker: string | undefined): boolean {
 	if (!marker) return true;
 	const expression = stripOuterParens(marker);
@@ -460,18 +468,7 @@ function evaluateMarker(marker: string | undefined): boolean {
 	const identifier = match[1]!;
 	const operator = match[2]!;
 	const rawRight = match[3]!;
-	const values: Record<string, string> = {
-		python_version: "3.13",
-		python_full_version: "3.13.2",
-		platform_python_implementation: "CPython",
-		implementation_name: "cpython",
-		sys_platform: "emscripten",
-		platform_system: "Emscripten",
-		os_name: "posix",
-		platform_machine: "wasm32",
-		extra: "",
-	};
-	const left = values[identifier.toLowerCase()];
+	const left = MARKER_VALUES[identifier.toLowerCase()];
 	if (left === undefined) fail(`unsupported dependency marker variable '${identifier}'`);
 	const right = markerValue(rawRight);
 	if (operator.toLowerCase() === "in" || operator.toLowerCase() === "not in") {
@@ -584,27 +581,25 @@ function compareVersions(leftInput: string, rightInput: string): number {
 }
 
 function versionSatisfies(version: string, specs: readonly VersionSpec[]): boolean {
+	if (specs.length === 0) return true;
 	const parsed = parseVersion(version);
 	const normalized = `${parsed.epoch ? `${parsed.epoch}!` : ""}${parsed.release.join(".")}${parsed.pre ? `${parsed.pre[0]}${parsed.pre[1]}` : ""}${parsed.post ? `.post${parsed.post}` : ""}`;
 	return specs.every((spec) => {
 		const wildcard = spec.version.endsWith(".*");
 		const expected = wildcard ? spec.version.slice(0, -2) : spec.version;
 		const comparison = compareVersions(version, expected);
+		const equals = (): boolean => {
+			if (!wildcard) return comparison === 0;
+			const release = parseVersion(expected).release.join(".");
+			return normalized === release || normalized.startsWith(`${release}.`);
+		};
 		switch (spec.operator) {
 			case "===":
 				return version === expected;
 			case "==":
-				return wildcard
-					? normalized.startsWith(`${parseVersion(expected).release.join(".")}.`) ||
-							normalized === parseVersion(expected).release.join(".")
-					: comparison === 0;
+				return equals();
 			case "!=":
-				return wildcard
-					? !(
-							normalized.startsWith(`${parseVersion(expected).release.join(".")}.`) ||
-							normalized === parseVersion(expected).release.join(".")
-						)
-					: comparison !== 0;
+				return !equals();
 			case "<":
 				return comparison < 0;
 			case "<=":
@@ -702,61 +697,60 @@ async function fetchPypi(ctx: CommandContext, url: string, json: boolean): Promi
 	fail("PyPI redirect handling failed");
 }
 
-async function fetchJson(ctx: CommandContext, url: string): Promise<PyPIIndex> {
+async function fetchJson(ctx: CommandContext, url: string, cache: Map<string, PyPIIndex>): Promise<PyPIIndex> {
+	const cached = cache.get(url);
+	if (cached) return cached;
 	const response = await fetchPypi(ctx, url, true);
+	let parsed: unknown;
 	try {
-		const parsed = JSON.parse(new TextDecoder().decode(response.body)) as PyPIIndex;
-		if (!parsed || typeof parsed !== "object") fail("PyPI returned invalid JSON");
-		return parsed;
-	} catch (error) {
-		if (error instanceof PipError) throw error;
+		parsed = JSON.parse(utf8Decoder.decode(response.body));
+	} catch {
 		fail("PyPI returned invalid JSON");
 	}
+	if (!parsed || typeof parsed !== "object") fail("PyPI returned invalid JSON");
+	const index = parsed as PyPIIndex;
+	cache.set(url, index);
+	return index;
 }
 
-async function selectPackage(ctx: CommandContext, requirement: Requirement): Promise<ResolvedPackage> {
-	const index = await fetchJson(ctx, `${PYPI_JSON_ORIGIN}/pypi/${encodeURIComponent(requirement.name)}/json`);
+async function selectPackage(
+	ctx: CommandContext,
+	requirement: Requirement,
+	cache: Map<string, PyPIIndex>,
+): Promise<ResolvedPackage> {
+	const index = await fetchJson(ctx, `${PYPI_JSON_ORIGIN}/pypi/${encodeURIComponent(requirement.name)}/json`, cache);
+	const allowPrerelease = hasExplicitPrerelease(requirement.specs);
 	const releases = Object.keys(index.releases ?? {})
 		.filter((version) => versionSatisfies(version, requirement.specs))
-		.filter((version) => hasExplicitPrerelease(requirement.specs) || !parseVersion(version).pre)
+		.filter((version) => allowPrerelease || !parseVersion(version).pre)
 		.sort((left, right) => compareVersions(right, left));
 	if (releases.length === 0) fail(`no PyPI release satisfies '${requirement.raw}'`);
-	let unsupported = false;
 	let inspected = 0;
 	for (const version of releases) {
 		if (++inspected > PIP_LIMITS.maxCandidateVersions)
 			fail(`too many candidate versions while resolving ${requirement.name}`);
 		const artifact = artifactFromFiles(index.releases?.[version], requirement.name, version);
-		if (!artifact) {
-			unsupported = true;
-			continue;
-		}
+		if (!artifact) continue;
 		const metadata =
 			version === index.info?.version
 				? index
 				: await fetchJson(
 						ctx,
 						`${PYPI_JSON_ORIGIN}/pypi/${encodeURIComponent(requirement.name)}/${encodeURIComponent(version)}/json`,
+						cache,
 					);
-		return {
-			name: requirement.name,
-			version,
-			artifact,
-			requiresDist: metadata.info?.requires_dist ?? [],
-			depth: 0,
-		};
+		return { name: requirement.name, version, artifact, requiresDist: metadata.info?.requires_dist ?? [] };
 	}
-	if (unsupported)
-		fail(
-			`${requirement.name} has no supported pure-Python py3-none-any wheel for the requested versions (sdists/native wheels are rejected)`,
-		);
-	fail(`PyPI has no installable wheel for ${requirement.name}`);
+	fail(
+		`${requirement.name} has no supported pure-Python py3-none-any wheel for the requested versions (sdists/native wheels are rejected)`,
+	);
 }
 
-async function resolvePlan(ctx: CommandContext, roots: readonly Requirement[]): Promise<InstallPlan> {
+async function resolvePlan(ctx: CommandContext, roots: readonly Requirement[]): Promise<readonly ResolvedPackage[]> {
 	const constraints = new Map<string, Requirement[]>();
 	const depths = new Map<string, number>();
 	const resolved = new Map<string, ResolvedPackage>();
+	const indexCache = new Map<string, PyPIIndex>();
 	const pending: string[] = [];
 	for (const root of roots) {
 		constraints.set(root.name, [...(constraints.get(root.name) ?? []), root]);
@@ -773,16 +767,13 @@ async function resolvePlan(ctx: CommandContext, roots: readonly Requirement[]): 
 			specs: requirements.flatMap((requirement) => requirement.specs),
 			raw: requirements.map((requirement) => requirement.raw).join(", "),
 		};
-		const candidate = await selectPackage(ctx, merged);
+		const candidate = await selectPackage(ctx, merged, indexCache);
 		const depth = depths.get(name) ?? 0;
-		if (depth > PIP_LIMITS.maxDependencyDepth)
-			fail(`dependency depth exceeds ${PIP_LIMITS.maxDependencyDepth} at ${name}`);
 		const previous = resolved.get(name);
 		if (previous?.version === candidate.version) continue;
-		const packageWithDepth = { ...candidate, depth };
-		resolved.set(name, packageWithDepth);
+		resolved.set(name, candidate);
 		if (resolved.size > PIP_LIMITS.maxDependencies) fail(`dependency count exceeds ${PIP_LIMITS.maxDependencies}`);
-		for (const rawDependency of packageWithDepth.requiresDist) {
+		for (const rawDependency of candidate.requiresDist) {
 			const dependency = parseRequirement(rawDependency);
 			if (!dependency) continue;
 			const dependencyDepth = depth + 1;
@@ -795,10 +786,7 @@ async function resolvePlan(ctx: CommandContext, roots: readonly Requirement[]): 
 			pending.push(dependency.name);
 		}
 	}
-	return {
-		packages: [...resolved.values()].sort((left, right) => left.name.localeCompare(right.name)),
-		totalDependencies: resolved.size,
-	};
+	return [...resolved.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 async function runWasmPython(ctx: CommandContext, code: string, args: readonly string[]): Promise<ExecResult> {
@@ -808,31 +796,32 @@ async function runWasmPython(ctx: CommandContext, code: string, args: readonly s
 		args: ["-c", code, ...args],
 		stdin: "",
 		signal: ctx.signal,
-		env: Object.fromEntries(ctx.env),
+		env: inheritedEnvironment(ctx),
 	});
 }
 
 async function existingPackageTotals(ctx: CommandContext): Promise<{ files: number; bytes: number }> {
+	const paths = ctx.fs.getAllPaths().filter((path) => path.startsWith(`${SITE_PACKAGES}/`));
+	const stats = await Promise.all(paths.map((path) => ctx.fs.lstat(path)));
 	let files = 0;
 	let bytes = 0;
-	for (const path of ctx.fs.getAllPaths()) {
-		if (!path.startsWith(`${SITE_PACKAGES}/`)) continue;
-		const stat = await ctx.fs.lstat(path);
-		if (stat.isFile) {
-			files++;
-			bytes += stat.size;
-		}
+	for (const stat of stats) {
+		if (!stat.isFile) continue;
+		files++;
+		bytes += stat.size;
 	}
 	return { files, bytes };
 }
 
-function parseJsonOutput(stdout: string, operation: string): Record<string, unknown> {
+/** The WASM helper prints one JSON object on both paths; tracebacks are not an API contract. */
+function parseHelperJson(stdout: string): Record<string, unknown> | undefined {
+	const trimmed = stdout.trim();
+	if (!trimmed) return undefined;
 	try {
-		const value = JSON.parse(stdout.trim()) as Record<string, unknown>;
-		if (!value || typeof value !== "object") fail(`${operation} returned invalid helper output`);
-		return value;
+		const value: unknown = JSON.parse(trimmed);
+		return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 	} catch {
-		fail(`${operation} returned invalid helper output`);
+		return undefined;
 	}
 }
 
@@ -855,37 +844,24 @@ async function verifyAndExtract(
 	if (totals.downloads + body.length > PIP_LIMITS.maxTotalDownloadBytes)
 		fail("total package downloads exceed the limit");
 	totals.downloads += body.length;
+	// The bytes are already in host memory, so verify before anything is written
+	// rather than paying a CPython worker boot to re-read them off the sandbox FS.
+	if (createHash("sha256").update(body).digest("hex") !== packageInfo.artifact.sha256)
+		fail(`SHA-256 verification failed for ${packageInfo.name} ${packageInfo.version}`);
 	await ctx.fs.mkdir(TEMP_ROOT, { recursive: true });
 	const safeFilename = packageInfo.artifact.filename.replace(/[^A-Za-z0-9._-]/g, "_");
 	const wheelPath = `${TEMP_ROOT}/${safeFilename}`;
 	await ctx.fs.writeFile(wheelPath, body);
 	try {
-		const hashResult = await runWasmPython(ctx, HASH_CODE, [wheelPath]);
-		if (hashResult.exitCode !== 0 || hashResult.stdout.trim().toLowerCase() !== packageInfo.artifact.sha256) {
-			fail(`SHA-256 verification failed for ${packageInfo.name} ${packageInfo.version}`);
-		}
 		const extraction = await runWasmPython(ctx, EXTRACT_CODE, [
 			wheelPath,
 			SITE_PACKAGES,
 			String(PIP_LIMITS.maxWheelFiles - totals.files),
 			String(PIP_LIMITS.maxExtractedBytes - totals.bytes),
 		]);
-		if (extraction.exitCode !== 0) {
-			const helper = extraction.stdout.trim();
-			let message = "wheel extraction failed";
-			if (helper) {
-				try {
-					const detail = JSON.parse(helper) as { error?: unknown };
-					if (typeof detail.error === "string") message = detail.error;
-				} catch {
-					// Keep the error generic; helper tracebacks are not an API contract.
-				}
-			}
-			fail(message);
-		}
-		const result = parseJsonOutput(extraction.stdout, "wheel extraction");
-		const files = result.files;
-		const bytes = result.bytes;
+		const report = parseHelperJson(extraction.stdout);
+		if (extraction.exitCode !== 0) fail(typeof report?.error === "string" ? report.error : "wheel extraction failed");
+		const { files, bytes } = report ?? {};
 		if (typeof files !== "number" || typeof bytes !== "number") fail("wheel extraction returned invalid limits");
 		totals.files += files;
 		totals.bytes += bytes;
@@ -897,39 +873,33 @@ async function verifyAndExtract(
 }
 
 async function install(ctx: CommandContext, specs: readonly string[]): Promise<ExecResult> {
-	if (!ctx.fetch)
-		return {
-			stdout: "",
-			stderr: "pip: network access is required; create the sandbox with network:true\n",
-			exitCode: 1,
-		};
-	if (specs.length === 0) return { stdout: "", stderr: "pip: install requires at least one package\n", exitCode: 2 };
+	if (!ctx.fetch) return commandFailure("pip: network access is required; create the sandbox with network:true", 1);
+	if (specs.length === 0) return commandFailure("pip: install requires at least one package", 2);
 	try {
 		const roots = specs.map(parseRequirement).filter((value): value is Requirement => value !== undefined);
 		if (roots.length !== specs.length)
-			return { stdout: "", stderr: "pip: package markers are not supported for direct installs\n", exitCode: 1 };
+			return commandFailure("pip: package markers are not supported for direct installs", 1);
 		if (await ctx.fs.exists(SITE_PACKAGES)) {
 			const rootStat = await ctx.fs.lstat(SITE_PACKAGES);
 			if (!rootStat.isDirectory || rootStat.isSymbolicLink) fail("package directory is not a real directory");
 		}
-		const plan = await resolvePlan(ctx, roots);
+		const packages = await resolvePlan(ctx, roots);
 		const installed = await existingPackageTotals(ctx);
 		if (installed.files > PIP_LIMITS.maxWheelFiles || installed.bytes > PIP_LIMITS.maxExtractedBytes)
 			fail("existing package contents exceed the limit");
 		const totals = { downloads: 0, files: installed.files, bytes: installed.bytes };
-		for (const packageInfo of plan.packages) {
+		for (const packageInfo of packages) {
 			const response = await fetchPypi(ctx, packageInfo.artifact.url, false);
 			await verifyAndExtract(ctx, packageInfo, response.body, totals);
 		}
-		if (plan.packages.some((packageInfo) => packageInfo.name === "requests")) await writeRequestsCompat(ctx);
+		if (packages.some((packageInfo) => packageInfo.name === "requests")) await writeRequestsCompat(ctx);
 		return {
-			stdout: `Successfully installed ${plan.packages.map((item) => `${item.name}-${item.version}`).join(" ")}\n`,
+			stdout: `Successfully installed ${packages.map((item) => `${item.name}-${item.version}`).join(" ")}\n`,
 			stderr: "",
 			exitCode: 0,
 		};
 	} catch (error) {
-		const message = error instanceof PipError ? error.message : "package installation failed";
-		return { stdout: "", stderr: `pip: ${message}\n`, exitCode: 1 };
+		return commandFailure(`pip: ${error instanceof PipError ? error.message : "package installation failed"}`, 1);
 	}
 }
 
@@ -937,10 +907,10 @@ async function executePip(args: string[], ctx: CommandContext): Promise<ExecResu
 	if (args[0] === "--version" || args[0] === "-V")
 		return { stdout: "sql-fs experimental pip (pure-Python wheels only)\n", stderr: "", exitCode: 0 };
 	if (args[0] !== "install")
-		return { stdout: "", stderr: "pip: only 'pip install PACKAGE' is supported by this experiment\n", exitCode: 2 };
+		return commandFailure("pip: only 'pip install PACKAGE' is supported by this experiment", 2);
 	const packages = args.slice(1);
 	if (packages.some((item) => item.startsWith("-")))
-		return { stdout: "", stderr: "pip: install options are not supported; use package specifiers only\n", exitCode: 2 };
+		return commandFailure("pip: install options are not supported; use package specifiers only", 2);
 	return install(ctx, packages);
 }
 
@@ -949,16 +919,24 @@ function commandFailure(message: string, exitCode = 127): ExecResult {
 }
 
 function inheritedEnvironment(ctx: CommandContext): Record<string, string> {
-	return Object.fromEntries(ctx.env);
+	const env: Record<string, string> = Object.create(null);
+	for (const [key, value] of ctx.env) env[key] = value;
+	return env;
 }
 
+const DATABRICKS_SECRET_KEYS = ["DATABRICKS_TOKEN", "DATABRICKS_PASSWORD", "DATABRICKS_REFRESH_TOKEN"] as const;
+
 function redactDatabricksResult(result: ExecResult, ctx: CommandContext): ExecResult {
-	const secrets = ["DATABRICKS_TOKEN", "DATABRICKS_PASSWORD", "DATABRICKS_REFRESH_TOKEN"]
-		.map((key) => ctx.env.get(key))
-		.filter((value): value is string => typeof value === "string" && value.length > 0);
-	const redact = (value: string): string =>
-		secrets.reduce((current, secret) => current.split(secret).join("[REDACTED]"), value);
-	return { ...result, stdout: redact(result.stdout), stderr: redact(result.stderr) };
+	const secrets = DATABRICKS_SECRET_KEYS.map((key) => ctx.env.get(key)).filter(
+		(value): value is string => typeof value === "string" && value.length > 0,
+	);
+	if (secrets.length === 0) return result;
+	const pattern = new RegExp(secrets.map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g");
+	return {
+		...result,
+		stdout: result.stdout.replace(pattern, "[REDACTED]"),
+		stderr: result.stderr.replace(pattern, "[REDACTED]"),
+	};
 }
 
 async function getDatabricksEntrypoint(
@@ -976,75 +954,74 @@ async function getDatabricksEntrypoint(
 	return undefined;
 }
 
-function invokeOriginalOrBuiltin(ctx: CommandContext, args: readonly string[], stdin: string): Promise<ExecResult> {
-	const original = (ctx as CommandContext & { origCommand?: (args: string[]) => Promise<ExecResult> }).origCommand;
-	if (original) return original([...args]);
+/** `ctx.exec` is just-bash's documented delegation path to the built-in WASM python. */
+function invokeBuiltinPython(ctx: CommandContext, args: readonly string[], stdin: string): Promise<ExecResult> {
 	if (!ctx.exec) return Promise.resolve(commandFailure("python3: WASM Python command is unavailable"));
 	return ctx.exec("python", { cwd: ctx.cwd, args: [...args], stdin, env: inheritedEnvironment(ctx) });
 }
 
-function packagePythonArgs(args: string[]): { readonly forwarded: string[]; readonly stdin: string } | undefined {
+/** Runs the bootstrap, sets `sys.argv`, then hands control to `body`. */
+function bootstrapProgram(argv: readonly string[], body: string): string[] {
+	return ["-c", `${PYTHON_PACKAGE_BOOTSTRAP}\n_sqlfs_sys.argv = ${JSON.stringify(argv)}\n${body}`];
+}
+
+function runpyProgram(argv: readonly string[], runner: "run_module" | "run_path", target: string): string[] {
+	return bootstrapProgram(
+		argv,
+		`import runpy as _sqlfs_runpy\n_sqlfs_runpy.${runner}(${JSON.stringify(target)}, run_name="__main__")`,
+	);
+}
+
+/** Rewrites a python3 invocation so installed packages are importable. */
+function packagePythonArgs(args: string[]): string[] | undefined {
 	const codeIndex = args.indexOf("-c");
 	if (codeIndex >= 0) {
 		const source = args[codeIndex + 1];
 		if (source === undefined) return undefined;
-		return { forwarded: ["-c", `${PYTHON_PACKAGE_BOOTSTRAP}\n${source}`, ...args.slice(codeIndex + 2)], stdin: "" };
+		return ["-c", `${PYTHON_PACKAGE_BOOTSTRAP}\n${source}`, ...args.slice(codeIndex + 2)];
 	}
 	const moduleIndex = args.indexOf("-m");
 	if (moduleIndex >= 0) {
 		const module = args[moduleIndex + 1];
 		if (module === undefined) return undefined;
-		const tail = args.slice(moduleIndex + 2);
-		const source = `${PYTHON_PACKAGE_BOOTSTRAP}\nimport runpy as _sqlfs_runpy\n_sqlfs_sys.argv = ${JSON.stringify([module, ...tail])}\n_sqlfs_runpy.run_module(${JSON.stringify(module)}, run_name="__main__")`;
-		return { forwarded: ["-c", source], stdin: "" };
+		return runpyProgram([module, ...args.slice(moduleIndex + 2)], "run_module", module);
 	}
 	const scriptIndex = args.findIndex((arg) => !arg.startsWith("-") || arg === "-");
-	if (scriptIndex >= 0) {
-		const script = args[scriptIndex]!;
-		const tail = args.slice(scriptIndex + 1);
-		if (script === "-") {
-			return {
-				forwarded: [
-					"-c",
-					`${PYTHON_PACKAGE_BOOTSTRAP}\n_sqlfs_sys.argv = ${JSON.stringify(["-", ...tail])}\nexec(compile(_sqlfs_sys.stdin.read(), "<stdin>", "exec"))`,
-				],
-				stdin: "",
-			};
-		}
-		const source = `${PYTHON_PACKAGE_BOOTSTRAP}\nimport runpy as _sqlfs_runpy\n_sqlfs_sys.argv = ${JSON.stringify([script, ...tail])}\n_sqlfs_runpy.run_path(${JSON.stringify(script)}, run_name="__main__")`;
-		return { forwarded: ["-c", source], stdin: "" };
-	}
-	return { forwarded: args, stdin: "" };
+	if (scriptIndex < 0) return args;
+	const script = args[scriptIndex]!;
+	const argv = [script, ...args.slice(scriptIndex + 1)];
+	if (script === "-") return bootstrapProgram(argv, 'exec(compile(_sqlfs_sys.stdin.read(), "<stdin>", "exec"))');
+	return runpyProgram(argv, "run_path", script);
 }
 
-export const pipCommand = defineCommand("pip", executePip);
-export const pip3Command = defineCommand("pip3", executePip);
+const pipCommand = defineCommand("pip", executePip);
+const pip3Command = defineCommand("pip3", executePip);
 
-export const python3PackageCommand = defineCommand("python3", async (args, ctx) => {
+const python3PackageCommand = defineCommand("python3", async (args, ctx): Promise<ExecResult> => {
 	const stdin = decodeBytesToUtf8(ctx.stdin);
 	if (args.includes("--version") || args.includes("-V") || args.includes("--help")) {
-		return invokeOriginalOrBuiltin(ctx, args, stdin);
+		return invokeBuiltinPython(ctx, args, stdin);
 	}
-	const packaged = packagePythonArgs(args);
-	if (!packaged) return invokeOriginalOrBuiltin(ctx, args, stdin);
-	const original = (ctx as CommandContext & { origCommand?: (args: string[]) => Promise<ExecResult> }).origCommand;
-	if (original) return original(packaged.forwarded);
-	if (!ctx.exec) return commandFailure("python3: WASM Python command is unavailable");
-	return ctx.exec("python", { cwd: ctx.cwd, args: packaged.forwarded, stdin, env: inheritedEnvironment(ctx) });
+	return invokeBuiltinPython(ctx, packagePythonArgs(args) ?? args, stdin);
 });
 
-export const databricksCommand = defineCommand("databricks", async (args, ctx) => {
+const databricksCommand = defineCommand("databricks", async (args, ctx): Promise<ExecResult> => {
 	if (!ctx.fetch) return commandFailure("databricks: network access is disabled; create the sandbox with network:true");
 	if (!ctx.exec) return commandFailure("databricks: WASM Python command is unavailable");
 	const entrypoint = await getDatabricksEntrypoint(ctx);
 	if (!entrypoint) return commandFailure("databricks: install databricks-cli first with 'pip install databricks-cli'");
-	const source = `${PYTHON_PACKAGE_BOOTSTRAP}\nimport os as _sqlfs_databricks_os\nimport sys as _sqlfs_databricks_sys\n_sqlfs_databricks_os.environ["DATABRICKS_CLI_DO_NOT_EXECUTE_NEWER_VERSION"] = "1"\nfrom ${entrypoint.moduleName} import ${entrypoint.functionName} as _sqlfs_databricks_main\n_sqlfs_databricks_sys.argv = ["databricks"] + ${JSON.stringify(args)}\n_sqlfs_databricks_main()`;
-	const result = await ctx.exec("python3", {
-		cwd: ctx.cwd,
-		args: ["-c", source],
-		stdin: decodeBytesToUtf8(ctx.stdin),
-		env: inheritedEnvironment(ctx),
-	});
+	// Dispatch to the built-in python, not the python3 override, so the
+	// bootstrap this program already carries is not prepended a second time.
+	const program = bootstrapProgram(
+		["databricks", ...args],
+		[
+			"import os as _sqlfs_databricks_os",
+			'_sqlfs_databricks_os.environ["DATABRICKS_CLI_DO_NOT_EXECUTE_NEWER_VERSION"] = "1"',
+			`from ${entrypoint.moduleName} import ${entrypoint.functionName} as _sqlfs_databricks_main`,
+			"_sqlfs_databricks_main()",
+		].join("\n"),
+	);
+	const result = await invokeBuiltinPython(ctx, program, decodeBytesToUtf8(ctx.stdin));
 	return redactDatabricksResult(result, ctx);
 });
 
