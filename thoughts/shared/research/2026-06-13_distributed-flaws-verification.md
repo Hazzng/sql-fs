@@ -12,7 +12,7 @@ method: "27-agent workflow — per flaw: independent investigation + adversarial
 
 # Consolidated Review — sql-fs Distributed Architecture (F1–F9)
 
-Lead-reviewer sign-off on the adversarial verification of nine flaws. All line references below are against current `main` of `/Users/nguyendangquang/master/Web-Dev/virtualFS` and were spot-verified against source.
+Lead-reviewer sign-off on the adversarial verification of nine flaws. All line references below are against the `main` branch of this repository as of 2026-06-13 and were spot-verified against source.
 
 ## 1. Verdict table
 

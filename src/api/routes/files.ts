@@ -10,6 +10,8 @@
  */
 
 import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { FsStat } from "just-bash";
 import { z } from "zod";
@@ -69,6 +71,23 @@ const MAX_TREE_ENTRIES = Number(process.env.MAX_TREE_ENTRIES ?? "50000");
 
 export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
+
+	// A write is bounded by the same limit as the file it produces, and the global body cap is four
+	// times looser. `bodyLimit` counts the bytes as they stream, so a chunked body carrying no
+	// Content-Length — or an under-declared one — is cut off rather than buffered on the header's word.
+	const writeBodyLimit = (subject: string): MiddlewareHandler<{ Variables: AuthVariables }> =>
+		bodyLimit({
+			maxSize: MAX_RAW_FILE_WRITE_BYTES,
+			onError: (c) =>
+				c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`${subject} exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+					},
+					413 as ContentfulStatusCode,
+				),
+		});
 
 	// GET /v1/sandboxes/:id/files/* — read file content
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
@@ -153,41 +172,15 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	});
 
 	// PUT /v1/sandboxes/:id/files/* — write raw file content
-	router.put("/:id/files/:path{.*}", async (c) => {
+	router.put("/:id/files/:path{.*}", writeBodyLimit("File body"), async (c) => {
 		const sandboxId = c.req.param("id");
 		const tenant = c.get("tenant");
 		const wildcard = c.req.param("path");
 		const filePath = `/${wildcard}`;
 
-		// Reject oversized uploads up-front via Content-Length so we never buffer
-		// a too-large body into memory.
-		const contentLength = c.req.header("content-length");
-		if (contentLength !== undefined) {
-			const declared = Number(contentLength);
-			if (Number.isFinite(declared) && declared > MAX_RAW_FILE_WRITE_BYTES) {
-				return c.json(
-					{
-						error: "payload_too_large",
-						code: "PAYLOAD_TOO_LARGE",
-						details: [`File body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
-					},
-					413 as ContentfulStatusCode,
-				);
-			}
-		}
-
+		// The limiter above aborts the stream past the cap, so this never buffers an oversized body.
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
-		if (content.byteLength > MAX_RAW_FILE_WRITE_BYTES) {
-			return c.json(
-				{
-					error: "payload_too_large",
-					code: "PAYLOAD_TOO_LARGE",
-					details: [`File body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
-				},
-				413 as ContentfulStatusCode,
-			);
-		}
 
 		try {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
@@ -209,24 +202,10 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		replaceAll: z.boolean().optional(),
 	});
 
-	router.patch("/:id/files/:path{.*}", async (c) => {
+	router.patch("/:id/files/:path{.*}", writeBodyLimit("Edit body"), async (c) => {
 		const sandboxId = c.req.param("id");
 		const tenant = c.get("tenant");
 		const filePath = `/${c.req.param("path")}`;
-
-		// Reject an oversized edit before parsing it: the strings are bounded by the same limit
-		// as the file they rewrite, and the global body cap is three orders of magnitude looser.
-		const declaredLength = Number(c.req.header("content-length"));
-		if (Number.isFinite(declaredLength) && declaredLength > MAX_RAW_FILE_WRITE_BYTES) {
-			return c.json(
-				{
-					error: "payload_too_large",
-					code: "PAYLOAD_TOO_LARGE",
-					details: [`Edit body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
-				},
-				413 as ContentfulStatusCode,
-			);
-		}
 
 		let body: z.infer<typeof editBodySchema>;
 		try {
@@ -236,7 +215,11 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
 			}
 			body = result.data;
-		} catch {
+		} catch (err) {
+			// A body that blew the cap surfaces here as a stream error, because `bodyLimit` aborts the
+			// stream it handed us. Rethrow so the middleware can turn it into its 413 on the way out —
+			// swallowing it would report an oversized edit as malformed JSON.
+			if (err instanceof Error && err.name === "BodyLimitError") throw err;
 			return c.json(
 				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
 				400 as ContentfulStatusCode,

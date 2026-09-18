@@ -20,8 +20,11 @@ import { defineCommand } from "just-bash";
 import type { Command, ExecResult, IFileSystem } from "just-bash";
 import { createGit } from "just-git";
 
-/** just-git's network option: `{}` for unrestricted outbound, `false` to block transport. */
+/** just-git's network option: a policy object grants outbound transport, `false` blocks it. */
 type GitNetworkOption = NonNullable<Parameters<typeof createGit>[0]>["network"];
+
+/** just-git's custom transport hook — not exported from the package root, so derive it. */
+type GitFetchFunction = NonNullable<Exclude<GitNetworkOption, false | undefined>["fetch"]>;
 
 interface CloneTarget {
 	readonly path: string;
@@ -80,11 +83,33 @@ async function isEmptyDir(fs: IFileSystem, path: string): Promise<boolean> {
 }
 
 /**
+ * Git HTTP transport that refuses plaintext.
+ *
+ * just-git resolves `GIT_HTTP_USER`/`GIT_HTTP_PASSWORD` from the sandbox env for *any* http(s)
+ * remote, so an `http://` URL would put the deployment token on the wire in the clear — a remote
+ * the agent was merely talked into cloning is enough. Redirects are checked on the way back:
+ * `fetch` already drops `Authorization` across origins, but a downgraded final hop would still
+ * have carried the response over plaintext.
+ */
+export const httpsOnlyGitFetch: GitFetchFunction = async (input, init) => {
+	const url = input instanceof Request ? input.url : String(input);
+	if (!url.startsWith("https://")) {
+		throw new Error(`git: refusing to send credentials over plaintext HTTP (${url}); use an https:// remote`);
+	}
+	const response = await fetch(input, init);
+	if (!response.url.startsWith("https://")) {
+		throw new Error(`git: remote redirected to plaintext HTTP (${response.url}); refusing to continue`);
+	}
+	return response;
+};
+
+/**
  * Build the sandbox `git` command. `defineCommand` marks it `trusted: true`, which runs it inside
  * `DefenseInDepthBox.runTrustedAsync` — git needs direct `fetch` and crypto.
  *
- * @param options.network `{}` grants unrestricted outbound, `false` blocks clone/fetch/push while
- *   leaving local git intact. Tests pass an in-process transport to run hermetically.
+ * @param options.network a policy object grants outbound transport (production passes
+ *   {@link httpsOnlyGitFetch}), `false` blocks clone/fetch/push while leaving local git intact.
+ *   Tests pass an in-process transport to run hermetically.
  */
 export function createGitCommand(options: { readonly network: GitNetworkOption }): Command {
 	const scopes = new AsyncLocalStorage<CloneScope>();

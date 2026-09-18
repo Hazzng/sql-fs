@@ -1,5 +1,6 @@
 import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { httpsOnlyGitFetch } from "../../commands/git-command.js";
 import { SessionManager, buildSandboxBaseEnv, deriveExecGitCredentials } from "../../session-manager.js";
 
 const T = "default";
@@ -43,10 +44,38 @@ describe("deriveExecGitCredentials", () => {
 		});
 	});
 
-	it("leaves an explicit git credential alone", () => {
+	it("keeps an explicit git credential and derives the half the request left out", () => {
 		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token", GIT_HTTP_PASSWORD: "explicit" }, true)).toEqual({
 			GITHUB_TOKEN: "request-token",
+			GIT_HTTP_USER: "x-access-token",
 			GIT_HTTP_PASSWORD: "explicit",
+		});
+	});
+
+	// A request that pins only the username must not keep authenticating with the deployment
+	// token: the base env's GIT_HTTP_PASSWORD would otherwise survive the merge untouched.
+	it("derives the password when the request pins only the username", () => {
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token", GIT_HTTP_USER: "oauth2" }, true)).toEqual({
+			GITHUB_TOKEN: "request-token",
+			GIT_HTTP_USER: "oauth2",
+			GIT_HTTP_PASSWORD: "request-token",
+		});
+	});
+
+	it("overwrites the inherited basic pair even when the request supplies a bearer token", () => {
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token", GIT_HTTP_BEARER_TOKEN: "bearer" }, true)).toEqual({
+			GITHUB_TOKEN: "request-token",
+			GIT_HTTP_BEARER_TOKEN: "bearer",
+			GIT_HTTP_USER: "x-access-token",
+			GIT_HTTP_PASSWORD: "request-token",
+		});
+	});
+
+	it("leaves an empty token override inert rather than falling back to the server token", () => {
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "", GIT_HTTP_USER: "oauth2" }, true)).toEqual({
+			GITHUB_TOKEN: "",
+			GIT_HTTP_USER: "oauth2",
+			GIT_HTTP_PASSWORD: "",
 		});
 	});
 
@@ -56,6 +85,41 @@ describe("deriveExecGitCredentials", () => {
 			GITHUB_TOKEN: "request-token",
 		});
 		expect(deriveExecGitCredentials(undefined, true)).toBeUndefined();
+	});
+});
+
+describe("httpsOnlyGitFetch", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("refuses a plaintext remote before the request leaves the process", async () => {
+		const spy = vi.fn();
+		vi.stubGlobal("fetch", spy);
+
+		await expect(httpsOnlyGitFetch("http://git.test/repo/info/refs")).rejects.toThrow(
+			/refusing to send credentials over plaintext HTTP/,
+		);
+		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("passes an https remote through untouched", async () => {
+		const response = new Response("ok");
+		Object.defineProperty(response, "url", { value: "https://git.test/repo/info/refs" });
+		const spy = vi.fn(async () => response);
+		vi.stubGlobal("fetch", spy);
+
+		const init = { method: "POST" };
+		await expect(httpsOnlyGitFetch("https://git.test/repo/info/refs", init)).resolves.toBe(response);
+		expect(spy).toHaveBeenCalledWith("https://git.test/repo/info/refs", init);
+	});
+
+	it("refuses a response that redirected down to plaintext", async () => {
+		const response = new Response("ok");
+		Object.defineProperty(response, "url", { value: "http://git.test/repo/info/refs" });
+		vi.stubGlobal("fetch", async () => response);
+
+		await expect(httpsOnlyGitFetch("https://git.test/repo/info/refs")).rejects.toThrow(/redirected to plaintext HTTP/);
 	});
 });
 

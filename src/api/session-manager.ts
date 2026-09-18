@@ -22,7 +22,7 @@ import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
-import { createGitCommand } from "./commands/git-command.js";
+import { createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -183,9 +183,10 @@ const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
  *
  * just-bash merges the exec env over the base env key by key, so an override of `GITHUB_TOKEN`
  * alone leaves `GIT_HTTP_PASSWORD` holding the deployment token — `git clone`/`push` would keep
- * authenticating as the server while `curl $GITHUB_TOKEN` used the caller's. Only sandboxes that
- * carry the credentials at all (network-enabled) are touched, and an explicit git credential in
- * the request always wins.
+ * authenticating as the server while `curl $GITHUB_TOKEN` used the caller's. Each alias is
+ * derived independently, so a request that pins only one half (`GIT_HTTP_USER: "oauth2"` for a
+ * non-GitHub host, say) keeps it and still has the other half re-derived rather than inherited.
+ * Only sandboxes that carry the credentials at all (network-enabled) are touched.
  */
 export function deriveExecGitCredentials(
 	env: Record<string, string> | undefined,
@@ -193,12 +194,12 @@ export function deriveExecGitCredentials(
 ): Record<string, string> | undefined {
 	if (env === undefined || !network) return env;
 	if (!Object.hasOwn(env, "GITHUB_TOKEN")) return env;
-	if (["GIT_HTTP_BEARER_TOKEN", "GIT_HTTP_USER", "GIT_HTTP_PASSWORD"].some((k) => Object.hasOwn(env, k))) return env;
 	const out: Record<string, string> = Object.assign(Object.create(null), env);
 	// An empty override means "no credentials": just-git only sends basic auth when both halves
 	// are non-empty, so the pair below stays inert rather than falling back to the server token.
-	out.GIT_HTTP_USER = "x-access-token";
-	out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
+	// A request-supplied GIT_HTTP_BEARER_TOKEN still outranks the pair inside just-git.
+	if (!Object.hasOwn(env, "GIT_HTTP_USER")) out.GIT_HTTP_USER = "x-access-token";
+	if (!Object.hasOwn(env, "GIT_HTTP_PASSWORD")) out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
 	return out;
 }
 
@@ -608,7 +609,9 @@ export class SessionManager {
 				// `false` → clone/fetch/push blocked; local git still works.
 				// The wrapper removes the destination of a clone that fails partway,
 				// so a refused symlink cannot leave a poisoned index behind.
-				const gitCommand = createGitCommand({ network: resolvedRuntime.network ? {} : false });
+				const gitCommand = createGitCommand({
+					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
+				});
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
