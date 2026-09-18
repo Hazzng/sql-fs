@@ -112,7 +112,11 @@ export interface DistributedRWLockOptions {
 const DEFAULTS: DistributedRWLockOptions = {
 	leaseMs: 60_000,
 	renewMs: 20_000,
-	acquireTimeoutMs: 300_000,
+	// #173: lease + ~15 s reap margin — long enough to ride out a crashed
+	// holder's lease expiry, short enough to answer inside typical ingress
+	// timeouts. Deployments get this from loadExecLockOptions(); this default
+	// only covers callers that omit the option entirely.
+	acquireTimeoutMs: 75_000,
 	acquireRetryMs: 50,
 	readerLeaseMs: 60_000,
 	errorBudgetMs: DEFAULT_ACQUIRE_ERROR_BUDGET_MS,

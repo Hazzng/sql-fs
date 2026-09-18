@@ -173,7 +173,7 @@ Key design choices:
 | `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No | `60000` | Distributed exec lock TTL. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No | `20000` | Lock heartbeat interval. Must be strictly less than lease. |
-| `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No | `300000` | Max wait to acquire exec lock before returning 503. |
+| `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No | `75000` | Max wait to acquire exec lock before returning 503. Must be strictly greater than `REDIS_EXEC_LOCK_LEASE_MS` and `REDIS_RWLOCK_READER_LEASE_MS` (asserted at startup), so a crashed holder's lease can be reaped before the waiter gives up. |
 | `REDIS_BLOB_CACHE_ENABLED` | No | `true` | Set `false` to disable Redis blob cache. |
 | `REDIS_BLOB_CACHE_TTL_MS` | No | `86400000` | Blob cache entry TTL (24h). |
 | `REDIS_BLOB_MAX_BYTES` | No | `8388608` | Blobs larger than this bypass Redis entirely (8 MB). |
