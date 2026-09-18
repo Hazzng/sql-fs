@@ -9,6 +9,12 @@ const errorSchema = {
 		error: { type: "string", example: "not_found" },
 		code: { type: "string", example: "ENOENT" },
 		details: { type: "array", items: { type: "string" } },
+		retryable: {
+			type: "boolean",
+			example: false,
+			description:
+				"Durability discriminator. `true` means the server knows the request applied NOTHING and the condition is transient, so an automatic retry is safe (`ELOCKTIMEOUT`, `ELOCKLOST`, `ECOHERENCE_UNAPPLIED`, `ESESSIONCLOSING`, `ESHUTTINGDOWN`, `ERUNTIME_BUSY`, and the Postgres capacity refusals). `false` means the effect may already be durable, or a retry would fail identically — retry only if the call is idempotent. Notably `503 ECOHERENCE` is `false`: the write committed and only the cross-replica version publish failed. Emitted on every error raised through the global handler; when absent, treat it as `false`.",
+		},
 	},
 	required: ["error", "code"],
 } as const;
@@ -69,7 +75,7 @@ const execBodySchema = {
 		retryOn5xx: {
 			type: "boolean",
 			description:
-				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs (the write committed; only the cache invalidation publish failed).",
+				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs: the write committed and only the cross-replica version publish failed, so a retry re-runs an already-applied script. Use the `retryable` field on the error body as the machine-readable form of this rule rather than enumerating codes.",
 		},
 	},
 	required: ["script"],
@@ -81,6 +87,16 @@ const sandboxIdParam = {
 	required: true,
 	description: "Sandbox UUID",
 	schema: { type: "string", format: "uuid" },
+} as const;
+
+/**
+ * #175: the exec 503 contract. Six codes share this status and they disagree
+ * about durability, so the response documents the split explicitly.
+ */
+const execUnavailableResponse = {
+	description:
+		"Service unavailable. Check `retryable` before retrying: `true` (ELOCKTIMEOUT, ELOCKLOST, ECOHERENCE_UNAPPLIED, ESESSIONCLOSING, ESHUTTINGDOWN, ERUNTIME_BUSY, EUNAVAILABLE capacity refusals) means nothing was applied and an automatic retry is safe. `ECOHERENCE` is `retryable: false` — the script ran and its writes COMMITTED; only the cross-replica cache-invalidation publish failed, so retrying re-applies a non-idempotent script. Treat an ECOHERENCE exec as applied-but-unacknowledged: re-read state, or retry only if the script is idempotent.",
+	content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 } as const;
 
 const bearerAuth = { bearerAuth: [] };
@@ -784,6 +800,7 @@ export const openapiSpec = {
 						description: "readOnly script attempted to mutate the filesystem",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
+					"503": execUnavailableResponse,
 				},
 			},
 		},
@@ -877,6 +894,7 @@ export const openapiSpec = {
 						description: "readOnly batch attempted to mutate the filesystem",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
+					"503": execUnavailableResponse,
 				},
 			},
 		},
@@ -930,6 +948,7 @@ export const openapiSpec = {
 						description: "Sandbox not found",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
+					"503": execUnavailableResponse,
 				},
 			},
 		},

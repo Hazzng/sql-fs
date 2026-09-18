@@ -17,7 +17,7 @@ import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
-import { clientSafeErrorCode, clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
+import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError, mapFsErrorToStatus } from "./errors.js";
 import { DEFAULT_SAMPLE_INTERVAL_MS, startEventLoopMonitor, stopEventLoopMonitor } from "./event-loop-monitor.js";
 import { loadExecLockOptions } from "./exec-lock-config.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
@@ -275,8 +275,12 @@ app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	const code = clientSafeErrorCode(err);
 	const message = clientSafeErrorMessage(err);
+	// #175: six distinct codes share 503, and they disagree about durability.
+	// `retryable` is the discriminator so a client never has to enumerate codes
+	// to learn whether a retry can double-apply a write.
+	const retryable = isRetryableError(err);
 
-	return c.json({ error: message, code }, status);
+	return c.json({ error: message, code, retryable }, status);
 });
 
 // ── Server bootstrap (only when run as entry point) ───────────────────────────

@@ -10,7 +10,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
-import { clientSafeErrorCode, clientSafeErrorMessage } from "../errors.js";
+import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError } from "../errors.js";
 import { type BatchScriptResult, type ExecuteBatchOptions, executeBatch } from "../lib/batch-exec.js";
 import {
 	forbiddenResponse,
@@ -394,6 +394,9 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 							t: "error",
 							code: clientSafeErrorCode(err),
 							error: clientSafeErrorMessage(err, "internal error"),
+							// #175: mirror the JSON error body's durability discriminator so an
+							// SSE client can make the same retry decision as a buffered one.
+							retryable: isRetryableError(err),
 						}),
 					});
 					await stream.writeSSE({
