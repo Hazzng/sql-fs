@@ -27,6 +27,7 @@ import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-f
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { createPythonPackageCommands } from "./commands/pip-command.js";
+import { createRedisWheelLease } from "./commands/pip-wheel-store.js";
 import { createPypiFetch } from "./commands/pypi-fetch.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -609,7 +610,7 @@ export class SessionManager {
 				const customCommands = [
 					// Experimental pure-Python package support. The commands are only
 					// available in Python sandboxes and use ctx.fs / ctx.fetch exclusively.
-					...(resolvedRuntime.python ? this.buildPythonPackageCommands(resolvedRuntime.network, fs) : []),
+					...(resolvedRuntime.python ? this.buildPythonPackageCommands(resolvedRuntime.network, fs, tenantId) : []),
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
@@ -1581,13 +1582,21 @@ export class SessionManager {
 	 * there would raise it for every sandbox command. The two admission slots
 	 * are injected so the commands never import this class.
 	 */
-	private buildPythonPackageCommands(network: boolean, fs: IFileSystem): Command[] {
+	private buildPythonPackageCommands(network: boolean, fs: IFileSystem, tenantId: string): Command[] {
 		// The store is taken from the real filesystem object rather than from
 		// `ctx.fs`: with defence-in-depth enabled just-bash hands commands an
 		// `IFileSystem`-only facade, which would hide the package store.
 		const packageStore = asPackageStore(fs);
+		// With Redis the wheel lease is fleet-wide, so the first install of a wheel
+		// anywhere downloads it once. Without Redis the commands fall back to their
+		// per-replica in-process singleflight: duplicate first-install work across
+		// replicas is accepted and still correct, because blob inserts are content
+		// addressed and the manifest write is an upsert.
+		const withWheelLease =
+			this.redis !== undefined ? createRedisWheelLease({ redis: this.redis, tenantId }) : undefined;
 		return createPythonPackageCommands({
 			...(packageStore ? { packageStore } : {}),
+			...(withWheelLease ? { withWheelLease } : {}),
 			fetch: network
 				? createPypiFetch({
 						maxResponseSize: Number(process.env.PIP_MAX_WHEEL_BYTES ?? String(32 * 1024 * 1024)),

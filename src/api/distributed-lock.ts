@@ -43,6 +43,13 @@ export interface DistributedLockOptions {
 	 * lock is never cut short by the breaker.
 	 */
 	readonly errorBudgetMs: number;
+	/**
+	 * Called once per failed (non-OK) acquire attempt, i.e. whenever this caller
+	 * is about to sleep behind another holder. The only way to tell *contention*
+	 * from a slow-but-uncontended round trip from outside; the pip wheel lease
+	 * uses it to decide whether a `pip_singleflight_wait` event is warranted.
+	 */
+	readonly onContended?: () => void;
 }
 
 const DEFAULTS: DistributedLockOptions = {
@@ -159,6 +166,7 @@ export async function withDistributedLock<T>(
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(key);
 		}
 		if (acquired) break;
+		merged.onContended?.();
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(key);
 		// F9d: jittered sleep to de-synchronize cross-replica pollers.
 		await new Promise((r) => setTimeout(r, jitteredDelayMs(acquireRetryMs)));
@@ -272,4 +280,13 @@ export async function withDistributedLock<T>(
 
 export function execLockKey(tenantId: string, sandboxId: string): string {
 	return `vfs:${tenantId}:lock:${sandboxId}`;
+}
+
+/**
+ * Key for the per-wheel install lease (pip Phase W). Scoped by tenant like
+ * every other key in this module: two tenants installing the same wheel hash
+ * do the work once each, because blobs and manifests are per-tenant databases.
+ */
+export function wheelLockKey(tenantId: string, wheelSha256Hex: string): string {
+	return `vfs:${tenantId}:pip:wheel:${wheelSha256Hex}`;
 }

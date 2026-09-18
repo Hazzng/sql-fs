@@ -9,6 +9,7 @@ import {
 	defineCommand,
 } from "just-bash";
 import { type IPackageStore, asPackageStore } from "../../sql-fs/package-store.js";
+import type { PackageManifest } from "../../sql-fs/types.js";
 import { pythonSlotAlreadyHeld } from "../python-slot-context.js";
 import { packageLimits } from "./package-limits.js";
 import {
@@ -29,7 +30,14 @@ import {
 	warmContentCache,
 } from "./pip-publish.js";
 import { COMPAT_PACKAGES, PipError, SITE_PACKAGES, fail } from "./pip-shared.js";
-import { type WheelLease, createInProcessWheelLease, createInstallBudget, prepareWheel } from "./pip-wheel-store.js";
+import {
+	type PipLogger,
+	type WheelLease,
+	createInProcessWheelLease,
+	createInstallBudget,
+	logPipEvent,
+	prepareWheel,
+} from "./pip-wheel-store.js";
 import type { PypiFetch, PypiFetchRequestOptions, PypiFetchResult } from "./pypi-fetch.js";
 
 const PYPI_JSON_ORIGIN = "https://pypi.org";
@@ -377,6 +385,11 @@ export interface PythonPackageCommandOptions {
 	 * singleflight; Phase 4 injects the Redis `withDistributedLock` version.
 	 */
 	readonly withWheelLease?: WheelLease;
+	/**
+	 * Structured install events (`pip_manifest_hit`, `pip_manifest_miss`,
+	 * `pip_singleflight_wait`, `pip_publish`). Defaults to one JSON line each.
+	 */
+	readonly log?: PipLogger;
 	/**
 	 * Blobs, manifests and the installed-package ledger for this sandbox.
 	 *
@@ -781,8 +794,10 @@ async function install(
 
 		// Phase W, one wheel at a time: at most one wheel buffer is live.
 		const lease = options.withWheelLease ?? sharedWheelLease;
+		const log = options.log ?? logPipEvent;
 		const budget = createInstallBudget();
 		const incoming: IncomingWheel[] = [];
+		const manifests: PackageManifest[] = [];
 		for (const packageInfo of plan.packages) {
 			const manifest = await prepareWheel({
 				store,
@@ -790,8 +805,10 @@ async function install(
 				limits: sizeLimits,
 				budget,
 				lease,
+				log,
 				download: () => downloadWheel(state, packageInfo),
 			});
+			manifests.push(manifest);
 			incoming.push({ name: packageInfo.name, version: packageInfo.version, wheelSha256: manifest.wheelSha256 });
 		}
 
@@ -800,6 +817,7 @@ async function install(
 			: undefined;
 		const publishArgs = { ctx, store, incoming, limits: sizeLimits, ...(compatOverlay ? { compatOverlay } : {}) };
 		let published: Awaited<ReturnType<typeof publishInstall>>;
+		const publishStartedAt = Date.now();
 		try {
 			published = await publishInstall(publishArgs);
 		} catch (error) {
@@ -823,11 +841,26 @@ async function install(
 					limits: sizeLimits,
 					budget: createInstallBudget(),
 					lease,
+					log,
 					download: () => downloadWheel(state, packageInfo),
 					force: true,
 				});
 			}
 			published = await publishInstall(publishArgs);
+		}
+		// One line per wheel this install linked into the sandbox; `elapsedMs` is
+		// the whole publish, which is a single transaction for every wheel at once.
+		const publishElapsedMs = Date.now() - publishStartedAt;
+		for (const manifest of manifests) {
+			log({
+				event: "pip_publish",
+				wheel: Buffer.from(manifest.wheelSha256).toString("hex"),
+				name: manifest.name,
+				version: manifest.version,
+				fileCount: manifest.fileCount,
+				bytes: manifest.totalBytes,
+				elapsedMs: publishElapsedMs,
+			});
 		}
 
 		// Reading the small interpreted files back through `readFile` fills the

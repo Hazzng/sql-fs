@@ -215,6 +215,19 @@ Every lease above (the exec-lock writer lease, the RW-lock writer flag, and the 
 
 `warn`/`critical` go to `console.warn`/`console.error` respectively; the sampler logs at `console.log`. A `critical` `heartbeat_gap` for `exec`/`rw-writer` is the breadcrumb that explains a subsequent `LockLostError`; for `rw-reader` it flags the window during which a writer could have reaped the stale reader entry and entered mid-read. `eventLoopLagSnapshot()` exposes the live histogram for a future health endpoint without perturbing the windowed log.
 
+### Package install observability (pip Phase W / Phase P)
+
+`pip install` emits one JSON line per wheel through the same `logAudit` convention, so the cost of an install can be read out of the logs instead of estimated. Every event carries `wheel` (the wheel's sha256, lowercase hex), `name`, `version`, `fileCount`, `bytes` (the extracted total) and `elapsedMs`.
+
+| Event | Emitted when | Extra fields | Meaning |
+|---|---|---|---|
+| `pip_manifest_hit` | the manifest lookup under the wheel lease found a current row | — | No download, no inflate, no blob transmission: the tenant already stores this wheel. `elapsedMs` is the lookup. |
+| `pip_manifest_miss` | Phase W finished the work for a wheel nobody had stored | — | `elapsedMs` covers download + verify + inflate + `ingestBlobs` + `recordManifest`. Emitted after the work, not at the lookup, because the counts it reports only exist once the archive has been read. |
+| `pip_singleflight_wait` | the wheel lease queued behind another holder; emitted just before the hit/miss for that wheel | `waitedMs` | The singleflight earned its keep: someone else was doing this wheel's Phase W. With Redis the holder may be another replica; without it, another session on this one. An uncontended acquire never emits this (the Redis lease keys off a lost `SET NX`, not off elapsed time). |
+| `pip_publish` | Phase P committed, one line per wheel the install linked | — | `elapsedMs` is the whole publish (one transaction for every wheel at once), so the same value repeats across the lines of one install. |
+
+The wheel lease itself is `withDistributedLock` on `vfs:{tenant}:pip:wheel:{sha256hex}` (`wheelLockKey`), with the module defaults — 60s lease, 20s renewal, compare-and-delete release. It is held for exactly one wheel's Phase W and released before the next wheel, so two sandboxes installing overlapping dependency closures in different orders cannot deadlock, and it is never held during Phase P. A lost lease surfaces as `LockLostError` and the install refuses for that wheel with `pip: wheel lease lost for <name> <version> (<sha256>)`; nothing needs undoing, because blob rows are content addressed and the manifest is written last. Without `REDIS_URL` the lease is a per-replica in-process singleflight: two replicas may both do the first install of one wheel, which is accepted and still correct.
+
 ---
 
 ## ReadOnly Safety Model

@@ -843,6 +843,97 @@ Structured log events: `pip_manifest_hit`, `pip_manifest_miss`,
 elapsed time, so the estimates in this document can be replaced with
 measurements.
 
+### Phase 4 status
+
+Implemented on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`). With Redis, the first install of a wheel anywhere in
+the fleet downloads it once; without Redis the per-replica singleflight from
+Phase 3 stands.
+
+- [x] **`createRedisWheelLease({ redis, tenantId })`**
+      (`src/api/commands/pip-wheel-store.ts`) wraps `fn` in
+      `withDistributedLock` on `wheelLockKey(tenantId, sha256hex)` =
+      `vfs:{tenant}:pip:wheel:{sha256hex}` (new helper next to `execLockKey`),
+      with the module defaults: 60 s lease, 20 s renewal, compare-and-delete
+      release.
+- [x] **The manifest lookup already ran inside the lease** (Phase 3 wrote
+      `prepareWheel` that way, with the "the previous holder may have just
+      recorded it" comment); nothing needed fixing. The lease covers the
+      re-check, the download, every `ingestBlobs` batch and `recordManifest`,
+      and is released when the callback returns — before the install loop's
+      next iteration, and never across Phase P.
+- [x] **`LockLostError` → `PipError` naming the wheel**: `prepareWheel` catches
+      it around the whole lease call and fails with `wheel lease lost for <name>
+      <version> (<sha256>); try again`. Nothing is undone: blob rows are content
+      addressed and the manifest is written last.
+- [x] **`SessionManager.buildPythonPackageCommands`** takes the `tenantId` and
+      injects `createRedisWheelLease` when `this.redis` is set; otherwise it
+      passes nothing and the commands keep their module-level in-process lease.
+- [x] **In-process lease cleanup on both outcomes**: the map entry is deleted in
+      a `finally`, so a rejected leader does not leave a chain the next caller
+      waits on; a waiter observes the manifest hit the leader recorded.
+- [x] **Structured events** `pip_manifest_hit`, `pip_manifest_miss`,
+      `pip_singleflight_wait` (Phase W) and `pip_publish` (Phase P), each with
+      `wheel`, `name`, `version`, `fileCount`, `bytes`, `elapsedMs`, plus
+      `waitedMs` on the wait event. Emitted through `logPipEvent`, which calls
+      the same `logAudit` one-JSON-line-per-event helper as the rest of
+      `src/api`; injectable as `log` on `createPythonPackageCommands` and on
+      `prepareWheel`.
+- [x] **Wait detection is a flag, not a stopwatch threshold**:
+      `DistributedLockOptions.onContended` (new, optional) fires on each failed
+      `SET NX`, and the Redis lease reports `waitedMs` only when it fired. An
+      uncontended acquire still costs a Redis round trip, so elapsed time alone
+      reported a "wait" on every cold install.
+- [x] **Docs**: CLAUDE.md's `REDIS_URL` row names the wheel-lease key and states
+      that duplicate first-install work across replicas is accepted without it;
+      DEVELOPER.md gained "Package install observability (pip Phase W / Phase
+      P)" with the four events and the lease's lifetime.
+- [x] **Tests**: unit — `pip-singleflight.test.ts` (6: concurrent cold installs
+      do one download and one `recordManifest`, rejection clears the map entry,
+      waiter sees a measured wait, exact event objects for miss+publish, hit,
+      and wait) and `pip-wheel-lease.test.ts` (7: exact key, `PX 60000`/`NX`,
+      `fn` runs while the key is held, compare-and-delete release on success and
+      on throw, no wait when the first `SET` wins, a measured wait after a lost
+      `SET`, `LockLostError` → `PipError`). Integration —
+      `pip-singleflight.integration.test.ts`: two replicas (own Redis client,
+      own lease, own `SqlFs`) install the same cold wheel concurrently against
+      one Redis and one Postgres; exactly one wheel fetch, both trees populated,
+      both ledger rows present, lock key gone.
+
+### Discoveries and Notable Information
+
+- **`withDistributedLock` exposes no "did you queue" signal**, and elapsed
+  acquire time is not a substitute: against a real Redis an uncontended acquire
+  measured 2 ms, so the first run of the two-replica integration test emitted
+  `pip_singleflight_wait` for the *leader*. The fix is the new optional
+  `onContended` callback in `DistributedLockOptions`, called once per failed
+  `SET NX`. The in-process lease has the same information for free (it knows
+  whether there was a previous entry for the hash).
+- **The lease callback now receives a `WheelLeaseInfo`** (`{ waitedMs }`), so
+  `WheelLease` changed from `(key, () => Promise<T>)` to
+  `(key, (info) => Promise<T>)`. That is the only contract change; both
+  implementations and every test lease provide it.
+- **`pip_manifest_miss` is emitted after the work, not at the lookup.** The
+  event's required `fileCount` / `bytes` do not exist until the archive has been
+  read, and an event whose numbers are zero half the time is not measurable.
+  `pip_singleflight_wait` is emitted immediately before the hit/miss for the
+  same wheel, so it carries the same counts plus `waitedMs`.
+- **`pip_publish` is one line per wheel with the same `elapsedMs`.** Phase P
+  publishes every wheel in one transaction, so a per-wheel split of the duration
+  would be invented; the repeated value is the honest reading.
+- **Measured, against a real Redis and Postgres** (temporary
+  `redis:7-alpine` container on 6399, `sqlfs_pip_test`): leader
+  `pip_manifest_miss elapsedMs=12`, follower `pip_singleflight_wait waitedMs=33`
+  then `pip_manifest_hit elapsedMs=1`, `pip_publish` 17 ms and 10 ms. One wheel
+  fetch across both replicas.
+- **The integration test builds its two shells directly rather than through two
+  `SessionManager`s.** The manager constructs its own `createPypiFetch`, and the
+  assertion is a count of wheel fetches; the shells are wired exactly as
+  `buildPythonPackageCommands` wires one (injected package store, injected
+  `createRedisWheelLease`), which is the code path the change touches.
+  Following `multi-replica-exec.integration.test.ts`, it is gated on both
+  `DATABASE_URL` and `REDIS_URL`.
+
 ## Phase 5: write methods as a capability
 
 Add `networkWrite: boolean` to `RuntimeOptions`, persisted in sandbox meta
