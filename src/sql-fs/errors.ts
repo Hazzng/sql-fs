@@ -75,6 +75,26 @@ export function createEsandboxgone(sandboxId: string): Error {
 	return makeFsError("ESANDBOXGONE", `ESANDBOXGONE: sandbox no longer exists, '${sandboxId}'`);
 }
 
+/**
+ * ESTALEEPOCH: this writer's fencing epoch no longer matches `sandboxes.version`.
+ *
+ * Raised by a composite write whose conditional `UPDATE sandboxes SET version =
+ * version + 1 WHERE id = $s AND version = $expected` matched zero rows: another
+ * writer committed after the epoch was pinned, so the in-memory base this write
+ * was built from (`appendFile` reads `contentSha256` out of the pathCache before
+ * any lock) is stale and applying it would erase that commit (#131 / #170).
+ *
+ * Every dependent CTE is gated on the same fence, so a fenced statement writes
+ * nothing and the surrounding transaction is rolled back — hence 503 + retryable:
+ * the caller's retry reloads the cache and re-runs against the live epoch.
+ */
+export function createEstaleepoch(sandboxId: string): Error {
+	return makeFsError(
+		"ESTALEEPOCH",
+		`ESTALEEPOCH: another writer committed to sandbox '${sandboxId}' after this scope pinned its epoch; nothing was applied, retry`,
+	);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */

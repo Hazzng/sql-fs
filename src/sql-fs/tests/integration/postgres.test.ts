@@ -1131,7 +1131,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		);
 		await dialect.transaction(async (tx) => dialect.insertDirent(tx, rootInodeId, "single.txt", inodeId));
 
-		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "single.txt"));
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "single.txt", null));
 
 		// Regression: the inode ROW must be gone, not lingering at nlink=0.
 		expect(await countInode(inodeId)).toBe(0);
@@ -1148,14 +1148,14 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 			await dialect.incrementNlink(tx, inodeId); // two links → nlink = 2
 		});
 
-		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link2.txt"));
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link2.txt", null));
 
 		const inode = await dialect.transaction(async (tx) => dialect.getInode(tx, inodeId));
 		expect(inode).not.toBeNull();
 		expect(inode!.nlink).toBe(1); // survives with the remaining link
 
 		// removing the last link now hard-deletes it
-		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link1.txt"));
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link1.txt", null));
 		expect(await countInode(inodeId)).toBe(0);
 	});
 
@@ -1169,11 +1169,11 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		// which no longer carries the blob_insert CTE — mirror the SqlFs write path.
 		await dialect.commitBlob(shaA, dataA);
 		const inodeA = await dialect.transaction(async (tx) =>
-			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataA.length, shaA, dataA),
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataA.length, shaA, dataA, null),
 		);
 		await dialect.commitBlob(shaB, dataB);
 		const inodeB = await dialect.transaction(async (tx) =>
-			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataB.length, shaB, dataB),
+			dialect.writeFileComposite(tx, sandboxId, rootInodeId, "ow.txt", 0o644, dataB.length, shaB, dataB, null),
 		);
 		expect(inodeB).not.toBe(inodeA);
 		// Regression: the replaced inode must be deleted, not left as an nlink=0 tombstone.
@@ -1187,7 +1187,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		expect(blobB).toEqual(dataB);
 
 		// cleanup
-		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "ow.txt"));
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "ow.txt", null));
 		await dialect.transaction(async (tx) => {
 			await tx`DELETE FROM blobs WHERE sha256 = ${shaB}`;
 		});
@@ -1249,7 +1249,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 
 		// Move src onto the existing dst, overwriting it.
 		await dialect.transaction(async (tx) =>
-			dialect.mvComposite(tx, sandboxId, rootInodeId, "mvsrc.txt", rootInodeId, "mvdst.txt"),
+			dialect.mvComposite(tx, sandboxId, rootInodeId, "mvsrc.txt", rootInodeId, "mvdst.txt", null),
 		);
 
 		// Regression: the overwritten destination inode must be deleted, not an nlink=0 tombstone.
@@ -1262,7 +1262,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		expect(await dialect.transaction(async (tx) => dialect.getBlob(tx, shaSrc))).toEqual(dataSrc);
 
 		// cleanup
-		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "mvdst.txt"));
+		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "mvdst.txt", null));
 		await dialect.transaction(async (tx) => {
 			await tx`DELETE FROM blobs WHERE sha256 = ${shaSrc}`;
 		});

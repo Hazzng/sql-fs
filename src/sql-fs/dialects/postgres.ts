@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { runTrustedDbAsync } from "../defense.js";
-import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
+import { createEisdir, createEnoent, createEnotdir, createEstaleepoch, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
 import {
 	type BulkIngestFile,
@@ -99,39 +99,98 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
 	}
 
+	/**
+	 * Reads the fencing epoch (#131). Callers must have set the RLS sandbox
+	 * context on `tx` first — the `sandboxes` policy would otherwise fall through
+	 * to its no-context escape, which is fine for correctness here but leaves the
+	 * read unscoped.
+	 */
+	async getSandboxVersion(tx: PgTx, sandboxId: string): Promise<bigint | null> {
+		const rows = await tx<{ version: string }[]>`SELECT version FROM sandboxes WHERE id = ${sandboxId}`;
+		const row = rows[0];
+		return row === undefined ? null : BigInt(row.version);
+	}
+
 	// ── Composite write operations ────────────────────────────────────────────────
 
-	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint> {
-		const rows = await tx<{ id: string }[]>`
+	async mkdirComposite(
+		tx: PgTx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		expectedEpoch: bigint | null,
+	): Promise<bigint> {
+		const epoch = expectedEpoch === null ? null : String(expectedEpoch);
+		const rows = await tx<{ id: string | null; fenced_version: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			fence AS (
+				UPDATE sandboxes SET version = version + 1
+				WHERE id = ${sandboxId}
+					AND version = COALESCE(${epoch}::bigint, version)
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+				RETURNING version
+			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx
+				SELECT ${sandboxId}, 2, ${mode}, 0 FROM fence
 				RETURNING id
+			),
+			new_dirent AS (
+				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+				SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
+				FROM new_inode
+				RETURNING inode_id
 			)
-			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-			SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
-			FROM new_inode
-			RETURNING inode_id AS id
+			SELECT (SELECT inode_id FROM new_dirent) AS id, (SELECT version FROM fence) AS fenced_version
 		`;
 		const row = rows[0];
 		if (!row) throw new Error("mkdirComposite: INSERT returned no rows");
+		if (row.fenced_version === null) throw createEstaleepoch(sandboxId);
+		if (row.id === null) throw new Error("mkdirComposite: INSERT returned no rows");
 		return BigInt(row.id);
 	}
 
-	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string): Promise<bigint> {
-		const rows = await tx<{ removed_inode_id: string }[]>`
+	async rmComposite(
+		tx: PgTx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		expectedEpoch: bigint | null,
+	): Promise<bigint> {
+		const epoch = expectedEpoch === null ? null : String(expectedEpoch);
+		const rows = await tx<
+			{
+				removed_inode_id: string | null;
+				fenced_version: string | null;
+				target_inode_id: string | null;
+			}[]
+		>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			),
+			target AS (
+				SELECT d.inode_id FROM dirents d, ctx
+				WHERE d.parent_inode_id = ${String(parentId)} AND d.name = ${name}
+			),
+			-- The epoch advance is gated on the target existing so an ENOENT (the
+			-- pathCache and the database disagreeing) cannot bump the counter and
+			-- then throw, leaving the caller's in-memory pin one behind the row.
+			fence AS (
+				UPDATE sandboxes SET version = version + 1
+				WHERE id = ${sandboxId}
+					AND version = COALESCE(${epoch}::bigint, version)
+					AND EXISTS (SELECT 1 FROM target)
+				RETURNING version
 			),
 			removed_dirent AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM fence) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Delete and decrement are split into two mutually-exclusive CTEs
@@ -150,10 +209,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE id IN (SELECT inode_id FROM removed_dirent)
 					AND nlink > 1
 			)
-			SELECT inode_id AS removed_inode_id FROM removed_dirent
+			SELECT (SELECT inode_id FROM removed_dirent) AS removed_inode_id,
+			       (SELECT version FROM fence) AS fenced_version,
+			       (SELECT inode_id FROM target) AS target_inode_id
 		`;
 		const row = rows[0];
-		if (!row) throw createEnoent(name);
+		if (!row || row.target_inode_id === null) throw createEnoent(name);
+		if (row.fenced_version === null) throw createEstaleepoch(sandboxId);
+		if (row.removed_inode_id === null) throw createEnoent(name);
 		return BigInt(row.removed_inode_id);
 	}
 
@@ -166,23 +229,38 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		expectedEpoch: bigint | null,
 	): Promise<bigint> {
 		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
-		const rows = await tx<{ new_inode_id: string }[]>`
+		const epoch = expectedEpoch === null ? null : String(expectedEpoch);
+		const rows = await tx<{ new_inode_id: string | null; fenced_version: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			-- #131: the epoch fence. Every other mutating CTE below reads from
+			-- fence (directly, or through new_inode / old_dirent), so a stale pin
+			-- yields zero rows here and this statement writes nothing at all.
+			fence AS (
+				UPDATE sandboxes SET version = version + 1
+				WHERE id = ${sandboxId}
+					AND version = COALESCE(${epoch}::bigint, version)
+					AND (SELECT 1 FROM ctx) IS NOT NULL
+				RETURNING version
+			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx
+				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM fence
 				RETURNING id
 			),
+			-- Cross-joined with fence so a fenced-out write also leaves the displaced
+			-- inode alone: gating only the INSERTs would still delete the live
+			-- writer's inode and orphan its dirent.
 			old_dirent AS (
-				SELECT inode_id FROM dirents
-				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+				SELECT d.inode_id FROM dirents d, fence
+				WHERE d.parent_inode_id = ${String(parentId)} AND d.name = ${name}
 			),
 			upserted AS (
 				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -205,10 +283,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE id IN (SELECT inode_id FROM old_dirent)
 					AND nlink > 1
 			)
-			SELECT id AS new_inode_id FROM new_inode
+			SELECT (SELECT id FROM new_inode) AS new_inode_id, (SELECT version FROM fence) AS fenced_version
 		`;
 		const row = rows[0];
 		if (!row) throw new Error("writeFileComposite: INSERT returned no rows");
+		if (row.fenced_version === null) throw createEstaleepoch(sandboxId);
+		if (row.new_inode_id === null) throw new Error("writeFileComposite: INSERT returned no rows");
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
@@ -222,6 +302,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		expectedEpoch: bigint | null,
 	): Promise<void> {
 		// Audit M10: a single wCTE that both DELETEs the destination dirent and
 		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
@@ -231,15 +312,30 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// 1 frees the destination slot (and cleans its inode), statement 2 renames
 		// the source into it. Statement 1's effects are visible to statement 2, so
 		// the rename can no longer collide. Atomicity is preserved by the tx.
-		await tx`
+		const epoch = expectedEpoch === null ? null : String(expectedEpoch);
+		const fenceRows = await tx<{ fenced_version: string | null; src_inode_id: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
 			),
+			src AS (
+				SELECT d.inode_id FROM dirents d, ctx
+				WHERE d.parent_inode_id = ${String(oldParentId)} AND d.name = ${oldName}
+			),
+			-- Gated on the source existing for the same reason as rmComposite: the
+			-- rename below raises ENOENT when it is missing, and a fence that had
+			-- already bumped would desynchronise the caller's pin.
+			fence AS (
+				UPDATE sandboxes SET version = version + 1
+				WHERE id = ${sandboxId}
+					AND version = COALESCE(${epoch}::bigint, version)
+					AND EXISTS (SELECT 1 FROM src)
+				RETURNING version
+			),
 			old_dest AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM fence) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Split delete/decrement by snapshot nlink so the overwritten
@@ -250,12 +346,20 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				DELETE FROM inodes
 				WHERE id IN (SELECT inode_id FROM old_dest)
 					AND nlink <= 1
+			),
+			decremented AS (
+				UPDATE inodes
+				SET nlink = nlink - 1
+				WHERE id IN (SELECT inode_id FROM old_dest)
+					AND nlink > 1
 			)
-			UPDATE inodes
-			SET nlink = nlink - 1
-			WHERE id IN (SELECT inode_id FROM old_dest)
-				AND nlink > 1
+			SELECT (SELECT version FROM fence) AS fenced_version, (SELECT inode_id FROM src) AS src_inode_id
 		`;
+		// Statement 2 is a bare UPDATE with no `ctx` CTE to hang a fence on, so the
+		// fence verdict from statement 1 has to gate it here — the transaction is
+		// still open and rolls back on throw.
+		if (fenceRows[0]?.src_inode_id == null) throw createEnoent(oldName);
+		if (fenceRows[0].fenced_version === null) throw createEstaleepoch(sandboxId);
 		const rows = await tx<{ inode_id: string }[]>`
 			UPDATE dirents
 			SET parent_inode_id = ${String(newParentId)}, name = ${newName}

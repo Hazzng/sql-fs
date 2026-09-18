@@ -29,6 +29,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ELOCKLOST",
 	"ECOHERENCE",
 	"ECOHERENCE_UNAPPLIED",
+	"ESTALEEPOCH",
 	"ERUNTIME_BUSY",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
@@ -92,6 +93,7 @@ const RETRY_SAFE_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ELOCKTIMEOUT",
 	"ELOCKLOST",
 	"ECOHERENCE_UNAPPLIED",
+	"ESTALEEPOCH",
 	"ERUNTIME_BUSY",
 ]);
 
@@ -149,12 +151,17 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  *                       only the cross-replica version publish failed (#175).
  * ECOHERENCE_    → 503  Service Unavailable, RETRYABLE. Coherence is broken but
  *   UNAPPLIED           the transaction was rolled back, so nothing was applied.
+ * ESTALEEPOCH    → 503  Service Unavailable, RETRYABLE. The epoch fence (#131)
+ *                       rejected the write because another writer committed after
+ *                       this one pinned its epoch; the fenced CTEs wrote nothing
+ *                       and the transaction was rolled back, so a retry (which
+ *                       reloads the cache) is both safe and the way forward.
  * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
  * 53400/57P03          out of capacity, not a caller bug (#174). Only the
  *                      capacity SQLSTATEs are advertised retryable (#175).
  * others         → 500  Internal Server Error
  *
- * Status alone never answers "is a retry safe?" — six distinct codes share 503.
+ * Status alone never answers "is a retry safe?" — seven distinct codes share 503.
  * `isRetryableError` is the discriminator, surfaced as the `retryable` field.
  */
 export function mapFsErrorToStatus(err: Error): number {
@@ -192,6 +199,10 @@ export function mapFsErrorToStatus(err: Error): number {
 		case "ECOHERENCE":
 			return 503;
 		case "ECOHERENCE_UNAPPLIED":
+			return 503;
+		case "ESTALEEPOCH":
+			// #131: the fenced composite matched zero rows and the transaction was
+			// rolled back — nothing applied, so a retry is safe.
 			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;
