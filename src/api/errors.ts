@@ -49,6 +49,45 @@ export function clientSafeErrorMessage(err: unknown, fallback = "Internal server
 }
 
 /**
+ * Postgres SQLSTATEs meaning "the database cannot take this work right now"
+ * rather than "the request was malformed": the whole connection-exception class
+ * 08xxx, plus the insufficient-resources / admin-shutdown conditions observed
+ * under load (#174 — `53300` too_many_connections, `53400`
+ * configuration_limit_exceeded, `57P03` cannot_connect_now). They are capacity
+ * conditions, so they must surface as a retryable 503; a 500 tells clients to
+ * give up rather than back off.
+ */
+const RETRYABLE_SQLSTATES: ReadonlySet<string> = new Set(["53300", "53400", "57P03"]);
+
+/** SQLSTATE class 08 — connection_exception (08000, 08003, 08006, 08P01, ...). */
+const CONNECTION_EXCEPTION_SQLSTATE = /^08[0-9A-Z]{3}$/;
+
+function isConnectionClassSqlState(code: string | undefined): boolean {
+	if (code === undefined) return false;
+	return CONNECTION_EXCEPTION_SQLSTATE.test(code) || RETRYABLE_SQLSTATES.has(code);
+}
+
+/**
+ * Code emitted for a retryable connection/capacity failure. A synthetic code, so
+ * the raw SQLSTATE never reaches the client while the 503 still says *why*.
+ */
+const UNAVAILABLE_ERROR_CODE = "EUNAVAILABLE";
+
+/**
+ * Returns a client-safe error `code`, the counterpart to `clientSafeErrorMessage`.
+ * Use the two together: leaking the code while redacting the message still hands
+ * clients raw driver identifiers (`ECONNRESET`, `CONNECTION_CLOSED`) and Postgres
+ * SQLSTATEs (#174).
+ */
+export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): string {
+	if (!(err instanceof Error)) return fallback;
+	const code = (err as Error & { code?: string }).code;
+	if (code !== undefined && SAFE_FS_ERROR_CODES.has(code)) return code;
+	if (isConnectionClassSqlState(code)) return UNAVAILABLE_ERROR_CODE;
+	return fallback;
+}
+
+/**
  * Maps an FS error code to an HTTP status code.
  *
  * ENOENT         → 404  Not Found
@@ -66,6 +105,8 @@ export function clientSafeErrorMessage(err: unknown, fallback = "Internal server
  *                       aborted (script-tx rolled back) BEFORE any commit when the
  *                       lease is definitively lost, so ELOCKLOST now genuinely
  *                       means "not committed" — safe for the client to retry.
+ * 08xxx/53300/  → 503  Service Unavailable, RETRYABLE — the DB refused the
+ * 53400/57P03          connection or is out of capacity, not a caller bug (#174).
  * others         → 500  Internal Server Error
  */
 export function mapFsErrorToStatus(err: Error): number {
@@ -105,7 +146,7 @@ export function mapFsErrorToStatus(err: Error): number {
 		case "ERUNTIME_BUSY":
 			return 503;
 		default:
-			return 500;
+			return isConnectionClassSqlState(code) ? 503 : 500;
 	}
 }
 
