@@ -24,6 +24,7 @@ import {
 	createEperm,
 	createEreadonly,
 	createEsandboxgone,
+	createEstale,
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
@@ -312,19 +313,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#scriptScope && this.#scriptTxLost !== undefined) throw this.#scriptTxLost;
 	}
 
-	async #assertScriptEpochFresh(): Promise<void> {
-		if (!this.#scriptScope || this.#scriptEpoch !== undefined || this.#lastKnownEpoch === undefined) return;
-		const currentEpoch = await this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-			return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
-		});
-		if (currentEpoch !== this.#lastKnownEpoch) {
-			throw new Error("sandbox epoch mismatch");
-		}
-	}
-
 	async #openScriptTx(): Promise<void> {
-		await this.#assertScriptEpochFresh();
 		const generation = ++this.#scriptTxGeneration;
 		let resolveTxReady!: () => void;
 		const txReady = new Promise<void>((r) => {
@@ -356,7 +345,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (generation !== this.#scriptTxGeneration || !this.#scriptScope) {
 					throw new Error("script-tx abandoned: scope ended while the transaction was opening");
 				}
-				this.#scriptEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				// Pin + compare inside the locked tx; a separate pre-read would TOCTOU.
+				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				if (this.#lastKnownEpoch !== undefined && epoch !== this.#lastKnownEpoch) {
+					throw createEstale(this.#sandboxId);
+				}
+				this.#scriptEpoch = epoch;
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -398,20 +392,25 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.#openScriptTx();
 			}
 			const scriptTx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(scriptTx));
+			const value = await runTrustedDbAsync(() => fn(scriptTx));
+			// Refresh tx-local epoch; composites advance version (mv twice).
+			if (this.#scriptEpoch !== undefined) {
+				this.#scriptEpoch = await runTrustedDbAsync(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+			}
+			return value;
 		}
 		// No active scope — use a fresh, self-committing transaction (original
 		// behavior, no extra round-trip for the mutation itself).
+		let observedEpoch: bigint | undefined;
 		const result = await runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
 				const value = await fn(tx);
-				// Read the incremented epoch before this write transaction commits so a
-				// later lazy script scope can detect an external writer without another
-				// round trip on the normal path.
-				this.#lastKnownEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				// Publish only after COMMIT; a failed COMMIT must not poison the cache.
+				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				return value;
 			}),
 		);
+		if (observedEpoch !== undefined) this.#lastKnownEpoch = observedEpoch;
 		return result;
 	}
 

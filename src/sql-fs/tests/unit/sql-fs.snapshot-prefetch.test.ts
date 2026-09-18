@@ -76,6 +76,7 @@ function makeDialect(pathEntries: Array<PathCacheEntry & { path: string }> = [])
 		loadAllPaths: vi.fn(async () => pathEntries),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		sandboxExists: vi.fn(),
 		getSandboxMeta: vi.fn(),
 		updateSandboxMeta: vi.fn(),

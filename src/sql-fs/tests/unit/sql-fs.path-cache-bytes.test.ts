@@ -66,6 +66,7 @@ describe("SqlFs.getPathCacheBytes() — incremental byte accounting (F9e)", () =
 			loadAllPaths: loadAllPathsMock,
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			getSandboxEpoch: vi.fn(async () => 0n),
 			createInode: vi.fn(async () => nextInode++),
 			getInode: vi.fn(),
 			updateInode: vi.fn(),

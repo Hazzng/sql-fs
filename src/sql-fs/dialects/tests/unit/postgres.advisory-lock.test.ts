@@ -21,12 +21,12 @@ interface RecordedCall {
 	readonly values: readonly unknown[];
 }
 
-function makeFakeTx(): { tx: postgres.TransactionSql; calls: RecordedCall[] } {
+function makeFakeTx(rows: unknown[] = []): { tx: postgres.TransactionSql; calls: RecordedCall[] } {
 	const calls: RecordedCall[] = [];
 	const fn = (strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]> => {
 		const sql = strings.join("?");
 		calls.push({ sql, values });
-		return Promise.resolve([]);
+		return Promise.resolve(rows as unknown[]);
 	};
 	return { tx: fn as unknown as postgres.TransactionSql, calls };
 }
@@ -66,7 +66,7 @@ describe("PostgresDialect.setSandboxContext — read-only, no advisory lock", ()
 describe("PostgresDialect.setSandboxContextWithLock — writer path", () => {
 	it("issues a single SELECT with set_config and pg_advisory_xact_lock(hashtextextended)", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
-		const { tx, calls } = makeFakeTx();
+		const { tx, calls } = makeFakeTx([{ epoch: "0" }]);
 		const sandboxId = "sandbox-abc-123";
 
 		await dialect.setSandboxContextWithLock(tx, sandboxId);
@@ -77,7 +77,13 @@ describe("PostgresDialect.setSandboxContextWithLock — writer path", () => {
 		expect(calls[0]!.sql).toContain("app.sandbox_id");
 		expect(calls[0]!.sql).toContain("pg_advisory_xact_lock");
 		expect(calls[0]!.sql).toContain("hashtextextended");
-		expect(calls[0]!.values).toEqual([sandboxId, sandboxId]);
+		expect(calls[0]!.values).toEqual([sandboxId, sandboxId, sandboxId]);
+	});
+
+	it("throws ENOENT when the sandbox row is absent", async () => {
+		const dialect = new PostgresDialect("postgres://stub");
+		const { tx } = makeFakeTx([]);
+		await expect(dialect.setSandboxContextWithLock(tx, "missing")).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
 
@@ -96,17 +102,17 @@ describe("PostgresDialect.deleteSandbox — advisory lock", () => {
 		expect(calls[0]!.values).toEqual([sandboxId]);
 
 		expect(calls[1]!.sql).toContain("DELETE FROM sandboxes");
-		expect(calls[1]!.values).toEqual([sandboxId]);
+		expect(calls[1]!.values).toEqual([sandboxId, sandboxId]);
 	});
 
 	it("uses the same hash key derivation on both lock acquisitions (write and destroy paths)", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
 		const sandboxId = "sandbox-parity";
 
-		const writePath = makeFakeTx();
+		const writePath = makeFakeTx([{ epoch: "0" }]);
 		await dialect.setSandboxContextWithLock(writePath.tx, sandboxId);
 
-		const destroyPath = makeFakeTx();
+		const destroyPath = makeFakeTx([{ epoch: "0" }]);
 		await dialect.deleteSandbox(destroyPath.tx, sandboxId);
 
 		const normalize = (sql: string): string => sql.replace(/\s+/g, " ").trim();

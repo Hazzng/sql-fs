@@ -89,6 +89,11 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// ── Sandbox context ───────────────────────────────────────────────────────────
 
+	/** Fence param: null skips the check; `>` accepts this tx's own advances. */
+	private static epochParam(expectedEpoch?: bigint): string | null {
+		return expectedEpoch === undefined ? null : String(expectedEpoch);
+	}
+
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
 		// RLS context only — no advisory lock. Read-only paths (cold-start load,
 		// cache reload) use this to avoid serializing against unrelated writers.
@@ -104,9 +109,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			FROM sandboxes s
 			WHERE s.id = ${sandboxId}
 		`;
-		// Fake transaction handles used by SQL composition tests do not return rows;
-		// a real connection always returns the live sandbox row here.
-		void rows;
+		// Fake tx handles resolve non-arrays; zero rows on a real conn means gone.
+		if (Array.isArray(rows) && rows.length === 0) throw createEnoent(sandboxId);
 	}
 
 	async getSandboxEpoch(tx: PgTx, sandboxId: string): Promise<bigint> {
@@ -137,13 +141,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE s.id = ${sandboxId}
 				  AND (
 					s.version = COALESCE(
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
 						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
 						s.version
 					)
 					OR (
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
 						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
 					)
 				  )
@@ -189,13 +193,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE s.id = ${sandboxId}
 				  AND (
 					s.version = COALESCE(
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
 						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
 						s.version
 					)
 					OR (
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
 						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
 					)
 				  )
@@ -262,13 +266,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE s.id = ${sandboxId}
 				  AND (
 					s.version = COALESCE(
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
 						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
 						s.version
 					)
 					OR (
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
 						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
 					)
 				  )
@@ -350,13 +354,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE s.id = ${sandboxId}
 				  AND (
 					s.version = COALESCE(
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
 						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
 						s.version
 					)
 					OR (
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
 						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
 					)
 				  )
@@ -400,13 +404,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE s.id = ${sandboxId}
 				  AND (
 					s.version = COALESCE(
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint,
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
 						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
 						s.version
 					)
 					OR (
-						${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version = ${expectedEpoch === undefined ? null : String(expectedEpoch)}::bigint + 1
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
 						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
 					)
 				  )
@@ -501,6 +505,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				RETURNING epoch
 			)
 			SELECT epoch FROM tombstone
+			UNION ALL
+			SELECT epoch FROM sandbox_epochs
+			WHERE sandbox_id = ${sandboxId} AND NOT EXISTS (SELECT 1 FROM tombstone)
 		`;
 		return BigInt(rows[0]?.epoch ?? 0);
 	}

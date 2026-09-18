@@ -6,6 +6,9 @@
 -- rows must survive deletion of the live sandbox row and prevent ID reuse from
 -- resetting an old writer's epoch.
 --
+-- RLS: global metadata like `blobs` (lifecycle ops run without sandbox context).
+-- `deleted_at` is last-write time, not liveness; check `sandboxes` for liveness.
+--
 -- Idempotent: startup applies every migration on every boot.
 
 ALTER TABLE sandboxes

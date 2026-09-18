@@ -16,6 +16,7 @@ function makeFs(): SqlFs<unknown> {
 		setSandboxContextWithLock: async () => {},
 		createSandbox: async () => ({ rootInodeId: 1n, createdAt: new Date().toISOString() }),
 		deleteSandbox: async () => {},
+		getSandboxEpoch: async () => 0n,
 		createInode: async () => 1n,
 		getInode: async () => null,
 		updateInode: async () => {},

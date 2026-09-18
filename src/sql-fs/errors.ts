@@ -60,6 +60,11 @@ export function createEreadonly(path: string, op: string): Error {
 	return makeFsError("EREADONLY", `EREADONLY: read-only filesystem, ${op} '${path}'`, path);
 }
 
+/** ESTALE: fencing epoch mismatch — retry with a fresh scope. */
+export function createEstale(sandboxId: string): Error {
+	return makeFsError("ESTALE", `ESTALE: stale sandbox epoch, '${sandboxId}'`);
+}
+
 /**
  * ESANDBOXGONE: the sandbox (or its root inode) no longer exists in the DB.
  *

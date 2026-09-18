@@ -18,6 +18,7 @@ function makeDialect(): SqlDialect<unknown> {
 		loadAllPaths: vi.fn(async () => []),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(),
 		getInode: vi.fn(),
 		updateInode: vi.fn(),

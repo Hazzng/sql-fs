@@ -100,10 +100,28 @@ describe("SqlFs script-tx — lazy activation", () => {
 		await fs.writeFile("/home/user/epoch-a.txt", "a");
 		await fs.mkdir("/home/user/epoch-dir");
 
-		expect(getSandboxEpoch).toHaveBeenCalledOnce();
 		expect(getSandboxEpoch).toHaveBeenCalledWith(expect.anything(), "s-tx");
 		expect(writeFileComposite.mock.calls[0]?.at(-1)).toBe(7n);
 		expect(mkdirComposite.mock.calls[0]?.at(-1)).toBe(7n);
+		await fs.endScriptScope();
+	});
+
+	it("advances the tx-local epoch so a third mutation still passes the fence", async () => {
+		let version = 7n;
+		const getSandboxEpoch = dialect.getSandboxEpoch as ReturnType<typeof vi.fn>;
+		getSandboxEpoch.mockImplementation(async () => version);
+		const writeFileComposite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
+		writeFileComposite.mockImplementation(async (_tx: unknown, ..._rest: unknown[]) => {
+			version += 1n;
+			return 101n;
+		});
+
+		fs.beginScriptScope();
+		await fs.writeFile("/home/user/m1.txt", "1");
+		await fs.writeFile("/home/user/m2.txt", "2");
+		await fs.writeFile("/home/user/m3.txt", "3");
+		const epochs = writeFileComposite.mock.calls.map((c) => c.at(-1));
+		expect(epochs).toEqual([7n, 8n, 9n]);
 		await fs.endScriptScope();
 	});
 

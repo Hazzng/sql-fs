@@ -172,7 +172,8 @@ export interface SqlDialect<Tx = unknown> {
 	 * Creates a new sandbox: inserts a root inode (kind=2, mode=0o755),
 	 * inserts the sandboxes row, and creates default directories
 	 * (/home, /home/user, /tmp, /bin).
-	 * Returns the root inode ID and the DB-generated creation timestamp (ISO-8601).
+	 * Returns the root inode ID, the DB-generated creation timestamp (ISO-8601),
+	 * and the fencing `epoch` (lifecycle token pinning script scopes; see #131).
 	 */
 	createSandbox(
 		tx: Tx,
@@ -187,7 +188,7 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	deleteSandbox(tx: Tx, sandboxId: string): Promise<bigint>;
 
-	/** Reads the live fencing epoch at script-entry time. */
+	/** Reads the live fencing epoch for a sandbox (script-entry pinning, see #131). */
 	getSandboxEpoch(tx: Tx, sandboxId: string): Promise<bigint>;
 
 	/**

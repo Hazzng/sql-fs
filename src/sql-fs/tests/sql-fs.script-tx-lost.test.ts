@@ -56,6 +56,7 @@ function makeDialect(): {
 		getBlobsForSandbox: vi.fn(async () => []),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async () => 101n),
 		getInode: vi.fn(),
 		loadSubtreeInodes: vi.fn(async () => []),
