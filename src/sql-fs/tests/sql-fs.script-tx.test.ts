@@ -76,6 +76,7 @@ describe("SqlFs script-tx — lazy activation", () => {
 		await fs.ready();
 		(dialect.transaction as ReturnType<typeof vi.fn>).mockClear();
 		(dialect.setSandboxContextWithLock as ReturnType<typeof vi.fn>).mockClear();
+		(dialect.getSandboxEpoch as ReturnType<typeof vi.fn>).mockClear();
 	});
 
 	it("beginScriptScope is synchronous and sets scriptScopeActive", () => {
@@ -92,11 +93,12 @@ describe("SqlFs script-tx — lazy activation", () => {
 	it("pins the writer epoch and passes it to every composite in the scope", async () => {
 		const getSandboxEpoch = dialect.getSandboxEpoch as ReturnType<typeof vi.fn>;
 		getSandboxEpoch.mockResolvedValue(7n);
+		// Baseline the fence token for the newly configured epoch.
+		await fs.reload();
 		const writeFileComposite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
 		const mkdirComposite = dialect.mkdirComposite as ReturnType<typeof vi.fn>;
 
 		fs.beginScriptScope();
-		expect(getSandboxEpoch).not.toHaveBeenCalled();
 		await fs.writeFile("/home/user/epoch-a.txt", "a");
 		await fs.mkdir("/home/user/epoch-dir");
 
@@ -110,6 +112,7 @@ describe("SqlFs script-tx — lazy activation", () => {
 		let version = 7n;
 		const getSandboxEpoch = dialect.getSandboxEpoch as ReturnType<typeof vi.fn>;
 		getSandboxEpoch.mockImplementation(async () => version);
+		await fs.reload();
 		const writeFileComposite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
 		writeFileComposite.mockImplementation(async (_tx: unknown, ..._rest: unknown[]) => {
 			version += 1n;

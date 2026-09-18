@@ -45,6 +45,7 @@ const dialect = {
 	getBlobsForSandbox: async () => [],
 	createSandbox: noop,
 	deleteSandbox: noop,
+	getSandboxEpoch: async () => 0n,
 	createInode: async () => 101n,
 	getInode: noop,
 	loadSubtreeInodes: async () => [],

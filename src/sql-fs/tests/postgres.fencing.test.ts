@@ -30,15 +30,17 @@ describe("PostgresDialect epoch fencing", () => {
 			),
 		]);
 		for (const recording of recordings) {
-			const sql = recording.calls[0]!.sql;
+			// calls[0] takes the writer lock; calls[1] runs the fenced CTE.
+			expect(recording.calls).toHaveLength(2);
+			const sql = recording.calls[1]!.sql;
 			expect(sql).toContain("pg_advisory_xact_lock");
 			expect(sql).toContain("FROM sandboxes");
 			expect(sql).toContain("version");
-			expect(recording.calls[0]!.values).toContain("7");
+			expect(recording.calls[1]!.values).toContain("7");
 		}
 	});
 
-	it("rejects fenced composites when the epoch does not match (no rows)", async () => {
+	it("throws the fenced no-row error when the ctx yields nothing", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
 		const empty = recordingTx([]);
 		await expect(dialect.mkdirComposite!(empty.tx as never, "s1", 1n, "new", 0o755, 7n)).rejects.toThrow(
@@ -63,10 +65,10 @@ describe("PostgresDialect epoch fencing", () => {
 		const dialect = new PostgresDialect("postgres://stub");
 		const recording = recordingTx();
 		await dialect.mvComposite!(recording.tx as never, "s1", 1n, "old", 2n, "new", 7n);
-		expect(recording.calls).toHaveLength(2);
-		expect(recording.calls[1]!.sql).toContain("WITH ctx AS");
-		expect(recording.calls[1]!.sql).toContain("pg_advisory_xact_lock");
-		expect(recording.calls[1]!.sql).toContain("version");
+		expect(recording.calls).toHaveLength(4);
+		expect(recording.calls[3]!.sql).toContain("WITH ctx AS");
+		expect(recording.calls[3]!.sql).toContain("pg_advisory_xact_lock");
+		expect(recording.calls[3]!.sql).toContain("version");
 	});
 
 	it("returns a strictly advanced epoch on recreation and deletion", async () => {
@@ -86,6 +88,7 @@ describe("PostgresDialect epoch fencing", () => {
 		expect(created.epoch).toBe(9n);
 		const deleted = await dialect.deleteSandbox(recording.tx as never, "s1");
 		expect(deleted).toBe(10n);
-		expect(recording.calls.some((call) => call.sql.includes("epoch + 1"))).toBe(true);
+		const deletion = recording.calls.find((call) => call.sql.includes("DELETE FROM sandboxes"));
+		expect(deletion?.sql).toContain("version + 1");
 	});
 });

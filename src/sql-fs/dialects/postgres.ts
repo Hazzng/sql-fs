@@ -94,6 +94,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return expectedEpoch === undefined ? null : String(expectedEpoch);
 	}
 
+	/**
+	 * Takes the per-sandbox writer lock as its own statement. The fenced CTEs
+	 * below must run after this: their snapshot would otherwise predate the
+	 * lock wait and fence on a stale version.
+	 */
+	private static async takeWriterLock(tx: PgTx, sandboxId: string): Promise<void> {
+		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+	}
+
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
 		// RLS context only — no advisory lock. Read-only paths (cold-start load,
 		// cache reload) use this to avoid serializing against unrelated writers.
@@ -132,6 +141,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		mode: number,
 		expectedEpoch?: bigint,
 	): Promise<bigint> {
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -184,6 +194,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		name: string,
 		expectedEpoch?: bigint,
 	): Promise<bigint> {
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ removed_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -257,6 +268,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ new_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -345,6 +357,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// 1 frees the destination slot (and cleans its inode), statement 2 renames
 		// the source into it. Statement 1's effects are visible to statement 2, so
 		// the rename can no longer collide. Atomicity is preserved by the tx.
+		// Both statements fence and advance the version; the tx-local epoch
+		// refresh in SqlFs absorbs the double bump.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
@@ -395,6 +410,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			WHERE id IN (SELECT inode_id FROM old_dest)
 				AND nlink > 1
 			`;
+		// Re-take for snapshot ordering; re-entrant within this tx.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),

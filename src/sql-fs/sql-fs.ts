@@ -377,6 +377,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return this.#scriptEpoch === undefined ? [] : [this.#scriptEpoch];
 	}
 
+	/** Records the live epoch for freshly installed cache state (F2-L2). */
+	async #refreshKnownEpoch(): Promise<void> {
+		this.#lastKnownEpoch = await runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+				return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+			}),
+		);
+	}
+
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
 		// Inside a script scope every write MUST run on the single script-tx so the
@@ -681,6 +691,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		for (const [p, e] of entries) this.#cacheSet(p, e);
 		// Initial load established committed state; the cache is not poisoned (F1).
 		this.#cachePoisoned = false;
+		// Baseline the fence token for the state just installed; without this a
+		// later scope cannot tell a cross-replica write from its own (F2-L2).
+		await this.#refreshKnownEpoch();
 
 		// On snapshot hit: synchronous Redis mget pre-populates contentCache before
 		// this method returns, eliminating the race window for Redis-cached blobs.
@@ -740,6 +753,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				// A successful reload re-established committed state in the caches,
 				// so any prior poison is resolved (F1).
 				this.#cachePoisoned = false;
+				await this.#refreshKnownEpoch();
 				this.#startPrewarm(true);
 			} finally {
 				this.#pendingReload = undefined;

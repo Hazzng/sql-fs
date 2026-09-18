@@ -124,7 +124,9 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 			);
 		});
 
-		await staleReady.promise;
+		// Race against the stale tx so a setup failure inside its callback
+		// surfaces here instead of hanging until the Vitest timeout.
+		await Promise.race([staleReady.promise, staleTransaction]);
 		let replacement!: Awaited<ReturnType<PostgresDialect["createSandbox"]>>;
 		try {
 			replacement = await dialect.transaction(async (tx) => {
@@ -167,7 +169,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 		expect(visible.map((row) => row.name)).not.toContain("zombie.txt");
 	});
 
-	it("keeps a destroyed ID fenced across recreation on the non-superuser RLS path", async () => {
+	it("keeps a destroyed ID fenced across recreation on the non-superuser RLS path", async (ctx) => {
 		const sandbox = await createSandbox("reuse");
 		const identity = await dialect.transaction(
 			(tx) => tx<{ current_user: string; rolsuper: boolean }[]>`
@@ -177,7 +179,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 			`,
 		);
 		expect(identity).toHaveLength(1);
-		if (identity[0]?.rolsuper === true) return;
+		if (identity[0]?.rolsuper === true) ctx.skip();
 
 		const staleEpoch = await dialect.transaction(async (tx) => {
 			await dialect.setSandboxContext(tx, sandbox.id);
@@ -209,7 +211,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 		expect(replacementRows).toEqual([{ id: sandbox.id, version: recreated.epoch.toString() }]);
 	});
 
-	it("allows the live non-superuser RLS transaction to mutate only its own sandbox", async () => {
+	it("allows the live non-superuser RLS transaction to mutate only its own sandbox", async (ctx) => {
 		const sandbox = await createSandbox("rls");
 		const other = await createSandbox("rls-other");
 		const identity = await dialect.transaction(
@@ -217,7 +219,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 				SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user
 			`,
 		);
-		if (identity[0]?.rolsuper === true) return;
+		if (identity[0]?.rolsuper === true) ctx.skip();
 		const created = await dialect.transaction(async (tx) => {
 			await dialect.setSandboxContext(tx, sandbox.id);
 			const own = await tx<{ n: number }[]>`
