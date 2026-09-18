@@ -321,7 +321,12 @@ export const openapiSpec = {
 										additionalProperties: { type: "string" },
 										description: "Initial files to write (path → content)",
 									},
-									python: { type: "boolean", default: false, description: "Enable CPython WASM runtime" },
+									python: {
+										type: "boolean",
+										default: false,
+										description:
+											"Enable CPython WASM runtime. Also registers the experimental pip / uninstall / list / freeze commands; pip install additionally needs network: true.",
+									},
 									javascript: { type: "boolean", default: false, description: "Enable QuickJS runtime" },
 									network: {
 										type: "boolean",

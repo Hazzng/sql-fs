@@ -37,8 +37,9 @@ pnpm dev                      # applies migrations on first boot, serves at http
 ```
 
 Migrations run automatically when the server boots (`src/api/migrations.ts`); there
-is no separate migrate step. (`pnpm db:generate` scaffolds a new migration SQL from
-`schema.ts` changes via drizzle-kit; the boot-time runner then applies it.)
+is no separate migrate step. Migrations are hand-written SQL under
+`src/sql-fs/migrations/postgres/`; add the next numbered file and the boot-time
+runner applies it.
 
 ### Docker Compose
 
@@ -160,7 +161,6 @@ Key design choices:
 |---|---|---|---|
 | `FS_BACKEND` | Yes | — | `postgres` \| `memory` |
 | `DATABASE_URL` | Yes (postgres) | — | Postgres connection string (use pooler endpoint for Neon) |
-| `DATABASE_DIRECT_URL` | No | `DATABASE_URL` | Direct (non-pooler) connection used **only** by drizzle-kit (`pnpm db:generate`). The server's boot-time migration runner uses `DATABASE_URL`. Falls back to `DATABASE_URL` when unset. |
 | `AUTH_SECRET` | Yes | — | Secret for Bearer token validation |
 | `PORT` | No | `8080` | HTTP server port |
 | `SESSION_IDLE_MS` | No | `600000` | Evict idle Bash instances after this many ms |
@@ -251,7 +251,6 @@ pnpm lint:fix               # format + lint (Biome)
 pnpm test:unit              # unit tests — no DB required
 pnpm test:integration       # integration tests — requires DATABASE_URL
 pnpm test                   # all tests
-pnpm db:generate            # scaffold a new migration SQL from schema changes (applied on server boot)
 pnpm db:gc                  # garbage-collect orphan blobs
 pnpm changeset              # record a version bump for the next release
 ```

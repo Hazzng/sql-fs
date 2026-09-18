@@ -32,9 +32,11 @@ pnpm test:integration       # Integration tests (requires DB — skips if unavai
 pnpm test -- src/sql-fs/sql-fs.cache.test.ts   # Run specific test file
 
 # Database
-pnpm db:generate            # Scaffold a new migration SQL from schema changes (drizzle-kit)
-                            # Migrations are APPLIED automatically on server boot (src/api/migrations.ts), not by a CLI
-pnpm db:gc                  # Run multi-tenant orphan-blob GC (external scheduler; see BLOB_GC_MIN_AGE_MS)
+# Migrations are hand-written SQL under src/sql-fs/migrations/postgres/ (0000, 0001, ...)
+# and are APPLIED automatically on server boot (src/api/migrations.ts). There is no
+# generator and no migrate CLI: add the next numbered file and restart.
+pnpm db:gc                  # Run multi-tenant orphan-blob + package-manifest GC
+                            # (external scheduler; see BLOB_GC_MIN_AGE_MS, PIP_MANIFEST_TTL_MS)
 
 # Docker
 docker build -t sql-fs-api .
@@ -59,6 +61,29 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
                                     Postgres  MySQL  Azure SQL
 ```
 
+### Package Install Pipeline (experimental `pip`)
+
+`pip install` runs entirely on the host — no CPython worker — and reuses wheels
+across every sandbox in the tenant:
+
+```
+Phase R  resolve   PyPI JSON metadata, PEP 440/508, extras, markers, synthetic `requests`
+Phase W  per wheel, sequential, under a wheel lease (Redis when configured, else in-process):
+         manifest lookup → hit: nothing to do
+                         → miss: download, verify sha256, read with yauzl, inflate in
+                           bounded async batches, verify CRC-32 + RECORD, `ingestBlobs`,
+                           `recordManifest`
+Phase P  publish, DB-only, inside the script transaction: ownership + quota checks,
+         supersede old versions, `bulkGraft` every manifest's rows into the sandbox tree,
+         upsert the `sandbox_packages` ledger
+```
+
+The first install of a wheel anywhere in the tenant does Phase W in full; every
+later install, in any sandbox, is a manifest lookup plus Phase P — no download,
+no inflate, no blob transmission. Phase W is host-side and self-committing;
+Phase P is the only step that mutates the sandbox, and it writes no bytes that
+are already stored.
+
 ### Key Modules
 
 **SqlFs** (`src/sql-fs/`): The core — implements `IFileSystem` from just-bash using SQL.
@@ -66,7 +91,9 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 - `types.ts` — `SqlDialect` interface, shared types (`InodeRow`, `DirentRow`, `PathCacheEntry`)
 - `sql-fs.ts` — Main class: implements all 20+ `IFileSystem` methods, manages pathCache (Map) and contentCache (LRU)
 - `errors.ts` — FS error constructors (ENOENT, EEXIST, etc.) and SQL error translation
-- `schema.ts` — Drizzle ORM schema (blobs, inodes, dirents, sandboxes tables)
+- `package-manifest.ts` — `MANIFEST_FORMAT`, the stored package-manifest row format version
+- `package-store.ts` — `IPackageStore`: the package surface (`ingestBlobs`, manifest CRUD, `bulkGraft`, the ledger trio, `contentHashAt`) that `SqlFs` implements and `SessionManager` injects into the pip commands
+- `package-path.ts` — shared path validation for grafted package paths
 - `index.ts` — Factory: `createSandboxFs()` and `destroySandbox()`
 - `dialects/postgres.ts` — Postgres/Neon dialect (uses `postgres` driver)
 - `dialects/mysql.ts` — MySQL 8+ dialect (uses `mysql2` driver)
@@ -148,7 +175,7 @@ sandbox_packages (sandbox_id, name, version, wheel_sha256 → package_manifests 
 - **Path validation:** All paths must be normalized via `resolvePath` from just-bash's `path-utils`. Reject null bytes.
 - **Error sanitization:** All errors pass through `sanitizeFsError` before reaching the API layer. No connection strings, host paths, or internal table names in responses.
 - **Auth:** Every `/v1/*` route requires Bearer token. Validate before any DB access.
-- **SQL injection:** Use parameterized queries only. Never interpolate user input into SQL strings. The `postgres` driver's tagged templates and Drizzle's query builder handle this automatically — do not bypass them with raw string concatenation.
+- **SQL injection:** Use parameterized queries only. Never interpolate user input into SQL strings. The `postgres` driver's tagged templates handle this automatically — do not bypass them with raw string concatenation.
 - **Prototype pollution:** Use `Object.create(null)` for objects with user-controlled keys. Use `Map` where possible.
 - **Defense-in-depth:** Opt-in via `JUST_BASH_DEFENSE_IN_DEPTH=true`. When enabled, just-bash monkey-patches host globals (`setTimeout`, `eval`, `Function`, dynamic `import`) during `bash.exec`. All Postgres I/O chokepoints (`#withTx`, `#withReadTx`, `#withBareTx`, `getBlobNoTx`) are wrapped in `DefenseInDepthBox.runTrustedAsync` to bypass the patch. When adding new dialects (MySQL, Azure SQL), this wrapping must be preserved — omitting it will throw `WorkerSecurityViolationError` at runtime.
 
@@ -208,7 +235,6 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 |---|---|---|
 | `FS_BACKEND` | Yes | `postgres` | `memory` |
 | `DATABASE_URL` | SQL backends | Connection string (use pooler endpoint for Neon) |
-| `DATABASE_DIRECT_URL` | Postgres (migrations) | Direct connection (not pooler) for DDL |
 | `FS_MOUNT_PATH` | FileShare backend | Mount path for Azure FileShare |
 | `PORT` | No (default: 8080) | HTTP server port |
 | `AUTH_SECRET` | Yes | Secret for Bearer token validation |
@@ -216,7 +242,13 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `MAX_CONCURRENT_PYTHON` | No (default: 5) | Max concurrent Python executions across all sessions. CPython WASM workers cost ~80MB each (EXIT_RUNTIME per invocation); the semaphore caps concurrency to prevent OOM. Excess scripts queue FIFO. |
 | `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
 | `MAX_CONCURRENT_PIP_INSTALLS` | No (default: 2) | Max concurrent experimental `pip install` orchestrations across all sessions. One slot is held for the whole install — resolution, every download and every extraction — because the transient memory of an install spans all of it. Excess installs queue FIFO on the same queue settings as the Python semaphore. The `python3` / `databricks` commands take a Python slot separately, at the point a CPython worker is actually spawned; an `AsyncLocalStorage` flag set by `execWithRuntimeThrottle` stops one exec from holding two Python slots. |
-| `PIP_MAX_WHEEL_BYTES` | No (default: 33554432) | Response cap for the pip-scoped PyPI fetch (`src/api/commands/pypi-fetch.ts`). `curl` keeps just-bash's 10 MB `secureFetch` default. |
+| `PIP_MAX_WHEEL_BYTES` | No (default: 33554432) | Largest single wheel (32 MB), and the response cap for the pip-scoped PyPI fetch (`src/api/commands/pypi-fetch.ts`). `curl` keeps just-bash's 10 MB `secureFetch` default. |
+| `PIP_MAX_INSTALL_DOWNLOAD_BYTES` | No (default: 268435456) | Cumulative downloaded bytes (256 MB) across every wheel of one `pip install`. A manifest hit downloads nothing and is not charged. |
+| `PIP_MAX_FILE_BYTES` | No (default: 33554432) | Largest single extracted file (32 MB), checked against the declared size before any inflate. |
+| `PIP_MAX_INSTALL_BYTES` | No (default: 536870912) | Cumulative extracted bytes (512 MB) for one `pip install`; a manifest hit is charged from the manifest's `total_bytes`. |
+| `PIP_MAX_INSTALL_FILES` | No (default: 50000) | Cumulative extracted file count for one `pip install`; a manifest hit is charged from the manifest's `file_count`. |
+| `PIP_SANDBOX_QUOTA_BYTES` | No (default: 1073741824) | Total package bytes (1 GB) one sandbox may hold, summed from the manifests its `sandbox_packages` rows reference and checked in Phase P before any mutation. Legacy `/site-packages` content with no ledger row is outside the quota until the package is reinstalled. |
+| `PIP_SANDBOX_MAX_FILES` | No (default: 100000) | Total package files one sandbox may hold. Lower than the ~330 000 paths the 50 MB path-cache budget fits, to leave headroom for user files. Same legacy caveat as the byte quota. |
 | `PIP_MAX_METADATA_BYTES` | No (default: 33554432) | Cumulative PyPI metadata bytes one `pip install` may download before it is refused. |
 | `PIP_MAX_METADATA_REQUESTS` | No (default: 200) | Cumulative PyPI metadata requests per `pip install`. |
 | `PIP_MAX_METADATA_CACHE_ENTRIES` | No (default: 200) | Cumulative PyPI metadata documents cached per `pip install`. |
@@ -237,6 +269,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `REDIS_RWLOCK_READER_LEASE_MS` | No (default: 60000) | TTL (ms) for reader entries in the distributed RW lock ZSET. Bounds the time a writer must wait for a crashed reader to be reaped. |
 | `REDIS_PATH_SNAPSHOT_ENABLED` | No (default: false) | Set to `true` to enable the Redis path snapshot cache. When enabled, cold-start pathCache is loaded from Redis instead of a full Postgres `loadAllPaths` scan. Requires `REDIS_URL`. |
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No (default: 3600000) | TTL for path snapshot entries (ms, default 1h). |
+| `REDIS_PATH_SNAPSHOT_MAX_BYTES` | No (default: 16777216) | Largest encoded path snapshot (16 MB) that will be published to Redis. A bigger sandbox — a large package tree, for instance — logs `snapshot_write_skipped_too_large` and writes nothing, so its next cold start falls back to a `loadAllPaths` scan instead of storing one oversized Redis value. |
 | `EVENT_LOOP_MONITOR_INTERVAL_MS` | No (default: 10000) | Sampling interval (ms) for the F8 event-loop lag monitor. Each window logs `event:"event_loop_lag"` (`p50Ms`/`p99Ms`/`maxMs`/`meanMs`) then resets the histogram. Purely observational; pairs with per-heartbeat `event:"heartbeat_gap"` warn/critical events that flag a stall eating into a Redis lease (see DEVELOPER.md "Lock observability"). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No (default: `false`) | Enables just-bash's defense-in-depth security layer (monkey-patches `setTimeout`, `eval`, `Function`, dynamic `import`, etc. for the duration of `bash.exec`). All Postgres I/O is wrapped in `DefenseInDepthBox.runTrustedAsync` to remain compatible. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
@@ -251,13 +284,14 @@ src/
     types.ts                     ← SqlDialect interface + shared types
     sql-fs.ts                    ← SqlFs class (IFileSystem + caching)
     errors.ts                    ← Error constructors + translation
-    schema.ts                    ← Drizzle schema
     index.ts                     ← Factory + destroy
     dialects/
       postgres.ts                ← Postgres/Neon dialect
       mysql.ts                   ← MySQL 8+ dialect
       azure-sql.ts               ← Azure SQL dialect
     package-manifest.ts          ← MANIFEST_FORMAT (package-manifest row format version)
+    package-store.ts             ← IPackageStore facade (blobs, manifests, graft, ledger)
+    package-path.ts              ← Shared path validation for grafted package paths
     migrations/
       postgres/                  ← Postgres DDL + RLS + stored procs (0000–0008; 0007 = package manifests + sandbox_packages, 0008 = sandboxes.network_write)
       mysql/                     ← MySQL DDL + stored procs
@@ -273,6 +307,11 @@ src/
     python-slot-context.ts       ← AsyncLocalStorage flag: this exec already holds a Python slot
     commands/
       pip-command.ts             ← Experimental pip / python3 / python / databricks commands
+      pip-wheel-store.ts         ← Phase W: wheel lease, manifest lookup, download, ingest, record
+      pip-publish.ts             ← Phase P: ownership, quota, supersede, bulkGraft, ledger upsert
+      pip-shared.ts              ← Types and helpers shared by the pip modules
+      wheel-reader.ts            ← yauzl wheel reader: validation, bounded async inflate, CRC + RECORD
+      package-limits.ts          ← All seven PIP_* size limits, read once and memoised
       pypi-fetch.ts              ← Pip-scoped PyPI-only fetch (own size cap, no redirects)
       pep440.ts                  ← Version parsing / comparison / specifiers (documented subset)
       pep508.ts                  ← Requirement parsing, extras, environment markers

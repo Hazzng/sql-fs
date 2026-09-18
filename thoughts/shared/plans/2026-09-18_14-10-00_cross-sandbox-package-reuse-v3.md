@@ -6,7 +6,7 @@ branch: experiment/pip-install-databricks-cli
 repository: virtualFS
 task: "Sandbox package install v3: v2 revised after audit"
 tags: [implementation-plan, pip, packages, blobs, cas, dedup, postgres, gc, wasm, memory, concurrency]
-status: draft
+status: implemented
 supersedes: 2026-09-18_12-44-19_cross-sandbox-package-reuse-v2.md
 audit: 2026-09-18_v2-audit-review.md
 last_updated: 2026-09-18
@@ -1049,6 +1049,92 @@ Implemented on `experiment/pip-install-databricks-cli` (worktree
   it. Whether to add an `includePackages` option is deferred.
 - Changeset: minor.
 
+### Phase 6 status
+
+Implemented on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`).
+
+- [x] **`deleteSandbox` doc comment** (`src/sql-fs/types.ts`) drops "blobs" and
+      says why: blobs are tenant-global CAS shared with other sandboxes and with
+      package manifests, reclaimed only by `gcOrphanBlobs`. It now also names
+      the `sandbox_packages` rows the CASCADE does remove.
+- [x] **`drizzle.config.ts` deleted**, with `pnpm db:generate`, the
+      `drizzle-orm` / `drizzle-kit` dependencies and the now-unreferenced
+      `DATABASE_DIRECT_URL` (CLAUDE.md, README, `.env.example`). Nothing in
+      `src/` ever imported drizzle and `src/sql-fs/schema.ts` never existed, so
+      writing a schema file now would have created a second source of truth to
+      drift from the hand-written SQL. CLAUDE.md's Commands section, Key
+      Modules list, file layout and the "Drizzle's query builder" line in the
+      SQL-injection rule were updated to match. `pnpm-lock.yaml` regenerated
+      (`pnpm install --lockfile-only`): 680 deleted lines, nothing added.
+- [x] **CLAUDE.md**: a "Package Install Pipeline" overview (Phase R / W / P) in
+      Architecture; `pip-wheel-store.ts`, `pip-publish.ts`, `pip-shared.ts`,
+      `wheel-reader.ts`, `package-limits.ts`, `package-store.ts`,
+      `package-path.ts` in the file layout (`package-manifest.ts`,
+      `python-slot-context.ts`, `gc-args.ts` and migrations 0007/0008 were
+      already there from Phases 2 and 5); env rows for
+      `PIP_MAX_INSTALL_DOWNLOAD_BYTES`, `PIP_MAX_FILE_BYTES`,
+      `PIP_MAX_INSTALL_BYTES`, `PIP_MAX_INSTALL_FILES`,
+      `PIP_SANDBOX_QUOTA_BYTES`, `PIP_SANDBOX_MAX_FILES` and
+      `REDIS_PATH_SNAPSHOT_MAX_BYTES`. The database-schema block already listed
+      the three new tables (Phase 2).
+- [x] **SECURITY.md**: "Package installation limits" became "Package
+      installation" with subsections for host-side extraction (yauzl,
+      central-directory validation before any inflate, bounded async inflate,
+      CRC-32 + `RECORD` + `WHEEL` verification, blobs and manifest before the
+      DB-only graft), a limits table naming all eleven knobs, the known
+      just-bash runtime limits (8 MB bridge buffer for sandbox file I/O,
+      roughly 6 MB for `jb_http` responses) and the deferred upstream
+      `createSecureFetch` export PR. The Phase 5 network section was checked
+      and left as written.
+- [x] **Legacy `/site-packages` quota note** in both places quotas are
+      documented: the two `PIP_SANDBOX_*` rows in CLAUDE.md and the limits
+      section of SECURITY.md.
+- [x] **DEVELOPER.md**: the Phase 2 "Orphan Blob and Manifest GC" section and
+      the Phase 4 "Package install observability" section were verified
+      complete and consistent with the CLI flags; a new "Exporting a sandbox
+      that has packages" subsection documents the `/home/user` default, the
+      broader base path, and the deferred `includePackages` option.
+- [x] **Export documented where the tool is defined too**: MCP `fs_export`'s
+      description now states the `/home/user` default and that it excludes
+      `/site-packages` unless a broader base path is given.
+- [x] **Stale runtime descriptions fixed**: `bash_exec` no longer says pip is
+      unsupported or that python is "stdlib only", and lists the four pip
+      subcommands with their network requirement; `sandbox_create` (MCP and the
+      OpenAPI `python` property) say the same.
+- [x] **Changeset** `.changeset/pip-cross-sandbox-package-reuse.md`, kind
+      `minor`. `package.json` has no `files`, `exports`, `main` or `bin` field,
+      so the new modules need nothing there.
+- [x] **Stale-statement sweep** (`WASM extractor`, `zipfile`, `EXTRACT_CODE`,
+      `TEMP_ROOT`, `.sqlfs-installed`, `presentBlobs`) over `*.md` and `*.ts`
+      outside `node_modules/`, `dist/` and `thoughts/`: no hits.
+
+### Discoveries and Notable Information
+
+- **Deleting the drizzle scaffold made `DATABASE_DIRECT_URL` dead.**
+  `drizzle.config.ts` was its only reader anywhere in the repository, so the
+  README's "used **only** by drizzle-kit" row, the CLAUDE.md row and the
+  `.env.example` block all went with it. Any deployment still setting it is
+  harmless — nothing reads it — but the boot-time runner has always used
+  `DATABASE_URL`.
+- **`drizzle-orm` was an unused runtime dependency**, not just `drizzle-kit`:
+  no file under `src/` imports it. Removing both is a pure deletion in the
+  lockfile.
+- **`changeset status` reports the combined bump as major**, because the
+  pending `git-sandbox-network.md` changeset from an earlier PR is a major.
+  This changeset is a minor as planned; the release PR will resolve to major
+  for the batch.
+- **The env-table audit found no pip-related gap after the additions**, and
+  the pre-existing gaps are all variables documented in README's env table
+  instead of CLAUDE.md's (`MAX_EXPORT_*`, `MAX_INGEST_*`, `MCP_SESSION_*`,
+  `TENANT_DATABASES`, `ADMIN_SECRET`, `TRUST_PROXY_HEADERS`, the queue knobs).
+  Left alone: unrelated to this plan, and the two tables have always divided
+  the surface this way.
+- **`bash_exec`'s tool description was materially wrong** once Phase 3 landed —
+  it told every MCP client that pip was unsupported and that python was stdlib
+  only. That is a behaviour-visible doc bug, not cosmetic: an agent reads it
+  before deciding what to attempt.
+
 ## Not doing
 
 As v2, plus: spec-complete wheel `.data/` spreading (verbatim extraction under
@@ -1109,3 +1195,67 @@ the old extractor stays the install path behind Phase 0's fixes.
 - Commit semantics: `src/api/session-manager.ts:1645-1666`; missing-blob read:
   `src/sql-fs/sql-fs.ts:1185-1189`; RLS pattern: `migrations/postgres/0005_enable_rls.sql`.
 - 3.4.2 path shim: `just-bash/packages/just-bash/src/commands/python3/worker.ts:702-716, 835-846`.
+
+## Implementation summary
+
+Six commits on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`), Phase 6 uncommitted at the time of writing:
+
+```
+ba51d33 Pip v3 Phase 0: python3 override, PyPI-scoped fetch, admission control, PEP 440/508 resolver hygiene
+ff40e7d Pip v3 Phase 1: yauzl wheel reader, SqlDialect.ingestBlobs and bulkGraft
+f29b242 Pip v3 Phase 2: migration 0007 package manifests and ledger, manifest-aware blob GC
+1941331 Pip v3 Phase 3: host-side install pipeline, publish, ledger, uninstall/list/freeze
+4240bcd Pip v3 Phase 4: Redis wheel lease singleflight and pip observability events
+404c2d9 Pip v3 Phase 5: networkWrite sandbox capability and single requests shim
+```
+
+### Deferred follow-ups
+
+Gathered from every phase's discoveries; none block the feature.
+
+- **Upstream just-bash PR to export `createSecureFetch`**, after which
+  `src/api/commands/pypi-fetch.ts` should be deleted rather than maintained
+  (Phase 0).
+- **`lostSignal` plumbing into Phase W** so a lost wheel lease aborts the
+  in-flight download and inflate instead of only failing at the end (Phase 4).
+- **`pip install --force`** for files the sandbox modified: today a modified
+  path the superseding wheel drops is preserved and reported, with no way to
+  overwrite it (Phase 3; audit open question 3).
+- **`includePackages` option on export**, so including `/site-packages` is an
+  explicit flag rather than an implicit consequence of the base path
+  (Phase 6 / v3 "Not doing").
+- **`rls.integration.test.ts` DDL-in-`beforeAll` deadlock flake** under file
+  parallelism: it applies `0005_enable_rls.sql`, whose `ALTER TABLE` takes
+  ACCESS EXCLUSIVE locks while other files are mid-transaction. Pre-existing;
+  the fix is to stop running DDL from a test that shares the database
+  (Phase 1).
+- **`concurrency.pg.test.ts` S2 ordering flake** (Phase 3).
+- **`multi-replica-coherence` destroy tombstone assertion** (Phase 3).
+- **Single-sandbox `GET /v1/sandboxes/:id` shows no runtime flags.** `network`
+  and `networkWrite` appear on the create response and the list route only;
+  changing that response shape was out of scope (Phase 5).
+- **`MAX_CONCURRENT_PIP_INSTALLS=2` is still a guess**, and the post-publish
+  content-cache warm bound (`CONTENT_WARM_MAX_FILE_BYTES` 64 KB /
+  `CONTENT_WARM_MAX_TOTAL_BYTES` 4 MB) carries a "to be tuned" comment. Both
+  want measurement under real concurrency (Phases 0, 3).
+
+## Human Verification
+
+The automated suites cover the units and a single-host Postgres + Redis. These
+three need a person and a production-like environment:
+
+- [ ] **Live `pip install databricks-cli`** against production-like Postgres
+      and Redis with **two replicas** behind the load balancer: run it
+      concurrently on both, confirm exactly one wheel fetch per wheel in the
+      logs (`pip_manifest_miss` on one replica, `pip_singleflight_wait` then
+      `pip_manifest_hit` on the other), and that both sandboxes end with the
+      full tree and ledger rows.
+- [ ] **`databricks --version` after a cold session start** — evict or restart
+      so the session rehydrates from Postgres, then run it: the package tree
+      must come back from the ledger and blobs with no reinstall, and the
+      command must print its version.
+- [ ] **A GC run with `PIP_MANIFEST_TTL_MS` on a staging tenant**: confirm an
+      expired, unreferenced manifest and its blobs go in one pass, that a
+      manifest a `sandbox_packages` row references survives, and that
+      `manifestsDeleted` appears in `blob_gc_tenant_ok` / `blob_gc_complete`.

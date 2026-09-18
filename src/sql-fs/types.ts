@@ -236,8 +236,12 @@ export interface SqlDialect<Tx = unknown> {
 	createSandbox(tx: Tx, sandboxId: string, owner?: string): Promise<{ rootInodeId: bigint; createdAt: string }>;
 
 	/**
-	 * Deletes a sandbox and all associated inodes, dirents, and blobs
-	 * by deleting the sandbox row (CASCADE removes child rows).
+	 * Deletes a sandbox and all associated inodes, dirents and `sandbox_packages`
+	 * ledger rows by deleting the sandbox row (CASCADE removes child rows).
+	 *
+	 * Blobs are NOT deleted: they are tenant-global content-addressed rows shared
+	 * with every other sandbox (and with package manifests), so they are reclaimed
+	 * only by `gcOrphanBlobs` once nothing references them.
 	 */
 	deleteSandbox(tx: Tx, sandboxId: string): Promise<void>;
 

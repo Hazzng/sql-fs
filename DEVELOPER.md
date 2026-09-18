@@ -228,6 +228,21 @@ Every lease above (the exec-lock writer lease, the RW-lock writer flag, and the 
 
 The wheel lease itself is `withDistributedLock` on `vfs:{tenant}:pip:wheel:{sha256hex}` (`wheelLockKey`), with the module defaults — 60s lease, 20s renewal, compare-and-delete release. It is held for exactly one wheel's Phase W and released before the next wheel, so two sandboxes installing overlapping dependency closures in different orders cannot deadlock, and it is never held during Phase P. A lost lease surfaces as `LockLostError` and the install refuses for that wheel with `pip: wheel lease lost for <name> <version> (<sha256>)`; nothing needs undoing, because blob rows are content addressed and the manifest is written last. Without `REDIS_URL` the lease is a per-replica in-process singleflight: two replicas may both do the first install of one wheel, which is accepted and still correct.
 
+### Exporting a sandbox that has packages
+
+`/site-packages` is an ordinary part of the sandbox tree, so nothing special
+happens to it on export — which is exactly the trap. MCP `fs_export` and the
+HTTP export both anchor on a `basePath` that defaults to `/home/user`, and
+`/site-packages` is not under it: the default export of a sandbox with a 40 MB
+package tree returns only the user's own files. Pass an explicit broader base
+path (`/`) to include the packages, and expect to hit `MAX_EXPORT_FILES` /
+`MAX_EXPORT_BYTES` if the tree is large. An `includePackages` option that would
+make the choice explicit rather than implicit in the path is deferred.
+
+Package trees survive without being exported: the blobs are tenant-global and
+the manifest is the reinstall path, so `pip install` into a fresh sandbox
+reproduces the tree with no download (see Phase P above).
+
 ---
 
 ## ReadOnly Safety Model
