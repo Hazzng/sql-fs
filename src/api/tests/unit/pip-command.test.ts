@@ -1,200 +1,9 @@
-import { createHash } from "node:crypto";
 import { Bash, InMemoryFs } from "just-bash";
-import type { SecureFetch } from "just-bash";
 import { describe, expect, it } from "vitest";
 import { pythonPackageCommands } from "../../commands/pip-command.js";
+import { fixtureFetch, makeBash, wheel } from "./pip-fixtures.js";
 
 const encoder = new TextEncoder();
-
-function crc32(bytes: Uint8Array): number {
-	let crc = 0xffffffff;
-	for (const byte of bytes) {
-		crc ^= byte;
-		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-	}
-	return (crc ^ 0xffffffff) >>> 0;
-}
-
-function u16(value: number): number[] {
-	return [value & 0xff, (value >>> 8) & 0xff];
-}
-
-function u32(value: number): number[] {
-	return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
-}
-
-/** Small stored ZIP writer so the tests do not depend on a host archive tool. */
-function storedZip(entries: Record<string, string>): Uint8Array {
-	const local: number[] = [];
-	const central: number[] = [];
-	let offset = 0;
-	for (const [name, value] of Object.entries(entries)) {
-		const nameBytes = encoder.encode(name);
-		const content = encoder.encode(value);
-		const crc = crc32(content);
-		local.push(
-			0x50,
-			0x4b,
-			0x03,
-			0x04,
-			...u16(20),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(crc),
-			...u32(content.length),
-			...u32(content.length),
-			...u16(nameBytes.length),
-			...u16(0),
-			...nameBytes,
-			...content,
-		);
-		central.push(
-			0x50,
-			0x4b,
-			0x01,
-			0x02,
-			...u16(20),
-			...u16(20),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(crc),
-			...u32(content.length),
-			...u32(content.length),
-			...u16(nameBytes.length),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(0),
-			...u32(offset),
-			...nameBytes,
-		);
-		offset = local.length;
-	}
-	const end = [
-		0x50,
-		0x4b,
-		0x05,
-		0x06,
-		...u16(0),
-		...u16(0),
-		...u16(Object.keys(entries).length),
-		...u16(Object.keys(entries).length),
-		...u32(central.length),
-		...u32(local.length),
-		...u16(0),
-	];
-	return Uint8Array.from([...local, ...central, ...end]);
-}
-
-function wheel(
-	packageName: string,
-	version: string,
-	files: Record<string, string>,
-	requiresDist: string[] = [],
-	entryPoint?: string,
-): Uint8Array {
-	const distribution = packageName.replace(/[-_.]+/g, "_");
-	const metadata = [
-		"Metadata-Version: 2.1",
-		`Name: ${packageName}`,
-		`Version: ${version}`,
-		...requiresDist.map((item) => `Requires-Dist: ${item}`),
-		"",
-		"",
-	].join("\n");
-	const allFiles: Record<string, string> = {
-		...files,
-		[`${distribution}-${version}.dist-info/METADATA`]: metadata,
-		[`${distribution}-${version}.dist-info/WHEEL`]: "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-	};
-	if (entryPoint)
-		allFiles[`${distribution}-${version}.dist-info/entry_points.txt`] =
-			`[console_scripts]\ndatabricks = ${entryPoint}\n`;
-	return storedZip(allFiles);
-}
-
-function sha256(body: Uint8Array): string {
-	return createHash("sha256").update(body).digest("hex");
-}
-
-type PackageFixture = {
-	readonly version: string;
-	readonly body: Uint8Array;
-	readonly requiresDist?: string[];
-	readonly entryPoint?: string;
-	readonly filename?: string;
-};
-
-type FetchResult = Awaited<ReturnType<SecureFetch>>;
-
-function fixtureFetch(packages: Record<string, PackageFixture>): SecureFetch {
-	return async (url): Promise<FetchResult> => {
-		const parsed = new URL(url);
-		if (parsed.hostname === "pypi.org") {
-			const match = parsed.pathname.match(/^\/pypi\/([^/]+)(?:\/([^/]+))?\/json$/);
-			const packageName = match?.[1];
-			const fixture = packageName ? packages[packageName] : undefined;
-			if (!fixture) return { status: 404, statusText: "Not Found", headers: {}, body: encoder.encode("{}"), url };
-			const filename = fixture.filename ?? `${packageName}-${fixture.version}-py3-none-any.whl`;
-			const artifact = {
-				filename,
-				url: `https://files.pythonhosted.org/${filename}`,
-				packagetype: "bdist_wheel",
-				digests: { sha256: sha256(fixture.body) },
-			};
-			const response = {
-				info: { version: fixture.version, requires_dist: fixture.requiresDist ?? [] },
-				releases: { [fixture.version]: [artifact] },
-				urls: [artifact],
-			};
-			return {
-				status: 200,
-				statusText: "OK",
-				headers: { "content-type": "application/json" },
-				body: encoder.encode(JSON.stringify(response)),
-				url,
-			};
-		}
-		if (parsed.hostname === "files.pythonhosted.org") {
-			const filename = parsed.pathname.slice(1);
-			const fixture = Object.entries(packages).find(
-				([name, value]) => (value.filename ?? `${name}-${value.version}-py3-none-any.whl`) === filename,
-			)?.[1];
-			if (!fixture) return { status: 404, statusText: "Not Found", headers: {}, body: new Uint8Array(), url };
-			return {
-				status: 200,
-				statusText: "OK",
-				headers: { "content-type": "application/octet-stream" },
-				body: fixture.body,
-				url,
-			};
-		}
-		if (parsed.hostname === "db.test") {
-			return {
-				status: 200,
-				statusText: "OK",
-				headers: { "content-type": "application/json" },
-				body: encoder.encode(JSON.stringify({ ok: true })),
-				url,
-			};
-		}
-		return { status: 403, statusText: "Forbidden", headers: {}, body: new Uint8Array(), url };
-	};
-}
-
-function makeBash(packages: Record<string, PackageFixture>): Bash {
-	return new Bash({
-		fs: new InMemoryFs(),
-		python: true,
-		fetch: fixtureFetch(packages),
-		customCommands: pythonPackageCommands,
-	});
-}
 
 describe("experimental SQL-FS pip commands", () => {
 	it("rejects installs when network is disabled", async () => {
@@ -204,11 +13,25 @@ describe("experimental SQL-FS pip commands", () => {
 		expect(result.stderr).toContain("network access is required");
 	});
 
-	it("returns a clear error for unsupported direct package syntax", async () => {
-		const body = wheel("demo", "1.0", { "demo.py": "" });
-		const result = await makeBash({ demo: { version: "1.0", body } }).exec("pip install demo[extra]");
+	it("installs the dependency an extra pulls in", async () => {
+		const bash = makeBash({
+			demo: {
+				version: "1.0",
+				body: wheel("demo", "1.0", { "demo.py": "" }, ['helper>=1.0; extra == "socks"']),
+				requiresDist: ['helper>=1.0; extra == "socks"'],
+			},
+			helper: { version: "1.0", body: wheel("helper", "1.0", { "helper.py": "" }) },
+		});
+		const result = await bash.exec("pip install demo[socks]");
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(result.stdout).toBe("Successfully installed demo-1.0 helper-1.0\n");
+	});
+
+	it("refuses a direct install whose specifier carries a marker", async () => {
+		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", { "demo.py": "" }) } });
+		const result = await bash.exec(`pip install 'demo; python_version > "3.0"'`);
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain("package extras are not supported");
+		expect(result.stderr).toBe("pip: package markers are not supported for direct installs\n");
 	});
 
 	it("verifies a wheel hash and persists imports for later python3 calls", async () => {
@@ -331,6 +154,50 @@ describe("experimental SQL-FS pip commands", () => {
 		const command = await bash.exec("databricks workspace list /");
 		expect(command.exitCode, command.stderr).toBe(0);
 		expect(command.stdout).toBe("True\n");
+	});
+
+	it("names the package and the limit when the fetch refuses an oversized response", async () => {
+		const tooLarge = Object.assign(new Error("response exceeds the maximum allowed size of 10 bytes"), {
+			name: "ResponseTooLargeError",
+		});
+		const bash = new Bash({
+			fs: new InMemoryFs(),
+			python: true,
+			fetch: () => Promise.reject(tooLarge),
+			customCommands: pythonPackageCommands,
+		});
+		const result = await bash.exec("pip install demo");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe("pip: demo metadata exceeds the 16777216 byte response limit\n");
+	});
+
+	it("includes the underlying message for a non-pip failure", async () => {
+		const bash = new Bash({
+			fs: new InMemoryFs(),
+			python: true,
+			fetch: () => Promise.reject(new Error("socket hang up")),
+			customCommands: pythonPackageCommands,
+		});
+		const result = await bash.exec("pip install demo");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe("pip: package installation failed: socket hang up\n");
+	});
+
+	it("leaves a secret shorter than eight characters unredacted", async () => {
+		const cli = wheel(
+			"databricks-cli",
+			"0.18.0",
+			{
+				"databricks_cli/__init__.py": "",
+				"databricks_cli/cli.py": "import os\ndef main():\n    print(os.environ.get('DATABRICKS_TOKEN'))\n",
+			},
+			[],
+			"databricks_cli.cli:main",
+		);
+		const bash = makeBash({ "databricks-cli": { version: "0.18.0", body: cli } });
+		expect((await bash.exec("pip install databricks-cli")).exitCode).toBe(0);
+		const result = await bash.exec("databricks workspace list /", { env: { DATABRICKS_TOKEN: "short" } });
+		expect(result.stdout).toBe("short\n");
 	});
 
 	it("redacts Databricks credentials from console output", async () => {

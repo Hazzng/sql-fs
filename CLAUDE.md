@@ -84,6 +84,7 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 - `routes/exec.ts` — Bash execution: sync (JSON) and streaming (SSE)
 - `routes/ingest.ts` — Ingest (tar.gz / JSON manifest) and export (tar.gz download)
 - `blob-gc.ts` — Multi-tenant orphan-blob GC orchestrator (`runBlobGc`); invoked by `cli/gc.ts`
+- `commands/pip-command.ts` — Experimental pure-Python package support: `pip`, the `python3` / `python` overrides (path translation, stdin, interpreter-option parsing) and `databricks`. Built by `createPythonPackageCommands({ fetch, acquireInstall, acquirePython })`; the built-in WASM python is reached through a sibling `Bash` per filesystem, because a custom command shadows the built-in of the same name for `ctx.exec` too.
 - `cli/gc.ts` — Blob GC CLI (`pnpm db:gc`), for an external cron / k8s CronJob
 - `mcp/server.ts` — MCP server setup with streamable HTTP transport
 - `mcp/tools.ts` — 10 MCP tool definitions and handlers
@@ -207,6 +208,13 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `SESSION_IDLE_MS` | No (default: 600000) | Idle timeout before session eviction (ms) |
 | `MAX_CONCURRENT_PYTHON` | No (default: 5) | Max concurrent Python executions across all sessions. CPython WASM workers cost ~80MB each (EXIT_RUNTIME per invocation); the semaphore caps concurrency to prevent OOM. Excess scripts queue FIFO. |
 | `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
+| `MAX_CONCURRENT_PIP_INSTALLS` | No (default: 2) | Max concurrent experimental `pip install` orchestrations across all sessions. One slot is held for the whole install — resolution, every download and every extraction — because the transient memory of an install spans all of it. Excess installs queue FIFO on the same queue settings as the Python semaphore. The `python3` / `databricks` commands take a Python slot separately, at the point a CPython worker is actually spawned; an `AsyncLocalStorage` flag set by `execWithRuntimeThrottle` stops one exec from holding two Python slots. |
+| `PIP_MAX_WHEEL_BYTES` | No (default: 33554432) | Response cap for the pip-scoped PyPI fetch (`src/api/commands/pypi-fetch.ts`). `curl` keeps just-bash's 10 MB `secureFetch` default. |
+| `PIP_MAX_METADATA_BYTES` | No (default: 33554432) | Cumulative PyPI metadata bytes one `pip install` may download before it is refused. |
+| `PIP_MAX_METADATA_REQUESTS` | No (default: 200) | Cumulative PyPI metadata requests per `pip install`. |
+| `PIP_MAX_METADATA_CACHE_ENTRIES` | No (default: 200) | Cumulative PyPI metadata documents cached per `pip install`. |
+| `PIP_MAX_METADATA_RESPONSE_BYTES` | No (default: 16777216) | Cap for a single PyPI JSON response (backstop; the per-version endpoint is tried first for a pinned requirement). |
+| `PIP_MAX_DEPENDENCY_DEPTH` | No (default: 16) | Longest dependency path a `pip install` may resolve. Depth is recomputed transitively when an edge lengthens one, so a diamond cannot bypass it. |
 | `GITHUB_TOKEN` | No | Optional shared GitHub token. When set, exported into `network:true` sandbox shell env as `GITHUB_TOKEN` for `curl` GitHub API calls, plus `GIT_HTTP_USER=x-access-token` and `GIT_HTTP_PASSWORD=<token>` for GitHub-compatible `git` HTTPS auth. This is a deployment-wide identity readable by network-enabled sandbox code; use only with trusted agents. Per-request `env` overrides it. |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` | No | Optional git identity values to export into every sandbox shell env so `git commit` has defaults. Per-request `env` overrides them. |
 | `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. |
@@ -252,6 +260,13 @@ src/
     session-manager.ts           ← Warm Bash instance pool
     errors.ts                    ← HTTP error helpers
     blob-gc.ts                   ← Orphan-blob GC orchestrator (runBlobGc)
+    python-slot-context.ts       ← AsyncLocalStorage flag: this exec already holds a Python slot
+    commands/
+      pip-command.ts             ← Experimental pip / python3 / python / databricks commands
+      pypi-fetch.ts              ← Pip-scoped PyPI-only fetch (own size cap, no redirects)
+      pep440.ts                  ← Version parsing / comparison / specifiers (documented subset)
+      pep508.ts                  ← Requirement parsing, extras, environment markers
+      node-command.ts            ← node → js-exec translation
     routes/
       sandboxes.ts               ← CRUD
       files.ts                   ← File operations

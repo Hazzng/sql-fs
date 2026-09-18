@@ -14,6 +14,7 @@
 
 import type { Redis } from "ioredis";
 import { Bash, defineCommand } from "just-bash";
+import type { Command } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
 import { createGit } from "just-git";
 import { createEnoent } from "../sql-fs/errors.js";
@@ -24,7 +25,8 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
-import { pythonPackageCommands } from "./commands/pip-command.js";
+import { createPythonPackageCommands } from "./commands/pip-command.js";
+import { createPypiFetch } from "./commands/pypi-fetch.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
@@ -32,6 +34,7 @@ import { logAudit } from "./lib/audit.js";
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
 // command from just-bash (enabled via `python: true` below) is the safe path.
+import { pythonSlotContext } from "./python-slot-context.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
@@ -407,6 +410,12 @@ export class SessionManager {
 
 	private readonly pythonSem: Semaphore;
 	private readonly jsSem: Semaphore;
+	/**
+	 * Bounds concurrent `pip install` orchestrations across the replica. An
+	 * install holds one slot for resolution, every download and every
+	 * extraction, because its transient memory is held across all of it.
+	 */
+	private readonly pipSem: Semaphore;
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
 	private readonly sandboxBaseEnv: Record<string, string>;
@@ -467,6 +476,13 @@ export class SessionManager {
 			limit: maxConcurrentJs ?? Number(process.env.MAX_CONCURRENT_JS ?? "5"),
 			maxWaiters: maxJsWaiters,
 			waitTimeoutMs: jsTimeout,
+			inFlight: 0,
+			waiters: [],
+		};
+		this.pipSem = {
+			limit: Number(process.env.MAX_CONCURRENT_PIP_INSTALLS ?? "2"),
+			maxWaiters: maxPyWaiters,
+			waitTimeoutMs: pyTimeout,
 			inFlight: 0,
 			waiters: [],
 		};
@@ -592,7 +608,7 @@ export class SessionManager {
 				const customCommands = [
 					// Experimental pure-Python package support. The commands are only
 					// available in Python sandboxes and use ctx.fs / ctx.fetch exclusively.
-					...(resolvedRuntime.python ? pythonPackageCommands : []),
+					...(resolvedRuntime.python ? this.buildPythonPackageCommands(resolvedRuntime.network) : []),
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
@@ -1556,6 +1572,33 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Experimental pure-Python package commands for one sandbox.
+	 *
+	 * `pip` gets its own fetch rather than `ctx.fetch`: the shared secure fetch
+	 * caps responses at 10 MB and is also what `curl` uses, so raising the cap
+	 * there would raise it for every sandbox command. The two admission slots
+	 * are injected so the commands never import this class.
+	 */
+	private buildPythonPackageCommands(network: boolean): Command[] {
+		return createPythonPackageCommands({
+			fetch: network
+				? createPypiFetch({
+						maxResponseSize: Number(process.env.PIP_MAX_WHEEL_BYTES ?? String(32 * 1024 * 1024)),
+						timeoutMs: 30_000,
+					})
+				: undefined,
+			acquireInstall: async (signal?: AbortSignal) => {
+				await this.acquireSlot(this.pipSem, signal);
+				return () => this.releaseSlot(this.pipSem);
+			},
+			acquirePython: async (signal?: AbortSignal) => {
+				await this.acquireSlot(this.pythonSem, signal);
+				return () => this.releaseSlot(this.pythonSem);
+			},
+		});
+	}
+
 	private acquireSlot(sem: Semaphore, signal?: AbortSignal): Promise<void> {
 		if (signal?.aborted) {
 			return Promise.reject(Object.assign(new Error("ABORTED"), { code: "ABORTED", name: "AbortError" }));
@@ -1703,7 +1746,11 @@ export class SessionManager {
 		}
 
 		try {
-			return updateCwd(await execFn());
+			// The flag is set ONLY here, inside the region where this exec holds a
+			// Python slot, so the custom `python3` / `databricks` commands skip
+			// their own acquire and one exec never occupies two slots.
+			const run = usesPython ? () => pythonSlotContext.run({ held: true }, execFn) : execFn;
+			return updateCwd(await run());
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);
