@@ -217,8 +217,8 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `MAX_CONCURRENT_JS` | No (default: 5) | Max concurrent JavaScript (`js-exec`/`node`) executions across all sessions. QuickJS executions cap at 64MB each. Excess scripts queue FIFO. Note: just-bash currently serializes `js-exec` internally through a single worker, so this cap is an upper bound that may not be binding today. |
 | `GITHUB_TOKEN` | No | Optional shared GitHub token. When set, exported into `network:true` sandbox shell env as `GITHUB_TOKEN` for `curl` GitHub API calls, plus `GIT_HTTP_USER=x-access-token` and `GIT_HTTP_PASSWORD=<token>` for GitHub-compatible `git` HTTPS auth. This is a deployment-wide identity readable by network-enabled sandbox code; use only with trusted agents. Per-request `env` overrides it. |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` | No | Optional git identity values to export into every sandbox shell env so `git commit` has defaults. Per-request `env` overrides them. |
-| `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When both `REDIS_URL` and `REDIS_DATA_URL` are absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. (`REDIS_DATA_URL` alone still enables the data plane: blob cache / path snapshot.) Carries the **control plane**: exec/RW locks, version counter, session state. |
-| `REDIS_DATA_URL` | No (default: `REDIS_URL`) | Connection string for the **data plane** (blob cache, path snapshot). #167: when both roles are opened they get separate ioredis connections even when this resolves to the same URL, because ioredis pipelines over one socket and a queue of multi-MiB blob `SET`s head-of-line blocks the latency-critical `INCR`/`EVAL` behind them (measured: `INCR` timed out at 2043 ms on the shared connection vs 44 ms on a separate one). A lock-only deployment (blob cache off, snapshot off) opens just the control connection. Set it to a different Redis only when you also want physical separation. |
+| `REDIS_URL` | No | Redis connection string. Required for multi-replica deployments. When both `REDIS_URL` and `REDIS_DATA_URL` are absent, distributed exec lock and all Redis caches are disabled — only in-process `session.mutex` protects execution. (`REDIS_DATA_URL` alone still enables the data plane: blob cache / path snapshot.) Carries the **control plane**: exec/RW locks, version counter, session state. The instance must evict under memory pressure — see **Redis eviction policy** below. |
+| `REDIS_DATA_URL` | No (default: `REDIS_URL`) | Connection string for the **data plane** (blob cache, path snapshot). #167: when both roles are opened they get separate ioredis connections even when this resolves to the same URL, because ioredis pipelines over one socket and a queue of multi-MiB blob `SET`s head-of-line blocks the latency-critical `INCR`/`EVAL` behind them (measured: `INCR` timed out at 2043 ms on the shared connection vs 44 ms on a separate one). A lock-only deployment (blob cache off, snapshot off) opens just the control connection. Set it to a different Redis only when you also want physical separation. This instance carries the blob cache, so it is the one that must run `maxmemory-policy allkeys-lru` — see **Redis eviction policy** below. |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No (default: 60000) | Distributed exec lock lease duration (ms). Lock auto-expires if the holder dies. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No (default: 20000) | Heartbeat interval for exec lock renewal (ms). Must be strictly less than `REDIS_EXEC_LOCK_LEASE_MS` to guarantee renewal fires before expiry. |
 | `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No (default: 75000) | Max time to wait to acquire the exec lock before returning 503 (ms). Asserted at startup to be strictly greater than both `REDIS_EXEC_LOCK_LEASE_MS` and `REDIS_RWLOCK_READER_LEASE_MS` — a crashed holder's lock is only reaped when its lease expires, so a shorter window turns crashed-holder recovery into a 503. The default (lease + ~15s reap margin) also keeps the reply inside typical ingress timeouts (commonly 60-240s); the previous 300s sat above them, so the connection was severed and the 503 never reached the client. A caller that must queue behind a full-length 300s exec is expected to retry on the 503. |
@@ -243,6 +243,29 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | No (default: `true`) | When `JUST_BASH_DEFENSE_IN_DEPTH=true`, controls whether violations throw (`false`) or are logged only (`true`). Recommended `true` for initial rollout, then flip to `false` once logs are clean. |
 | `BLOB_GC_MIN_AGE_MS` | No (default: 10800000) | Grace window (ms, default 3h) before an orphan blob becomes collectible by `pnpm db:gc`. Orphans whose `last_referenced_at` is newer than this are kept; the `ON CONFLICT DO UPDATE` row lock on blob writes is the actual dedup re-adoption race guard — this window is churn/margin control. Rows with NULL `last_referenced_at` (legacy, pre-migration-0006) are treated as ancient and always collectible. Override per-run with `--min-age-ms`. |
 
+### Redis eviction policy
+
+**The Redis carrying the data plane (`REDIS_DATA_URL`, defaulting to `REDIS_URL`) must run `maxmemory-policy allkeys-lru`** — any `allkeys-*` policy works.
+
+Redis defaults to `noeviction`, under which an instance that reaches `maxmemory` refuses every write and **never recovers on its own**: blob cache entries carry a 24h TTL (`REDIS_BLOB_CACHE_TTL_MS`), so waiting it out is not a strategy and a human has to flush keys or raise the limit. The load harness measured 97.6% 5xx with no recovery, against a `CLIENT PAUSE` that recovered the moment the pause lifted (#188). With `allkeys-lru` the same pressure evicts cold blobs, which costs a Postgres read.
+
+`volatile-*` is not sufficient: it evicts only keys carrying a TTL, and on the default single-instance setup the exec-lock leases and version counters carry one too, so it can reap a live lease to cache a blob.
+
+```bash
+redis-cli CONFIG SET maxmemory-policy allkeys-lru   # and persist it in redis.conf
+```
+
+Checked at boot via `CONFIG GET maxmemory-policy` (`src/redis/eviction-policy.ts`, wired in `server.ts`):
+
+| Outcome | Log line |
+|---|---|
+| `allkeys-*` | `event:"redis_eviction_policy"` |
+| anything else | `event:"redis_eviction_policy_unsafe"`, `severity:"critical"` |
+| `CONFIG GET` refused (`NOPERM`, unknown command) | `event:"redis_eviction_policy_unknown"`, `reason:"config_get_denied"` |
+| `CONFIG GET` failed or unparseable | `event:"redis_eviction_policy_unknown"`, `reason:"config_get_failed"` |
+
+**It is a warning and never a startup failure**, and it is never awaited — managed providers routinely forbid `CONFIG GET`, and a Redis that answers slowly must not delay `listen`.
+
 ## File Layout
 
 ```
@@ -262,6 +285,10 @@ src/
       mysql/                     ← MySQL DDL + stored procs
       azure-sql/                 ← T-SQL DDL + RLS + stored procs
     integration/                 ← DB integration tests (skippable)
+  redis/                         ← Role-split clients, breaker, boot-time config checks
+    client.ts                    ← control/data ioredis clients
+    circuit-breaker.ts           ← per-role breaker
+    eviction-policy.ts           ← boot maxmemory-policy check (warn-only)
   api/                           ← HTTP + MCP server
     server.ts                    ← Hono entry + migration runner
     auth.ts                      ← Bearer token middleware
