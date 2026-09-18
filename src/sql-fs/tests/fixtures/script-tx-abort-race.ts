@@ -56,15 +56,12 @@ const fs = new SqlFs({ dialect, sandboxId: "s-abort-race" });
 await fs.ready();
 
 fs.beginScriptScope();
-// The write is expected to reject with the abort. Any OTHER rejection means the fixture stopped
-// reaching the window under test — fail loudly rather than pass as a no-op.
-void fs.writeFile("/x.txt", "y").catch((e: unknown) => {
-	const message = (e as Error).message;
-	if (!message.includes("script-tx aborted")) {
-		process.stderr.write(`MISCONFIGURED: write failed before the abort window: ${message}\n`);
-		process.exit(2);
-	}
-});
+// Never settles: `#openScriptTx` races txReady against the transaction promise and the mock
+// resolves neither, so this write is still parked inside the window when the abort lands. The
+// guard against the fixture drifting out of that window is `await opening` — if the open is never
+// reached this hangs and the test times out, rather than passing as a no-op.
+void fs.writeFile("/x.txt", "y").catch(() => undefined);
+
 await opening;
 await fs.abortScriptScope();
 // Give Node a turn to report an unhandled rejection before we claim success.

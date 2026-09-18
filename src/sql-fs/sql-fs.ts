@@ -200,6 +200,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * lost the only correct outcome is that every remaining operation in the scope fails.
 	 */
 	#scriptTxLost: Error | undefined;
+	/**
+	 * Bumped on every open. The transaction callback assigns `#scriptTx` only while its own
+	 * generation is still current: an abort that beats a queued `setSandboxContextWithLock` clears
+	 * the scope, and the statement can still resolve afterwards. Assigning then would leave a
+	 * rolled-back handle in place, and the NEXT scope would reuse it and skip opening a transaction
+	 * of its own — committing into a transaction that no longer exists.
+	 */
+	#scriptTxGeneration = 0;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -277,7 +285,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-		if (this.#scriptScope) this.#assertScriptTxAlive();
+		this.#assertScriptTxAlive();
 		const scriptTx = this.#scriptTx;
 		if (this.#scriptScope && scriptTx !== undefined) {
 			return runTrustedDbAsync(() => fn(scriptTx));
@@ -290,12 +298,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		);
 	}
 
-	/** Refuse any further work in a scope whose transaction is gone. See `#scriptTxLost`. */
+	/**
+	 * Refuse further work in a scope whose transaction is gone. See `#scriptTxLost`.
+	 *
+	 * The scope check lives here rather than at each call site: a reader that forgets it would
+	 * serve mutations that are about to be rolled back.
+	 */
 	#assertScriptTxAlive(): void {
-		if (this.#scriptTxLost !== undefined) throw this.#scriptTxLost;
+		if (this.#scriptScope && this.#scriptTxLost !== undefined) throw this.#scriptTxLost;
 	}
 
 	async #openScriptTx(): Promise<void> {
+		const generation = ++this.#scriptTxGeneration;
 		let resolveTxReady!: () => void;
 		const txReady = new Promise<void>((r) => {
 			resolveTxReady = r;
@@ -321,6 +335,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const scriptTxPromise = runTrustedDbAsync(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				// The scope may have aborted while this statement was queued; adopting `tx` now would
+				// hand the next scope a rolled-back handle.
+				if (generation !== this.#scriptTxGeneration || !this.#scriptScope) {
+					throw new Error("script-tx abandoned: scope ended while the transaction was opening");
+				}
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -715,6 +734,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
 		this.#scriptTxLost = undefined;
+		// Any open still in flight from a previous scope belongs to an older generation and will
+		// abandon itself rather than adopt into this one.
+		this.#scriptTxGeneration += 1;
 		this.#scriptScope = true;
 	}
 
@@ -874,6 +896,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	// ── IFileSystem: cache-served methods ────────────────────────────────────────
 
 	getAllPaths(): string[] {
+		this.#assertScriptTxAlive();
 		return [...this.#pathCache.keys()];
 	}
 
@@ -1224,19 +1247,23 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async readFile(inputPath: string, _options?: ReadFileOpts): Promise<string> {
+		this.#assertScriptTxAlive();
 		return new TextDecoder().decode(await this.#readBytes(inputPath));
 	}
 
 	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
+		this.#assertScriptTxAlive();
 		return this.#readBytes(inputPath);
 	}
 
 	async exists(inputPath: string): Promise<boolean> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		return this.#pathCache.has(path);
 	}
 
 	async stat(inputPath: string): Promise<FsStat> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		const lentry = this.#pathCache.get(path);
 		if (!lentry) throw createEnoent(path);
@@ -1259,6 +1286,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async lstat(inputPath: string): Promise<FsStat> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
@@ -1274,6 +1302,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async readdir(inputPath: string): Promise<string[]> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);

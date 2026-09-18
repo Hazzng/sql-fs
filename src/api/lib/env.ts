@@ -36,3 +36,17 @@ export function positiveIntEnv(value: string | undefined, fallback: number): num
  * dies on one request.
  */
 export const MAX_FILE_WRITE_BYTES = positiveIntEnv(process.env.MAX_FILE_WRITE_BYTES, DEFAULT_CONTENT_CACHE_MAX_BYTES);
+
+// An override above the cache cap is allowed — a large container may legitimately want bigger
+// files — but it must not be silent, because the cost is a step change rather than a gradient.
+if (MAX_FILE_WRITE_BYTES > DEFAULT_CONTENT_CACHE_MAX_BYTES) {
+	console.warn(
+		JSON.stringify({
+			event: "write_cap_above_content_cache",
+			maxFileWriteBytes: MAX_FILE_WRITE_BYTES,
+			contentCacheMaxBytes: DEFAULT_CONTENT_CACHE_MAX_BYTES,
+			warning:
+				"files above the contentCache cap are retained about twice over, and again per pool connection that reads one, for the whole SESSION_IDLE_MS",
+		}),
+	);
+}
