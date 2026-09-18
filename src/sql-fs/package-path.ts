@@ -28,6 +28,9 @@ function commonProblem(path: string): string | null {
 	return null;
 }
 
+/** Length of the `/site-packages/` prefix added at graft time. */
+const GRAFT_PREFIX_LENGTH = "/site-packages/".length;
+
 /**
  * Validates an archive-relative path (`pkg/mod.py`); the caller strips a
  * directory entry's trailing slash first.
@@ -35,6 +38,9 @@ function commonProblem(path: string): string | null {
 export function packageEntryPathProblem(path: string): string | null {
 	const common = commonProblem(path);
 	if (common !== null) return common;
+	if (path.length + GRAFT_PREFIX_LENGTH > MAX_PACKAGE_PATH_LENGTH) {
+		return `path would exceed ${MAX_PACKAGE_PATH_LENGTH} characters after install-root prefix: '${path.slice(0, 64)}…'`;
+	}
 	if (path.startsWith("/")) return `absolute path '${path}'`;
 	if (/^[a-zA-Z]:/.test(path)) return `drive-letter path '${path}'`;
 	return segmentProblem(path, path.split("/"));

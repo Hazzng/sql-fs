@@ -98,7 +98,7 @@ describe("requests compat module under WASM python", () => {
 		expect(result.stderr).toContain(NO_NETWORK);
 	});
 
-	it("rejects files= with the base64-in-JSON message, write capability or not", async () => {
+	it("rejects files= with the base64-in-JSON message when write capability is set", async () => {
 		const bash = await shellWithCompatOverlay();
 		const script = `python3 -c "import requests; requests.post('https://example.com', files={'f': 'x'})"`;
 		const withWrite = await bash.exec(script, { env: { [HTTP_WRITE_ENV_VAR]: "1" } });
@@ -108,6 +108,14 @@ describe("requests compat module under WASM python", () => {
 		expect(REQUESTS_FILES_UNSUPPORTED_MESSAGE).toBe(
 			"requests shim: files= is not supported; send the body as a JSON string via data= and base64-encode any binary field inside that JSON",
 		);
+	});
+
+	it("rejects files= with the write-denied message when write capability is not set", async () => {
+		const bash = await shellWithCompatOverlay();
+		const script = `python3 -c "import requests; requests.post('https://example.com', files={'f': 'x'})"`;
+		const withoutWrite = await bash.exec(script);
+		expect(withoutWrite.exitCode).toBe(1);
+		expect(withoutWrite.stderr).toContain(requestsWriteDeniedMessage("POST"));
 	});
 
 	it("still reaches the transport for get() without the write capability", async () => {

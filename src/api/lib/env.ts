@@ -16,5 +16,7 @@
 export function positiveIntEnv(value: string | undefined, fallback: number): number {
 	if (value === undefined || value === "") return fallback;
 	const n = Number(value);
-	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+	if (!Number.isFinite(n) || n <= 0) return fallback;
+	const floored = Math.floor(n);
+	return floored > 0 ? floored : fallback;
 }

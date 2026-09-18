@@ -70,7 +70,7 @@ export function createInProcessWheelLease(): WheelLease {
 	return async <T>(key: string, fn: (info: WheelLeaseInfo) => Promise<T>): Promise<T> => {
 		const previous = inFlight.get(key);
 		const startedAt = Date.now();
-		const call = (): Promise<T> => fn({ waitedMs: previous === undefined ? 0 : Date.now() - startedAt });
+		const call = (): Promise<T> => fn({ waitedMs: previous === undefined ? 0 : Math.max(1, Date.now() - startedAt) });
 		const run = (previous ?? Promise.resolve()).then(call, call);
 		// Keep the chain alive but never let a rejection escape twice.
 		const link = run.then(

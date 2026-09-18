@@ -709,7 +709,7 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 		expandedExtras.set(name, signature);
 		if (resolved.size > MAX_DEPENDENCIES) fail(`dependency count exceeds ${MAX_DEPENDENCIES}`);
 
-		const childSet = children.get(name) ?? new Set<string>();
+		const childSet = new Set<string>();
 		children.set(name, childSet);
 		for (const rawDependency of candidate.requiresDist) {
 			// A dependency is included when it applies to the base set or to any

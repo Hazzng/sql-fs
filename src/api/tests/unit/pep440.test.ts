@@ -63,6 +63,12 @@ describe("PEP 440 specifier conformance", () => {
 		expect(versionSatisfies("2.0", specs("~=1.4"))).toBe(false);
 	});
 
+	it("preserves epoch in ~= upper bound", () => {
+		expect(versionSatisfies("1!1.5", specs("~=1!1.4"))).toBe(true);
+		expect(versionSatisfies("1!2.0", specs("~=1!1.4"))).toBe(false);
+		expect(versionSatisfies("2.0", specs("~=1!1.4"))).toBe(false);
+	});
+
 	it("compares === against the raw string, local label included", () => {
 		expect(versionSatisfies("1.0+abc", specs("===1.0+abc"))).toBe(true);
 		expect(versionSatisfies("1.0", specs("===1.0+abc"))).toBe(false);
@@ -88,6 +94,15 @@ describe("PEP 440 specifier conformance", () => {
 	it("refuses an unparseable specifier", () => {
 		expect(() => specs("=>1.0")).toThrowError(/unsupported version specifier/);
 	});
+
+	it("refuses a local version on an ordering operator", () => {
+		expect(() => specs(">=1.0+local")).toThrowError(/local version not supported/);
+		expect(() => specs("<1.0+local")).toThrowError(/local version not supported/);
+		expect(() => specs("~=1.0+local")).toThrowError(/local version not supported/);
+		// == and != accept local versions (used for exact pinning / exclusion).
+		expect(specs("==1.0+local")).toEqual([{ operator: "==", version: "1.0+local" }]);
+		expect(specs("!=1.0+local")).toEqual([{ operator: "!=", version: "1.0+local" }]);
+	});
 });
 
 describe("pre-release and development release detection", () => {
@@ -102,5 +117,16 @@ describe("pre-release and development release detection", () => {
 		expect(hasExplicitPrerelease(specs(">=1.0"))).toBe(false);
 		expect(hasExplicitPrerelease(specs(">=1.0a1"))).toBe(true);
 		expect(hasExplicitPrerelease(specs("==1.0.dev1"))).toBe(true);
+	});
+
+	it("detects pre-releases even with a post-release suffix", () => {
+		expect(hasExplicitPrerelease(specs(">=1.0a1.post1"))).toBe(true);
+		expect(hasExplicitPrerelease(specs(">=1.0b2.post0"))).toBe(true);
+		expect(hasExplicitPrerelease(specs(">=1.0rc1.post3"))).toBe(true);
+	});
+
+	it("detects pre-releases through a wildcard suffix", () => {
+		expect(hasExplicitPrerelease(specs("==1.0a1.*"))).toBe(true);
+		expect(hasExplicitPrerelease(specs("==1.0.dev0.*"))).toBe(true);
 	});
 });

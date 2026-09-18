@@ -117,7 +117,7 @@ export function makeBash(
 		fs,
 		python: true,
 		fetch: fixtureFetch(packages),
-		customCommands: createPythonPackageCommands({ packageStore: fs, ...options }),
+		customCommands: createPythonPackageCommands({ ...options, packageStore: fs }),
 	}) as Bash & { fs: FakePackageFs };
 }
 
@@ -132,6 +132,6 @@ export function makeBashWithFetch(
 		fs,
 		python: true,
 		...(fetch ? { fetch } : {}),
-		customCommands: createPythonPackageCommands({ packageStore: fs, ...options }),
+		customCommands: createPythonPackageCommands({ ...options, packageStore: fs }),
 	}) as Bash & { fs: FakePackageFs };
 }

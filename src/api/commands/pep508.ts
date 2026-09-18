@@ -9,7 +9,7 @@
  * than refusing up front.
  */
 
-import { type VersionSpec, compareVersions, parseSpecifierSet } from "./pep440.js";
+import { type VersionSpec, compareVersions, parseSpecifierSet, parseVersion } from "./pep440.js";
 import { normalizePackageName } from "./pip-shared.js";
 
 export interface Requirement {
@@ -203,13 +203,30 @@ export function evaluateMarker(marker: string | undefined, extra: string, fail: 
 			: left.value > right.value
 				? 1
 				: 0;
+	const wildcardPrefix = (version: string): string => {
+		const parsed = parseVersion(version.endsWith(".*") ? version.slice(0, -2) : version);
+		return `${parsed.epoch ? `${parsed.epoch}!` : ""}${parsed.release.join(".")}`;
+	};
+
 	switch (operator) {
-		case "==":
+		case "==": {
+			if (asVersion && right.value.endsWith(".*")) {
+				const prefix = wildcardPrefix(right.value);
+				const leftStr = wildcardPrefix(left.value);
+				return leftStr === prefix || leftStr.startsWith(`${prefix}.`);
+			}
 			return comparison === 0;
+		}
 		case "===":
 			return left.value === right.value;
-		case "!=":
+		case "!=": {
+			if (asVersion && right.value.endsWith(".*")) {
+				const prefix = wildcardPrefix(right.value);
+				const leftStr = wildcardPrefix(left.value);
+				return leftStr !== prefix && !leftStr.startsWith(`${prefix}.`);
+			}
 			return comparison !== 0;
+		}
 		case "<":
 			return comparison < 0;
 		case "<=":
@@ -218,8 +235,16 @@ export function evaluateMarker(marker: string | undefined, extra: string, fail: 
 			return comparison > 0;
 		case ">=":
 			return comparison >= 0;
-		case "~=":
-			return comparison >= 0;
+		case "~=": {
+			const expectedVersion = parseVersion(right.value);
+			const upperRelease =
+				expectedVersion.release.length <= 1
+					? [(expectedVersion.release[0] ?? 0) + 1]
+					: [...expectedVersion.release.slice(0, -2), (expectedVersion.release.at(-2) ?? 0) + 1];
+			const epoch = expectedVersion.epoch ? `${expectedVersion.epoch}!` : "";
+			const upper = `${epoch}${upperRelease.join(".")}`;
+			return compareVersions(left.value, right.value) >= 0 && compareVersions(left.value, upper) < 0;
+		}
 		default:
 			fail(`unsupported dependency marker operator '${operator}'`);
 	}

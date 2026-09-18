@@ -201,6 +201,7 @@ export function buildRuntimeSandboxEnv(
 	const out: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(baseEnv)) {
 		if (!network && SANDBOX_NETWORK_CREDENTIAL_KEYS.has(key)) continue;
+		if (key === HTTP_WRITE_ENV_VAR) continue;
 		out[key] = value;
 	}
 	// Both flags are required: `networkWrite` without `network` is refused at
@@ -1497,7 +1498,7 @@ export class SessionManager {
 
 		// Reject any queued runtime semaphore waiters: they would otherwise
 		// hold their request closures alive past shutdown.
-		for (const sem of [this.pythonSem, this.jsSem]) {
+		for (const sem of [this.pythonSem, this.jsSem, this.pipSem]) {
 			while (sem.waiters.length > 0) {
 				const w = sem.waiters.shift();
 				if (w === undefined) break;

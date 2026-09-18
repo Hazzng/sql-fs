@@ -156,9 +156,11 @@ export async function withDistributedLock<T>(
 	while (true) {
 		if (breaker.isOpen()) throw new LockAcquireTimeoutError(key);
 		let acquired = false;
+		let contested = false;
 		try {
 			const ok = await redis.set(key, token, "PX", leaseMs, "NX");
 			acquired = ok === "OK";
+			contested = !acquired;
 			breaker.recordSuccess();
 			errorBudget.reset();
 		} catch {
@@ -166,7 +168,7 @@ export async function withDistributedLock<T>(
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(key);
 		}
 		if (acquired) break;
-		merged.onContended?.();
+		if (contested) merged.onContended?.();
 		if (Date.now() >= deadline) throw new LockAcquireTimeoutError(key);
 		// F9d: jittered sleep to de-synchronize cross-replica pollers.
 		await new Promise((r) => setTimeout(r, jitteredDelayMs(acquireRetryMs)));

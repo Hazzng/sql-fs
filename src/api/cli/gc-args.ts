@@ -63,6 +63,9 @@ export function resolveDurationMs(
 	readEnv: (name: string, fallback: number) => number,
 ): number {
 	if (value === undefined) return readEnv(envVar, fallback);
+	if (value.trim() === "") {
+		throw Object.assign(new Error(`${flag} must be a non-negative integer (got "${value}").`), { code: "EINVAL" });
+	}
 	const parsed = Number(value);
 	if (!Number.isInteger(parsed) || parsed < 0) {
 		throw Object.assign(new Error(`${flag} must be a non-negative integer (got "${value}").`), { code: "EINVAL" });

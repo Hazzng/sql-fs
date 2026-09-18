@@ -157,7 +157,8 @@ export function versionSatisfies(version: string, specs: readonly VersionSpec[])
 					expectedVersion.release.length <= 1
 						? [(expectedVersion.release[0] ?? 0) + 1]
 						: [...expectedVersion.release.slice(0, -2), (expectedVersion.release.at(-2) ?? 0) + 1];
-				const upper = upperRelease.join(".");
+				const epochPrefix = expectedVersion.epoch ? `${expectedVersion.epoch}!` : "";
+				const upper = `${epochPrefix}${upperRelease.join(".")}`;
 				return compareVersions(version, expected) >= 0 && compareVersions(version, upper) < 0;
 			}
 			default:
@@ -189,6 +190,9 @@ export function parseSpecifierSet(input: string, onError: (reason: string) => ne
 		if (wildcards === 1 && operator !== "==" && operator !== "!=") {
 			onError(`wildcard is only supported with == or != in '${part.slice(0, 80)}'`);
 		}
+		if (version.includes("+") && operator !== "==" && operator !== "!=" && operator !== "===") {
+			onError(`local version not supported with '${operator}' in '${part.slice(0, 80)}'`);
+		}
 		specs.push({ operator, version });
 	}
 	return specs;
@@ -196,7 +200,11 @@ export function parseSpecifierSet(input: string, onError: (reason: string) => ne
 
 /** True when any specifier explicitly names a pre-release or development release. */
 export function hasExplicitPrerelease(specs: readonly VersionSpec[]): boolean {
-	return specs.some((spec) => /(?:a|b|c|rc|alpha|beta|pre|preview|dev)[0-9]*(?:\.\*)?$/i.test(spec.version));
+	return specs.some((spec) => {
+		const version = spec.version.endsWith(".*") ? spec.version.slice(0, -2) : spec.version;
+		const parsed = parseVersion(version);
+		return parsed.pre !== undefined || parsed.dev !== undefined;
+	});
 }
 
 /** True when a release is a pre-release or a development release. */

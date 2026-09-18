@@ -40,12 +40,20 @@ describe("parseGcArgs", () => {
 	});
 
 	it("throws EINVAL when --manifest-ttl-ms has no value", () => {
-		expect(() => parseGcArgs(["--manifest-ttl-ms"])).toThrowError("Missing value for --manifest-ttl-ms");
+		expect(() => parseGcArgs(["--manifest-ttl-ms"])).toThrow(
+			expect.objectContaining({
+				code: "EINVAL",
+				message: expect.stringContaining("Missing value for --manifest-ttl-ms"),
+			}),
+		);
 	});
 
 	it("throws EINVAL when --manifest-ttl-ms is followed by another flag", () => {
-		expect(() => parseGcArgs(["--manifest-ttl-ms", "--tenant", "t1"])).toThrowError(
-			"Missing value for --manifest-ttl-ms",
+		expect(() => parseGcArgs(["--manifest-ttl-ms", "--tenant", "t1"])).toThrow(
+			expect.objectContaining({
+				code: "EINVAL",
+				message: expect.stringContaining("Missing value for --manifest-ttl-ms"),
+			}),
 		);
 	});
 });
@@ -109,12 +117,28 @@ describe("resolveDurationMs", () => {
 	it("throws EINVAL naming the flag for a negative value", () => {
 		expect(() =>
 			resolveDurationMs("--manifest-ttl-ms", "-1", "PIP_MANIFEST_TTL_MS", DEFAULT_MANIFEST_TTL_MS, envReader({})),
-		).toThrowError('--manifest-ttl-ms must be a non-negative integer (got "-1").');
+		).toThrow(
+			expect.objectContaining({
+				code: "EINVAL",
+				message: expect.stringContaining('--manifest-ttl-ms must be a non-negative integer (got "-1")'),
+			}),
+		);
 	});
 
 	it("throws EINVAL naming the flag for a non-integer value", () => {
 		expect(() =>
 			resolveDurationMs("--min-age-ms", "1.5", "BLOB_GC_MIN_AGE_MS", DEFAULT_BLOB_GC_MIN_AGE_MS, envReader({})),
-		).toThrowError('--min-age-ms must be a non-negative integer (got "1.5").');
+		).toThrow(
+			expect.objectContaining({
+				code: "EINVAL",
+				message: expect.stringContaining('--min-age-ms must be a non-negative integer (got "1.5")'),
+			}),
+		);
+	});
+
+	it("throws EINVAL for an empty string value", () => {
+		expect(() =>
+			resolveDurationMs("--manifest-ttl-ms", "", "PIP_MANIFEST_TTL_MS", DEFAULT_MANIFEST_TTL_MS, envReader({})),
+		).toThrow(expect.objectContaining({ code: "EINVAL" }));
 	});
 });

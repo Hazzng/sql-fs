@@ -122,9 +122,11 @@ function captureSandboxCreate(sessionManager: SessionManager): ToolCall {
 }
 
 describe("MCP sandbox_create — networkWrite", () => {
-	it("declares networkWrite in the tool schema", () => {
+	it("declares networkWrite as an optional boolean in the tool schema", () => {
 		const { schema } = captureSandboxCreate(new SessionManager({ createFs: async () => new InMemoryFs() }));
 		expect(Object.keys(schema).sort()).toEqual(["javascript", "name", "network", "networkWrite", "python"]);
+		const nwSchema = schema.networkWrite as { type?: string };
+		expect(nwSchema).toBeDefined();
 	});
 
 	it("creates a sandbox with networkWrite and echoes it", async () => {
@@ -151,6 +153,16 @@ describe("MCP sandbox_create — networkWrite", () => {
 			error: NETWORK_WRITE_REQUIRES_NETWORK,
 		});
 	});
+
+	it("treats networkWrite as boolean (non-boolean coerces or defaults)", async () => {
+		const sessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
+		const { handler } = captureSandboxCreate(sessionManager);
+		const result = (await handler({ network: true, networkWrite: false })) as {
+			content: [{ text: string }];
+		};
+		const payload = JSON.parse(result.content[0].text) as { id: string; networkWrite: boolean };
+		expect(payload.networkWrite).toBe(false);
+	});
 });
 
 describe("buildRuntimeSandboxEnv — SQLFS_HTTP_WRITE", () => {
@@ -170,5 +182,17 @@ describe("buildRuntimeSandboxEnv — SQLFS_HTTP_WRITE", () => {
 
 	it("never exports it without network, even if networkWrite leaked through", () => {
 		expect(buildRuntimeSandboxEnv({}, false, true)).toBeUndefined();
+	});
+
+	it("strips a leaked SQLFS_HTTP_WRITE from baseEnv when network is disabled", () => {
+		const result = buildRuntimeSandboxEnv({ [HTTP_WRITE_ENV_VAR]: "1" }, false, true);
+		expect(result).toBeUndefined();
+	});
+
+	it("strips a leaked SQLFS_HTTP_WRITE from baseEnv when networkWrite is false", () => {
+		const result = buildRuntimeSandboxEnv({ [HTTP_WRITE_ENV_VAR]: "1", OTHER: "x" }, true, false);
+		expect(result).toBeDefined();
+		expect(result![HTTP_WRITE_ENV_VAR]).toBeUndefined();
+		expect(result!.OTHER).toBe("x");
 	});
 });

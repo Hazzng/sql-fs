@@ -68,6 +68,7 @@ function sameHash(left: Uint8Array | undefined, right: Uint8Array | undefined): 
 interface Owned {
 	readonly package: string;
 	readonly sha256: Uint8Array;
+	readonly mode: number;
 }
 
 /**
@@ -132,6 +133,16 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 	// Each post-install wheel's rows, looked up once and reused by every step below.
 	const planned = [...postInstall.values()].map((row) => ({ row, files: filesOf(row.wheelSha256) }));
 
+	// 1b. Every incoming wheel must have manifest rows; a missing manifest means
+	// GC collected it between Phase W and Phase P.
+	for (const wheel of incoming) {
+		if (filesOf(wheel.wheelSha256).length === 0) {
+			fail(
+				`package manifest for ${wheel.name}-${wheel.version} is missing (may have been collected); retry the install`,
+			);
+		}
+	}
+
 	// 2. Ownership (two packages may share a path only when the bytes are
 	// identical) and 3. quota, both over the post-install set. An ownership
 	// conflict is refused where it is found, the quota once the totals are in.
@@ -140,15 +151,17 @@ export async function publishInstall(options: PublishOptions): Promise<PublishRe
 	let quotaBytes = 0;
 	for (const { row, files } of planned) {
 		for (const file of files) {
-			quotaFiles += 1;
-			quotaBytes += file.size;
 			const existing = owners.get(file.path);
 			if (existing === undefined) {
-				owners.set(file.path, { package: row.name, sha256: file.sha256 });
+				quotaFiles += 1;
+				quotaBytes += file.size;
+				owners.set(file.path, { package: row.name, sha256: file.sha256, mode: file.mode });
 				continue;
 			}
-			if (existing.package !== row.name && !sameHash(existing.sha256, file.sha256)) {
-				fail(`${existing.package} and ${row.name} both provide '${file.path}' with different contents`);
+			if (existing.package !== row.name) {
+				if (!sameHash(existing.sha256, file.sha256) || existing.mode !== file.mode) {
+					fail(`${existing.package} and ${row.name} both provide '${file.path}' with different contents or modes`);
+				}
 			}
 		}
 	}
@@ -288,7 +301,7 @@ export async function uninstallPackage(
 	const stillOwned = new Map<string, Owned>();
 	for (const row of remaining) {
 		for (const file of manifestFiles.get(hex(row.wheelSha256)) ?? []) {
-			stillOwned.set(file.path, { package: row.name, sha256: file.sha256 });
+			stillOwned.set(file.path, { package: row.name, sha256: file.sha256, mode: file.mode });
 		}
 	}
 	const notes = await removeOwnedPaths(ctx, store, manifestFiles.get(hex(target.wheelSha256)) ?? [], stillOwned);

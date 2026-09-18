@@ -95,6 +95,8 @@ describe("pip publish", () => {
 		await expect(publish(fs, [one], { sandboxMaxFiles: 1 })).rejects.toThrow(
 			"installed packages would use 2 files, over this sandbox's 1 file limit (PIP_SANDBOX_MAX_FILES)",
 		);
+		expect(fs.graftedPaths).toEqual([]);
+		expect(fs.ledger.size).toBe(0);
 	});
 
 	it("removes a superseded version's files, keeps an edited one, and prunes the emptied directory", async () => {

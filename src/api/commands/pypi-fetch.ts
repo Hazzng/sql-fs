@@ -102,7 +102,10 @@ async function readCapped(response: Response, maxResponseSize: number): Promise<
 	const declared = response.headers.get("content-length");
 	if (declared !== null) {
 		const length = Number(declared);
-		if (Number.isFinite(length) && length > maxResponseSize) throw new ResponseTooLargeError(maxResponseSize);
+		if (Number.isFinite(length) && length > maxResponseSize) {
+			response.body?.cancel().catch(() => undefined);
+			throw new ResponseTooLargeError(maxResponseSize);
+		}
 	}
 	const body = response.body;
 	if (body === null) return new Uint8Array(0);

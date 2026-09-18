@@ -76,6 +76,24 @@ describe("PEP 508 environment markers", () => {
 			"unknown dependency marker variable 'platform_libc' in marker 'platform_libc == \"glibc\"'",
 		);
 	});
+
+	it("applies the compatible-release upper bound for ~=", () => {
+		// Runtime is 3.13.2 — outside the 3.12.x compatible range.
+		expect(evaluate('python_full_version ~= "3.12.0"')).toBe(false);
+		// Inside the 3.13.x compatible range.
+		expect(evaluate('python_full_version ~= "3.13.0"')).toBe(true);
+		// python_version is "3.13" — inside ~= "3.7" means >= 3.7, < 4.
+		expect(evaluate('python_version ~= "3.7"')).toBe(true);
+	});
+
+	it("performs wildcard prefix matching for == and !=", () => {
+		// Runtime python_full_version is 3.13.2 — matches 3.13.*.
+		expect(evaluate('python_full_version == "3.13.*"')).toBe(true);
+		expect(evaluate('python_full_version != "3.13.*"')).toBe(false);
+		// Does not match 3.12.*.
+		expect(evaluate('python_full_version == "3.12.*"')).toBe(false);
+		expect(evaluate('python_full_version != "3.12.*"')).toBe(true);
+	});
 });
 
 describe("PEP 508 requirements", () => {
