@@ -17,7 +17,7 @@ import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import { extractErrCode } from "../errors.js";
 import { MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES } from "../lib/env.js";
-import { type EditOutcome, editFile, ensureParentDir } from "../lib/file-ops.js";
+import { type EditOutcome, type WriteOutcome, editFile, ensureParentDir, writeFileAtPath } from "../lib/file-ops.js";
 import { runInScriptTx } from "../lib/script-tx.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
@@ -226,16 +226,19 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const buffer = await c.req.raw.arrayBuffer();
 		const content = new Uint8Array(buffer);
 
+		let outcome: WriteOutcome;
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				await ensureParentDir(session.fs, filePath);
-				await session.fs.writeFile(filePath, content);
-			});
+			outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), (session) =>
+				writeFileAtPath(session, filePath, content),
+			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			throw err;
 		}
 
+		if (outcome.kind === "eisdir") {
+			return c.json({ error: "is_directory", code: "EISDIR" }, 400 as ContentfulStatusCode);
+		}
 		return c.body(null, 204);
 	});
 

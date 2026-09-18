@@ -16,6 +16,12 @@ import type { Session } from "../session-manager.js";
  * saying "not written" about a write that is durable, and lets that write race the replica which
  * took over the expired lease. Throwing here rolls the scope back instead.
  *
+ * A lease lost during the COMMIT round-trip itself still commits and is still reported as
+ * retryable, so the client may double-apply on retry: closing that needs the commit fenced in the
+ * database on an epoch the takeover replica invalidates, which is the deferred F2-L2 (#131) and is
+ * not something a signal check on this side of the round-trip can do. The exec path carries the
+ * same window.
+ *
  * Backends without script-tx (in-memory) have no scope to roll back, so `fn` runs directly.
  */
 export async function runInScriptTx<T>(session: Session, fn: () => Promise<T>): Promise<T> {

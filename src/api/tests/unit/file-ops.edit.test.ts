@@ -6,7 +6,7 @@
 
 import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
-import { editFile } from "../../lib/file-ops.js";
+import { REPLACE_FLUSH_PIECES, editFile } from "../../lib/file-ops.js";
 import type { Session } from "../../session-manager.js";
 
 const MAX = 1024;
@@ -73,6 +73,40 @@ describe("editFile", () => {
 
 		expect(outcome).toEqual({ kind: "too_large" });
 		expect(await fs.readFile("/a.txt", "utf8")).toBe("aaaa");
+	});
+
+	// The replacement is built in flushed chunks. These pin the seams that shape can get wrong:
+	// matches either side of a flush, adjacent matches, and matches touching both ends of the file.
+	it("replaces every occurrence across the chunk-flush boundary", async () => {
+		const fs = new InMemoryFs();
+		// Derived, not literal: a raised flush threshold must not quietly stop crossing a boundary.
+		const count = REPLACE_FLUSH_PIECES;
+		await fs.writeFile("/many.txt", "ab".repeat(count));
+
+		const outcome = await editFile(
+			makeSession(fs),
+			"/many.txt",
+			{ oldString: "a", newString: "X", replaceAll: true },
+			MAX * 8,
+		);
+
+		expect(outcome).toEqual({ kind: "ok", replacements: count, size: count * 2 });
+		expect(await fs.readFile("/many.txt", "utf8")).toBe("Xb".repeat(count));
+	});
+
+	it("replaces adjacent matches at both ends of the file", async () => {
+		const fs = new InMemoryFs();
+		await fs.writeFile("/edges.txt", "aabaa");
+
+		const outcome = await editFile(
+			makeSession(fs),
+			"/edges.txt",
+			{ oldString: "a", newString: "z", replaceAll: true },
+			MAX,
+		);
+
+		expect(outcome).toEqual({ kind: "ok", replacements: 4, size: 5 });
+		expect(await fs.readFile("/edges.txt", "utf8")).toBe("zzbzz");
 	});
 
 	it("refuses a file already past the limit without reading it", async () => {

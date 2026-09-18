@@ -17,7 +17,7 @@ import { clientSafeErrorMessage, extractErrCode } from "../errors.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
 import { MAX_FILE_WRITE_BYTES as MAX_EDIT_BYTES, positiveIntEnv } from "../lib/env.js";
-import { editFile, ensureParentDir } from "../lib/file-ops.js";
+import { editFile, writeFileAtPath } from "../lib/file-ops.js";
 import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -302,25 +302,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			}
 
 			try {
-				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
-					// Guard here rather than relying on the backend: SqlFs rejects a write
-					// over a directory, InMemoryFs silently clobbers it.
-					try {
-						if ((await session.fs.stat(filePath)).isDirectory) return { kind: "eisdir" } as const;
-					} catch (e) {
-						if (extractErrCode(e) !== "ENOENT") throw e;
-					}
-
-					await ensureParentDir(session.fs, filePath);
-					try {
-						await session.fs.writeFile(filePath, encoded);
-					} catch (e) {
-						const code = extractErrCode(e);
-						if (code === "EISDIR") return { kind: "eisdir" } as const;
-						throw e;
-					}
-					return { kind: "ok" } as const;
-				});
+				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
+					writeFileAtPath(session, filePath, encoded),
+				);
 
 				if (outcome.kind === "eisdir") return fail("path is a directory", { code: "EISDIR", path: filePath });
 				return {

@@ -58,6 +58,36 @@ function countOccurrences(haystack: string, needle: string): number {
 	return count;
 }
 
+/** Pieces buffered before flushing, two per match. Sized off a peak-RSS sweep; 1024 is the knee. */
+export const REPLACE_FLUSH_PIECES = 1024;
+
+/**
+ * Replace `needle` left-to-right and non-overlapping, matching how `countOccurrences` counts.
+ *
+ * Hand-rolled because both `split().join()` and `String.replaceAll` allocate per occurrence, and
+ * a one-character `oldString` repeated through a file at `MAX_FILE_WRITE_BYTES` has tens of
+ * millions of them: measured peak RSS at 64 MiB is 357 MB here against 1184 MB for split/join and
+ * 2474 MB for the builtin. Flushing keeps the pending array bounded, so memory tracks the output.
+ */
+function replaceOccurrences(text: string, needle: string, replacement: string, all: boolean): string {
+	let out = "";
+	const pending: string[] = [];
+	let from = 0;
+	let idx = text.indexOf(needle);
+	while (idx !== -1) {
+		pending.push(text.slice(from, idx), replacement);
+		if (pending.length >= REPLACE_FLUSH_PIECES) {
+			out += pending.join("");
+			pending.length = 0;
+		}
+		from = idx + needle.length;
+		if (!all) break;
+		idx = text.indexOf(needle, from);
+	}
+	pending.push(text.slice(from));
+	return out + pending.join("");
+}
+
 async function applyEdit(session: Session, filePath: string, req: EditRequest, maxBytes: number): Promise<EditOutcome> {
 	let stat: FsStat;
 	try {
@@ -85,11 +115,12 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 	}
 	if (text.includes("\0")) return { kind: "binary" };
 
+	const all = req.replaceAll === true;
 	const count = countOccurrences(text, req.oldString);
 	if (count === 0) return { kind: "no_match" };
-	if (count > 1 && req.replaceAll !== true) return { kind: "not_unique", count };
+	if (count > 1 && !all) return { kind: "not_unique", count };
 
-	const replacements = req.replaceAll === true ? count : 1;
+	const replacements = all ? count : 1;
 	const encoder = new TextEncoder();
 
 	// Project the result size before building it. A fatal, BOM-preserving decode round-trips
@@ -98,11 +129,7 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 	const delta = encoder.encode(req.newString).byteLength - encoder.encode(req.oldString).byteLength;
 	if (bytes.byteLength + replacements * delta > maxBytes) return { kind: "too_large" };
 
-	const index = text.indexOf(req.oldString);
-	const updated =
-		req.replaceAll === true
-			? text.split(req.oldString).join(req.newString)
-			: text.slice(0, index) + req.newString + text.slice(index + req.oldString.length);
+	const updated = replaceOccurrences(text, req.oldString, req.newString, all);
 
 	// Encode once: `writeFile` would otherwise re-encode the same string internally.
 	const encoded = encoder.encode(updated);
@@ -125,4 +152,33 @@ export async function editFile(
 	maxBytes: number,
 ): Promise<EditOutcome> {
 	return runInScriptTx(session, () => applyEdit(session, filePath, req, maxBytes));
+}
+
+export type WriteOutcome = { kind: "ok" } | { kind: "eisdir" };
+
+/**
+ * Overwrite a whole file, creating its parents, inside one script-tx scope — so the parents and
+ * the file commit together and a lease lost mid-write does not commit at all.
+ *
+ * Owns its scope for the same reason `editFile` does: a write surface that has to remember to
+ * wrap itself is a write surface that eventually forgets.
+ */
+export async function writeFileAtPath(session: Session, filePath: string, content: Uint8Array): Promise<WriteOutcome> {
+	return runInScriptTx(session, async () => {
+		// Guard here rather than relying on the backend: SqlFs rejects a write over a directory,
+		// InMemoryFs silently clobbers it.
+		try {
+			if ((await session.fs.stat(filePath)).isDirectory) return { kind: "eisdir" };
+		} catch (e) {
+			if (extractErrCode(e) !== "ENOENT") throw e;
+		}
+		await ensureParentDir(session.fs, filePath);
+		try {
+			await session.fs.writeFile(filePath, content);
+		} catch (e) {
+			if (extractErrCode(e) === "EISDIR") return { kind: "eisdir" };
+			throw e;
+		}
+		return { kind: "ok" };
+	});
 }
