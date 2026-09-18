@@ -45,6 +45,17 @@ export class FakeRedis {
 		return z;
 	}
 
+	async set(key: string, value: string, unit: "PX" | "EX", amount: number): Promise<"OK"> {
+		this.gc();
+		this.store.set(key, { value, expiresAt: Date.now() + (unit === "EX" ? amount * 1000 : amount) });
+		return "OK";
+	}
+
+	async get(key: string): Promise<string | null> {
+		this.gc();
+		return this.store.get(key)?.value ?? null;
+	}
+
 	async getex(key: string, _ex: "EX", seconds: number): Promise<string | null> {
 		this.gc();
 		const e = this.store.get(key);
@@ -53,9 +64,18 @@ export class FakeRedis {
 		return e.value;
 	}
 
+	/**
+	 * Faithful to real Redis on the point #187 turns on: INCR against a key whose
+	 * value is not an integer is a command error, not a clamp to 0. Tests poison a
+	 * key by writing a non-numeric value into `store` and let this throw.
+	 */
 	async incr(key: string): Promise<number> {
 		this.gc();
-		const current = Number(this.store.get(key)?.value ?? "0") || 0;
+		const raw = this.store.get(key)?.value;
+		if (raw !== undefined && !/^-?\d+$/.test(raw)) {
+			throw new Error("ERR value is not an integer or out of range");
+		}
+		const current = Number(raw ?? "0") || 0;
 		const next = current + 1;
 		this.store.set(key, { value: String(next), expiresAt: Date.now() + 60_000 });
 		return next;

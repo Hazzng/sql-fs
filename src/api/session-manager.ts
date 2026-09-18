@@ -86,6 +86,25 @@ export function assertIdleBelowVersionTtl(idleMs: number, hasRedis: boolean): vo
 	}
 }
 
+/**
+ * #187: true when an `INCR` on the version key failed because the key itself is
+ * structurally unusable rather than because Redis was unreachable.
+ *
+ * Redis answers `INCR` on a non-numeric string with `ERR value is not an integer
+ * or out of range` and on a hash/list/set/zset with `WRONGTYPE ...`. Both are
+ * permanent: every later INCR fails identically, so the #175 deferral never
+ * drains and the sandbox stays write-wedged until a human edits Redis. Every
+ * other failure — timeouts, ECONNRESET, `READONLY You can't write against a read
+ * only replica`, breaker rejections — is transient or environmental and must keep
+ * the deferral, so this matcher is deliberately narrow: two exact Redis reply
+ * prefixes, nothing inferred from error class or command name.
+ */
+export function isPoisonedVersionKeyError(err: unknown): boolean {
+	const message = (err as { message?: unknown } | null)?.message;
+	if (typeof message !== "string") return false;
+	return message.startsWith("WRONGTYPE") || message.startsWith("ERR value is not an integer");
+}
+
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
 	if (
@@ -1066,6 +1085,69 @@ export class SessionManager {
 		console.error(JSON.stringify({ event: "session_torn_down_sandbox_gone", tenantId, sandboxId }));
 	}
 
+	/**
+	 * #187: repair a structurally invalid version key so the sandbox stops
+	 * returning `503 ECOHERENCE` on every write forever. Returns the version the
+	 * caller should publish, or `null` if the repair itself failed (Redis is also
+	 * unreachable) — in which case the caller falls back to the #175 deferral.
+	 *
+	 * The poisoned value destroyed the counter, so its old height is unknowable.
+	 * We reset to the current epoch-millis instead of restarting at 1: every
+	 * replica reloads on `lastSeenVersion !== current`, and a counter that
+	 * restarted at 1 would silently match a sibling still holding 1 (serving
+	 * stale reads with no further write to shake it loose). An epoch stamp is
+	 * above any value a real counter can reach — it takes ~1.7e12 writes — and it
+	 * grows across repeated resets, so no sibling can be holding it. It is not a
+	 * clock dependency: only the *difference* is load-bearing, so skew between
+	 * replicas is harmless.
+	 */
+	private async resetPoisonedVersionKey(
+		tenantId: string,
+		sandboxId: string,
+		key: string,
+		cause: unknown,
+	): Promise<number | null> {
+		// F7's destroy tombstone is also a non-numeric string, so it fails INCR the
+		// same way — but it is a deliberate sentinel, not corruption. Overwriting it
+		// with a live counter would resurrect a destroyed sandbox for every sibling
+		// replica that has not yet torn its warm session down. Leave it alone and
+		// let the caller defer; the next `ensureFreshCache` sees the tombstone and
+		// raises ENOENT. A read that throws (WRONGTYPE) is genuine corruption.
+		let current: string | null = null;
+		try {
+			current = await this.redis!.get(key);
+		} catch {
+			current = null;
+		}
+		if (current === VERSION_TOMBSTONE) return null;
+
+		const reset = Date.now();
+		try {
+			// Unconditional SET replaces any type, so this heals WRONGTYPE too.
+			await this.redis!.set(key, String(reset), "EX", VERSION_KEY_TTL_SECONDS);
+		} catch (err) {
+			console.error(
+				JSON.stringify({
+					event: "version_key_reset_error",
+					tenantId,
+					sandboxId,
+					error: (err as Error).message,
+				}),
+			);
+			return null;
+		}
+		console.error(
+			JSON.stringify({
+				event: "version_key_poisoned_reset",
+				tenantId,
+				sandboxId,
+				resetTo: reset,
+				error: (cause as Error).message,
+			}),
+		);
+		return reset;
+	}
+
 	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
@@ -1100,40 +1182,50 @@ export class SessionManager {
 		try {
 			newVersion = Number(await this.redis.incr(key));
 		} catch (err) {
-			// The local write committed to Postgres but we could not publish a
-			// new version to Redis — other replicas will continue to serve
-			// stale reads from their local pathCache. Preserve the dirty flag
-			// (do NOT clearDirty), force the next exec on this replica to
-			// reload from Postgres, and surface a caller-visible 503 so the
-			// client knows cross-replica coherence is broken.
-			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
-			session.lastSeenVersion = -1;
-			session.publishPending = true;
-			// F3: enqueue for the background drainer so the stranded bump is healed
-			// even if no further client traffic arrives on this replica (and before
-			// the reaper would evict the session, discarding `publishPending`).
-			this.pendingPublishes.set(this.sessionKey(tenantId, sandboxId), { tenantId, sandboxId });
-			// #175: this turn mutated nothing — it only piggy-backed a previous turn's
-			// stranded bump. Its own result is correct and durable, so it must not
-			// inherit that turn's 503; the drainer (and the next writer) heals the
-			// bump. Without this, a pure read on a session with `publishPending` set
-			// returns "write committed but version publish failed", which is a lie
-			// about a request that wrote nothing.
-			if (!dirty) {
-				console.error(JSON.stringify({ event: "version_incr_error_deferred", sandboxId }));
-				return;
+			// #187: a structurally invalid key (non-numeric string, wrong type) makes
+			// every future INCR fail identically, so deferring forever wedges the
+			// sandbox. Repair it in place and carry on with the publish. A transport
+			// failure gets the #175 deferral below, unchanged.
+			const recovered = isPoisonedVersionKeyError(err)
+				? await this.resetPoisonedVersionKey(tenantId, sandboxId, key, err)
+				: null;
+			if (recovered === null) {
+				// The local write committed to Postgres but we could not publish a
+				// new version to Redis — other replicas will continue to serve
+				// stale reads from their local pathCache. Preserve the dirty flag
+				// (do NOT clearDirty), force the next exec on this replica to
+				// reload from Postgres, and surface a caller-visible 503 so the
+				// client knows cross-replica coherence is broken.
+				console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (err as Error).message }));
+				session.lastSeenVersion = -1;
+				session.publishPending = true;
+				// F3: enqueue for the background drainer so the stranded bump is healed
+				// even if no further client traffic arrives on this replica (and before
+				// the reaper would evict the session, discarding `publishPending`).
+				this.pendingPublishes.set(this.sessionKey(tenantId, sandboxId), { tenantId, sandboxId });
+				// #175: this turn mutated nothing — it only piggy-backed a previous turn's
+				// stranded bump. Its own result is correct and durable, so it must not
+				// inherit that turn's 503; the drainer (and the next writer) heals the
+				// bump. Without this, a pure read on a session with `publishPending` set
+				// returns "write committed but version publish failed", which is a lie
+				// about a request that wrote nothing.
+				if (!dirty) {
+					console.error(JSON.stringify({ event: "version_incr_error_deferred", sandboxId }));
+					return;
+				}
+				// #175: the mutation IS committed in Postgres. Retrying re-applies a
+				// non-idempotent script, so the message must not instruct a retry — the
+				// old wording ("client should retry") contradicted the OpenAPI contract
+				// and told clients to do the one unsafe thing.
+				throw Object.assign(
+					new Error(
+						"ECOHERENCE: write committed but cross-replica version publish failed; " +
+							"the write IS applied — do not blindly retry",
+					),
+					{ code: "ECOHERENCE" },
+				);
 			}
-			// #175: the mutation IS committed in Postgres. Retrying re-applies a
-			// non-idempotent script, so the message must not instruct a retry — the
-			// old wording ("client should retry") contradicted the OpenAPI contract
-			// and told clients to do the one unsafe thing.
-			throw Object.assign(
-				new Error(
-					"ECOHERENCE: write committed but cross-replica version publish failed; " +
-						"the write IS applied — do not blindly retry",
-				),
-				{ code: "ECOHERENCE" },
-			);
+			newVersion = recovered;
 		}
 		try {
 			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);
