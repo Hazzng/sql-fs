@@ -1,35 +1,60 @@
 /**
- * Shared Redis client singleton.
+ * Role-split Redis clients.
  *
- * `getRedisClient()` lazily constructs a single `ioredis` instance from the
- * `REDIS_URL` environment variable. If `REDIS_URL` is unset, returns `undefined`
- * so callers can gracefully fall back to Postgres-only operation.
+ * #167: one ioredis connection carried everything — blob cache, path snapshot,
+ * locks, version counter and session state. ioredis pipelines commands over a
+ * single socket, so a queue of multi-MiB blob `SET`s head-of-line blocks the
+ * latency-critical `INCR`/`EVAL` behind them; at 260 in-flight 2 MiB writes an
+ * `INCR` on the shared connection timed out at 2043 ms while the same command
+ * on a separate connection answered in 44 ms. Each timeout then drove the lock
+ * acquire breaker, which fast-failed every request on the replica.
+ *
+ * So the data plane (blob cache, path snapshot) gets its own connection and the
+ * control plane (locks, version counter, session state) keeps the original one.
+ * `REDIS_DATA_URL` defaults to `REDIS_URL`: the split is by connection, not by
+ * server, so existing single-Redis deployments get the isolation for free.
  */
 
 import { Redis, type RedisOptions } from "ioredis";
 
-let client: Redis | undefined;
-let initialized = false;
+/**
+ * Which class of traffic a client carries. `control` is latency-critical and
+ * correctness-bearing (a timeout there fails a request); `data` is best-effort
+ * cache traffic that always falls back to Postgres.
+ */
+export type RedisRole = "control" | "data";
+
+export const REDIS_ROLES: readonly RedisRole[] = ["control", "data"];
+
+const clients: Map<RedisRole, Redis> = new Map();
+const initialized: Set<RedisRole> = new Set();
 
 export interface RedisConfig {
 	readonly url: string;
 	readonly options?: RedisOptions;
 }
 
+/** Env var holding the connection string for a role. Data falls back to `REDIS_URL`. */
+function urlFor(role: RedisRole): string | undefined {
+	if (role === "control") return process.env.REDIS_URL;
+	return process.env.REDIS_DATA_URL || process.env.REDIS_URL;
+}
+
 /**
- * Returns the process-wide Redis client, or `undefined` when `REDIS_URL` is
- * unset. The client is created on first call and reused for the lifetime of
- * the process.
+ * Returns the Redis client for `role`, or `undefined` when no URL is configured
+ * for it. Clients are created on first call and reused for the lifetime of the
+ * process. Roles never share a socket, even when they resolve to the same URL —
+ * that separation is the whole point (#167).
  */
-export function getRedisClient(): Redis | undefined {
-	if (initialized) return client;
-	initialized = true;
-	const url = process.env.REDIS_URL;
+export function getRedisClient(role: RedisRole = "control"): Redis | undefined {
+	if (initialized.has(role)) return clients.get(role);
+	initialized.add(role);
+	const url = urlFor(role);
 	if (!url) {
-		console.log(JSON.stringify({ event: "redis_disabled", reason: "REDIS_URL not set" }));
+		console.log(JSON.stringify({ event: "redis_disabled", role, reason: "REDIS_URL not set" }));
 		return undefined;
 	}
-	client = new Redis(url, {
+	const client = new Redis(url, {
 		lazyConnect: false,
 		maxRetriesPerRequest: 3,
 		enableReadyCheck: true,
@@ -39,18 +64,20 @@ export function getRedisClient(): Redis | undefined {
 		// advance within a few seconds and the circuit breaker open.
 		commandTimeout: 2_000,
 		retryStrategy: (times) => Math.min(1000 * 2 ** times, 30_000),
+		connectionName: `sql-fs-${role}`,
 	});
+	clients.set(role, client);
 	client.on("error", (err) => {
-		console.error(JSON.stringify({ event: "redis_error", error: err.message }));
+		console.error(JSON.stringify({ event: "redis_error", role, error: err.message }));
 	});
 	client.on("connect", () => {
-		console.log(JSON.stringify({ event: "redis_connect" }));
+		console.log(JSON.stringify({ event: "redis_connect", role }));
 	});
 	return client;
 }
 
 /**
- * Gracefully close the shared Redis client. Issues `quit()` (drains pending
+ * Gracefully close every role's Redis client. Issues `quit()` (drains pending
  * commands), and falls back to `disconnect()` on timeout or failure so a
  * misbehaving Redis cannot block process shutdown.
  *
@@ -58,24 +85,26 @@ export function getRedisClient(): Redis | undefined {
  * calls are no-ops. Once closed, `getRedisClient()` will not reinitialize.
  */
 export async function closeRedisClient(timeoutMs = 5_000): Promise<void> {
-	const c = client;
-	if (c === undefined) {
-		// Mark as initialized so future getRedisClient() calls don't construct a new client during shutdown.
-		initialized = true;
-		return;
-	}
-	client = undefined;
-	try {
-		await Promise.race([
-			c.quit(),
-			new Promise<void>((_, reject) => setTimeout(() => reject(new Error("redis_quit_timeout")), timeoutMs)),
-		]);
-	} catch (err) {
-		console.error(JSON.stringify({ event: "redis_quit_error", error: (err as Error).message }));
-		try {
-			c.disconnect();
-		} catch {
-			// best-effort
-		}
-	}
+	// Mark every role initialized so a late getRedisClient() during shutdown
+	// cannot construct a fresh connection.
+	for (const role of REDIS_ROLES) initialized.add(role);
+	const open = [...clients.entries()];
+	clients.clear();
+	await Promise.all(
+		open.map(async ([role, c]) => {
+			try {
+				await Promise.race([
+					c.quit(),
+					new Promise<void>((_, reject) => setTimeout(() => reject(new Error("redis_quit_timeout")), timeoutMs)),
+				]);
+			} catch (err) {
+				console.error(JSON.stringify({ event: "redis_quit_error", role, error: (err as Error).message }));
+				try {
+					c.disconnect();
+				} catch {
+					// best-effort
+				}
+			}
+		}),
+	);
 }
