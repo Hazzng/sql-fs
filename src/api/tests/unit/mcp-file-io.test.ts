@@ -122,6 +122,21 @@ describe("MCP tool — file_read", () => {
 
 	// The cap governs the reply, so it is asserted on the serialized envelope: budgeting only the
 	// content let the echoed path and metadata push the actual response past it.
+	// `editFile` preserves a BOM, so a read that consumed it would strip the marker on the first
+	// read-then-write round trip, and every byte offset would sit 3 bytes off the file's own.
+	it("keeps a leading UTF-8 BOM in the content it returns", async () => {
+		const { call, fs } = await makeEnv();
+		const withBom = new TextEncoder().encode("\uFEFFconst port = 3000;\n");
+		await fs.writeFile("/bom.ts", withBom);
+
+		const result = await call("file_read", { path: "/bom.ts" });
+
+		expect(result.content).toBe("\uFEFFconst port = 3000;\n");
+		expect(result.size).toBe(withBom.byteLength);
+		// Round-trips: writing the content back reproduces the file byte for byte.
+		expect(Array.from(new TextEncoder().encode(result.content as string))).toEqual(Array.from(withBom));
+	});
+
 	// 0, not 1: bare `"".split("\n")` would say 1, and the code this replaced special-cased the empty
 	// string to avoid exactly that.
 	it("reports an empty file as having no lines", async () => {

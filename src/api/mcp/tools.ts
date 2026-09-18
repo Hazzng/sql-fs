@@ -225,7 +225,10 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 
 					let text: string;
 					try {
-						text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+						// `ignoreBOM` keeps a leading U+FEFF in the string rather than consuming it, matching
+						// `editFile`: a read whose content is written back must not silently drop the marker,
+						// and the byte offsets below are only the file's own if the text round-trips exactly.
+						text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 					} catch {
 						return { kind: "not_text" } as const;
 					}
@@ -843,7 +846,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		},
 		async (args) => {
 			const basePath = args.basePath ?? "/home/user";
-			const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+			// `ignoreBOM` for the same reason as file_read: an export is re-imported verbatim.
+			const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 			try {
 				const { files, errors } = await withOwnedSessionOrRehydrate(
