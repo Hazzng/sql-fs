@@ -29,5 +29,10 @@ export function positiveIntEnv(value: string | undefined, fallback: number): num
  * one it rejects is retained twice over — and again per pool connection that read it, so load
  * testing measured a 64 MiB file costing 256 MB per warm session for the full `SESSION_IDLE_MS`.
  * Raising this past `DEFAULT_CONTENT_CACHE_MAX_BYTES` buys larger writes at 4x the memory each.
+ *
+ * Sizing note: on Linux a write costs roughly 7x the file size over baseline, and the bytes live
+ * in `external`, not the V8 heap — so `--max-old-space-size` does not bound it and the cgroup
+ * OOM-kills instead. At this default a single legal write needs a container of 768 MiB; 512 MiB
+ * dies on one request.
  */
 export const MAX_FILE_WRITE_BYTES = positiveIntEnv(process.env.MAX_FILE_WRITE_BYTES, DEFAULT_CONTENT_CACHE_MAX_BYTES);
