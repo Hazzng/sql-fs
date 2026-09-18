@@ -10,15 +10,14 @@
  */
 
 import { Hono } from "hono";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
-import { clientSafeErrorMessage, mapFsErrorToStatus } from "../../errors.js";
 import { fileRoutes } from "../../routes/files.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
+import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "test-secret-writefiles-atomicity-at-least-32b!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -58,12 +57,9 @@ describe.skipIf(!process.env.DATABASE_URL)("writeFiles atomicity (H10, real Post
 		app.use("/v1/*", authMiddleware);
 		app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 		app.route("/v1/sandboxes", fileRoutes(sessionManager));
-		// Mirror the production error handler so FS errors map to their status
+		// Shares the production error handler so FS errors map to their status
 		// (e.g. EISDIR → 400) instead of a generic 500.
-		app.onError((err, c) => {
-			const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-			return c.json({ error: clientSafeErrorMessage(err), code }, mapFsErrorToStatus(err) as ContentfulStatusCode);
-		});
+		app.onError(testErrorHandler);
 	});
 
 	it("rolls back the whole batch when one entry fails mid-write (no partial persist)", async () => {
