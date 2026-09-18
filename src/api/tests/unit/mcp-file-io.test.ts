@@ -122,6 +122,46 @@ describe("MCP tool — file_read", () => {
 
 	// The cap governs the reply, so it is asserted on the serialized envelope: budgeting only the
 	// content let the echoed path and metadata push the actual response past it.
+	// 0, not 1: bare `"".split("\n")` would say 1, and the code this replaced special-cased the empty
+	// string to avoid exactly that.
+	it("reports an empty file as having no lines", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/empty.txt", "");
+
+		expect(await call("file_read", { path: "/empty.txt" })).toMatchObject({
+			ok: true,
+			content: "",
+			size: 0,
+			totalLines: 0,
+			truncated: false,
+		});
+	});
+
+	// The cap takes any positive integer, so it can sit below the envelope — where the only pages on
+	// offer are one over the cap or one whose `nextByteOffset` never advances.
+	it("refuses a configured budget too small to hold an envelope", async () => {
+		vi.stubEnv("AUTH_SECRET", "test-secret-mcp-file-io-at-least-32bytes");
+		vi.stubEnv("MAX_MCP_READ_RESPONSE_BYTES", "50");
+		vi.resetModules();
+		const { registerTools: registerFresh } = await import("../../mcp/tools.js");
+
+		const fs = new InMemoryFs();
+		const sessionManager = new SessionManager({ createFs: async () => fs });
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, OWNER);
+		const { server, handlers } = captureToolHandlers();
+		registerFresh(server, sessionManager, OWNER, "default");
+		await fs.writeFile("/x.txt", "hello world");
+
+		const res = (await requireHandler(handlers, "file_read")({ id: SANDBOX_ID, path: "/x.txt" }, {})) as {
+			content: Array<{ text: string }>;
+		};
+
+		expect(JSON.parse(res.content[0]?.text ?? "")).toMatchObject({
+			ok: false,
+			code: "RESPONSE_BUDGET_TOO_SMALL",
+		});
+	});
+
 	it("keeps the whole serialized reply within the wire cap", async () => {
 		const { callRaw, fs } = await makeEnv();
 		await fs.writeFile("/big.txt", "z".repeat(2 * 1024 * 1024));

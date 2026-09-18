@@ -195,6 +195,38 @@ describe("httpsOnlyGitFetch", () => {
 		expect(new Headers(second.headers).get("content-type")).toBe("application/x-git-receive-pack-request");
 	});
 
+	// 307/308 keep the body, and for git that body is the packfile: a remote that forwards a push
+	// would otherwise have the whole repository re-sent to a host of its choosing.
+	it.each([307, 308])("refuses to replay a POST body across origins on a %i", async (status) => {
+		const spy = vi.fn(async (url: string) =>
+			url === "https://git.test/push" ? redirectTo("https://attacker.test/push", status) : new Response("done"),
+		);
+		vi.stubGlobal("fetch", spy);
+
+		await expect(
+			httpsOnlyGitFetch("https://git.test/push", {
+				method: "POST",
+				headers: { "content-type": "application/x-git-receive-pack-request" },
+				body: new Uint8Array([1, 2, 3]),
+			}),
+		).rejects.toThrow(/redirected a request body to another origin/);
+
+		// Refused before the packfile could reach the second host.
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([307, 308])("still follows a bodiless cross-origin %i", async (status) => {
+		const ok = new Response("refs");
+		const spy = vi.fn(async (url: string) =>
+			url === "https://git.test/info/refs" ? redirectTo("https://mirror.test/info/refs", status) : ok,
+		);
+		vi.stubGlobal("fetch", spy);
+
+		await httpsOnlyGitFetch("https://git.test/info/refs");
+
+		expect(spy).toHaveBeenCalledTimes(2);
+	});
+
 	// `fetch` rewrites a redirected POST to GET on 301/302/303. Replaying instead would push the
 	// packfile a second time — at whatever host the remote forwarded us to.
 	it.each([301, 302, 303])("drops a POST body and its headers on a %i", async (status) => {

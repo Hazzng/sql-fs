@@ -124,10 +124,6 @@ export const httpsOnlyGitFetch: GitFetchFunction = async (input, init) => {
 
 		const next = new URL(location, url).href;
 		requireHttps(next, "remote redirected to plaintext HTTP");
-		if (new URL(next).origin !== new URL(url).origin) {
-			headers.delete("authorization");
-			headers.delete("cookie");
-		}
 		// What `fetch` does when it follows a redirect itself: 303 is "repeat this as a GET", and so is
 		// 301/302 on a POST. Only 307/308 replay the body — which for git is a packfile, so replaying it
 		// onto a host we were forwarded to would re-send the push.
@@ -138,6 +134,15 @@ export const httpsOnlyGitFetch: GitFetchFunction = async (input, init) => {
 			method = "GET";
 			body = undefined;
 			for (const header of BODY_HEADERS) headers.delete(header);
+		}
+		if (new URL(next).origin !== new URL(url).origin) {
+			headers.delete("authorization");
+			headers.delete("cookie");
+			// 307/308 keep the body, and for git that body is the packfile: dropping the credential would
+			// still let a remote forward the whole push to an origin of its choosing.
+			if (body !== undefined) {
+				throw new Error(`git: remote redirected a request body to another origin (${next}); refusing to re-send it`);
+			}
 		}
 		url = next;
 	}

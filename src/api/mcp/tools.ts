@@ -49,9 +49,8 @@ function jsonSize(text: string): number {
 }
 
 /**
- * Lines in `text`, counting the empty line after a trailing newline exactly as `split("\n")` would,
- * without allocating one array slot per line — a 16 MiB file of newlines would otherwise materialize
- * ~16M of them for a read whose reply is capped at 1 MiB.
+ * Lines in `text`, counted as `split("\n")` would (empty file: 0), without a slot per line — a 16 MiB
+ * file of newlines would otherwise materialize ~16M of them for a reply capped at 1 MiB.
  */
 function countLines(text: string): number {
 	if (text.length === 0) return 0;
@@ -236,11 +235,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					const firstLine = args.offset ?? 1;
 					const selectionStartChar = paging ? lineStartOffset(text, firstLine) : 0;
 					let selectionEndChar = text.length;
-					// `join("\n")` drops the separator before the line after the page, so the slice stops one
-					// character short of it — but only when that line exists. Deciding that on the offset
-					// instead (`afterLast >= text.length`) gets the synthetic empty line after a trailing
-					// newline wrong: it starts AT the end, so a page ending just before it kept a newline
-					// that `split`/`join` would have dropped.
+					// `join("\n")` drops the separator before the next line, so the slice stops one short of it
+					// — but only when that line exists. The empty line after a trailing newline starts AT the
+					// end, so deciding this from the offset kept a newline `split`/`join` would have dropped.
 					if (paging && args.limit !== undefined && firstLine + args.limit <= totalLines) {
 						selectionEndChar = lineStartOffset(text, firstLine + args.limit) - 1;
 					}
@@ -281,12 +278,14 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
 					);
 					let reply = replyFor(end);
-					// Measured on the whole reply in the form the wire carries it: the envelope and echoed
-					// path travel too, and this text is serialized a SECOND time inside the MCP JSON-RPC
-					// result, which re-escapes every backslash the first pass added. A NUL costs six
-					// characters here and seven there, so a page of them budgeted on the inner form alone
-					// lands well over. Shrink until the embedded form fits — the ratio converges in a couple
-					// of passes, and `end - 1` guarantees progress when it does not.
+					// A budget below the envelope has no honest page: the reply would exceed the cap and its
+					// `nextByteOffset` would equal the offset asked for, resuming forever without advancing.
+					if (jsonSize(replyFor(start)) > MAX_READ_RESPONSE_BYTES) {
+						return { kind: "budget_too_small" } as const;
+					}
+					// Sized on the form the wire carries: the MCP transport serializes this text again inside
+					// the JSON-RPC result, re-escaping every backslash, so a page of NULs budgeted on the
+					// inner form lands ~17% over. `end - 1` guarantees progress if the ratio does not.
 					while (end > start && jsonSize(reply) > MAX_READ_RESPONSE_BYTES) {
 						const fit = MAX_READ_RESPONSE_BYTES / jsonSize(reply);
 						const proposed = start + Math.max(1, Math.floor((end - start) * fit));
@@ -308,6 +307,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 							code: "PAYLOAD_TOO_LARGE",
 							path: filePath,
 						});
+					case "budget_too_small":
+						return fail(
+							`MAX_MCP_READ_RESPONSE_BYTES (${MAX_READ_RESPONSE_BYTES}) is too small to hold a response envelope for this path`,
+							{ code: "RESPONSE_BUDGET_TOO_SMALL", path: filePath },
+						);
 					default:
 						// Serialized under the budget above, not re-assembled here: rebuilding it would
 						// reintroduce the unmeasured envelope this cap exists to account for.

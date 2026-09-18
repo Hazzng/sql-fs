@@ -26,14 +26,18 @@ import type { Session } from "../../session-manager.js";
 function makeScriptTxFs(fs: InMemoryFs): { scriptTxFs: IScriptTxFs; calls: string[] } {
 	const calls: string[] = [];
 	let active = false;
-	let snap: Map<string, Uint8Array> | undefined;
+	let snap: { files: Map<string, Uint8Array>; dirs: Set<string> } | undefined;
 
-	const snapshot = async (): Promise<Map<string, Uint8Array>> => {
-		const taken = new Map<string, Uint8Array>();
+	// Directories too: `writeFileAtPath` creates parents, and restoring only file contents would
+	// leave `/nested/dir` standing — not a rollback.
+	const snapshot = async (): Promise<{ files: Map<string, Uint8Array>; dirs: Set<string> }> => {
+		const files = new Map<string, Uint8Array>();
+		const dirs = new Set<string>();
 		for (const path of fs.getAllPaths()) {
-			if (!(await fs.stat(path)).isDirectory) taken.set(path, await fs.readFileBuffer(path));
+			if ((await fs.stat(path)).isDirectory) dirs.add(path);
+			else files.set(path, await fs.readFileBuffer(path));
 		}
-		return taken;
+		return { files, dirs };
 	};
 
 	const scriptTxFs = {
@@ -54,13 +58,21 @@ function makeScriptTxFs(fs: InMemoryFs): { scriptTxFs: IScriptTxFs; calls: strin
 		async abortScriptScope(): Promise<void> {
 			calls.push("abort");
 			active = false;
-			if (snap !== undefined) {
-				for (const path of fs.getAllPaths()) {
-					if ((await fs.stat(path)).isDirectory) continue;
-					const before = snap.get(path);
-					if (before === undefined) await fs.rm(path);
-					else await fs.writeFile(path, before);
+			if (snap === undefined) return;
+			const taken = snap;
+			const created: string[] = [];
+			for (const path of fs.getAllPaths()) {
+				if ((await fs.stat(path)).isDirectory) {
+					if (!taken.dirs.has(path)) created.push(path);
+					continue;
 				}
+				const before = taken.files.get(path);
+				if (before === undefined) created.push(path);
+				else await fs.writeFile(path, before);
+			}
+			// Deepest first, so a directory is empty by the time it is removed.
+			for (const path of created.sort((a, b) => b.length - a.length)) {
+				await fs.rm(path, { recursive: true });
 			}
 		},
 	} as unknown as IScriptTxFs;
@@ -166,6 +178,9 @@ describe("writeFileAtPath under a lost lease", () => {
 		);
 		expect(calls).toEqual(["begin", "abort"]);
 		expect(await fs.exists("/nested/dir/new.txt")).toBe(false);
+		// The parents the write created go back too, or the rollback left half the change standing.
+		expect(await fs.exists("/nested/dir")).toBe(false);
+		expect(await fs.exists("/nested")).toBe(false);
 	});
 
 	it("commits the file and its parents when the lease held", async () => {
