@@ -12,6 +12,7 @@ import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
+import { installDriverFaultGuard } from "../sql-fs/driver-fault.js";
 import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
@@ -299,6 +300,12 @@ app.onError((err, c) => {
 const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""));
 
 if (isMain) {
+	// Before anything opens a connection: postgres.js can throw a fatal TypeError out of its own
+	// socket-write path when a backend is reaped mid-transaction, killing the replica and every
+	// other in-flight request on it (#169). The guard absorbs exactly that frame and fails the
+	// in-flight DB awaits with EDRIVERFAULT; everything else still crashes the process.
+	installDriverFaultGuard();
+
 	void (async () => {
 		try {
 			if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
