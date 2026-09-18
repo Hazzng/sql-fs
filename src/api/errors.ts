@@ -34,6 +34,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ERUNTIME_BUSY",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
+	"EDRIVERFAULT",
 ]);
 
 /**
@@ -173,6 +174,9 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  *                       is durable and a retry re-applies it (#175 M1).
  * ECOHERENCE     → 503  Service Unavailable, NOT retryable. The write COMMITTED;
  *                       only the cross-replica version publish failed (#175).
+ * EDRIVERFAULT   → 503  Service Unavailable, NOT retryable. The Postgres driver threw
+ *                       out of its own socket-write path and never settled the query
+ *                       (#169); the commit status of the lost statement is unknowable.
  * ECOHERENCE_    → 503  Service Unavailable, RETRYABLE. Coherence is broken but
  *   UNAPPLIED           the transaction was rolled back, so nothing was applied.
  * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
@@ -224,6 +228,11 @@ export function mapFsErrorToStatus(err: Error): number {
 			// Fencing epoch mismatch: a concurrent writer committed first.
 			// Safe to retry with a fresh scope.
 			return 409;
+		case "EDRIVERFAULT":
+			// #169: the driver threw out of its own socket-write path. The replica lost a
+			// connection mid-statement; not a caller bug, and not advertised retryable
+			// because the fault can land after a COMMIT was already on the wire.
+			return 503;
 		case "ECOHERENCE_UNAPPLIED":
 			return 503;
 		case "ERUNTIME_BUSY":

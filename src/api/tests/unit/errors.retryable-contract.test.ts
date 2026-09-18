@@ -34,6 +34,14 @@ describe("isRetryableError", () => {
 		expect(isRetryableError(errWithCode("ELOCKLOST_APPLIED"))).toBe(false);
 	});
 
+	// #169: the driver threw out of its own socket write and never settled the statement, so the
+	// commit status of that statement is unknowable — the same doubt as a connection-exception
+	// SQLSTATE, and the same verdict. NEGATIVE GUARD: `false` is the default, so this passes without
+	// the change too; it exists to catch a future edit that adds EDRIVERFAULT to the retry allowlist.
+	it("reports EDRIVERFAULT as NOT retryable — the lost statement may have committed", () => {
+		expect(isRetryableError(errWithCode("EDRIVERFAULT"))).toBe(false);
+	});
+
 	it.each(["53300", "53400", "57P03"])("reports capacity SQLSTATE %s as retryable", (sqlstate) => {
 		expect(isRetryableError(errWithCode(sqlstate))).toBe(true);
 	});
@@ -78,6 +86,12 @@ describe("mapFsErrorToStatus — coherence codes", () => {
 
 	it("maps ELOCKLOST_APPLIED to 503", () => {
 		expect(mapFsErrorToStatus(errWithCode("ELOCKLOST_APPLIED"))).toBe(503);
+	});
+
+	// #169: the replica lost a connection mid-statement. That is infrastructure, not a caller bug,
+	// so it must not land in the 500 bucket alongside genuine server faults.
+	it("maps EDRIVERFAULT to 503", () => {
+		expect(mapFsErrorToStatus(errWithCode("EDRIVERFAULT"))).toBe(503);
 	});
 });
 
@@ -140,6 +154,14 @@ describe("app.onError — retryable field", () => {
 		expect(await probe(errWithCode("ECOHERENCE_UNAPPLIED", message))).toEqual({
 			status: 503,
 			body: { error: message, code: "ECOHERENCE_UNAPPLIED", retryable: true },
+		});
+	});
+
+	it("marks a 503 EDRIVERFAULT not retryable and keeps its own message", async () => {
+		const message = "EDRIVERFAULT: the database connection failed mid-statement";
+		expect(await probe(errWithCode("EDRIVERFAULT", message))).toEqual({
+			status: 503,
+			body: { error: message, code: "EDRIVERFAULT", retryable: false },
 		});
 	});
 
