@@ -188,6 +188,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	/**
+	 * Set once the script-tx's connection is gone, and sticky for the rest of the scope.
+	 *
+	 * postgres.js keeps the scope's `sql` bound to one connection OBJECT, and the pool reconnects
+	 * that same object for the next root-`sql` query — `commitBlob`, which every write issues first.
+	 * A later write in the scope would therefore run on a live but transaction-LESS connection and
+	 * self-commit outside the scope: measured as 599 of 600 files durable on a request that answered
+	 * 500. Clearing `#scriptTx` alone is not enough, because the helpers below would simply reopen a
+	 * fresh tx and `endScriptScope` would commit that one and report success. Once the connection is
+	 * lost the only correct outcome is that every remaining operation in the scope fails.
+	 */
+	#scriptTxLost: Error | undefined;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -244,6 +256,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
+			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
@@ -264,6 +277,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * same sandbox. Use for getBlob / resolvePath paths that only serve reads.
 	 */
 	async #withReadTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		if (this.#scriptScope) this.#assertScriptTxAlive();
 		const scriptTx = this.#scriptTx;
 		if (this.#scriptScope && scriptTx !== undefined) {
 			return runTrustedDbAsync(() => fn(scriptTx));
@@ -274,6 +288,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				return await fn(tx);
 			}),
 		);
+	}
+
+	/** Refuse any further work in a scope whose transaction is gone. See `#scriptTxLost`. */
+	#assertScriptTxAlive(): void {
+		if (this.#scriptTxLost !== undefined) throw this.#scriptTxLost;
 	}
 
 	async #openScriptTx(): Promise<void> {
@@ -308,10 +327,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}),
 		);
 		this.#scriptTxPromise = scriptTxPromise;
-		// Guard against unhandled rejection if the connection closes before endScriptScope/abortScriptScope.
-		// endScriptScope still sees the rejection via `await this.#scriptTxPromise` because .catch() creates
-		// a new derived chain without affecting the original promise's rejected state.
-		scriptTxPromise.catch(() => {});
+		// Consumes the rejection so a lost connection cannot surface as an unhandled rejection, and
+		// records it so the rest of the scope fails closed (see `#scriptTxLost`). `endScriptScope`
+		// still sees the rejection via `await this.#scriptTxPromise`, because .catch() creates a new
+		// derived chain without clearing the original's rejected state. `#scriptTx` is deliberately
+		// left set: `endScriptScope`'s recovery keys off `hadTx` to reload the cache off the rolled-
+		// back state, and that reload is still needed.
+		scriptTxPromise.catch((err: unknown) => {
+			this.#scriptTxLost ??= err instanceof Error ? err : new Error("script-tx connection lost");
+		});
 
 		// Race txReady against #scriptTxPromise so that a connection failure before
 		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
@@ -329,6 +353,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// scope is active would (a) auto-commit the write outside the scope — breaking
 		// atomicity — and (b) deadlock against the script-tx's advisory lock.
 		if (this.#scriptScope) {
+			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
@@ -689,6 +714,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#scriptScope) {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
+		this.#scriptTxLost = undefined;
 		this.#scriptScope = true;
 	}
 
