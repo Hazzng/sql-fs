@@ -1,8 +1,6 @@
-import { Bash, InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetPackageLimits } from "../../commands/package-limits.js";
-import { pythonPackageCommands } from "../../commands/pip-command.js";
-import { fixtureFetch, makeBash, wheel } from "./pip-fixtures.js";
+import { fixtureFetch, makeBash, makeBashWithFetch, wheel } from "./pip-fixtures.js";
 
 const encoder = new TextEncoder();
 
@@ -13,7 +11,7 @@ describe("experimental SQL-FS pip commands", () => {
 	});
 
 	it("rejects installs when network is disabled", async () => {
-		const bash = new Bash({ fs: new InMemoryFs(), python: true, customCommands: pythonPackageCommands });
+		const bash = makeBashWithFetch(undefined);
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("network access is required");
@@ -58,21 +56,16 @@ describe("experimental SQL-FS pip commands", () => {
 	it("rejects a mismatched PyPI SHA-256 without extracting it", async () => {
 		const body = wheel("demo", "1.0", { "demo.py": "VALUE = 1\n" });
 		const fetch = fixtureFetch({ demo: { version: "1.0", body } });
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: async (url, options) => {
-				const response = await fetch(url, options);
-				if (new URL(url).hostname === "pypi.org") {
-					const value = JSON.parse(new TextDecoder().decode(response.body)) as {
-						releases: Record<string, Array<{ digests: { sha256: string } }>>;
-					};
-					value.releases["1.0"]![0]!.digests.sha256 = "0".repeat(64);
-					return { ...response, body: encoder.encode(JSON.stringify(value)) };
-				}
-				return response;
-			},
-			customCommands: pythonPackageCommands,
+		const bash = makeBashWithFetch(async (url, options) => {
+			const response = await fetch(url, options);
+			if (new URL(url).hostname === "pypi.org") {
+				const value = JSON.parse(new TextDecoder().decode(response.body)) as {
+					releases: Record<string, Array<{ digests: { sha256: string } }>>;
+				};
+				value.releases["1.0"]![0]!.digests.sha256 = "0".repeat(64);
+				return { ...response, body: encoder.encode(JSON.stringify(value)) };
+			}
+			return response;
 		});
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
@@ -85,7 +78,7 @@ describe("experimental SQL-FS pip commands", () => {
 		const bash = makeBash({ demo: { version: "1.0", body } });
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain("zip path traversal");
+		expect(result.stderr).toContain("demo 1.0: corrupt or hostile archive");
 		expect(await bash.fs.exists("/escape.py")).toBe(false);
 	});
 
@@ -106,22 +99,17 @@ describe("experimental SQL-FS pip commands", () => {
 		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", manyFiles) } });
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr).toContain("file limit");
+		expect(result.stderr).toContain("install exceeds 4 files (PIP_MAX_INSTALL_FILES)");
 	});
 
 	it("fails when PyPI exceeds the redirect limit", async () => {
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: async (url) => ({
-				status: 302,
-				statusText: "Found",
-				headers: { location: url },
-				body: new Uint8Array(),
-				url,
-			}),
-			customCommands: pythonPackageCommands,
-		});
+		const bash = makeBashWithFetch(async (url) => ({
+			status: 302,
+			statusText: "Found",
+			headers: { location: url },
+			body: new Uint8Array(),
+			url,
+		}));
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("redirect");
@@ -168,24 +156,14 @@ describe("experimental SQL-FS pip commands", () => {
 		const tooLarge = Object.assign(new Error("response exceeds the maximum allowed size of 10 bytes"), {
 			name: "ResponseTooLargeError",
 		});
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: () => Promise.reject(tooLarge),
-			customCommands: pythonPackageCommands,
-		});
+		const bash = makeBashWithFetch(() => Promise.reject(tooLarge));
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toBe("pip: demo metadata exceeds the 16777216 byte response limit\n");
 	});
 
 	it("includes the underlying message for a non-pip failure", async () => {
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: () => Promise.reject(new Error("socket hang up")),
-			customCommands: pythonPackageCommands,
-		});
+		const bash = makeBashWithFetch(() => Promise.reject(new Error("socket hang up")));
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toBe("pip: package installation failed: socket hang up\n");

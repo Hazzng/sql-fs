@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import {
 	Bash,
@@ -9,6 +8,7 @@ import {
 	decodeBytesToUtf8,
 	defineCommand,
 } from "just-bash";
+import { type IPackageStore, asPackageStore } from "../../sql-fs/package-store.js";
 import { pythonSlotAlreadyHeld } from "../python-slot-context.js";
 import { packageLimits } from "./package-limits.js";
 import {
@@ -19,15 +19,23 @@ import {
 	versionSatisfies,
 } from "./pep440.js";
 import { type Requirement, parseRequirement, parseRequirementText } from "./pep508.js";
+import {
+	type IncomingWheel,
+	StaleManifestError,
+	formatFreeze,
+	formatPackageList,
+	publishInstall,
+	uninstallPackage,
+	warmContentCache,
+} from "./pip-publish.js";
+import { COMPAT_PACKAGES, PipError, SITE_PACKAGES, fail } from "./pip-shared.js";
+import { type WheelLease, createInProcessWheelLease, createInstallBudget, prepareWheel } from "./pip-wheel-store.js";
 import type { PypiFetch, PypiFetchRequestOptions, PypiFetchResult } from "./pypi-fetch.js";
 
 const PYPI_JSON_ORIGIN = "https://pypi.org";
 const PYPI_FILE_ORIGIN = "https://files.pythonhosted.org";
-const SITE_PACKAGES = "/site-packages";
-const COMPAT_PACKAGES = `${SITE_PACKAGES}/_sqlfs_compat`;
 const PYTHON_SITE_PACKAGES = `/host${SITE_PACKAGES}`;
 const PYTHON_COMPAT_PACKAGES = `/host${COMPAT_PACKAGES}`;
-const TEMP_ROOT = "/tmp/.sqlfs-pip";
 /** The CPython WASM runtime just-bash ships; `Requires-Python` is checked against it. */
 const RUNTIME_PYTHON_VERSION = "3.13.2";
 
@@ -43,14 +51,8 @@ function envNumber(name: string, fallback: number): number {
 export interface PipLimits {
 	/** `PIP_MAX_WHEEL_BYTES`. */
 	readonly maxDownloadBytes: number;
-	/** `PIP_MAX_INSTALL_DOWNLOAD_BYTES`. */
-	readonly maxTotalDownloadBytes: number;
 	readonly maxDependencies: number;
 	readonly maxDependencyDepth: number;
-	/** `PIP_MAX_INSTALL_FILES`. */
-	readonly maxWheelFiles: number;
-	/** `PIP_MAX_INSTALL_BYTES`. */
-	readonly maxExtractedBytes: number;
 	readonly maxRedirects: number;
 	/** Cap for a single PyPI JSON response. */
 	readonly maxMetadataBytes: number;
@@ -62,18 +64,16 @@ export interface PipLimits {
 }
 
 /**
- * Size limits come from `packageLimits()` so there is one place per limit;
- * the rest are resolver knobs that only pip uses.
+ * Resolver-only knobs. The size limits Phase W and Phase P enforce all come
+ * from `packageLimits()`; the single one kept here is the per-response download
+ * cap the PyPI fetch loop needs.
  */
 export function readPipLimits(): PipLimits {
 	const shared = packageLimits();
 	return {
 		maxDownloadBytes: shared.maxWheelBytes,
-		maxTotalDownloadBytes: shared.maxInstallDownloadBytes,
 		maxDependencies: 64,
 		maxDependencyDepth: envNumber("PIP_MAX_DEPENDENCY_DEPTH", 16),
-		maxWheelFiles: shared.maxInstallFiles,
-		maxExtractedBytes: shared.maxInstallBytes,
 		maxRedirects: 5,
 		maxMetadataBytes: envNumber("PIP_MAX_METADATA_RESPONSE_BYTES", 16 * 1024 * 1024),
 		maxTotalMetadataBytes: envNumber("PIP_MAX_METADATA_BYTES", 32 * 1024 * 1024),
@@ -82,68 +82,6 @@ export function readPipLimits(): PipLimits {
 		maxCandidateVersions: 64,
 	};
 }
-
-/**
- * This code runs in the just-bash CPython WASM worker. It is intentionally
- * small and uses zipfile rather than a host-side archive library: all reads
- * and writes go through the worker's virtual filesystem mount.
- */
-const EXTRACT_CODE = `
-import json
-import os
-import stat
-import sys
-import zipfile
-
-wheel_path, destination, max_files, max_bytes = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-seen = set()
-file_count = 0
-total_bytes = 0
-
-def fail(message):
-    print(json.dumps({"error": message[:240]}))
-    raise SystemExit(1)
-
-try:
-    with zipfile.ZipFile(wheel_path, "r") as archive:
-        for info in archive.infolist():
-            name = info.filename
-            if not name or len(name) > 512 or "\\\\" in name or name.startswith("/"):
-                fail("wheel contains an unsafe path")
-            parts = name.rstrip("/").split("/")
-            if any(part in ("", ".", "..") for part in parts):
-                fail("wheel contains a zip path traversal")
-            mode = (info.external_attr >> 16) & 0o170000
-            if mode == stat.S_IFLNK:
-                fail("wheel contains a symbolic link")
-            if name in seen:
-                fail("wheel contains duplicate paths")
-            seen.add(name)
-            if name.endswith("/"):
-                continue
-            file_count += 1
-            if file_count > max_files:
-                fail("wheel exceeds the extracted file limit")
-            total_bytes += info.file_size
-            if total_bytes > max_bytes:
-                fail("wheel exceeds the extracted byte limit")
-            target = os.path.join(destination, *parts)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with archive.open(info, "r") as source, open(target, "wb") as output:
-                remaining = info.file_size
-                while remaining:
-                    chunk = source.read(min(1024 * 1024, remaining))
-                    if not chunk:
-                        fail("wheel entry ended before its declared size")
-                    output.write(chunk)
-                    remaining -= len(chunk)
-except zipfile.BadZipFile:
-    fail("download is not a valid wheel ZIP")
-except OSError as error:
-    fail("wheel extraction failed: " + str(error))
-
-print(json.dumps({"files": file_count, "bytes": total_bytes}))
-`;
 
 /**
  * Version the synthetic `requests` provider declares. A `requests`
@@ -434,15 +372,29 @@ export interface PythonPackageCommandOptions {
 	readonly acquireInstall?: SlotAcquire;
 	/** Bounds concurrent CPython WASM workers spawned by these commands. */
 	readonly acquirePython?: SlotAcquire;
+	/**
+	 * Serialises Phase W per wheel hash. Defaults to a per-replica in-process
+	 * singleflight; Phase 4 injects the Redis `withDistributedLock` version.
+	 */
+	readonly withWheelLease?: WheelLease;
+	/**
+	 * Blobs, manifests and the installed-package ledger for this sandbox.
+	 *
+	 * Injected rather than taken from `ctx.fs` because just-bash replaces
+	 * `ctx.fs` with a defence-in-depth facade carrying only the `IFileSystem`
+	 * methods whenever that layer is enabled; the facade would hide the store and
+	 * `pip install` would report "requires a SQL backend" on a perfectly good
+	 * Postgres sandbox. `ctx.fs` is still duck-typed as a fallback, which is what
+	 * keeps the module usable without a `SessionManager`.
+	 */
+	readonly packageStore?: IPackageStore;
 }
 
-class PipError extends Error {
-	readonly code = "PIP_EXPERIMENT_ERROR";
-}
-
-function fail(message: string): never {
-	throw new PipError(message);
-}
+/**
+ * The default wheel lease, shared by every command built without one so two
+ * sandboxes on this replica installing the same wheel download it once.
+ */
+const sharedWheelLease: WheelLease = createInProcessWheelLease();
 
 function isSupportedPureWheel(filename: string): boolean {
 	if (!filename.endsWith(".whl")) return false;
@@ -764,47 +716,6 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 	};
 }
 
-async function runWasmPython(ctx: CommandContext, code: string, args: readonly string[]): Promise<ExecResult> {
-	// NOTE: no Python slot is taken here. The extractor worker is transitional —
-	// Phase 1 of the package-reuse plan replaces it with a host-side wheel
-	// reader — and holding a Python slot for the whole install would starve real
-	// Python users behind network waits.
-	const result = await builtinPythonShell(ctx).exec("python", {
-		cwd: ctx.cwd,
-		args: ["-c", code, ...args],
-		stdin: "",
-		signal: ctx.signal,
-		env: inheritedEnvironment(ctx),
-		replaceEnv: true,
-	});
-	return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
-}
-
-async function existingPackageTotals(ctx: CommandContext): Promise<{ files: number; bytes: number }> {
-	const paths = ctx.fs.getAllPaths().filter((path) => path.startsWith(`${SITE_PACKAGES}/`));
-	const stats = await Promise.all(paths.map((path) => ctx.fs.lstat(path)));
-	let files = 0;
-	let bytes = 0;
-	for (const stat of stats) {
-		if (!stat.isFile) continue;
-		files++;
-		bytes += stat.size;
-	}
-	return { files, bytes };
-}
-
-/** The WASM helper prints one JSON object on both paths; tracebacks are not an API contract. */
-function parseHelperJson(stdout: string): Record<string, unknown> | undefined {
-	const trimmed = stdout.trim();
-	if (!trimmed) return undefined;
-	try {
-		const value: unknown = JSON.parse(trimmed);
-		return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 async function writeRequestsCompat(ctx: CommandContext): Promise<void> {
 	for (const [relativePath, content] of Object.entries(REQUESTS_COMPAT_FILES)) {
 		const slash = relativePath.lastIndexOf("/");
@@ -814,44 +725,25 @@ async function writeRequestsCompat(ctx: CommandContext): Promise<void> {
 	}
 }
 
-async function verifyAndExtract(
-	ctx: CommandContext,
-	limits: PipLimits,
-	packageInfo: ResolvedPackage,
-	body: Uint8Array,
-	totals: { downloads: number; files: number; bytes: number },
-): Promise<void> {
-	if (body.length > limits.maxDownloadBytes) fail(`wheel ${packageInfo.name} exceeds the download limit`);
-	if (totals.downloads + body.length > limits.maxTotalDownloadBytes) fail("total package downloads exceed the limit");
-	totals.downloads += body.length;
-	// The bytes are already in host memory, so verify before anything is written
-	// rather than paying a CPython worker boot to re-read them off the sandbox FS.
-	if (createHash("sha256").update(body).digest("hex") !== packageInfo.artifact.sha256)
-		fail(`SHA-256 verification failed for ${packageInfo.name} ${packageInfo.version}`);
-	await ctx.fs.mkdir(TEMP_ROOT, { recursive: true });
-	const safeFilename = packageInfo.artifact.filename.replace(/[^A-Za-z0-9._-]/g, "_");
-	const wheelPath = `${TEMP_ROOT}/${safeFilename}`;
-	await ctx.fs.writeFile(wheelPath, body);
-	try {
-		const extraction = await runWasmPython(ctx, EXTRACT_CODE, [
-			wheelPath,
-			SITE_PACKAGES,
-			String(limits.maxWheelFiles - totals.files),
-			String(limits.maxExtractedBytes - totals.bytes),
-		]);
-		const report = parseHelperJson(extraction.stdout);
-		if (extraction.exitCode !== 0) fail(typeof report?.error === "string" ? report.error : "wheel extraction failed");
-		const { files, bytes } = report ?? {};
-		if (typeof files !== "number" || typeof bytes !== "number") fail("wheel extraction returned invalid limits");
-		totals.files += files;
-		totals.bytes += bytes;
-		if (totals.files > limits.maxWheelFiles || totals.bytes > limits.maxExtractedBytes)
-			fail("installed package contents exceed the limit");
-	} finally {
-		await ctx.fs.rm(wheelPath, { force: true });
-	}
+/** Fetches one wheel's bytes. Phase W owns everything that happens next. */
+async function downloadWheel(state: ResolveState, packageInfo: ResolvedPackage): Promise<Uint8Array> {
+	const response = await fetchPypi(state, packageInfo.artifact.url, false, `wheel ${packageInfo.name}`);
+	if (!response) fail(`PyPI did not serve the wheel for ${packageInfo.name}`);
+	return response.body;
 }
 
+const NO_STORE = "pip: package management requires a SQL backend; this sandbox's filesystem has no package store";
+
+/** The injected store, or the one `ctx.fs` carries when nothing was injected. */
+function resolveStore(ctx: CommandContext, options: PythonPackageCommandOptions): IPackageStore | undefined {
+	return options.packageStore ?? asPackageStore(ctx.fs);
+}
+
+/**
+ * Resolve (Phase R), make every wheel durable and reusable (Phase W), then
+ * publish once into the sandbox (Phase P). No CPython worker is spawned
+ * anywhere on this path.
+ */
 async function install(
 	ctx: CommandContext,
 	specs: readonly string[],
@@ -860,7 +752,10 @@ async function install(
 	const fetchFn = (options.fetch ?? ctx.fetch) as AnyFetch | undefined;
 	if (!fetchFn) return commandFailure("pip: network access is required; create the sandbox with network:true", 1);
 	if (specs.length === 0) return commandFailure("pip: install requires at least one package", 2);
+	const store = resolveStore(ctx, options);
+	if (!store) return commandFailure(NO_STORE, 1);
 	const limits = readPipLimits();
+	const sizeLimits = packageLimits();
 	try {
 		const roots: Requirement[] = [];
 		for (const spec of specs) {
@@ -883,27 +778,121 @@ async function install(
 			metadataRequests: 0,
 		};
 		const plan = await resolvePlan(state, roots);
-		const installed = await existingPackageTotals(ctx);
-		if (installed.files > limits.maxWheelFiles || installed.bytes > limits.maxExtractedBytes)
-			fail("existing package contents exceed the limit");
-		const totals = { downloads: 0, files: installed.files, bytes: installed.bytes };
+
+		// Phase W, one wheel at a time: at most one wheel buffer is live.
+		const lease = options.withWheelLease ?? sharedWheelLease;
+		const budget = createInstallBudget();
+		const incoming: IncomingWheel[] = [];
 		for (const packageInfo of plan.packages) {
-			const response = await fetchPypi(state, packageInfo.artifact.url, false, `wheel ${packageInfo.name}`);
-			if (!response) fail(`PyPI did not serve the wheel for ${packageInfo.name}`);
-			await verifyAndExtract(ctx, limits, packageInfo, response.body, totals);
+			const manifest = await prepareWheel({
+				store,
+				target: { name: packageInfo.name, version: packageInfo.version, sha256: packageInfo.artifact.sha256 },
+				limits: sizeLimits,
+				budget,
+				lease,
+				download: () => downloadWheel(state, packageInfo),
+			});
+			incoming.push({ name: packageInfo.name, version: packageInfo.version, wheelSha256: manifest.wheelSha256 });
 		}
-		if (plan.synthetic.some((item) => item.name === "requests")) await writeRequestsCompat(ctx);
+
+		const compatOverlay = plan.synthetic.some((item) => item.name === "requests")
+			? () => writeRequestsCompat(ctx)
+			: undefined;
+		const publishArgs = { ctx, store, incoming, limits: sizeLimits, ...(compatOverlay ? { compatOverlay } : {}) };
+		let published: Awaited<ReturnType<typeof publishInstall>>;
+		try {
+			published = await publishInstall(publishArgs);
+		} catch (error) {
+			if (!(error instanceof StaleManifestError)) throw error;
+			// A blob a manifest claimed is gone. Drop the manifest, redo Phase W
+			// for exactly those wheels, and publish once more.
+			for (const wheelHex of error.wheels) {
+				const packageInfo = plan.packages.find((item) => item.artifact.sha256 === wheelHex);
+				if (!packageInfo) fail("a package manifest went stale during the install; try again");
+				try {
+					await store.deleteManifest(new Uint8Array(Buffer.from(wheelHex, "hex")));
+				} catch (deleteError) {
+					// EMANIFESTINUSE means another sandbox still has this package
+					// installed, so the row cannot go. Redoing Phase W below re-ingests
+					// its blobs and rewrites its file rows, which is the actual repair.
+					if ((deleteError as { code?: unknown }).code !== "EMANIFESTINUSE") throw deleteError;
+				}
+				await prepareWheel({
+					store,
+					target: { name: packageInfo.name, version: packageInfo.version, sha256: packageInfo.artifact.sha256 },
+					limits: sizeLimits,
+					budget: createInstallBudget(),
+					lease,
+					download: () => downloadWheel(state, packageInfo),
+					force: true,
+				});
+			}
+			published = await publishInstall(publishArgs);
+		}
+
+		// Reading the small interpreted files back through `readFile` fills the
+		// content cache (and backfills Redis) so the first import is not paid
+		// file by file.
+		await warmContentCache(ctx, published.grafted);
+
 		const reported = [...plan.packages, ...plan.synthetic]
 			.map((item) => `${item.name}-${item.version}`)
 			.sort()
 			.join(" ");
-		return { stdout: `Successfully installed ${reported}\n`, stderr: "", exitCode: 0 };
+		const prefix = published.notes.length > 0 ? `${published.notes.join("\n")}\n` : "";
+		return { stdout: `${prefix}Successfully installed ${reported}\n`, stderr: "", exitCode: 0 };
 	} catch (error) {
 		if (error instanceof PipError) return commandFailure(`pip: ${error.message}`, 1);
 		const detail = error instanceof Error && error.message ? error.message : String(error);
 		return commandFailure(`pip: package installation failed: ${detail}`, 1);
 	}
 }
+
+/** `pip uninstall NAME...`, `-y` accepted and ignored (nothing prompts here). */
+async function uninstall(
+	ctx: CommandContext,
+	args: readonly string[],
+	options: PythonPackageCommandOptions,
+): Promise<ExecResult> {
+	const store = resolveStore(ctx, options);
+	if (!store) return commandFailure(NO_STORE, 1);
+	const names = args.filter((arg) => arg !== "-y" && arg !== "--yes");
+	if (names.some((name) => name.startsWith("-")))
+		return commandFailure("pip: uninstall options are not supported; use package names only", 2);
+	if (names.length === 0) return commandFailure("pip: uninstall requires at least one package", 2);
+	const lines: string[] = [];
+	try {
+		for (const name of names) {
+			const result = await uninstallPackage(ctx, store, name);
+			if (result.removed === undefined) return commandFailure(`pip: package '${name}' is not installed`, 1);
+			lines.push(...result.notes, `Successfully uninstalled ${result.removed.name}-${result.removed.version}`);
+		}
+	} catch (error) {
+		if (error instanceof PipError) return commandFailure(`pip: ${error.message}`, 1);
+		const detail = error instanceof Error && error.message ? error.message : String(error);
+		return commandFailure(`pip: uninstall failed: ${detail}`, 1);
+	}
+	return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
+}
+
+/** `pip list` and `pip freeze` read the ledger and nothing else. */
+async function listInstalled(
+	ctx: CommandContext,
+	freeze: boolean,
+	options: PythonPackageCommandOptions,
+): Promise<ExecResult> {
+	const store = resolveStore(ctx, options);
+	if (!store) return commandFailure(NO_STORE, 1);
+	try {
+		const rows = await store.listInstalledPackages();
+		return { stdout: freeze ? formatFreeze(rows) : formatPackageList(rows), stderr: "", exitCode: 0 };
+	} catch (error) {
+		const detail = error instanceof Error && error.message ? error.message : String(error);
+		return commandFailure(`pip: could not read the installed-package ledger: ${detail}`, 1);
+	}
+}
+
+const SUPPORTED_SUBCOMMANDS = "pip: only 'install', 'uninstall', 'list' and 'freeze' are supported by this experiment";
 
 async function executePip(
 	args: string[],
@@ -912,14 +901,16 @@ async function executePip(
 ): Promise<ExecResult> {
 	if (args[0] === "--version" || args[0] === "-V")
 		return { stdout: "sql-fs experimental pip (pure-Python wheels only)\n", stderr: "", exitCode: 0 };
-	if (args[0] !== "install")
-		return commandFailure("pip: only 'pip install PACKAGE' is supported by this experiment", 2);
+	if (args[0] === "uninstall") return uninstall(ctx, args.slice(1), options);
+	if (args[0] === "list") return listInstalled(ctx, false, options);
+	if (args[0] === "freeze") return listInstalled(ctx, true, options);
+	if (args[0] !== "install") return commandFailure(SUPPORTED_SUBCOMMANDS, 2);
 	const packages = args.slice(1);
 	if (packages.some((item) => item.startsWith("-")))
 		return commandFailure("pip: install options are not supported; use package specifiers only", 2);
-	// The admission slot covers the whole orchestration — resolution, every
-	// download and every extraction — because the transient memory of an
-	// install is held across all of it, not only during one wheel.
+	// The admission slot covers the whole orchestration — resolution and every
+	// wheel — because the transient memory of an install is held across all of
+	// it, not only during one wheel.
 	const release = options.acquireInstall ? await acquireOrFail(options.acquireInstall, ctx) : undefined;
 	if (release === false) return commandFailure("pip: too many concurrent installs; try again shortly", 1);
 	try {

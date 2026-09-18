@@ -165,6 +165,12 @@ export interface WheelSpec {
 	/** Overrides for the generated payload entries. */
 	readonly entryOverrides?: Readonly<Record<string, Omit<EntrySpec, "name">>>;
 	readonly wheelMetadata?: string;
+	/** Extra `Key: value` lines appended to METADATA (e.g. `Requires-Dist:`). */
+	readonly metadataExtra?: readonly string[];
+	/** Extra files inside the `.dist-info` directory, keyed by base name. */
+	readonly distInfoFiles?: Readonly<Record<string, string>>;
+	/** Skip the generated `<name>/__init__.py` payload module. */
+	readonly omitDefaultModule?: boolean;
 	/** Replaces the generated RECORD body. */
 	readonly record?: string;
 	/** Paths omitted from the generated RECORD. */
@@ -181,16 +187,26 @@ export function buildWheel(spec: WheelSpec = {}): Uint8Array {
 	const name = spec.name ?? "demo";
 	const version = spec.version ?? "1.0";
 	const distInfo = `${name}-${version}.dist-info`;
-	const files: Record<string, string> = { [`${name}/__init__.py`]: "x = 1\n", ...spec.files };
+	const files: Record<string, string> = spec.omitDefaultModule
+		? { ...spec.files }
+		: { [`${name}/__init__.py`]: "x = 1\n", ...spec.files };
 	const wheelMeta =
 		spec.wheelMetadata ?? "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n";
-	const metadata = `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\n\n`;
+	const metadata = [
+		"Metadata-Version: 2.1",
+		`Name: ${name}`,
+		`Version: ${version}`,
+		...(spec.metadataExtra ?? []),
+		"",
+		"",
+	].join("\n");
 
 	const contents: Record<string, string> = {
 		...files,
 		[`${distInfo}/METADATA`]: metadata,
 		[`${distInfo}/WHEEL`]: wheelMeta,
 	};
+	for (const [base, body] of Object.entries(spec.distInfoFiles ?? {})) contents[`${distInfo}/${base}`] = body;
 
 	const omit = new Set(spec.omitFromRecord ?? []);
 	const corrupt = new Set(spec.corruptRecordFor ?? []);

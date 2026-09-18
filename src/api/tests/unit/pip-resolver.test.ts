@@ -1,8 +1,6 @@
-import { Bash, InMemoryFs } from "just-bash";
 import type { SecureFetch } from "just-bash";
 import { afterEach, describe, expect, it } from "vitest";
-import { pythonPackageCommands } from "../../commands/pip-command.js";
-import { type PackageFixture, fixtureFetch, makeBash, sha256, wheel } from "./pip-fixtures.js";
+import { type PackageFixture, fixtureFetch, makeBash, makeBashWithFetch, sha256, wheel } from "./pip-fixtures.js";
 
 const encoder = new TextEncoder();
 
@@ -25,10 +23,8 @@ describe("synthetic requests provider", () => {
 	it("satisfies a requests dependency without any request for it", async () => {
 		const seen: string[] = [];
 		const cli = wheel("databricks-cli", "0.18.0", { "databricks_cli/__init__.py": "" }, ["requests>=2.0"]);
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: recordingFetch(
+		const bash = makeBashWithFetch(
+			recordingFetch(
 				{
 					"databricks-cli": { version: "0.18.0", body: cli, requiresDist: ["requests>=2.0"] },
 					requests: { version: "2.34.2", body: wheel("requests", "2.34.2", { "requests/__init__.py": "" }) },
@@ -36,8 +32,7 @@ describe("synthetic requests provider", () => {
 				},
 				seen,
 			),
-			customCommands: pythonPackageCommands,
-		});
+		);
 		const result = await bash.exec("pip install databricks-cli");
 		expect(result.exitCode, result.stderr).toBe(0);
 		expect(result.stdout).toBe("Successfully installed databricks-cli-0.18.0 requests-2.31.0\n");
@@ -144,40 +139,35 @@ describe("resolver hygiene", () => {
 	it("skips a release whose Requires-Python excludes the runtime", async () => {
 		const old = wheel("demo", "1.0", { "demo.py": "OLD = 1\n" });
 		const fresh = wheel("demo", "2.0", { "demo.py": "NEW = 1\n" });
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: async (url): Promise<Awaited<ReturnType<SecureFetch>>> => {
-				const parsed = new URL(url);
-				if (parsed.hostname === "pypi.org") {
-					const file = (version: string, body: Uint8Array, requiresPython: string | null) => ({
-						filename: `demo-${version}-py3-none-any.whl`,
-						url: `https://files.pythonhosted.org/demo-${version}-py3-none-any.whl`,
-						packagetype: "bdist_wheel",
-						requires_python: requiresPython,
-						digests: { sha256: sha256(body) },
-					});
-					const version = parsed.pathname.match(/^\/pypi\/demo\/([^/]+)\/json$/)?.[1];
-					const document =
-						version === undefined
-							? {
-									info: { version: "2.0", requires_dist: [], requires_python: "<3.13" },
-									releases: { "1.0": [file("1.0", old, ">=3.8")], "2.0": [file("2.0", fresh, "<3.13")] },
-								}
-							: {
-									info: {
-										version,
-										requires_dist: [],
-										requires_python: version === "1.0" ? ">=3.8" : "<3.13",
-									},
-									urls: [version === "1.0" ? file("1.0", old, ">=3.8") : file("2.0", fresh, "<3.13")],
-								};
-					return { status: 200, statusText: "OK", headers: {}, body: encoder.encode(JSON.stringify(document)), url };
-				}
-				const body = parsed.pathname.includes("2.0") ? fresh : old;
-				return { status: 200, statusText: "OK", headers: {}, body, url };
-			},
-			customCommands: pythonPackageCommands,
+		const bash = makeBashWithFetch(async (url: string): Promise<Awaited<ReturnType<SecureFetch>>> => {
+			const parsed = new URL(url);
+			if (parsed.hostname === "pypi.org") {
+				const file = (version: string, body: Uint8Array, requiresPython: string | null) => ({
+					filename: `demo-${version}-py3-none-any.whl`,
+					url: `https://files.pythonhosted.org/demo-${version}-py3-none-any.whl`,
+					packagetype: "bdist_wheel",
+					requires_python: requiresPython,
+					digests: { sha256: sha256(body) },
+				});
+				const version = parsed.pathname.match(/^\/pypi\/demo\/([^/]+)\/json$/)?.[1];
+				const document =
+					version === undefined
+						? {
+								info: { version: "2.0", requires_dist: [], requires_python: "<3.13" },
+								releases: { "1.0": [file("1.0", old, ">=3.8")], "2.0": [file("2.0", fresh, "<3.13")] },
+							}
+						: {
+								info: {
+									version,
+									requires_dist: [],
+									requires_python: version === "1.0" ? ">=3.8" : "<3.13",
+								},
+								urls: [version === "1.0" ? file("1.0", old, ">=3.8") : file("2.0", fresh, "<3.13")],
+							};
+				return { status: 200, statusText: "OK", headers: {}, body: encoder.encode(JSON.stringify(document)), url };
+			}
+			const body = parsed.pathname.includes("2.0") ? fresh : old;
+			return { status: 200, statusText: "OK", headers: {}, body, url };
 		});
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode, result.stderr).toBe(0);
@@ -197,18 +187,13 @@ describe("resolver hygiene", () => {
 				},
 			];
 		}
-		const bash = new Bash({
-			fs: new InMemoryFs(),
-			python: true,
-			fetch: async (url) => ({
-				status: 200,
-				statusText: "OK",
-				headers: {},
-				body: encoder.encode(JSON.stringify({ info: { version: "1.79", requires_dist: [] }, releases })),
-				url,
-			}),
-			customCommands: pythonPackageCommands,
-		});
+		const bash = makeBashWithFetch(async (url) => ({
+			status: 200,
+			statusText: "OK",
+			headers: {},
+			body: encoder.encode(JSON.stringify({ info: { version: "1.79", requires_dist: [] }, releases })),
+			url,
+		}));
 		const result = await bash.exec("pip install native");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("no supported pure-Python py3-none-any wheel");

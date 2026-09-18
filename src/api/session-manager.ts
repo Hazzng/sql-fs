@@ -19,6 +19,7 @@ import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, Se
 import { createGit } from "just-git";
 import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
+import { asPackageStore } from "../sql-fs/package-store.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs/redis-path-snapshot.js";
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
@@ -608,7 +609,7 @@ export class SessionManager {
 				const customCommands = [
 					// Experimental pure-Python package support. The commands are only
 					// available in Python sandboxes and use ctx.fs / ctx.fetch exclusively.
-					...(resolvedRuntime.python ? this.buildPythonPackageCommands(resolvedRuntime.network) : []),
+					...(resolvedRuntime.python ? this.buildPythonPackageCommands(resolvedRuntime.network, fs) : []),
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
@@ -1580,8 +1581,13 @@ export class SessionManager {
 	 * there would raise it for every sandbox command. The two admission slots
 	 * are injected so the commands never import this class.
 	 */
-	private buildPythonPackageCommands(network: boolean): Command[] {
+	private buildPythonPackageCommands(network: boolean, fs: IFileSystem): Command[] {
+		// The store is taken from the real filesystem object rather than from
+		// `ctx.fs`: with defence-in-depth enabled just-bash hands commands an
+		// `IFileSystem`-only facade, which would hide the package store.
+		const packageStore = asPackageStore(fs);
 		return createPythonPackageCommands({
+			...(packageStore ? { packageStore } : {}),
 			fetch: network
 				? createPypiFetch({
 						maxResponseSize: Number(process.env.PIP_MAX_WHEEL_BYTES ?? String(32 * 1024 * 1024)),

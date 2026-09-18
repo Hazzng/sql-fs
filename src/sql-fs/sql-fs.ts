@@ -25,9 +25,18 @@ import {
 	createEreadonly,
 	createEsandboxgone,
 } from "./errors.js";
+import type { IPackageStore, PackageBlob } from "./package-store.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
-import { type BulkIngestFile, type GraftFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
+import {
+	type BulkIngestFile,
+	type GraftFile,
+	INODE_KIND,
+	type PackageManifest,
+	type PathCacheEntry,
+	type SandboxPackageRow,
+	type SqlDialect,
+} from "./types.js";
 
 /**
  * Normalize a virtual filesystem path: resolve `.` and `..` components,
@@ -154,7 +163,7 @@ export interface IReadOnlyScopeFs extends IFileSystem {
 	readonly readOnlyScopeActive: boolean;
 }
 
-export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
+export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs, IPackageStore {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
 	readonly #tenantId: string;
@@ -866,6 +875,61 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#cacheSet(path, entry);
 		}
 		this.#dirty = true;
+	}
+
+	// ── IPackageStore ─────────────────────────────────────────────────────────
+	//
+	// The installer (`src/api/commands/pip-command.ts`) sees only `ctx.fs`, and
+	// this class is the single place that knows the dialect. Everything above the
+	// ledger trio is tenant-global and self-committing on the pool; the ledger
+	// runs through `#withTx`, so inside a script scope it joins the script
+	// transaction alongside `bulkGraft` and the installer's `rm` calls.
+
+	async ingestBlobs(blobs: readonly PackageBlob[]): Promise<void> {
+		await runTrustedDbAsync(() => this.#dialect.ingestBlobs(blobs));
+	}
+
+	async lookupManifest(wheelSha256: Uint8Array, manifestFormat: number): Promise<PackageManifest | undefined> {
+		return runTrustedDbAsync(() => this.#dialect.lookupManifest(wheelSha256, manifestFormat));
+	}
+
+	async recordManifest(manifest: PackageManifest, files: readonly GraftFile[]): Promise<void> {
+		await runTrustedDbAsync(() => this.#dialect.recordManifest(manifest, files));
+	}
+
+	async deleteManifest(wheelSha256: Uint8Array): Promise<void> {
+		await runTrustedDbAsync(() => this.#dialect.deleteManifest(wheelSha256));
+	}
+
+	async loadManifestFiles(wheelSha256s: readonly Uint8Array[]): Promise<Map<string, GraftFile[]>> {
+		return runTrustedDbAsync(() => this.#dialect.loadManifestFiles(wheelSha256s));
+	}
+
+	async touchManifests(wheelSha256s: readonly Uint8Array[]): Promise<void> {
+		await runTrustedDbAsync(() => this.#dialect.touchManifests(wheelSha256s));
+	}
+
+	async listInstalledPackages(): Promise<SandboxPackageRow[]> {
+		return this.#withTx((tx) => this.#dialect.listSandboxPackages(tx));
+	}
+
+	async upsertInstalledPackages(rows: readonly SandboxPackageRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		this.#assertWritable("/", "upsertInstalledPackages");
+		await this.#withTx((tx) => this.#dialect.upsertSandboxPackages(tx, rows));
+		this.#dirty = true;
+	}
+
+	async deleteInstalledPackage(name: string): Promise<void> {
+		this.#assertWritable("/", "deleteInstalledPackage");
+		await this.#withTx((tx) => this.#dialect.deleteSandboxPackage(tx, name));
+		this.#dirty = true;
+	}
+
+	async contentHashAt(path: string): Promise<Uint8Array | undefined> {
+		const entry = this.#pathCache.get(validatePath(path));
+		if (entry === undefined || entry.kind !== INODE_KIND.FILE) return undefined;
+		return entry.contentSha256 ?? undefined;
 	}
 
 	// ── IFileSystem: cache-served methods ────────────────────────────────────────

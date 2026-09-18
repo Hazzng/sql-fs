@@ -1,96 +1,18 @@
 /** Shared wheel / PyPI fixtures for the experimental pip command tests. */
 import { createHash } from "node:crypto";
-import { Bash, InMemoryFs } from "just-bash";
-import type { Command, SecureFetch } from "just-bash";
-import { pythonPackageCommands } from "../../commands/pip-command.js";
+import { Bash } from "just-bash";
+import type { SecureFetch } from "just-bash";
+import { type PythonPackageCommandOptions, createPythonPackageCommands } from "../../commands/pip-command.js";
+import { type FakePackageFs, type PackageState, createPackageFs } from "./package-store-fake.js";
+import { buildWheel } from "./wheel-fixtures.js";
 
 const encoder = new TextEncoder();
 
-function crc32(bytes: Uint8Array): number {
-	let crc = 0xffffffff;
-	for (const byte of bytes) {
-		crc ^= byte;
-		for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-	}
-	return (crc ^ 0xffffffff) >>> 0;
-}
-
-function u16(value: number): number[] {
-	return [value & 0xff, (value >>> 8) & 0xff];
-}
-
-function u32(value: number): number[] {
-	return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
-}
-
-/** Small stored ZIP writer so the tests do not depend on a host archive tool. */
-export function storedZip(entries: Record<string, string>): Uint8Array {
-	const local: number[] = [];
-	const central: number[] = [];
-	let offset = 0;
-	for (const [name, value] of Object.entries(entries)) {
-		const nameBytes = encoder.encode(name);
-		const content = encoder.encode(value);
-		const crc = crc32(content);
-		local.push(
-			0x50,
-			0x4b,
-			0x03,
-			0x04,
-			...u16(20),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(crc),
-			...u32(content.length),
-			...u32(content.length),
-			...u16(nameBytes.length),
-			...u16(0),
-			...nameBytes,
-			...content,
-		);
-		central.push(
-			0x50,
-			0x4b,
-			0x01,
-			0x02,
-			...u16(20),
-			...u16(20),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(crc),
-			...u32(content.length),
-			...u32(content.length),
-			...u16(nameBytes.length),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u16(0),
-			...u32(0),
-			...u32(offset),
-			...nameBytes,
-		);
-		offset = local.length;
-	}
-	const end = [
-		0x50,
-		0x4b,
-		0x05,
-		0x06,
-		...u16(0),
-		...u16(0),
-		...u16(Object.keys(entries).length),
-		...u16(Object.keys(entries).length),
-		...u32(central.length),
-		...u32(local.length),
-		...u16(0),
-	];
-	return Uint8Array.from([...local, ...central, ...end]);
-}
-
+/**
+ * A RECORD-valid pure-Python wheel, built by the same fixture builder the
+ * wheel-reader suites use — the installer now reads these through `readWheel`,
+ * so a hand-rolled ZIP without a RECORD would be rejected before anything else.
+ */
 export function wheel(
 	packageName: string,
 	version: string,
@@ -99,23 +21,14 @@ export function wheel(
 	entryPoint?: string,
 ): Uint8Array {
 	const distribution = packageName.replace(/[-_.]+/g, "_");
-	const metadata = [
-		"Metadata-Version: 2.1",
-		`Name: ${packageName}`,
-		`Version: ${version}`,
-		...requiresDist.map((item) => `Requires-Dist: ${item}`),
-		"",
-		"",
-	].join("\n");
-	const allFiles: Record<string, string> = {
-		...files,
-		[`${distribution}-${version}.dist-info/METADATA`]: metadata,
-		[`${distribution}-${version}.dist-info/WHEEL`]: "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-	};
-	if (entryPoint)
-		allFiles[`${distribution}-${version}.dist-info/entry_points.txt`] =
-			`[console_scripts]\ndatabricks = ${entryPoint}\n`;
-	return storedZip(allFiles);
+	return buildWheel({
+		name: distribution,
+		version,
+		files,
+		omitDefaultModule: true,
+		metadataExtra: requiresDist.map((item) => `Requires-Dist: ${item}`),
+		...(entryPoint ? { distInfoFiles: { "entry_points.txt": `[console_scripts]\ndatabricks = ${entryPoint}\n` } } : {}),
+	});
 }
 
 export function sha256(body: Uint8Array): string {
@@ -187,11 +100,38 @@ export function fixtureFetch(packages: Record<string, PackageFixture>): SecureFe
 	};
 }
 
-export function makeBash(packages: Record<string, PackageFixture>, commands: Command[] = pythonPackageCommands): Bash {
+/**
+ * A python-enabled shell whose filesystem carries a package store.
+ *
+ * The store is injected into the commands exactly as `SessionManager` does it,
+ * because just-bash's defence-in-depth layer (on by default in a bare `Bash`)
+ * replaces `ctx.fs` with an `IFileSystem`-only facade.
+ */
+export function makeBash(
+	packages: Record<string, PackageFixture>,
+	options: PythonPackageCommandOptions = {},
+	state?: PackageState,
+): Bash & { fs: FakePackageFs } {
+	const fs = createPackageFs(state);
 	return new Bash({
-		fs: new InMemoryFs(),
+		fs,
 		python: true,
 		fetch: fixtureFetch(packages),
-		customCommands: commands,
-	});
+		customCommands: createPythonPackageCommands({ packageStore: fs, ...options }),
+	}) as Bash & { fs: FakePackageFs };
+}
+
+/** `makeBash` with an arbitrary fetch — for the failure-shaped fetch doubles. */
+export function makeBashWithFetch(
+	fetch: SecureFetch | undefined,
+	options: PythonPackageCommandOptions = {},
+	state?: PackageState,
+): Bash & { fs: FakePackageFs } {
+	const fs = createPackageFs(state);
+	return new Bash({
+		fs,
+		python: true,
+		...(fetch ? { fetch } : {}),
+		customCommands: createPythonPackageCommands({ packageStore: fs, ...options }),
+	}) as Bash & { fs: FakePackageFs };
 }

@@ -1,7 +1,8 @@
-import { Bash, InMemoryFs } from "just-bash";
+import { Bash } from "just-bash";
 import { describe, expect, it } from "vitest";
 import { type SlotAcquire, createPythonPackageCommands } from "../../commands/pip-command.js";
 import { pythonSlotContext } from "../../python-slot-context.js";
+import { createPackageFs } from "./package-store-fake.js";
 import { fixtureFetch, wheel } from "./pip-fixtures.js";
 
 interface SlotCounter {
@@ -30,11 +31,13 @@ function counter(): SlotCounter {
 }
 
 function makeBash(packages: Parameters<typeof fixtureFetch>[0], install: SlotCounter, python: SlotCounter): Bash {
+	const fs = createPackageFs();
 	return new Bash({
-		fs: new InMemoryFs(),
+		fs,
 		python: true,
 		fetch: fixtureFetch(packages),
 		customCommands: createPythonPackageCommands({
+			packageStore: fs,
 			acquireInstall: install.acquire,
 			acquirePython: python.acquire,
 		}),
@@ -71,8 +74,8 @@ describe("pip and python admission slots", () => {
 		const python = counter();
 		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", { "demo.py": "" }) } }, install, python);
 		expect((await bash.exec("pip install demo")).exitCode).toBe(0);
-		// pip's WASM extractor is transitional and deliberately takes no Python
-		// slot; only python3 / databricks do.
+		// `pip install` is entirely host-side now: it spawns no CPython worker, so
+		// it takes no Python slot. Only python3 / databricks do.
 		expect(python.acquired).toBe(0);
 		const run = await bash.exec(`python3 -c "print(1)"`);
 		expect(run.exitCode, run.stderr).toBe(0);

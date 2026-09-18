@@ -705,6 +705,128 @@ before this change) are invisible to the quota until reinstalled; the first
 `pip install` of any package writes ledger rows for that install only.
 Documented.
 
+### Phase 3 status
+
+Implemented on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`). The WASM extractor is gone: `pip install` spawns no
+CPython worker and transmits no bytes the tenant already stores.
+
+- [x] **`IPackageStore` facade** (`src/sql-fs/package-store.ts`), implemented by
+      `SqlFs` and injected into the commands by `SessionManager`; `asPackageStore`
+      duck-types `ctx.fs` as a fallback. Tenant-global methods (`ingestBlobs`,
+      `lookupManifest`, `recordManifest`, `deleteManifest`, `loadManifestFiles`,
+      `touchManifests`) run pool-level and self-committing; `bulkGraft`, the
+      ledger trio and `contentHashAt` run through `SqlFs`'s own `#withTx`, so
+      inside a script scope they join the script transaction. `SqlFs` is still
+      the only class that knows the dialect.
+- [x] **Phase W** (`src/api/commands/pip-wheel-store.ts`): `withWheelLease` →
+      `lookupManifest(sha256, MANIFEST_FORMAT)` → hit: skip everything; miss:
+      download, verify the bytes against the PyPI-declared sha256, `readWheel`
+      batches → `ingestBlobs` per batch → `recordManifest`. One wheel buffer at a
+      time, scoped to the lease callback. `EGRAFTMISSING` from `recordManifest`
+      re-reads the buffer, re-ingests every blob and retries once. Every
+      `WheelError` is re-raised as a `PipError` naming the package and version.
+- [x] **Wheel lease seam for Phase 4**: `withWheelLease` is an option on
+      `createPythonPackageCommands`, defaulting to `createInProcessWheelLease()`
+      (a per-replica keyed promise chain). Phase 4 swaps in
+      `withDistributedLock`; nothing else changes.
+- [x] **Per-install cumulative limits**: an `InstallBudget` carries download
+      bytes, extracted files and extracted bytes across wheels (a manifest hit is
+      charged from the manifest's own `file_count` / `total_bytes`). Messages name
+      the number and the knob: `PIP_MAX_INSTALL_DOWNLOAD_BYTES`,
+      `PIP_MAX_INSTALL_FILES`, `PIP_MAX_INSTALL_BYTES`.
+- [x] **Phase P** (`publishInstall` in `src/api/commands/pip-publish.ts`): the
+      seven steps, in order, DB-only, no network and no inflate; aborts before
+      the first statement when `ctx.signal.aborted`; ownership and quota refuse
+      before any mutation; superseded paths owned solely by the old wheel are
+      removed when their current hash matches and reported as
+      `kept modified file <path>` when it does not; emptied directories are
+      pruned deepest-first; `EGRAFTMISSING` becomes a `StaleManifestError` naming
+      the wheels; an identical `(name, wheel_sha256)` already in the ledger is a
+      no-op reported as `already satisfied: <name>-<version>`.
+- [x] **Ledger written last.** The compat overlay is written before the ledger
+      upsert, not after it as the numbered list had it, so an interrupted publish
+      still leaves no ledger claim on a partly linked tree.
+- [x] **Content-cache warm** after publish: `.py` and `*.dist-info/*` files under
+      `CONTENT_WARM_MAX_FILE_BYTES` (64 KB) up to `CONTENT_WARM_MAX_TOTAL_BYTES`
+      (4 MB), read through `ctx.fs.readFileBuffer` so Redis backfills. Both
+      constants carry a "to be tuned" comment.
+- [x] **Dead code deleted**: `EXTRACT_CODE`, `verifyAndExtract`, `runWasmPython`,
+      `existingPackageTotals`, `parseHelperJson`, `TEMP_ROOT`, and the three
+      `PipLimits` fields the extractor owned.
+- [x] **`pip uninstall NAME`** (accepting and ignoring `-y`), **`pip list`** (the
+      padded `Package Version` table) and **`pip freeze`** (`name==version`,
+      sorted). Uninstall matches the name the way PEP 503 normalises it, removes
+      the ledger row and the paths owned solely by that wheel whose hash still
+      matches, preserves and reports modified files, and prunes emptied
+      directories. Any other subcommand now names the four that exist.
+- [x] **Memory backend** fails every pip subcommand with `pip: package
+      management requires a SQL backend; this sandbox's filesystem has no package
+      store` rather than crashing.
+- [x] **Tests**: unit — `pip-phase-w.test.ts` (7), `pip-publish.test.ts` (11),
+      `pip-ledger.test.ts` (12), plus the rewritten install tests in
+      `pip-command.test.ts`; a `package-store-fake.ts` `InMemoryFs` +
+      `IPackageStore` double with a shareable tenant-global `PackageState`.
+      Integration — `pip-install.integration.test.ts` (4) against real Postgres:
+      first sandbox downloads once, second downloads zero, uninstall removes
+      files and ledger row, and a GC-shaped manifest+blob removal makes the third
+      sandbox re-fetch exactly once.
+
+### Discoveries and Notable Information
+
+- **Phase 1's "no wrapper needed to reach `bulkGraft` from a command" was wrong
+  for `ctx.fs`.** `session.fs` is the `SqlFs`, but a *command* does not see it:
+  just-bash's defence-in-depth layer (`defenseInDepth` defaults to **true** in a
+  bare `Bash`) replaces `ctx.fs` with a plain object carrying only the
+  `IFileSystem` methods, each wrapped in `requireDefenseContext`. Duck-typing
+  `ctx.fs` therefore finds no package store whenever that layer is on, and pip
+  would report "requires a SQL backend" on a perfectly good Postgres sandbox.
+  The fix is the `packageStore` option: `SessionManager` resolves the store from
+  the real `fs` it just built and injects it, exactly as it already injects the
+  fetch and the two admission slots. `ctx.fs` duck-typing is kept as a fallback
+  for callers with no `SessionManager`. `routes/ingest.ts` was never affected
+  because it uses `session.fs` directly.
+- **Manifest paths are stored absolute** (`/site-packages/<archive path>`),
+  prefixed once in Phase W. The ownership map, the quota sum, the supersede diff
+  and `bulkGraft` all work in sandbox-path space, so prefixing at graft time
+  would mean four places converting instead of one. `MANIFEST_FORMAT` is what
+  invalidates every row if the install root ever moves. (Phase 2's integration
+  fixtures already assumed this shape.)
+- **`contentHashAt` had to be async.** `SqlFs` answers it from the path cache for
+  free, but a backend without one has to read, and the test double does; a sync
+  signature would have forced the double to shadow every write.
+- **A blob a manifest references cannot be hand-deleted.** The
+  `package_manifest_files → blobs` FK is `ON DELETE RESTRICT`, so the integration
+  test cannot simulate "someone deleted a blob" directly — it has to do what the
+  GC does (manifest first, blobs second), and the manifest itself only goes once
+  no `sandbox_packages` row references it. That makes `EGRAFTMISSING` from
+  `bulkGraft` a narrow race rather than a routine state, which is the point of
+  the FK. `EGRAFTMISSING` from `recordManifest` is still reachable and is covered
+  by a unit test.
+- **Stale-manifest recovery no longer depends on `deleteManifest` succeeding.**
+  If another sandbox still has the package installed, the delete raises
+  `EMANIFESTINUSE`; the installer now swallows that and redoes Phase W with
+  `force: true`, which re-ingests the blobs and rewrites the manifest's file rows
+  in place. Failing the install there (the first implementation) would have left
+  a sandbox unable to install a package purely because a second sandbox held it.
+- **A file the new version still ships is overwritten, not preserved.** "Kept
+  modified file" only applies to paths the superseding wheel drops; a path both
+  versions provide is grafted over, which is what an upgrade means. Worth
+  remembering when `--force` is added.
+- **Live run against real PyPI** (scratch Postgres, `network: true`):
+  `pip install databricks-cli` resolved and installed
+  `click-8.5.0 databricks-cli-0.18.0 oauthlib-3.3.1 pyjwt-2.14.0 requests-2.31.0
+  six-1.17.0 tabulate-0.10.0 urllib3-2.8.0` in **1852 ms** cold; the same install
+  into a second sandbox took **182 ms** with zero downloads. `databricks
+  --version` printed `Version 0.18.0` in both (≈2 s, all CPython boot).
+- **`pip-fixtures.ts`'s hand-rolled `storedZip` is gone**; `wheel()` now delegates
+  to `wheel-fixtures.ts`'s `buildWheel`, which generates a valid RECORD — the
+  reader rejects anything else. `buildWheel` gained `metadataExtra`,
+  `distInfoFiles` and `omitDefaultModule` for that.
+- **`pip uninstall` of something not installed exits 1** with
+  `pip: package 'X' is not installed`, rather than real pip's warning-and-exit-0.
+  An agent reading exit codes is better served by the refusal.
+
 ## Phase 4: singleflight
 
 Wheel lease via `withDistributedLock` on `vfs:{tenant}:pip:wheel:{sha256hex}`
