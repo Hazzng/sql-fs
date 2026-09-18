@@ -16,12 +16,17 @@ function errWithCode(code: string, message = "boom"): Error {
 }
 
 describe("isRetryableError", () => {
-	it.each(["ELOCKTIMEOUT", "ELOCKLOST", "ECOHERENCE_UNAPPLIED", "ESESSIONCLOSING", "ESHUTTINGDOWN", "ERUNTIME_BUSY"])(
-		"reports %s as retryable — the request applied nothing",
-		(code) => {
-			expect(isRetryableError(errWithCode(code))).toBe(true);
-		},
-	);
+	it.each([
+		"ELOCKTIMEOUT",
+		"ELOCKLOST",
+		"ECOHERENCE_UNAPPLIED",
+		"ESTALEEPOCH",
+		"ESESSIONCLOSING",
+		"ESHUTTINGDOWN",
+		"ERUNTIME_BUSY",
+	])("reports %s as retryable — the request applied nothing", (code) => {
+		expect(isRetryableError(errWithCode(code))).toBe(true);
+	});
 
 	it("reports ECOHERENCE as NOT retryable — the write committed", () => {
 		expect(isRetryableError(errWithCode("ECOHERENCE"))).toBe(false);
@@ -68,6 +73,13 @@ describe("mapFsErrorToStatus — coherence codes", () => {
 	it("maps ECOHERENCE_UNAPPLIED to 503", () => {
 		expect(mapFsErrorToStatus(errWithCode("ECOHERENCE_UNAPPLIED"))).toBe(503);
 	});
+
+	// #131: the epoch fence rejects the write with the transaction rolled back, so
+	// it belongs with the other "nothing applied, retry" 503s — a 500 would tell
+	// the client to give up on a request that a reload-and-retry resolves.
+	it("maps ESTALEEPOCH to 503", () => {
+		expect(mapFsErrorToStatus(errWithCode("ESTALEEPOCH"))).toBe(503);
+	});
 });
 
 // Exercises the real `app.onError` in server.ts via a throwing probe route
@@ -103,6 +115,14 @@ describe("app.onError — retryable field", () => {
 		expect(await probe(errWithCode("ECOHERENCE_UNAPPLIED", message))).toEqual({
 			status: 503,
 			body: { error: message, code: "ECOHERENCE_UNAPPLIED", retryable: true },
+		});
+	});
+
+	it("marks a 503 ESTALEEPOCH retryable and keeps its own message", async () => {
+		const message = "ESTALEEPOCH: another writer committed to sandbox 's1' after this scope pinned its epoch";
+		expect(await probe(errWithCode("ESTALEEPOCH", message))).toEqual({
+			status: 503,
+			body: { error: message, code: "ESTALEEPOCH", retryable: true },
 		});
 	});
 

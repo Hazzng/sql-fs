@@ -271,11 +271,41 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	moveDirent(tx: Tx, oldParentId: bigint, oldName: string, newParentId: bigint, newName: string): Promise<void>;
 
+	/**
+	 * Reads the sandbox's fencing epoch (`sandboxes.version`), or null when the
+	 * sandbox row is gone (#131).
+	 *
+	 * Optional: a dialect that does not implement it disables epoch fencing —
+	 * `SqlFs` then passes `null` as the expected epoch and the composites bump
+	 * the counter unconditionally instead of conditionally.
+	 */
+	getSandboxVersion?(tx: Tx, sandboxId: string): Promise<bigint | null>;
+
 	// ── Composite write operations (optional) ────────────────────────────────────
+	//
+	// `expectedEpoch` is the writer's fencing epoch (#131). The composite must bump
+	// `sandboxes.version` from exactly that value INSIDE its advisory-locked `ctx`
+	// CTE and gate every mutating CTE on that bump, so a writer whose pin is stale
+	// writes nothing and the transaction is rolled back. `null` means "unfenced":
+	// bump unconditionally, which keeps the counter monotonic for peers that ARE
+	// fenced. A fenced-out write throws ESTALEEPOCH.
 
-	mkdirComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint>;
+	mkdirComposite?(
+		tx: Tx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		expectedEpoch: bigint | null,
+	): Promise<bigint>;
 
-	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string): Promise<bigint>;
+	rmComposite?(
+		tx: Tx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		expectedEpoch: bigint | null,
+	): Promise<bigint>;
 
 	writeFileComposite?(
 		tx: Tx,
@@ -286,6 +316,7 @@ export interface SqlDialect<Tx = unknown> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		expectedEpoch: bigint | null,
 	): Promise<bigint>;
 
 	mvComposite?(
@@ -295,6 +326,7 @@ export interface SqlDialect<Tx = unknown> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		expectedEpoch: bigint | null,
 	): Promise<void>;
 
 	// ── Blob storage ──────────────────────────────────────────────────────────────

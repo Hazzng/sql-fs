@@ -208,6 +208,29 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * of its own — committing into a transaction that no longer exists.
 	 */
 	#scriptTxGeneration = 0;
+	/**
+	 * The sandbox's fencing epoch (`sandboxes.version`) as of the state the
+	 * in-memory caches reflect, plus every composite this scope has already
+	 * applied in its open transaction (#131).
+	 *
+	 * Read from Postgres in the SAME call that loads the pathCache, so the pin is
+	 * bound to the snapshot `appendFile` will later take its base from — not to
+	 * some later moment when a peer may already have committed. `undefined` means
+	 * the dialect exposes no epoch (mocks, the memory backend): fencing is then
+	 * off and the composites bump the counter unconditionally.
+	 */
+	#epoch: bigint | undefined;
+	/**
+	 * Set when a composite in this script scope was fenced out.
+	 *
+	 * The fence is a zero-row conditional UPDATE, NOT a raised SQL error, so the
+	 * transaction stays perfectly committable — and bash swallows a failed command
+	 * unless the script asked otherwise, so `endScriptScope` would happily COMMIT
+	 * and report exit 0 for a script whose writes were all dropped. That is the
+	 * silent lost update of #170 wearing a different hat, so the verdict is sticky:
+	 * every later operation in the scope fails and the scope rolls back.
+	 */
+	#scopeFenced: Error | undefined;
 	#readOnlyDepth = 0;
 	/**
 	 * Incremental byte estimate of `#pathCache`, maintained O(1) on every
@@ -306,6 +329,33 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#assertScriptTxAlive(): void {
 		if (this.#scriptScope && this.#scriptTxLost !== undefined) throw this.#scriptTxLost;
+		if (this.#scriptScope && this.#scopeFenced !== undefined) throw this.#scopeFenced;
+	}
+
+	/**
+	 * Runs one composite write under the caller's fencing epoch (#131) and
+	 * advances the in-memory epoch in lockstep with the `version` bump the
+	 * composite's own CTE just applied.
+	 *
+	 * The bump is only recorded on success, so a failed write leaves the pin where
+	 * it was and every subsequent write stays fenced until a reload re-reads the
+	 * live epoch. That is the safe direction in both cases: a peer's commit leaves
+	 * the pin too low, and a rolled-back scope leaves it too high, and neither can
+	 * accidentally match.
+	 */
+	async #fencedComposite<T>(run: (tx: Tx, expectedEpoch: bigint | null) => Promise<T>): Promise<T> {
+		const expected = this.#epoch ?? null;
+		let result: T;
+		try {
+			result = await this.#withBareTx((tx) => run(tx, expected));
+		} catch (err) {
+			if (this.#scriptScope && (err as Error & { code?: string }).code === "ESTALEEPOCH") {
+				this.#scopeFenced ??= err as Error;
+			}
+			throw err;
+		}
+		if (this.#epoch !== undefined) this.#epoch += 1n;
+		return result;
 	}
 
 	async #openScriptTx(): Promise<void> {
@@ -517,9 +567,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * `vfs:{tenantId}:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
 	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
 	 */
-	async #loadFreshPathCache(): Promise<{ entries: Map<string, PathCacheEntry>; fromSnapshot: boolean }> {
+	async #loadFreshPathCache(): Promise<{
+		entries: Map<string, PathCacheEntry>;
+		fromSnapshot: boolean;
+		epoch: bigint | undefined;
+	}> {
 		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
 		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
+			// Read the epoch BEFORE the snapshot, never after: a peer committing in
+			// between then leaves us pinned OLDER than the tree we install, which
+			// fails the next write closed (retryable 503). Pinning NEWER than the
+			// tree would instead wave a lost update straight through.
+			const snapshotEpoch = await this.#readSandboxEpoch();
 			try {
 				const raw = await this.#redis.get(versionKey(this.#tenantId, this.#sandboxId));
 				// F7: a tombstone must never be coerced to 0 by `Number(raw) || 0`
@@ -542,7 +601,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 							entries: snap.entries.size,
 						}),
 					);
-					return { entries: snap.entries, fromSnapshot: true };
+					return { entries: snap.entries, fromSnapshot: true, epoch: snapshotEpoch };
 				}
 			} catch (err) {
 				missReason = "error";
@@ -556,15 +615,34 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 		}
 		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
-		const rows = await this.#dialect.transaction(async (tx) => {
+		const getVersion = this.#dialect.getSandboxVersion?.bind(this.#dialect);
+		const loaded = await this.#dialect.transaction(async (tx) => {
 			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-			return await this.#dialect.loadAllPaths(tx);
+			// Epoch first, tree second — see the ordering note above. READ COMMITTED
+			// gives each statement its own snapshot, so the two can straddle a peer's
+			// commit and only this order errs on the safe side.
+			const epoch = getVersion === undefined ? null : await getVersion(tx, this.#sandboxId);
+			return { epoch, rows: await this.#dialect.loadAllPaths(tx) };
 		});
 		const fresh = new Map<string, PathCacheEntry>();
-		for (const { path, ...entry } of rows) {
+		for (const { path, ...entry } of loaded.rows) {
 			fresh.set(path, entry);
 		}
-		return { entries: fresh, fromSnapshot: false };
+		return { entries: fresh, fromSnapshot: false, epoch: loaded.epoch ?? undefined };
+	}
+
+	/**
+	 * Reads the fencing epoch on its own connection — used only by the Redis
+	 * path-snapshot branch, which never opens a Postgres transaction of its own.
+	 */
+	async #readSandboxEpoch(): Promise<bigint | undefined> {
+		const getVersion = this.#dialect.getSandboxVersion?.bind(this.#dialect);
+		if (getVersion === undefined) return undefined;
+		const version = await this.#dialect.transaction(async (tx) => {
+			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+			return getVersion(tx, this.#sandboxId);
+		});
+		return version ?? undefined;
 	}
 
 	/**
@@ -646,9 +724,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// load. Covers blobs not in Redis and the non-snapshot path.
 		this.#startPrewarm();
 
-		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
+		const { entries, fromSnapshot, epoch } = await this.#loadFreshPathCache();
 		this.#cacheClear();
 		for (const [p, e] of entries) this.#cacheSet(p, e);
+		this.#epoch = epoch;
 		// Initial load established committed state; the cache is not poisoned (F1).
 		this.#cachePoisoned = false;
 
@@ -689,7 +768,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 		const p = (async (): Promise<void> => {
 			try {
-				const { entries } = await this.#loadFreshPathCache();
+				const { entries, epoch } = await this.#loadFreshPathCache();
 				// F7: a cross-replica reload that comes back EMPTY means the sandbox
 				// was destroyed on another replica — the recursive CTE anchor joins
 				// `sandboxes` → root `inode`, so a live sandbox always yields at least
@@ -705,6 +784,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				}
 				this.#cacheClear();
 				for (const [path, entry] of entries) this.#cacheSet(path, entry);
+				this.#epoch = epoch;
 				this.#contentCache.clear();
 				this.#dirty = false;
 				// A successful reload re-established committed state in the caches,
@@ -734,6 +814,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
 		this.#scriptTxLost = undefined;
+		this.#scopeFenced = undefined;
 		// Any open still in flight from a previous scope belongs to an older generation and will
 		// abandon itself rather than adopt into this one.
 		this.#scriptTxGeneration += 1;
@@ -774,6 +855,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async endScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
+
+		// A fenced composite matched zero rows instead of raising, so this
+		// transaction is still committable and COMMIT would succeed — handing the
+		// caller a 200 for a script whose writes were all dropped. Roll back and
+		// surface the fence instead (#131).
+		const fenced = this.#scopeFenced;
+		if (fenced !== undefined) {
+			await this.abortScriptScope();
+			throw fenced;
+		}
+
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
@@ -814,6 +906,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async abortScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
 		this.#scriptScope = false;
+		this.#scopeFenced = undefined;
 
 		const hadTx = this.#scriptTx !== undefined;
 		const abort = this.#scriptTxAbort;
@@ -920,7 +1013,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, bytes);
 
 		const inodeId = this.#dialect.writeFileComposite
-			? await this.#withBareTx((tx) =>
+			? await this.#fencedComposite((tx, expectedEpoch) =>
 					this.#dialect.writeFileComposite!(
 						tx,
 						this.#sandboxId,
@@ -930,6 +1023,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						bytes.length,
 						sha256,
 						bytes,
+						expectedEpoch,
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1000,7 +1094,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, fullBytes);
 
 		const inodeId = this.#dialect.writeFileComposite
-			? await this.#withBareTx((tx) =>
+			? await this.#fencedComposite((tx, expectedEpoch) =>
 					this.#dialect.writeFileComposite!(
 						tx,
 						this.#sandboxId,
@@ -1010,6 +1104,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						fullBytes.length,
 						sha256,
 						fullBytes,
+						expectedEpoch,
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1095,8 +1190,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const inodeId = this.#dialect.mkdirComposite
-			? await this.#withBareTx((tx) =>
-					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+			? await this.#fencedComposite((tx, expectedEpoch) =>
+					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755, expectedEpoch),
 				)
 			: await this.#withTx(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
@@ -1179,7 +1274,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.rmComposite) {
-			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+			await this.#fencedComposite((tx, expectedEpoch) =>
+				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, expectedEpoch),
+			);
 		} else {
 			await this.#withTx(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
@@ -1468,7 +1565,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.mvComposite) {
-			await this.#withBareTx((tx) =>
+			await this.#fencedComposite((tx, expectedEpoch) =>
 				this.#dialect.mvComposite!(
 					tx,
 					this.#sandboxId,
@@ -1476,6 +1573,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					srcName,
 					destParentEntry.inodeId,
 					destName,
+					expectedEpoch,
 				),
 			);
 		} else {

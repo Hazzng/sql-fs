@@ -151,6 +151,10 @@ describe("SqlFs.writeFile — composite path", () => {
 			new TextEncoder().encode(content).length,
 			expect.any(Uint8Array),
 			expect.any(Uint8Array),
+			// #131: this mock dialect exposes no `getSandboxVersion`, so SqlFs has no
+			// epoch to pin and passes the unfenced sentinel. The fenced values are
+			// covered in sql-fs.epoch-fence.test.ts.
+			null,
 		);
 	});
 
@@ -228,7 +232,7 @@ describe("SqlFs.mkdir — composite path", () => {
 	it("passes correct arguments to mkdirComposite", async () => {
 		await fs.mkdir("/home/user/projects");
 
-		expect(m.mkdirCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "projects", 0o755);
+		expect(m.mkdirCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "projects", 0o755, null);
 	});
 
 	it("updates pathCache after composite mkdir", async () => {
@@ -278,7 +282,7 @@ describe("SqlFs.rm — composite path", () => {
 	it("passes correct arguments to rmComposite", async () => {
 		await fs.rm("/home/user/existing.txt");
 
-		expect(m.rmCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt");
+		expect(m.rmCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", null);
 	});
 
 	it("removes entry from pathCache after composite rm", async () => {
@@ -325,7 +329,7 @@ describe("SqlFs.mv — composite path", () => {
 	it("passes correct arguments to mvComposite", async () => {
 		await fs.mv("/home/user/existing.txt", "/other/moved.txt");
 
-		expect(m.mvCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", 5n, "moved.txt");
+		expect(m.mvCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", 5n, "moved.txt", null);
 	});
 
 	it("updates pathCache after composite mv", async () => {

@@ -49,6 +49,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.mvComposite — over
 				srcBytes.length,
 				await sha(srcBytes),
 				srcBytes,
+				null,
 			);
 		});
 		await dialect.transaction(async (tx) => {
@@ -61,12 +62,13 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect.mvComposite — over
 				dstBytes.length,
 				await sha(dstBytes),
 				dstBytes,
+				null,
 			);
 		});
 
 		// The overwrite: rename src -> dst, where dst already exists.
 		await expect(
-			dialect.transaction((tx) => dialect.mvComposite!(tx, sandboxId, dirId, "src", dirId, "dst")),
+			dialect.transaction((tx) => dialect.mvComposite!(tx, sandboxId, dirId, "src", dirId, "dst", null)),
 		).resolves.toBeUndefined();
 
 		// dst now resolves to the source's inode; src is gone.

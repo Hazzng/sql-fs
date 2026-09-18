@@ -94,6 +94,15 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 				WHERE n.nspname = 'public' AND p.proname = 'fs_resolve'
 			`;
 			expect(Number(procs[0]?.n)).toBeGreaterThanOrEqual(1);
+
+			// #131: the fencing epoch. Shape matters — a nullable column or a
+			// non-zero default would let a brand-new sandbox start off an epoch no
+			// writer ever pinned.
+			const version = await sql<{ data_type: string; is_nullable: string; column_default: string | null }[]>`
+				SELECT data_type, is_nullable, column_default FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
+			`;
+			expect(version[0]).toEqual({ data_type: "bigint", is_nullable: "NO", column_default: "0" });
 		} finally {
 			await sql.end({ timeout: 5 });
 		}

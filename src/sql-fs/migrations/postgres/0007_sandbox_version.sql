@@ -1,0 +1,19 @@
+-- Migration 0007: sandboxes.version — the writer fencing epoch (#131, closes #170).
+--
+-- Every composite write bumps this counter inside its advisory-locked CTE,
+-- conditional on the epoch the writer pinned when its in-memory pathCache was
+-- last known current. A writer whose lease lapsed still holds that stale pin, so
+-- its conditional UPDATE matches zero rows, the dependent CTEs write nothing and
+-- the transaction is rolled back — instead of silently replacing a live writer's
+-- committed dirent with `new-inode(stale-base + append)`.
+--
+-- Backward compatible with a replica that predates it: `createSandbox` inserts
+-- with an explicit column list, nothing SELECTs `*` from `sandboxes`, and an old
+-- replica simply never bumps the counter (it neither breaks nor is fenced).
+--
+-- Transaction-safe (required — the runner applies every file in ONE transaction):
+-- ADD COLUMN with a *constant* default is a catalog-only change since PG 11, so
+-- there is no table rewrite and no CONCURRENTLY/VACUUM step.
+--
+-- Idempotent: ADD COLUMN IF NOT EXISTS.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;

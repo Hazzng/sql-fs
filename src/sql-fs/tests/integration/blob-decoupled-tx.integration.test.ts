@@ -105,7 +105,7 @@ describe.skipIf(SKIP)("PostgresDialect — F6 decoupled blob commit", () => {
 		// A: open a long-lived script-tx and run writeFileComposite (which must NOT
 		// touch the blob row anymore), then hold the tx open.
 		const longTx = dialectA.transaction(async (tx) => {
-			await dialectA.writeFileComposite!(tx, sandboxId, rootInodeId, "hot.txt", 0o644, data.length, sha, data);
+			await dialectA.writeFileComposite!(tx, sandboxId, rootInodeId, "hot.txt", 0o644, data.length, sha, data, null);
 			inComposite();
 			await releasePromise;
 		});
