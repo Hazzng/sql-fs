@@ -236,10 +236,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					const firstLine = args.offset ?? 1;
 					const selectionStartChar = paging ? lineStartOffset(text, firstLine) : 0;
 					let selectionEndChar = text.length;
-					if (paging && args.limit !== undefined) {
-						const afterLast = lineStartOffset(text, firstLine + args.limit);
-						// `join("\n")` drops the separator before the next line; at EOF there is none to drop.
-						selectionEndChar = afterLast >= text.length ? text.length : afterLast - 1;
+					// `join("\n")` drops the separator before the line after the page, so the slice stops one
+					// character short of it — but only when that line exists. Deciding that on the offset
+					// instead (`afterLast >= text.length`) gets the synthetic empty line after a trailing
+					// newline wrong: it starts AT the end, so a page ending just before it kept a newline
+					// that `split`/`join` would have dropped.
+					if (paging && args.limit !== undefined && firstLine + args.limit <= totalLines) {
+						selectionEndChar = lineStartOffset(text, firstLine + args.limit) - 1;
 					}
 					const selected = paging ? text.slice(selectionStartChar, selectionEndChar) : text;
 
@@ -398,6 +401,11 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						});
 					case "too_large":
 						return fail("edited file exceeds the size limit", { code: "PAYLOAD_TOO_LARGE", path: filePath });
+					case "lone_surrogate":
+						return fail("oldString and newString must be well-formed text; a lone surrogate matches half a character", {
+							code: "EDIT_LONE_SURROGATE",
+							path: filePath,
+						});
 					default:
 						return {
 							content: [

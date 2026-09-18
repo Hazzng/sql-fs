@@ -42,7 +42,28 @@ export type EditOutcome =
 	| { kind: "binary" }
 	| { kind: "no_match" }
 	| { kind: "not_unique"; count: number }
-	| { kind: "too_large" };
+	| { kind: "too_large" }
+	| { kind: "lone_surrogate" };
+
+/**
+ * True when `s` holds a surrogate without its pair. A file decoded from UTF-8 never contains one, so
+ * such an `oldString` can only match half of a supplementary character — and re-encoding the result
+ * turns the orphaned half into U+FFFD, rewriting bytes the edit never matched. It also breaks the
+ * size projection below, whose arithmetic assumes the match encodes to the bytes it replaces.
+ */
+function hasLoneSurrogate(s: string): boolean {
+	for (let i = 0; i < s.length; i += 1) {
+		const code = s.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = i + 1 < s.length ? s.charCodeAt(i + 1) : Number.NaN;
+			if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+			i += 1;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return true;
+		}
+	}
+	return false;
+}
 
 /** Mode `writeFile` assigns to a freshly created file on every backend. */
 const DEFAULT_FILE_MODE = 0o644;
@@ -89,6 +110,8 @@ function replaceOccurrences(text: string, needle: string, replacement: string, a
 }
 
 async function applyEdit(session: Session, filePath: string, req: EditRequest, maxBytes: number): Promise<EditOutcome> {
+	if (hasLoneSurrogate(req.oldString) || hasLoneSurrogate(req.newString)) return { kind: "lone_surrogate" };
+
 	let stat: FsStat;
 	try {
 		stat = await session.fs.stat(filePath);
@@ -133,6 +156,9 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 
 	// Encode once: `writeFile` would otherwise re-encode the same string internally.
 	const encoded = encoder.encode(updated);
+	// The projection above is a cheap pre-filter that avoids building an oversized result at all;
+	// this is the guarantee. They agree for well-formed input, and only this one governs the write.
+	if (encoded.byteLength > maxBytes) return { kind: "too_large" };
 
 	await session.fs.writeFile(filePath, encoded);
 	// Every backend recreates the inode at the default mode on write, so an edit would

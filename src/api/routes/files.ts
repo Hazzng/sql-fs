@@ -324,6 +324,15 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					},
 					413 as ContentfulStatusCode,
 				);
+			case "lone_surrogate":
+				return c.json(
+					{
+						error: "lone_surrogate",
+						code: "EDIT_LONE_SURROGATE",
+						details: ["oldString and newString must be well-formed text; a lone surrogate matches half a character"],
+					},
+					400 as ContentfulStatusCode,
+				);
 			default:
 				return c.json({ path: filePath, replacements: result.replacements, size: result.size });
 		}

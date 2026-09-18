@@ -171,17 +171,53 @@ describe("MCP tool — file_read", () => {
 		expect(embedded).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
 	});
 
-	// A file that is mostly newlines used to materialize one array slot per line before the reply was
-	// truncated to 1 MiB; the counts and offsets below are what that split was providing.
-	it("counts and pages lines without splitting the whole file", async () => {
+	// Lines are counted and located by scanning rather than `split`. These pin the semantics that
+	// rewrite has to preserve — the seam is the synthetic empty line after a trailing newline, which
+	// starts at the end of the text, so a page ending just before it must still drop its separator.
+	it("pages lines exactly as split and join did", async () => {
 		const { call, fs } = await makeEnv();
 		await fs.writeFile("/lines.txt", "a\nb\nc\nd\n");
+		const read = async (args: Record<string, unknown>): Promise<unknown> =>
+			(await call("file_read", { path: "/lines.txt", ...args })).content;
 
-		expect(await call("file_read", { path: "/lines.txt" })).toMatchObject({ totalLines: 5, content: "a\nb\nc\nd\n" });
-		expect(await call("file_read", { path: "/lines.txt", offset: 2, limit: 2 })).toMatchObject({ content: "b\nc" });
-		expect(await call("file_read", { path: "/lines.txt", offset: 3 })).toMatchObject({ content: "c\nd\n" });
-		// Past the end: no lines to return, and the resume offset does not run off the file.
-		expect(await call("file_read", { path: "/lines.txt", offset: 99 })).toMatchObject({ content: "" });
+		expect(await call("file_read", { path: "/lines.txt" })).toMatchObject({
+			totalLines: 5,
+			content: "a\nb\nc\nd\n",
+		});
+		expect(await read({ offset: 2, limit: 2 })).toBe("b\nc");
+		expect(await read({ offset: 3 })).toBe("c\nd\n");
+		// The page stops before the trailing empty line: no newline of its own.
+		expect(await read({ offset: 1, limit: 4 })).toBe("a\nb\nc\nd");
+		expect(await read({ offset: 4, limit: 1 })).toBe("d");
+		// Reaching past the last line takes the rest of the file, trailing newline included.
+		expect(await read({ offset: 1, limit: 5 })).toBe("a\nb\nc\nd\n");
+		expect(await read({ offset: 99 })).toBe("");
+	});
+
+	it("pages a file of bare newlines the same way", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/blank.txt", "\n\n\n");
+		const read = async (args: Record<string, unknown>): Promise<unknown> =>
+			(await call("file_read", { path: "/blank.txt", ...args })).content;
+
+		expect(await read({ offset: 2, limit: 2 })).toBe("\n");
+		expect(await read({ offset: 3, limit: 1 })).toBe("");
+		expect(await read({ offset: 1, limit: 4 })).toBe("\n\n\n");
+	});
+
+	// The allocation this replaced was one array slot per line, so the shape that mattered is a file
+	// with a great many of them. Memory is not asserted here — what is asserted is that a file with
+	// a million line boundaries is counted and capped correctly rather than by materializing them.
+	it("counts a newline-heavy file and still caps the reply", async () => {
+		const { call, callRaw, fs } = await makeEnv();
+		await fs.writeFile("/many-lines.txt", "\n".repeat(1_000_000));
+
+		const result = await call("file_read", { path: "/many-lines.txt" });
+		const raw = await callRaw("file_read", { path: "/many-lines.txt" });
+
+		expect(result.totalLines).toBe(1_000_001);
+		expect(result.truncated).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(raw), "utf8") - 2).toBeLessThanOrEqual(MAX_READ_RESPONSE_BYTES);
 	});
 
 	it("normalizes the path it echoes rather than replaying the caller's string", async () => {

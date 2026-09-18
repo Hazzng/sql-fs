@@ -109,6 +109,46 @@ describe("editFile", () => {
 		expect(await fs.readFile("/edges.txt", "utf8")).toBe("zzbzz");
 	});
 
+	// A lone surrogate matches half of a supplementary character. Re-encoding the result turns the
+	// orphaned half into U+FFFD — rewriting bytes the edit never matched — and the size projection,
+	// which assumes a match encodes to the bytes it replaces, was off by two per occurrence: a
+	// 400-byte file of emoji edited under a 420-byte limit wrote 500 bytes and reported "ok".
+	it("refuses an edit whose oldString would cut a character in half", async () => {
+		const fs = new InMemoryFs();
+		const emoji = "\u{1F600}".repeat(100);
+		await fs.writeFile("/emoji.txt", emoji);
+
+		const outcome = await editFile(
+			makeSession(fs),
+			"/emoji.txt",
+			{ oldString: "\uD83D", newString: "aa", replaceAll: true },
+			420,
+		);
+
+		expect(outcome).toEqual({ kind: "lone_surrogate" });
+		expect(await fs.readFile("/emoji.txt", "utf8")).toBe(emoji);
+	});
+
+	it("refuses a newString carrying a lone surrogate", async () => {
+		const fs = new InMemoryFs();
+		await fs.writeFile("/t.txt", "hello");
+
+		const outcome = await editFile(makeSession(fs), "/t.txt", { oldString: "hello", newString: "\uDE00" }, MAX);
+
+		expect(outcome).toEqual({ kind: "lone_surrogate" });
+		expect(await fs.readFile("/t.txt", "utf8")).toBe("hello");
+	});
+
+	it("still edits a whole supplementary character", async () => {
+		const fs = new InMemoryFs();
+		await fs.writeFile("/emoji2.txt", "a\u{1F600}b");
+
+		const outcome = await editFile(makeSession(fs), "/emoji2.txt", { oldString: "\u{1F600}", newString: "!" }, MAX);
+
+		expect(outcome).toEqual({ kind: "ok", replacements: 1, size: 3 });
+		expect(await fs.readFile("/emoji2.txt", "utf8")).toBe("a!b");
+	});
+
 	it("refuses a file already past the limit without reading it", async () => {
 		const fs = new InMemoryFs();
 		await fs.writeFile("/big.txt", "x".repeat(100));
