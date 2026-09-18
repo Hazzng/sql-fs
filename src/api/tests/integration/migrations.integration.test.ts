@@ -29,6 +29,19 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 	let dbName: string;
 	let testUrl: string;
 	let admin: postgres.Sql | undefined;
+	const scratchDbs: string[] = [];
+
+	/** Create an extra ephemeral database and return its connection string. */
+	async function createScratchDb(): Promise<string> {
+		const base = process.env.DATABASE_URL;
+		if (base === undefined || admin === undefined) {
+			throw new Error("DATABASE_URL required for this suite");
+		}
+		const name = `vfs_mig_${randomBytes(8).toString("hex")}`;
+		await admin.unsafe(`CREATE DATABASE ${name}`);
+		scratchDbs.push(name);
+		return withDatabase(base, name);
+	}
 
 	beforeAll(async () => {
 		const base = process.env.DATABASE_URL;
@@ -47,12 +60,14 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			return;
 		}
 		try {
-			await admin`
-				SELECT pg_terminate_backend(pid)
-				FROM pg_stat_activity
-				WHERE datname = ${dbName} AND pid <> pg_backend_pid()
-			`;
-			await admin.unsafe(`DROP DATABASE IF EXISTS ${dbName}`);
+			for (const name of [dbName, ...scratchDbs]) {
+				await admin`
+					SELECT pg_terminate_backend(pid)
+					FROM pg_stat_activity
+					WHERE datname = ${name} AND pid <> pg_backend_pid()
+				`;
+				await admin.unsafe(`DROP DATABASE IF EXISTS ${name}`);
+			}
 		} finally {
 			await admin.end({ timeout: 5 });
 		}
@@ -84,5 +99,37 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 		}
 
 		await expect(runMigrations(cfg)).resolves.toBeUndefined();
+	});
+
+	/**
+	 * #164: the whole run must be one transaction, because that is what lets the
+	 * advisory lock be transaction-scoped and therefore survive a transaction
+	 * pooler. A view named `blobs` is skipped by 0000's CREATE TABLE IF NOT EXISTS
+	 * and then fails 0006's ALTER TABLE, so the failure lands in the last file —
+	 * after every earlier file would have committed under the old per-file loop.
+	 */
+	it("commits nothing when a later migration fails", async () => {
+		const url = await createScratchDb();
+		const seed = postgres(url, { prepare: false, max: 1 });
+		try {
+			await seed.unsafe("CREATE VIEW blobs AS SELECT 1 AS sha256");
+		} finally {
+			await seed.end({ timeout: 5 });
+		}
+
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await expect(runMigrations(cfg)).rejects.toThrow(/blobs.*is not a table|Migration failed/);
+
+		const sql = postgres(url, { prepare: false, max: 1 });
+		try {
+			const tables = await sql<{ name: string }[]>`
+				SELECT table_name AS name FROM information_schema.tables
+				WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+				ORDER BY table_name
+			`;
+			expect(tables.map((r) => r.name)).toEqual([]);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
 	});
 });
