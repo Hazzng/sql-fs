@@ -95,6 +95,27 @@ export function createEstaleepoch(sandboxId: string): Error {
 	);
 }
 
+/**
+ * EDRIVERFAULT: the Postgres driver threw out of its own socket-write path while
+ * this call was in flight (#169).
+ *
+ * `postgres.js` nulls a connection's socket in `closed()` and then flushes a
+ * still-buffered write for it, throwing a `TypeError` from a bare `setImmediate`
+ * rather than rejecting the query it was writing. The query's promise therefore
+ * never settles: without this the request hangs until the client gives up, which
+ * is what suppressing the crash alone buys you. The process guard converts that
+ * into this error instead.
+ *
+ * NOT advertised retryable. The fault can land on a connection that had already
+ * sent its COMMIT, so "nothing was applied" is exactly what we cannot prove —
+ * same reasoning as ECOHERENCE. The `cause` carries the driver's own error for
+ * the log; the message never reaches a client unsanitized.
+ */
+export function createEdriverfault(cause: Error): Error {
+	const err = makeFsError("EDRIVERFAULT", "EDRIVERFAULT: the database connection failed mid-statement");
+	return Object.assign(err, { cause });
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */

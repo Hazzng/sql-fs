@@ -14,6 +14,7 @@ import { LRUCache } from "lru-cache";
 
 import { readOnlyContext } from "../api/read-only-context.js";
 import { runTrustedDbAsync } from "./defense.js";
+import { raceDriverFault } from "./driver-fault.js";
 import {
 	createEexist,
 	createEinval,
@@ -285,6 +286,30 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
 
+	/**
+	 * Every await on the driver goes through here.
+	 *
+	 * `runTrustedDbAsync` exits just-bash's defense-in-depth scope; `raceDriverFault` fails the call
+	 * if postgres.js throws out of its own socket-write path while it is in flight (#169). The driver
+	 * throws there INSTEAD of rejecting the query it was writing, so without the race the promise
+	 * never settles and the request hangs until the client gives up — the crash guard alone just
+	 * trades a loud failure for a silent one.
+	 *
+	 * Inside a script scope the verdict is sticky: the scope's transaction is on a connection that is
+	 * at best suspect, so the rest of the script must fail closed rather than reopen a fresh
+	 * transaction and commit half a script (the same reasoning as `#scriptTxLost`).
+	 */
+	async #db<T>(fn: () => Promise<T>): Promise<T> {
+		try {
+			return await raceDriverFault(() => runTrustedDbAsync(fn));
+		} catch (err) {
+			if (this.#scriptScope && (err as Error & { code?: string }).code === "EDRIVERFAULT") {
+				this.#scriptTxLost ??= err as Error;
+			}
+			throw err;
+		}
+	}
+
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
 			this.#assertScriptTxAlive();
@@ -292,9 +317,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.#openScriptTx();
 			}
 			const tx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(tx));
+			return this.#db(() => fn(tx));
 		}
-		return runTrustedDbAsync(() =>
+		return this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
 				return await fn(tx);
@@ -311,9 +336,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#assertScriptTxAlive();
 		const scriptTx = this.#scriptTx;
 		if (this.#scriptScope && scriptTx !== undefined) {
-			return runTrustedDbAsync(() => fn(scriptTx));
+			return this.#db(() => fn(scriptTx));
 		}
-		return runTrustedDbAsync(() =>
+		return this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 				return await fn(tx);
@@ -408,8 +433,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		// Race txReady against #scriptTxPromise so that a connection failure before
 		// setSandboxContextWithLock completes (i.e. before resolveTxReady fires) propagates
-		// immediately rather than leaving this call hanging forever.
-		await Promise.race([txReady, this.#scriptTxPromise]);
+		// immediately rather than leaving this call hanging forever. The driver fault (#169) is a
+		// third way for BOTH arms to stay pending forever: postgres.js throws out of its socket
+		// write instead of rejecting the query, so `setSandboxContextWithLock` never settles.
+		// `scriptTxPromise` itself is deliberately NOT raced — it lives for the whole scope and
+		// `endScriptScope` needs the real COMMIT verdict off it.
+		try {
+			await raceDriverFault(() => Promise.race([txReady, scriptTxPromise]));
+		} catch (err) {
+			// The transaction callback may still be parked with nobody to end it. Nothing in this
+			// scope may reopen on that connection, so the loss is sticky exactly as for a rejection.
+			if ((err as Error & { code?: string }).code === "EDRIVERFAULT") this.#scriptTxLost ??= err as Error;
+			throw err;
+		}
 	}
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
@@ -427,11 +463,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.#openScriptTx();
 			}
 			const scriptTx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(scriptTx));
+			return this.#db(() => fn(scriptTx));
 		}
 		// No active scope — use a fresh, self-committing transaction (original
 		// behavior, no extra round-trip).
-		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
+		return this.#db(() => this.#dialect.transaction(fn));
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -690,7 +726,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const cap = this.#contentCache.maxSize;
 		const task = (async (): Promise<void> => {
 			try {
-				const blobs = await runTrustedDbAsync(() => this.#dialect.getBlobsForSandbox(this.#sandboxId, cap));
+				// Raced but NOT routed through `#db`: prewarm is a background cache warm, not part of any
+				// request, so a driver fault must bound its wait without condemning a script scope that
+				// happens to be open at the time. Its failure is swallowed below either way.
+				const blobs = await raceDriverFault(() =>
+					runTrustedDbAsync(() => this.#dialect.getBlobsForSandbox(this.#sandboxId, cap)),
+				);
 				for (const { inodeId, data } of blobs) {
 					if (data.byteLength > 0) this.#contentCache.set(inodeId, data);
 				}
@@ -872,7 +913,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		try {
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
-				await this.#scriptTxPromise;
+				// The COMMIT is the last driver await of the scope and hangs the same way on a
+				// driver fault (#169), so it races too — a request that cannot learn whether it
+				// committed must at least be told that, not left open until the client times out.
+				const txPromise = this.#scriptTxPromise;
+				if (txPromise !== undefined) await raceDriverFault(() => txPromise);
 			}
 		} catch (err) {
 			// COMMIT failed — Postgres rolled the transaction back, but the
@@ -1337,7 +1382,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		// `blobs` is global (no RLS), so a transaction wrapper is unnecessary.
-		const data = await runTrustedDbAsync(() => this.#dialect.getBlobNoTx(entry.contentSha256!));
+		const data = await this.#db(() => this.#dialect.getBlobNoTx(entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
 		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;

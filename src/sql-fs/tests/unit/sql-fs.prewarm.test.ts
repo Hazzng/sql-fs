@@ -224,7 +224,10 @@ describe("SqlFs prewarm — non-fatal on dialect error (AC4)", () => {
 		await fs.ready();
 		await waitForPrewarm();
 
-		expect(errSpy).toHaveBeenCalled();
+		// `waitForPrewarm` resolves when the DIALECT promise settles; SqlFs's own catch runs a few
+		// microtasks later (the #169 driver-fault race adds hops to that chain), so poll rather than
+		// assume they land in the same tick.
+		await vi.waitFor(() => expect(errSpy).toHaveBeenCalled());
 		const call = errSpy.mock.calls[0]?.[0] as string;
 		expect(JSON.parse(call).event).toBe("content_prewarm_error");
 	});
