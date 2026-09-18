@@ -1,14 +1,16 @@
 /**
- * Process-wide Redis circuit breaker for the distributed-lock ACQUIRE paths.
+ * Per-role Redis circuit breaker.
  *
  * Problem (F5): the lock acquire loops conflate "lock busy" (contention) with
  * "Redis unreachable" (a thrown connection-class error). Both are retried until
  * `acquireTimeoutMs` (default 300 s), so a Redis outage hangs every exec for
  * ~5 minutes on an otherwise-healthy Postgres.
  *
- * This breaker is consulted by the acquire paths ONLY. Renew/release paths must
- * keep tolerating transient errors (dropping a lease or skipping a RELEASE would
- * regress H4 / leak ZSET+flag keys for a full lease), so they do NOT use it.
+ * On the control role this breaker is consulted by the lock ACQUIRE paths ONLY.
+ * Renew/release paths must keep tolerating transient errors (dropping a lease or
+ * skipping a RELEASE would regress H4 / leak ZSET+flag keys for a full lease), so
+ * they do NOT use it. On the data role it short-circuits best-effort cache I/O,
+ * which is fail-open by contract.
  *
  * State machine:
  *   - CLOSED: acquire proceeds. Each thrown (connection-class) error bumps a
@@ -19,10 +21,18 @@
  *   - HALF_OPEN: one probe is allowed. A success closes the breaker; a failure
  *     re-opens it for another `openMs`.
  *
- * The breaker is intentionally process-wide (one Redis per process), not
- * per-key: a Redis outage is global, so once we've seen K failures there is no
- * value in letting other keys re-discover the outage one slow acquire at a time.
+ * The breaker is intentionally per-role rather than per-key: a Redis outage is
+ * global to a connection, so once we've seen K failures there is no value in
+ * letting other keys re-discover it one slow acquire at a time. It is scoped by
+ * role (#167) so a stalled data-plane cache can never fast-fail the control
+ * plane's locks, nor the reverse.
+ *
+ * Every state transition logs `redis_circuit_open` / `redis_circuit_closed` with
+ * the role: the original 114,213-request outage produced zero log lines beyond
+ * request logs, which is why it was misdiagnosed.
  */
+
+import type { RedisRole } from "./client.js";
 
 type BreakerState = "closed" | "open" | "half_open";
 
@@ -33,9 +43,11 @@ export interface RedisCircuitBreakerOptions {
 	readonly openMs: number;
 	/** Clock source (injectable for tests). Defaults to `Date.now`. */
 	readonly now?: () => number;
+	/** Role label emitted on transition events. Defaults to `"control"`. */
+	readonly role?: RedisRole;
 }
 
-const DEFAULT_OPTIONS: Required<Omit<RedisCircuitBreakerOptions, "now">> = {
+const DEFAULT_OPTIONS: Required<Omit<RedisCircuitBreakerOptions, "now" | "role">> = {
 	threshold: 5,
 	openMs: 5_000,
 };
@@ -57,11 +69,13 @@ export class RedisCircuitBreaker {
 	readonly #threshold: number;
 	readonly #openMs: number;
 	readonly #now: () => number;
+	readonly #role: RedisRole;
 
 	constructor(options: RedisCircuitBreakerOptions = DEFAULT_OPTIONS) {
 		this.#threshold = options.threshold ?? DEFAULT_OPTIONS.threshold;
 		this.#openMs = options.openMs ?? DEFAULT_OPTIONS.openMs;
 		this.#now = options.now ?? Date.now;
+		this.#role = options.role ?? "control";
 	}
 
 	/**
@@ -95,9 +109,15 @@ export class RedisCircuitBreaker {
 
 	/** A successful PING / eval / set: close the breaker and clear the failure run. */
 	recordSuccess(): void {
+		const wasOpen = this.#state !== "closed";
 		this.#state = "closed";
 		this.#consecutiveFailures = 0;
 		this.#halfOpenInFlight = false;
+		// Only a real transition is an event; the steady-state success path runs
+		// on every acquire and must not log.
+		if (wasOpen) {
+			console.log(JSON.stringify({ event: "redis_circuit_closed", role: this.#role }));
+		}
 	}
 
 	/** A thrown (connection-class) error: count it; open at threshold, or re-open a failed half-open probe. */
@@ -118,10 +138,21 @@ export class RedisCircuitBreaker {
 	}
 
 	#open(): void {
+		const reopened = this.#state === "open";
 		this.#state = "open";
 		this.#openedAt = this.#now();
 		this.#halfOpenInFlight = false;
 		this.#consecutiveFailures = this.#threshold;
+		if (!reopened) {
+			console.error(
+				JSON.stringify({
+					event: "redis_circuit_open",
+					role: this.#role,
+					threshold: this.#threshold,
+					openMs: this.#openMs,
+				}),
+			);
+		}
 	}
 }
 
@@ -159,17 +190,21 @@ export class AcquireErrorBudget {
 /** Default per-call acquire error budget (ms): how long thrown errors are tolerated before fast-failing. */
 export const DEFAULT_ACQUIRE_ERROR_BUDGET_MS = 4_000;
 
-let singleton: RedisCircuitBreaker | undefined;
+const singletons: Map<RedisRole, RedisCircuitBreaker> = new Map();
 
-/** Process-wide breaker shared by every acquire path. */
-export function getRedisCircuitBreaker(): RedisCircuitBreaker {
-	if (singleton === undefined) {
-		singleton = new RedisCircuitBreaker();
-	}
-	return singleton;
+/**
+ * Breaker for `role`, shared by every caller on that role's connection.
+ * Defaults to `control` so existing lock-path callers are unchanged.
+ */
+export function getRedisCircuitBreaker(role: RedisRole = "control"): RedisCircuitBreaker {
+	const existing = singletons.get(role);
+	if (existing !== undefined) return existing;
+	const created = new RedisCircuitBreaker({ ...DEFAULT_OPTIONS, role });
+	singletons.set(role, created);
+	return created;
 }
 
-/** Test hook: drop the singleton so each test starts from a clean breaker. */
+/** Test hook: drop the singletons so each test starts from a clean breaker. */
 export function resetRedisCircuitBreakerForTest(): void {
-	singleton = undefined;
+	singletons.clear();
 }
