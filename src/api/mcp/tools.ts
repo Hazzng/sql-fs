@@ -42,6 +42,11 @@ function fail(error: string, extra: Record<string, unknown> = {}): { content: Ar
 }
 
 /** Sandbox paths are absolute; accept a relative one rather than failing on a missing slash. */
+/** Bytes this string will occupy once JSON-escaped into the response, its quotes excluded. */
+function jsonSize(text: string): number {
+	return Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
+}
+
 /**
  * Walk an offset back to the start of a UTF-8 codepoint so a resumed read never opens mid-sequence
  * (a caller that passes back our own `nextByteOffset` already lands on one; this covers a hand-written
@@ -165,7 +170,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				.int()
 				.nonnegative()
 				.optional()
-				.describe("Resume a truncated read: pass the previous response's nextByteOffset"),
+				.describe(
+					"Resume a truncated read from this byte offset in the file: pass the previous response's nextByteOffset",
+				),
 		},
 		async (args) => {
 			const filePath = toAbsolute(args.path);
@@ -199,25 +206,38 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						? lines.slice(firstLine - 1, args.limit === undefined ? undefined : firstLine - 1 + args.limit).join("\n")
 						: text;
 
+					// Byte offsets are absolute in the file, not relative to a paged selection, so a resume
+					// means the same thing whether or not the caller repeats the original offset/limit.
+					const selectionStart =
+						firstLine > 1 ? Buffer.byteLength(`${lines.slice(0, firstLine - 1).join("\n")}\n`, "utf8") : 0;
+					const selectedBytes = Buffer.from(selected, "utf8");
+					const start = snapToCodepointStart(
+						selectedBytes,
+						args.byteOffset === undefined ? 0 : args.byteOffset - selectionStart,
+					);
+
 					// Bound what crosses the wire even when the whole file was requested. The budget is in
 					// bytes but the paging controls are in lines, so a line longer than the budget would
 					// strand its own tail — no offset can reach past the first megabyte of one line. The cut
-					// point comes back as `nextByteOffset` for the caller to resume from.
-					const selectedBytes = Buffer.from(selected, "utf8");
-					const start = snapToCodepointStart(selectedBytes, args.byteOffset ?? 0);
-					let content = selected;
-					let truncated = false;
-					let nextByteOffset: number | undefined;
-					if (start > 0 || selectedBytes.byteLength > MAX_READ_RESPONSE_BYTES) {
-						// Cut on the byte budget, then drop a codepoint split across the boundary.
-						content = selectedBytes
-							.subarray(start, start + MAX_READ_RESPONSE_BYTES)
-							.toString("utf8")
-							.replace(/\uFFFD$/, "");
-						const end = start + Buffer.byteLength(content, "utf8");
-						truncated = end < selectedBytes.byteLength;
-						if (truncated) nextByteOffset = end;
+					// point comes back as `nextByteOffset` for the caller to resume from. Cutting on a
+					// codepoint boundary keeps a split character out of the response without having to guess
+					// afterwards whether a trailing U+FFFD was the file's own or one we made.
+					let end = snapToCodepointStart(
+						selectedBytes,
+						Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
+					);
+					let content = selectedBytes.subarray(start, end).toString("utf8");
+					// The cap describes what crosses the wire, and what crosses it is JSON: a NUL costs six
+					// characters there, not one, so a megabyte of them would serialize to six. Shrink until
+					// the escaped form fits — the ratio converges in a couple of passes.
+					while (end > start && jsonSize(content) > MAX_READ_RESPONSE_BYTES) {
+						const fit = MAX_READ_RESPONSE_BYTES / jsonSize(content);
+						const proposed = start + Math.max(1, Math.floor((end - start) * fit));
+						end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
+						content = selectedBytes.subarray(start, end).toString("utf8");
 					}
+					const truncated = end < selectedBytes.byteLength;
+					const nextByteOffset = truncated ? selectionStart + end : undefined;
 					return { kind: "ok", content, size: stat.size, totalLines, firstLine, truncated, nextByteOffset } as const;
 				});
 

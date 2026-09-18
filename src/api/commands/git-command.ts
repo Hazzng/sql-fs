@@ -87,6 +87,9 @@ const MAX_GIT_REDIRECTS = 5;
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+/** Headers that describe a body, dropped with it when a redirect rewrites the request to GET. */
+const BODY_HEADERS = ["content-length", "content-type", "content-encoding", "content-language", "content-location"];
+
 /**
  * Git HTTP transport that refuses plaintext, hop by hop.
  *
@@ -115,16 +118,26 @@ export const httpsOnlyGitFetch: GitFetchFunction = async (input, init) => {
 		const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
 		if (location === null) return response;
 
+		// Nothing reads a redirect's body, and a remote is free to stream one; leaving it open would
+		// hold a connection per hop for as long as the chain runs.
+		await response.body?.cancel().catch(() => {});
+
 		const next = new URL(location, url).href;
 		requireHttps(next, "remote redirected to plaintext HTTP");
 		if (new URL(next).origin !== new URL(url).origin) {
 			headers.delete("authorization");
 			headers.delete("cookie");
 		}
-		// 303 means "repeat this as a GET" — replaying a POST body would re-send the packfile.
-		if (response.status === 303 && method !== "HEAD") {
+		// What `fetch` does when it follows a redirect itself: 303 is "repeat this as a GET", and so is
+		// 301/302 on a POST. Only 307/308 replay the body — which for git is a packfile, so replaying it
+		// onto a host we were forwarded to would re-send the push.
+		const rewriteToGet =
+			(response.status === 303 && method !== "GET" && method !== "HEAD") ||
+			((response.status === 301 || response.status === 302) && method === "POST");
+		if (rewriteToGet) {
 			method = "GET";
 			body = undefined;
+			for (const header of BODY_HEADERS) headers.delete(header);
 		}
 		url = next;
 	}

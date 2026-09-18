@@ -106,7 +106,10 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 							seen += value.byteLength;
 							if (seen > MAX_RAW_FILE_WRITE_BYTES) {
 								overflowed = true;
-								// Error the stream so the handler cannot act on a body it only half received.
+								// Error the stream so the handler cannot act on a body it only half received,
+								// and cancel the source so the rest of the upload is not left streaming into a
+								// reader nobody will drain.
+								await reader.cancel().catch(() => {});
 								controller.error(new Error("body exceeds limit"));
 								return;
 							}
@@ -116,6 +119,9 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					} catch (err) {
 						controller.error(err);
 					}
+				},
+				cancel(reason) {
+					return reader.cancel(reason);
 				},
 			});
 			c.req.raw = new Request(c.req.raw, { body: counted, duplex: "half" } as RequestInit);

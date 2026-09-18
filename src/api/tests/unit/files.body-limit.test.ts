@@ -32,7 +32,7 @@ async function makeApp(): Promise<Hono<{ Variables: AuthVariables }>> {
 	return app;
 }
 
-function chunked(totalBytes: number): ReadableStream<Uint8Array> {
+function chunked(totalBytes: number, onCancel?: () => void): ReadableStream<Uint8Array> {
 	const chunk = new TextEncoder().encode("x".repeat(256));
 	let sent = 0;
 	return new ReadableStream({
@@ -40,6 +40,9 @@ function chunked(totalBytes: number): ReadableStream<Uint8Array> {
 			if (sent >= totalBytes) return controller.close();
 			controller.enqueue(chunk);
 			sent += chunk.byteLength;
+		},
+		cancel() {
+			onCancel?.();
 		},
 	});
 }
@@ -111,6 +114,27 @@ describe("PATCH file edit body limit", () => {
 			code: "PAYLOAD_TOO_LARGE",
 			details: [`Edit body exceeds limit (${LIMIT} bytes)`],
 		});
+	});
+
+	// An upload cut off at the cap must not leave the incoming stream open with nobody draining it.
+	it("cancels the incoming stream when the body overflows", async () => {
+		const app = await makeApp();
+		let canceled = false;
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/files/home/user/f.txt`, {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json" },
+				body: chunked(LIMIT * 4, () => {
+					canceled = true;
+				}),
+				// Node requires `duplex` for a streamed request body.
+				duplex: "half",
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(canceled).toBe(true);
 	});
 
 	it("lets a body under the limit through to validation", async () => {

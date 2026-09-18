@@ -176,14 +176,39 @@ describe("httpsOnlyGitFetch", () => {
 		expect(spy).toHaveBeenCalledTimes(6);
 	});
 
-	it("replays a POST body across a redirect, and drops it on a 303", async () => {
+	it("replays a POST body across a 307, which preserves the method", async () => {
 		const ok = new Response("done");
 		const spy = vi.fn(async (url: string) =>
-			url === "https://git.test/push" ? redirectTo("https://git.test/moved", 303) : ok,
+			url === "https://git.test/push" ? redirectTo("https://git.test/moved", 307) : ok,
 		);
 		vi.stubGlobal("fetch", spy);
 
-		await httpsOnlyGitFetch("https://git.test/push", { method: "POST", body: new Uint8Array([1, 2, 3]) });
+		await httpsOnlyGitFetch("https://git.test/push", {
+			method: "POST",
+			headers: { "content-type": "application/x-git-receive-pack-request" },
+			body: new Uint8Array([1, 2, 3]),
+		});
+
+		const [, second] = spy.mock.calls[1] as unknown as [string, RequestInit];
+		expect(second.method).toBe("POST");
+		expect(new Uint8Array(second.body as ArrayBuffer)).toEqual(new Uint8Array([1, 2, 3]));
+		expect(new Headers(second.headers).get("content-type")).toBe("application/x-git-receive-pack-request");
+	});
+
+	// `fetch` rewrites a redirected POST to GET on 301/302/303. Replaying instead would push the
+	// packfile a second time — at whatever host the remote forwarded us to.
+	it.each([301, 302, 303])("drops a POST body and its headers on a %i", async (status) => {
+		const ok = new Response("done");
+		const spy = vi.fn(async (url: string) =>
+			url === "https://git.test/push" ? redirectTo("https://git.test/moved", status) : ok,
+		);
+		vi.stubGlobal("fetch", spy);
+
+		await httpsOnlyGitFetch("https://git.test/push", {
+			method: "POST",
+			headers: { "content-type": "application/x-git-receive-pack-request" },
+			body: new Uint8Array([1, 2, 3]),
+		});
 
 		const [, first] = spy.mock.calls[0] as unknown as [string, RequestInit];
 		const [, second] = spy.mock.calls[1] as unknown as [string, RequestInit];
@@ -191,6 +216,31 @@ describe("httpsOnlyGitFetch", () => {
 		expect(new Uint8Array(first.body as ArrayBuffer)).toEqual(new Uint8Array([1, 2, 3]));
 		expect(second.method).toBe("GET");
 		expect(second.body).toBeUndefined();
+		expect(new Headers(second.headers).get("content-type")).toBe(null);
+	});
+
+	it("cancels a redirect's body instead of leaving the connection open", async () => {
+		const ok = new Response("refs");
+		let canceled = false;
+		const redirect = new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode("ignored"));
+				},
+				cancel() {
+					canceled = true;
+				},
+			}),
+			{ status: 302, headers: { location: "https://git.test/b" } },
+		);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => (url === "https://git.test/a" ? redirect : ok)),
+		);
+
+		await httpsOnlyGitFetch("https://git.test/a");
+
+		expect(canceled).toBe(true);
 	});
 });
 

@@ -156,6 +156,61 @@ describe("MCP tool — file_read", () => {
 		expect((first.content as string) + (second.content as string)).toBe(line);
 	});
 
+	// The response is JSON, so the budget has to hold for the escaped form: a NUL is six characters
+	// there. Cutting on raw bytes alone would let a megabyte of them leave as six.
+	it("keeps the cap on the escaped response, not the raw bytes", async () => {
+		const { call, fs } = await makeEnv();
+		const line = "\u0000".repeat(1024 * 1024);
+		await fs.writeFile("/nuls.txt", line);
+
+		const first = await call("file_read", { path: "/nuls.txt" });
+
+		expect(first.truncated).toBe(true);
+		expect(JSON.stringify(first.content as string).length - 2).toBeLessThanOrEqual(1024 * 1024);
+		// Still resumable, and the pieces still reassemble.
+		let content = first.content as string;
+		let next = first.nextByteOffset as number | undefined;
+		while (next !== undefined) {
+			const page = await call("file_read", { path: "/nuls.txt", byteOffset: next });
+			content += page.content as string;
+			next = page.nextByteOffset as number | undefined;
+		}
+		expect(content).toBe(line);
+	});
+
+	// U+FFFD is a character a file may legitimately contain; only a cut through a multi-byte
+	// character should ever cost one, and cutting on a boundary means none is ever invented.
+	it("keeps a U+FFFD the file itself contains at the cut point", async () => {
+		const { call, fs } = await makeEnv();
+		// The replacement char is 3 bytes, so it ends exactly on the 1 MiB budget.
+		const line = `${"a".repeat(1024 * 1024 - 3)}\uFFFDtail`;
+		await fs.writeFile("/fffd.txt", line);
+
+		const first = await call("file_read", { path: "/fffd.txt" });
+
+		expect((first.content as string).endsWith("\uFFFD")).toBe(true);
+		expect(first.nextByteOffset).toBe(1024 * 1024);
+		const second = await call("file_read", { path: "/fffd.txt", byteOffset: first.nextByteOffset as number });
+		expect((first.content as string) + (second.content as string)).toBe(line);
+	});
+
+	// nextByteOffset is absolute in the file, so resuming does not depend on the caller repeating
+	// the offset/limit that produced the truncated page.
+	it("returns a resume offset that is absolute even for a paged read", async () => {
+		const { call, fs } = await makeEnv();
+		// 1.5 MiB: one page fills the 1 MiB budget, and what is left fits in the resume page.
+		const long = "z".repeat(1536 * 1024);
+		await fs.writeFile("/paged.txt", `first line\n${long}\n`);
+
+		const page = await call("file_read", { path: "/paged.txt", offset: 2, limit: 1 });
+		const rest = await call("file_read", { path: "/paged.txt", byteOffset: page.nextByteOffset as number });
+
+		expect(page.truncated).toBe(true);
+		expect(rest.truncated).toBe(false);
+		expect(page.nextByteOffset).toBe("first line\n".length + 1024 * 1024);
+		expect((page.content as string) + (rest.content as string)).toBe(`${long}\n`);
+	});
+
 	it("snaps a hand-written byteOffset back to the start of the character it lands inside", async () => {
 		const { call, fs } = await makeEnv();
 		await fs.writeFile("/euro-small.txt", "a€b");
