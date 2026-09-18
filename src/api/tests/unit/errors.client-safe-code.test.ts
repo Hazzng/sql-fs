@@ -89,28 +89,28 @@ describe("app.onError", () => {
 	it("does not echo a raw driver code", async () => {
 		expect(await probe(errWithCode("ECONNRESET", "read ECONNRESET"))).toEqual({
 			status: 500,
-			body: { error: "Internal server error", code: "INTERNAL_ERROR" },
+			body: { error: "Internal server error", code: "INTERNAL_ERROR", retryable: false },
 		});
 	});
 
 	it("does not echo a raw SQLSTATE", async () => {
 		expect(await probe(errWithCode("23503", "insert or update on table violates foreign key"))).toEqual({
 			status: 500,
-			body: { error: "Internal server error", code: "INTERNAL_ERROR" },
+			body: { error: "Internal server error", code: "INTERNAL_ERROR", retryable: false },
 		});
 	});
 
 	it("returns a retryable 503 with EUNAVAILABLE for too_many_connections", async () => {
 		expect(await probe(errWithCode("53300", "sorry, too many clients already"))).toEqual({
 			status: 503,
-			body: { error: "Internal server error", code: "EUNAVAILABLE" },
+			body: { error: "Internal server error", code: "EUNAVAILABLE", retryable: true },
 		});
 	});
 
 	it("still surfaces an allowlisted FS code and message", async () => {
 		expect(await probe(errWithCode("ENOENT", "ENOENT: no such file or directory, '/a.txt'"))).toEqual({
 			status: 404,
-			body: { error: "ENOENT: no such file or directory, '/a.txt'", code: "ENOENT" },
+			body: { error: "ENOENT: no such file or directory, '/a.txt'", code: "ENOENT", retryable: false },
 		});
 	});
 });
