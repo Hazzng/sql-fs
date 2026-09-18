@@ -383,6 +383,42 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return result;
 	}
 
+	/**
+	 * The same fence for the mutations that are not one composite CTE (#192):
+	 * `bulkIngest`, `mkdir -p`, `rm -r`, `cp`, `link`, `symlink`, `chmod`,
+	 * `utimes`, and the non-composite fallbacks.
+	 *
+	 * These issue a variable number of statements, so there is nothing to gate a
+	 * `fence` CTE onto. Instead the bump is the FIRST statement in their
+	 * transaction: a stale pin throws ESTALEEPOCH before a single mutating
+	 * statement is issued, so the writes are unreachable rather than merely rolled
+	 * back — the outcome does not depend on anyone honouring the rollback.
+	 *
+	 * Leaving these unfenced was not only a hole in the fence but a slow leak in
+	 * its precision: a live writer using only them left `sandboxes.version`
+	 * unmoved, so a genuinely stale peer's pin still matched and sailed through.
+	 * Every mutation has to advance the counter for the fence to mean anything.
+	 */
+	async #fencedWrite<T>(run: (tx: Tx) => Promise<T>): Promise<T> {
+		const bump = this.#dialect.bumpSandboxVersion?.bind(this.#dialect);
+		if (bump === undefined) return this.#withTx(run);
+		const expected = this.#epoch ?? null;
+		let result: T;
+		try {
+			result = await this.#withTx(async (tx) => {
+				await bump(tx, this.#sandboxId, expected);
+				return run(tx);
+			});
+		} catch (err) {
+			if (this.#scriptScope && (err as Error & { code?: string }).code === "ESTALEEPOCH") {
+				this.#scopeFenced ??= err as Error;
+			}
+			throw err;
+		}
+		if (this.#epoch !== undefined) this.#epoch += 1n;
+		return result;
+	}
+
 	async #openScriptTx(): Promise<void> {
 		const generation = ++this.#scriptTxGeneration;
 		let resolveTxReady!: () => void;
@@ -1014,7 +1050,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			normalized.push({ path, content: file.content, mode: file.mode });
 			bytesByPath.set(path, file.content);
 		}
-		const newEntries = await this.#withTx((tx) => this.#dialect.bulkIngest(tx, normalized));
+		const newEntries = await this.#fencedWrite((tx) => this.#dialect.bulkIngest(tx, normalized));
 		// Evict overwritten inodes from contentCache so stale content is never served.
 		// Populate #contentCache with the bytes already in memory — next readFile is a Map lookup.
 		for (const [path, entry] of newEntries) {
@@ -1071,7 +1107,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						expectedEpoch,
 					),
 				)
-			: await this.#withTx(async (tx) => {
+			: await this.#fencedWrite(async (tx) => {
 					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, bytes);
 					const id = await this.#dialect.createInode(tx, {
 						sandboxId: this.#sandboxId,
@@ -1152,7 +1188,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						expectedEpoch,
 					),
 				)
-			: await this.#withTx(async (tx) => {
+			: await this.#fencedWrite(async (tx) => {
 					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, fullBytes);
 					const id = await this.#dialect.createInode(tx, {
 						sandboxId: this.#sandboxId,
@@ -1203,7 +1239,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					// mkdir -p /a/b with /a as a file would silently insert a
 					// dirent under the file's inode (dirents has no FK on kind).
 					if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
-					const inodeId = await this.#withTx(async (tx) => {
+					// One fence (and one epoch) per segment actually created: each
+					// segment is its own transaction outside a script scope, and
+					// batching them into one would change `mkdir -p`'s partial-failure
+					// behaviour, which is not this fix's business. A `mkdir -p` over an
+					// existing tree creates nothing and so spends nothing.
+					const inodeId = await this.#fencedWrite(async (tx) => {
 						const id = await this.#dialect.createInode(tx, {
 							sandboxId: this.#sandboxId,
 							kind: INODE_KIND.DIRECTORY,
@@ -1238,7 +1279,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			? await this.#fencedComposite((tx, expectedEpoch) =>
 					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755, expectedEpoch),
 				)
-			: await this.#withTx(async (tx) => {
+			: await this.#fencedWrite(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
 						sandboxId: this.#sandboxId,
 						kind: INODE_KIND.DIRECTORY,
@@ -1281,7 +1322,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			const subtreePaths = this.#allPathsUnder(path);
 			subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length);
 
-			await this.#withTx(async (tx) => {
+			await this.#fencedWrite(async (tx) => {
 				// Step 1: unlink the subtree root from its parent
 				if (parentEntry) {
 					await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
@@ -1323,7 +1364,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, expectedEpoch),
 			);
 		} else {
-			await this.#withTx(async (tx) => {
+			await this.#fencedWrite(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
 				const newNlink = await this.#dialect.decrementNlink(tx, removedInodeId);
 				if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
@@ -1341,7 +1382,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
-		await this.#withTx(async (tx) => {
+		await this.#fencedWrite(async (tx) => {
 			await this.#dialect.updateInode(tx, entry.inodeId, { mode });
 		});
 
@@ -1355,7 +1396,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
-		await this.#withTx(async (tx) => {
+		await this.#fencedWrite(async (tx) => {
 			await this.#dialect.updateInode(tx, entry.inodeId, { mtime });
 		});
 
@@ -1495,7 +1536,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			// Maps destPath → new inodeId so children can look up their parent's new id
 			const newInodeIds = new Map<string, bigint>();
 
-			await this.#withTx(async (tx) => {
+			await this.#fencedWrite(async (tx) => {
 				for (const srcPath of srcPaths) {
 					const entry = this.#pathCache.get(srcPath)!;
 					const destPath = dest + srcPath.slice(src.length);
@@ -1540,7 +1581,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// a copied symlink into a corrupt FILE inode (non-zero size, NULL content).
 		// Copying a symlink preserves the link (target + size), matching the
 		// recursive-cp path above.
-		const newInodeId = await this.#withTx(async (tx) => {
+		const newInodeId = await this.#fencedWrite(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
 				kind: srcEntry.kind,
@@ -1622,7 +1663,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				),
 			);
 		} else {
-			await this.#withTx(async (tx) => {
+			await this.#fencedWrite(async (tx) => {
 				if (destEntry) {
 					const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
 					if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
@@ -1670,7 +1711,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const mtime = new Date();
 
-		const inodeId = await this.#withTx(async (tx) => {
+		const inodeId = await this.#fencedWrite(async (tx) => {
 			const id = await this.#dialect.createInode(tx, {
 				sandboxId: this.#sandboxId,
 				kind: INODE_KIND.SYMLINK,
@@ -1705,7 +1746,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(newPath);
 
-		await this.#withTx(async (tx) => {
+		await this.#fencedWrite(async (tx) => {
 			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
 			await this.#dialect.incrementNlink(tx, srcEntry.inodeId);
 		});

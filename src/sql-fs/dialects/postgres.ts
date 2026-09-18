@@ -111,6 +111,32 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return row === undefined ? null : BigInt(row.version);
 	}
 
+	/**
+	 * The composites' `fence` CTE, extracted so the multi-statement mutations can
+	 * take it too (#192). Callers must issue it as the FIRST statement of their
+	 * transaction — it fences by throwing, so anything already written above it
+	 * would survive.
+	 *
+	 * A missing sandbox row also yields zero rows and is reported as ESTALEEPOCH:
+	 * the writer's pin cannot be current for a row that no longer exists, and both
+	 * verdicts are the same retryable 503.
+	 */
+	async bumpSandboxVersion(tx: PgTx, sandboxId: string, expectedEpoch: bigint | null): Promise<void> {
+		const epoch = expectedEpoch === null ? null : String(expectedEpoch);
+		const rows = await tx<{ version: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+			)
+			UPDATE sandboxes SET version = version + 1
+			WHERE id = ${sandboxId}
+				AND version = COALESCE(${epoch}::bigint, version)
+				AND (SELECT 1 FROM ctx) IS NOT NULL
+			RETURNING version
+		`;
+		if (rows.length === 0) throw createEstaleepoch(sandboxId);
+	}
+
 	// ── Composite write operations ────────────────────────────────────────────────
 
 	async mkdirComposite(

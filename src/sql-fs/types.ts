@@ -281,6 +281,24 @@ export interface SqlDialect<Tx = unknown> {
 	 */
 	getSandboxVersion?(tx: Tx, sandboxId: string): Promise<bigint | null>;
 
+	/**
+	 * Applies the same conditional `sandboxes.version` bump the composites embed,
+	 * as a statement of its own (#192).
+	 *
+	 * For the mutations that are not one composite CTE — `bulkIngest`, `mkdir -p`,
+	 * `rm -r`, `cp`, `link`, `symlink`, `chmod`, `utimes` — there is no single
+	 * statement to gate, so the fence runs FIRST in their transaction and throws
+	 * ESTALEEPOCH before any mutating statement is issued. The caller must keep
+	 * that ordering: a bump issued after the writes would fence nothing.
+	 *
+	 * Takes the same advisory lock and RLS context as the composites so it is
+	 * serialized against them; the lock is re-entrant within a transaction.
+	 * `null` means "unfenced": bump unconditionally, keeping the counter monotonic
+	 * for peers that ARE fenced. Optional: a dialect without it disables fencing
+	 * on these paths.
+	 */
+	bumpSandboxVersion?(tx: Tx, sandboxId: string, expectedEpoch: bigint | null): Promise<void>;
+
 	// ── Composite write operations (optional) ────────────────────────────────────
 	//
 	// `expectedEpoch` is the writer's fencing epoch (#131). The composite must bump
