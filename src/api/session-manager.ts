@@ -24,6 +24,7 @@ import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { nodeCommand } from "./commands/node-command.js";
+import { pythonPackageCommands } from "./commands/pip-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
 import { logAudit } from "./lib/audit.js";
@@ -589,6 +590,9 @@ export class SessionManager {
 					git.execute(args, ctx as Parameters<typeof git.execute>[1]),
 				);
 				const customCommands = [
+					// Experimental pure-Python package support. The commands are only
+					// available in Python sandboxes and use ctx.fs / ctx.fetch exclusively.
+					...(resolvedRuntime.python ? pythonPackageCommands : []),
 					// Override just-bash's built-in nodeStubCommand with a smarter
 					// version that translates `node -e CODE` → `js-exec -c CODE` and
 					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
