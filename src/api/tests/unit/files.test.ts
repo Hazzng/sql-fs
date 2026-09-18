@@ -135,6 +135,26 @@ describe("PUT /v1/sandboxes/:id/files/*path", () => {
 		expect(await getRes.text()).toBe(content);
 	});
 
+	// The in-memory backend clobbers a directory on write where SqlFs raises EISDIR; both surfaces
+	// now refuse it up front, so PUT and the MCP write tool answer the same request the same way.
+	it("refuses to write over a directory with 400 EISDIR", async () => {
+		const { sessionManager, fs } = await makeTestEnv();
+		const app = makeTestApp(sessionManager);
+		const token = await makeToken();
+
+		await (fs as InMemoryFs).mkdir("/putdir");
+
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/files/putdir`, {
+			method: "PUT",
+			headers: { Authorization: `Bearer ${token}` },
+			body: "clobber",
+		});
+
+		expect(res.status).toBe(400);
+		expect((await res.json()) as { code: string }).toEqual({ error: "is_directory", code: "EISDIR" });
+		expect((await (fs as InMemoryFs).stat("/putdir")).isDirectory).toBe(true);
+	});
+
 	it("overwrite existing file via PUT returns 204 and new content is readable", async () => {
 		const { sessionManager, fs } = await makeTestEnv();
 		const app = makeTestApp(sessionManager);

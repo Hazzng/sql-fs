@@ -26,10 +26,10 @@ with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub
 
     # Bash execution
     result = sb.exec("echo hello && ls /home/user")
-    print(result.stdout)        # "hello\n..."
-    print(result.error)         # alias for stderr
-    print(result.exit_code)     # 0
-    print(result.ok)            # True
+    print(result.stdout)  # "hello\n..."
+    print(result.error)  # alias for stderr
+    print(result.exit_code)  # 0
+    print(result.ok)  # True
     print(result.duration_ms)
 
     # Python execution — CPython on WASM, stdlib only, isolated per call.
@@ -66,8 +66,10 @@ offending path and size; nothing is transmitted. The limit is threaded to every
 `Sandbox` the client creates or attaches.
 
 ```python
-fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=128 * 1024 * 1024)  # raise to 128 MiB
-fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=0)                   # disable the check
+fs = Client(
+    base_url="...", auth_secret="...", sub="agent", max_file_size=128 * 1024 * 1024
+)  # raise to 128 MiB
+fs = Client(base_url="...", auth_secret="...", sub="agent", max_file_size=0)  # disable the check
 ```
 
 > The server also caps the whole request body (`MAX_REQUEST_BODY_BYTES`, default

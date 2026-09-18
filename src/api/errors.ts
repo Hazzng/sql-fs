@@ -108,3 +108,15 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 500;
 	}
 }
+
+/**
+ * Filesystem error code from `.code`, falling back to the POSIX prefix in the message
+ * ("ENOENT: no such file..." → "ENOENT"). just-bash's InMemoryFs sets no `.code`, so the
+ * message fallback is required — this predicate decides 404 vs 409 vs 500 across the API.
+ */
+export function extractErrCode(e: unknown): string | undefined {
+	if (!(e instanceof Error)) return undefined;
+	const fe = e as Error & { code?: string };
+	if (fe.code) return fe.code;
+	return fe.message.match(/^([A-Z]+):/)?.[1];
+}

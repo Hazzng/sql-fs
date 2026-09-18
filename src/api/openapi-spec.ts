@@ -455,6 +455,84 @@ export const openapiSpec = {
 					},
 				},
 			},
+			patch: {
+				tags: ["Files"],
+				summary: "Edit file by exact string replacement",
+				description:
+					"Replace `oldString` with `newString` inside an existing file. `oldString` must match exactly once unless `replaceAll` is true; an ambiguous match is rejected so a stale read cannot patch the wrong occurrence. The file is left untouched on every rejection.",
+				parameters: [
+					sandboxIdParam,
+					{
+						name: "path",
+						in: "path",
+						required: true,
+						description: "Path to edit (without leading slash)",
+						schema: { type: "string" },
+					},
+				],
+				requestBody: {
+					required: true,
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								required: ["oldString", "newString"],
+								properties: {
+									oldString: {
+										type: "string",
+										minLength: 1,
+										description: "Exact text to replace, with enough context to be unique",
+									},
+									newString: { type: "string", description: "Replacement text; empty string deletes the match" },
+									replaceAll: {
+										type: "boolean",
+										default: false,
+										description: "Replace every occurrence instead of requiring a unique match",
+									},
+								},
+							},
+						},
+					},
+				},
+				responses: {
+					"200": {
+						description: "Edited",
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									required: ["path", "replacements", "size"],
+									properties: {
+										path: { type: "string" },
+										replacements: { type: "integer" },
+										size: { type: "integer", description: "Size of the file after the edit, in bytes" },
+									},
+								},
+							},
+						},
+					},
+					"400": {
+						description: "Invalid body, path is a directory (EISDIR), or file is not UTF-8 text (EDIT_BINARY)",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "File or sandbox not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"409": {
+						description: "oldString absent (EDIT_NO_MATCH) or matched more than once (EDIT_NOT_UNIQUE)",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"413": {
+						description: "Edited file would exceed the size limit",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+				},
+			},
 			delete: {
 				tags: ["Files"],
 				summary: "Delete file or directory",
