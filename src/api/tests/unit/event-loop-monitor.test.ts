@@ -7,6 +7,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	DEFAULT_STALL_THRESHOLD_MS,
 	classifyHeartbeatGap,
 	eventLoopLagSnapshot,
 	recordHeartbeatGap,
@@ -112,6 +113,22 @@ describe("event-loop monitor lifecycle", () => {
 		expect(typeof snap?.p99Ms).toBe("number");
 	});
 
+	// An empty histogram reports mean as NaN, which JSON.stringify renders as null — the snapshot
+	// is on /readyz now, so that would put a null where the type promises a number (#168).
+	it("reports finite numbers from a histogram with nothing sampled yet", () => {
+		startEventLoopMonitor({ sampleIntervalMs: 100_000, log: () => {} });
+		const snap = eventLoopLagSnapshot();
+		expect(snap).toBeDefined();
+		expect(Number.isFinite(snap?.meanMs)).toBe(true);
+		expect(JSON.parse(JSON.stringify(snap))).toEqual({
+			p50Ms: expect.any(Number),
+			p99Ms: expect.any(Number),
+			p999Ms: expect.any(Number),
+			maxMs: expect.any(Number),
+			meanMs: expect.any(Number),
+		});
+	});
+
 	it("double start and double stop are safe (idempotent)", () => {
 		startEventLoopMonitor({ sampleIntervalMs: 100_000, log: () => {} });
 		expect(() => startEventLoopMonitor({ log: () => {} })).not.toThrow();
@@ -135,10 +152,82 @@ describe("event-loop monitor lifecycle", () => {
 			event: "event_loop_lag",
 			p50Ms: expect.any(Number),
 			p99Ms: expect.any(Number),
+			p999Ms: expect.any(Number),
 			maxMs: expect.any(Number),
 			meanMs: expect.any(Number),
 			windowMs: 40,
 		});
+	});
+
+	// #168: a lone multi-second stall is a few tenths of a percent of a window's readings, so p99
+	// reports the idle floor and only max moves. p99.9 is the percentile that answers.
+	it("reports a lone stall at p99.9 that p99 dilutes away", async () => {
+		startEventLoopMonitor({ sampleIntervalMs: 100_000, resolutionMs: 5, stallThresholdMs: 100_000, log: () => {} });
+		try {
+			// ~100 idle readings at 5 ms, so one stall is ~1% of the window — enough for p99 to
+			// swallow it (the production window holds ~400, where it is swallowed far harder).
+			await new Promise((res) => setTimeout(res, 500));
+			busyLoopMs(200);
+			await new Promise((res) => setTimeout(res, 40));
+			const snap = eventLoopLagSnapshot();
+			expect(snap).toBeDefined();
+			expect(snap?.p99Ms).toBeLessThan(50);
+			expect(snap?.p999Ms).toBeGreaterThanOrEqual(100);
+		} finally {
+			stopEventLoopMonitor();
+		}
+	});
+
+	it("emits event_loop_stall when a window max crosses the threshold", async () => {
+		const lines: string[] = [];
+		startEventLoopMonitor({ sampleIntervalMs: 60, resolutionMs: 10, stallThresholdMs: 100, log: (l) => lines.push(l) });
+		try {
+			// Warm up: monitorEventLoopDelay only attributes a stall once its internal timer baseline
+			// is established (one loop tick after enable()).
+			await new Promise((res) => setTimeout(res, 40));
+			busyLoopMs(250);
+			await new Promise((res) => setTimeout(res, 140));
+		} finally {
+			stopEventLoopMonitor();
+		}
+		const stalls = lines.map((l) => JSON.parse(l)).filter((o) => o.event === "event_loop_stall");
+		expect(stalls.length).toBeGreaterThan(0);
+		const s = stalls[0]!;
+		expect(s.severity).toBe("critical");
+		expect(s.thresholdMs).toBe(100);
+		expect(s.windowMs).toBe(60);
+		expect(s.maxMs).toBeGreaterThan(100);
+	});
+
+	// Negative guard: the line is gated on the threshold, not on "a stall happened" — the same
+	// 150 ms stall that would trip a 100 ms threshold must stay silent under a high one, or the
+	// signal is a per-window chorus and worthless as an alert.
+	it("stays silent when a real stall stays under the threshold", async () => {
+		const lines: string[] = [];
+		startEventLoopMonitor({
+			sampleIntervalMs: 60,
+			resolutionMs: 10,
+			stallThresholdMs: 100_000,
+			log: (l) => lines.push(l),
+		});
+		try {
+			await new Promise((res) => setTimeout(res, 40));
+			busyLoopMs(150);
+			await new Promise((res) => setTimeout(res, 140));
+		} finally {
+			stopEventLoopMonitor();
+		}
+		const parsed = lines.map((l) => JSON.parse(l));
+		const lag = parsed.filter((o) => o.event === "event_loop_lag");
+		// The stall really did land in the histogram — this is not a silent run.
+		expect(Math.max(...lag.map((o) => o.maxMs as number))).toBeGreaterThanOrEqual(100);
+		expect(parsed.filter((o) => o.event === "event_loop_stall")).toEqual([]);
+	});
+
+	// The default is the Redis client's commandTimeout — the point where a stall stops being a
+	// latency problem and starts failing other tenants' in-flight commands (#168).
+	it("defaults the stall threshold to the 2 s Redis command timeout", () => {
+		expect(DEFAULT_STALL_THRESHOLD_MS).toBe(2_000);
 	});
 
 	it("snapshot reflects an elevated max after a synchronous stall", async () => {
