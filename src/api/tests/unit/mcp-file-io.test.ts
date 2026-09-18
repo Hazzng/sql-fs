@@ -124,6 +124,46 @@ describe("MCP tool — file_read", () => {
 		expect(result.truncated).toBe(true);
 		expect((result.content as string).length).toBe(1024 * 1024);
 		expect(result.size).toBe(2 * 1024 * 1024);
+		expect(result.nextByteOffset).toBe(1024 * 1024);
+	});
+
+	// The cap is in bytes and the paging controls are in lines, so one over-long line would otherwise
+	// strand its own tail: every read of that line returns the same prefix, and the next line skips it.
+	it("resumes a truncated single line from nextByteOffset", async () => {
+		const { call, fs } = await makeEnv();
+		const line = "z".repeat(2 * 1024 * 1024);
+		await fs.writeFile("/one-line.txt", line);
+
+		const first = await call("file_read", { path: "/one-line.txt" });
+		const second = await call("file_read", { path: "/one-line.txt", byteOffset: first.nextByteOffset as number });
+
+		expect(second.truncated).toBe(false);
+		expect(second.nextByteOffset).toBeUndefined();
+		expect((first.content as string) + (second.content as string)).toBe(line);
+	});
+
+	it("resumes on a codepoint boundary rather than splitting a character", async () => {
+		const { call, fs } = await makeEnv();
+		// 3 bytes per `€`, so the 1 MiB budget lands mid-character.
+		const line = "€".repeat(500 * 1024);
+		await fs.writeFile("/euro.txt", line);
+
+		const first = await call("file_read", { path: "/euro.txt" });
+		const second = await call("file_read", { path: "/euro.txt", byteOffset: first.nextByteOffset as number });
+
+		expect(first.truncated).toBe(true);
+		expect(first.nextByteOffset).toBe(Buffer.byteLength(first.content as string, "utf8"));
+		expect((first.content as string) + (second.content as string)).toBe(line);
+	});
+
+	it("snaps a hand-written byteOffset back to the start of the character it lands inside", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/euro-small.txt", "a€b");
+
+		// Byte 2 is the middle of `€` (bytes 1-3); the read resumes at the character, not inside it.
+		const result = await call("file_read", { path: "/euro-small.txt", byteOffset: 2 });
+
+		expect(result.content).toBe("€b");
 	});
 });
 

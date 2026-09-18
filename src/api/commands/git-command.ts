@@ -82,26 +82,59 @@ async function isEmptyDir(fs: IFileSystem, path: string): Promise<boolean> {
 	return (await fs.readdir(path)).length === 0;
 }
 
+/** Redirect chains a git remote may send us through before we call it a loop. */
+const MAX_GIT_REDIRECTS = 5;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
- * Git HTTP transport that refuses plaintext.
+ * Git HTTP transport that refuses plaintext, hop by hop.
  *
  * just-git resolves `GIT_HTTP_USER`/`GIT_HTTP_PASSWORD` from the sandbox env for *any* http(s)
  * remote, so an `http://` URL would put the deployment token on the wire in the clear — a remote
- * the agent was merely talked into cloning is enough. Redirects are checked on the way back:
- * `fetch` already drops `Authorization` across origins, but a downgraded final hop would still
- * have carried the response over plaintext.
+ * the agent was merely talked into cloning is enough.
+ *
+ * Redirects are followed by hand (`redirect: "manual"`) because checking the response afterwards
+ * is too late: `fetch` would already have made the downgraded request, and a chain that dips
+ * through `http://` and back to `https://` would hand back a final URL that looks clean. Crossing
+ * origins drops the credentials, which is what `fetch` does for us when it follows redirects
+ * itself — the token is for the host the user named, not for wherever it forwards us.
  */
 export const httpsOnlyGitFetch: GitFetchFunction = async (input, init) => {
-	const url = input instanceof Request ? input.url : String(input);
-	if (!url.startsWith("https://")) {
-		throw new Error(`git: refusing to send credentials over plaintext HTTP (${url}); use an https:// remote`);
+	const request = input instanceof Request ? input : new Request(input, init);
+	requireHttps(request.url, "refusing to send credentials over plaintext HTTP");
+
+	// Buffered once so every hop can replay it; just-git only ever sends byte-array bodies.
+	let body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+	let method = request.method;
+	let url = request.url;
+	const headers = new Headers(request.headers);
+
+	for (let hop = 0; hop <= MAX_GIT_REDIRECTS; hop++) {
+		const response = await fetch(url, { method, headers, body, redirect: "manual", signal: request.signal });
+		const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
+		if (location === null) return response;
+
+		const next = new URL(location, url).href;
+		requireHttps(next, "remote redirected to plaintext HTTP");
+		if (new URL(next).origin !== new URL(url).origin) {
+			headers.delete("authorization");
+			headers.delete("cookie");
+		}
+		// 303 means "repeat this as a GET" — replaying a POST body would re-send the packfile.
+		if (response.status === 303 && method !== "HEAD") {
+			method = "GET";
+			body = undefined;
+		}
+		url = next;
 	}
-	const response = await fetch(input, init);
-	if (!response.url.startsWith("https://")) {
-		throw new Error(`git: remote redirected to plaintext HTTP (${response.url}); refusing to continue`);
-	}
-	return response;
+
+	throw new Error(`git: remote redirected more than ${MAX_GIT_REDIRECTS} times; refusing to continue`);
 };
+
+function requireHttps(url: string, reason: string): void {
+	if (!url.startsWith("https://")) throw new Error(`git: ${reason} (${url}); use an https:// remote`);
+}
 
 /**
  * Build the sandbox `git` command. `defineCommand` marks it `trusted: true`, which runs it inside

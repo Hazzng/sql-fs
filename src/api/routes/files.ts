@@ -10,8 +10,7 @@
  */
 
 import { Hono } from "hono";
-import type { MiddlewareHandler } from "hono";
-import { bodyLimit } from "hono/body-limit";
+import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { FsStat } from "just-bash";
 import { z } from "zod";
@@ -73,21 +72,59 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// A write is bounded by the same limit as the file it produces, and the global body cap is four
-	// times looser. `bodyLimit` counts the bytes as they stream, so a chunked body carrying no
-	// Content-Length — or an under-declared one — is cut off rather than buffered on the header's word.
-	const writeBodyLimit = (subject: string): MiddlewareHandler<{ Variables: AuthVariables }> =>
-		bodyLimit({
-			maxSize: MAX_RAW_FILE_WRITE_BYTES,
-			onError: (c) =>
-				c.json(
-					{
-						error: "payload_too_large",
-						code: "PAYLOAD_TOO_LARGE",
-						details: [`${subject} exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
-					},
-					413 as ContentfulStatusCode,
-				),
-		});
+	// times looser. Content-Length only ever shortens the work: a request that declares too much is
+	// refused unread, but every byte is counted as it streams, so a chunked body carrying no header
+	// — or one that under-declares — is cut off rather than trusted. (hono's own `bodyLimit` skips
+	// the counting whenever the declared length fits, which is exactly the case a liar declares.)
+	const writeBodyLimit = (subject: string): MiddlewareHandler<{ Variables: AuthVariables }> => {
+		const tooLarge = (c: Context<{ Variables: AuthVariables }>): Response =>
+			c.json(
+				{
+					error: "payload_too_large",
+					code: "PAYLOAD_TOO_LARGE",
+					details: [`${subject} exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+				},
+				413 as ContentfulStatusCode,
+			);
+
+		return async (c, next) => {
+			const declared = Number(c.req.header("content-length"));
+			if (Number.isFinite(declared) && declared > MAX_RAW_FILE_WRITE_BYTES) return tooLarge(c);
+
+			const body = c.req.raw.body;
+			if (body === null) return next();
+
+			let overflowed = false;
+			let seen = 0;
+			const reader = body.getReader();
+			const counted = new ReadableStream<Uint8Array>({
+				async start(controller) {
+					try {
+						for (;;) {
+							const { done, value } = await reader.read();
+							if (done) break;
+							seen += value.byteLength;
+							if (seen > MAX_RAW_FILE_WRITE_BYTES) {
+								overflowed = true;
+								// Error the stream so the handler cannot act on a body it only half received.
+								controller.error(new Error("body exceeds limit"));
+								return;
+							}
+							controller.enqueue(value);
+						}
+						controller.close();
+					} catch (err) {
+						controller.error(err);
+					}
+				},
+			});
+			c.req.raw = new Request(c.req.raw, { body: counted, duplex: "half" } as RequestInit);
+
+			await next();
+			// Whatever the handler made of the aborted read — a 400, a 500 — the honest answer is 413.
+			if (overflowed) c.res = tooLarge(c);
+		};
+	};
 
 	// GET /v1/sandboxes/:id/files/* — read file content
 	// Hono requires /:path{.*} to capture wildcard segments that may contain slashes
@@ -215,11 +252,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
 			}
 			body = result.data;
-		} catch (err) {
-			// A body that blew the cap surfaces here as a stream error, because `bodyLimit` aborts the
-			// stream it handed us. Rethrow so the middleware can turn it into its 413 on the way out —
-			// swallowing it would report an oversized edit as malformed JSON.
-			if (err instanceof Error && err.name === "BodyLimitError") throw err;
+		} catch {
 			return c.json(
 				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
 				400 as ContentfulStatusCode,

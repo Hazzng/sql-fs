@@ -93,6 +93,11 @@ describe("httpsOnlyGitFetch", () => {
 		vi.unstubAllGlobals();
 	});
 
+	/** A redirect response `fetch` hands back under `redirect: "manual"`. */
+	function redirectTo(location: string, status = 302): Response {
+		return new Response(null, { status, headers: { location } });
+	}
+
 	it("refuses a plaintext remote before the request leaves the process", async () => {
 		const spy = vi.fn();
 		vi.stubGlobal("fetch", spy);
@@ -103,23 +108,89 @@ describe("httpsOnlyGitFetch", () => {
 		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("passes an https remote through untouched", async () => {
-		const response = new Response("ok");
-		Object.defineProperty(response, "url", { value: "https://git.test/repo/info/refs" });
-		const spy = vi.fn(async () => response);
+	it("passes an https response through untouched", async () => {
+		const ok = new Response("refs");
+		const spy = vi.fn(async () => ok);
 		vi.stubGlobal("fetch", spy);
 
-		const init = { method: "POST" };
-		await expect(httpsOnlyGitFetch("https://git.test/repo/info/refs", init)).resolves.toBe(response);
-		expect(spy).toHaveBeenCalledWith("https://git.test/repo/info/refs", init);
+		await expect(httpsOnlyGitFetch("https://git.test/repo/info/refs")).resolves.toBe(ok);
+		expect(spy).toHaveBeenCalledTimes(1);
+		const [url, requestInit] = spy.mock.calls[0] as unknown as [string, RequestInit];
+		expect(url).toBe("https://git.test/repo/info/refs");
+		expect(requestInit.redirect).toBe("manual");
 	});
 
-	it("refuses a response that redirected down to plaintext", async () => {
-		const response = new Response("ok");
-		Object.defineProperty(response, "url", { value: "http://git.test/repo/info/refs" });
-		vi.stubGlobal("fetch", async () => response);
+	it("refuses a redirect down to plaintext without making the request", async () => {
+		const spy = vi.fn(async () => redirectTo("http://git.test/repo/info/refs"));
+		vi.stubGlobal("fetch", spy);
 
 		await expect(httpsOnlyGitFetch("https://git.test/repo/info/refs")).rejects.toThrow(/redirected to plaintext HTTP/);
+		// The plaintext hop was never requested — only the original https URL was.
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	// A chain that dips through http:// and back would look clean if only the final URL were checked.
+	it("refuses a plaintext hop even when the chain ends back on https", async () => {
+		const spy = vi.fn(async (url: string) =>
+			url === "https://git.test/a" ? redirectTo("http://git.test/b") : new Response("refs"),
+		);
+		vi.stubGlobal("fetch", spy);
+
+		await expect(httpsOnlyGitFetch("https://git.test/a")).rejects.toThrow(/redirected to plaintext HTTP/);
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it("follows an https redirect, keeping credentials for the same origin", async () => {
+		const ok = new Response("refs");
+		const spy = vi.fn(async (url: string) => (url === "https://git.test/a" ? redirectTo("/b") : ok));
+		vi.stubGlobal("fetch", spy);
+
+		const response = await httpsOnlyGitFetch("https://git.test/a", {
+			headers: { authorization: "Basic dG9rZW4=" },
+		});
+
+		expect(response).toBe(ok);
+		expect(spy).toHaveBeenCalledTimes(2);
+		const [url, requestInit] = spy.mock.calls[1] as unknown as [string, RequestInit];
+		expect(url).toBe("https://git.test/b");
+		expect(new Headers(requestInit.headers).get("authorization")).toBe("Basic dG9rZW4=");
+	});
+
+	it("drops credentials when a redirect crosses origins", async () => {
+		const ok = new Response("refs");
+		const spy = vi.fn(async (url: string) => (url === "https://git.test/a" ? redirectTo("https://mirror.test/a") : ok));
+		vi.stubGlobal("fetch", spy);
+
+		await httpsOnlyGitFetch("https://git.test/a", { headers: { authorization: "Basic dG9rZW4=" } });
+
+		const [url, requestInit] = spy.mock.calls[1] as unknown as [string, RequestInit];
+		expect(url).toBe("https://mirror.test/a");
+		expect(new Headers(requestInit.headers).get("authorization")).toBe(null);
+	});
+
+	it("gives up on a redirect loop", async () => {
+		const spy = vi.fn(async () => redirectTo("https://git.test/loop"));
+		vi.stubGlobal("fetch", spy);
+
+		await expect(httpsOnlyGitFetch("https://git.test/loop")).rejects.toThrow(/redirected more than 5 times/);
+		expect(spy).toHaveBeenCalledTimes(6);
+	});
+
+	it("replays a POST body across a redirect, and drops it on a 303", async () => {
+		const ok = new Response("done");
+		const spy = vi.fn(async (url: string) =>
+			url === "https://git.test/push" ? redirectTo("https://git.test/moved", 303) : ok,
+		);
+		vi.stubGlobal("fetch", spy);
+
+		await httpsOnlyGitFetch("https://git.test/push", { method: "POST", body: new Uint8Array([1, 2, 3]) });
+
+		const [, first] = spy.mock.calls[0] as unknown as [string, RequestInit];
+		const [, second] = spy.mock.calls[1] as unknown as [string, RequestInit];
+		expect(first.method).toBe("POST");
+		expect(new Uint8Array(first.body as ArrayBuffer)).toEqual(new Uint8Array([1, 2, 3]));
+		expect(second.method).toBe("GET");
+		expect(second.body).toBeUndefined();
 	});
 });
 

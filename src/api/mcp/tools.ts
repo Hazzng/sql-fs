@@ -42,6 +42,17 @@ function fail(error: string, extra: Record<string, unknown> = {}): { content: Ar
 }
 
 /** Sandbox paths are absolute; accept a relative one rather than failing on a missing slash. */
+/**
+ * Walk an offset back to the start of a UTF-8 codepoint so a resumed read never opens mid-sequence
+ * (a caller that passes back our own `nextByteOffset` already lands on one; this covers a hand-written
+ * offset, which would otherwise decode to a leading replacement char).
+ */
+function snapToCodepointStart(bytes: Buffer, offset: number): number {
+	let i = Math.min(Math.max(offset, 0), bytes.byteLength);
+	while (i > 0 && i < bytes.byteLength && ((bytes[i] ?? 0) & 0xc0) === 0x80) i--;
+	return i;
+}
+
 function toAbsolute(path: string): string {
 	return path.startsWith("/") ? path : `/${path}`;
 }
@@ -143,12 +154,18 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 
 	server.tool(
 		"file_read",
-		"Read one sandbox file as text. Returns the whole file by default; pass offset/limit to page through a large one. Use this instead of `bash_exec 'cat …'` so the content comes back structured and bounded rather than through shell quoting.",
+		"Read one sandbox file as text. Returns the whole file by default; pass offset/limit to page through a large one, and byteOffset to resume a response that came back truncated. Use this instead of `bash_exec 'cat …'` so the content comes back structured and bounded rather than through shell quoting.",
 		{
 			id: z.string(),
 			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
 			offset: z.number().int().positive().optional().describe("1-based line to start from"),
 			limit: z.number().int().positive().optional().describe("Maximum number of lines to return"),
+			byteOffset: z
+				.number()
+				.int()
+				.nonnegative()
+				.optional()
+				.describe("Resume a truncated read: pass the previous response's nextByteOffset"),
 		},
 		async (args) => {
 			const filePath = toAbsolute(args.path);
@@ -178,25 +195,30 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					const lines = text.length === 0 ? [] : text.split("\n");
 					const totalLines = lines.length;
 					const firstLine = args.offset ?? 1;
-					let content = paging
+					const selected = paging
 						? lines.slice(firstLine - 1, args.limit === undefined ? undefined : firstLine - 1 + args.limit).join("\n")
 						: text;
 
-					// Bound what crosses the wire even when the whole file was requested. UTF-8 is never
-					// shorter than UTF-16, so an over-length string short-circuits the byte scan.
+					// Bound what crosses the wire even when the whole file was requested. The budget is in
+					// bytes but the paging controls are in lines, so a line longer than the budget would
+					// strand its own tail — no offset can reach past the first megabyte of one line. The cut
+					// point comes back as `nextByteOffset` for the caller to resume from.
+					const selectedBytes = Buffer.from(selected, "utf8");
+					const start = snapToCodepointStart(selectedBytes, args.byteOffset ?? 0);
+					let content = selected;
 					let truncated = false;
-					if (
-						content.length > MAX_READ_RESPONSE_BYTES ||
-						Buffer.byteLength(content, "utf8") > MAX_READ_RESPONSE_BYTES
-					) {
+					let nextByteOffset: number | undefined;
+					if (start > 0 || selectedBytes.byteLength > MAX_READ_RESPONSE_BYTES) {
 						// Cut on the byte budget, then drop a codepoint split across the boundary.
-						content = Buffer.from(content, "utf8")
-							.subarray(0, MAX_READ_RESPONSE_BYTES)
+						content = selectedBytes
+							.subarray(start, start + MAX_READ_RESPONSE_BYTES)
 							.toString("utf8")
 							.replace(/\uFFFD$/, "");
-						truncated = true;
+						const end = start + Buffer.byteLength(content, "utf8");
+						truncated = end < selectedBytes.byteLength;
+						if (truncated) nextByteOffset = end;
 					}
-					return { kind: "ok", content, size: stat.size, totalLines, firstLine, truncated } as const;
+					return { kind: "ok", content, size: stat.size, totalLines, firstLine, truncated, nextByteOffset } as const;
 				});
 
 				switch (outcome.kind) {
@@ -224,6 +246,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 										totalLines: outcome.totalLines,
 										firstLine: outcome.firstLine,
 										truncated: outcome.truncated,
+										...(outcome.nextByteOffset === undefined ? {} : { nextByteOffset: outcome.nextByteOffset }),
 									}),
 								},
 							],

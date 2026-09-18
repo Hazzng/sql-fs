@@ -70,6 +70,28 @@ describe("PATCH file edit body limit", () => {
 		});
 	});
 
+	// A declared length is a claim, not a measurement: the cap has to survive one that lies low.
+	it("rejects an oversized body that under-declares its Content-Length", async () => {
+		const app = await makeApp();
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/files/home/user/f.txt`, {
+				method: "PATCH",
+				headers: { "Content-Type": "application/json", "Content-Length": "12" },
+				body: chunked(LIMIT * 4),
+				// Node requires `duplex` for a streamed request body.
+				duplex: "half",
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(await res.json()).toEqual({
+			error: "payload_too_large",
+			code: "PAYLOAD_TOO_LARGE",
+			details: [`Edit body exceeds limit (${LIMIT} bytes)`],
+		});
+	});
+
 	it("rejects an oversized body streamed without a Content-Length", async () => {
 		const app = await makeApp();
 
@@ -119,6 +141,27 @@ describe("PUT raw file body limit", () => {
 			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/files/home/user/f.bin`, {
 				method: "PUT",
 				body: "x".repeat(LIMIT * 2),
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(await res.json()).toEqual({
+			error: "payload_too_large",
+			code: "PAYLOAD_TOO_LARGE",
+			details: [`File body exceeds limit (${LIMIT} bytes)`],
+		});
+	});
+
+	it("rejects an oversized body that under-declares its Content-Length", async () => {
+		const app = await makeApp();
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/files/home/user/f.bin`, {
+				method: "PUT",
+				headers: { "Content-Length": "12" },
+				body: chunked(LIMIT * 4),
+				// Node requires `duplex` for a streamed request body.
+				duplex: "half",
 			}),
 		);
 
