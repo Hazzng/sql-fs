@@ -19,6 +19,7 @@ import {
 } from "../redis/circuit-breaker.js";
 export { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
 import { LockAcquireTimeoutError, LockLostError, jitteredDelayMs } from "./distributed-lock.js";
+import { recordHeartbeatGap } from "./event-loop-monitor.js";
 
 // ── Lua scripts ──────────────────────────────────────────────────────────────
 
@@ -222,8 +223,12 @@ function startSharedHeartbeat(
 
 	const schedule = (delayMs: number): void => {
 		if (stopped) return;
+		// F8: a stall that delays this tick past the reader lease lets a writer
+		// enter mid-read; measure the gap (readerLeaseMs is the reader's "lease").
+		const expectedFireAt = Date.now() + delayMs;
 		timer = setTimeout(async () => {
 			if (stopped) return;
+			recordHeartbeatGap({ lock: "rw-reader", key: keys.readers, expectedFireAt, renewMs, leaseMs: readerLeaseMs });
 			let outcome: "renewed" | "ownership_lost" | "transient";
 			let raceTimeout: ReturnType<typeof setTimeout> | undefined; // L1: clear on settle
 			try {
@@ -349,8 +354,12 @@ function startExclusiveHeartbeat(
 
 	const schedule = (delayMs: number): void => {
 		if (stopped) return;
+		// F8: a stall that delays this tick past the writer lease lets a peer
+		// replica acquire the flag while we believe we still hold it; measure it.
+		const expectedFireAt = Date.now() + delayMs;
 		timer = setTimeout(async () => {
 			if (stopped) return;
+			recordHeartbeatGap({ lock: "rw-writer", key: keys.writer, expectedFireAt, renewMs, leaseMs });
 			let outcome: "renewed" | "ownership_lost" | "transient";
 			let raceTimeout: ReturnType<typeof setTimeout> | undefined; // L1: clear on settle
 			try {

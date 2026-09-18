@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.10.0
+
+### Minor Changes
+
+- [#157](https://github.com/Hazzng/sql-fs/pull/157) Thanks [@Hazzng](https://github.com/Hazzng)! - feat(observability): event-loop lag monitoring for the Redis leases (F8).
+
+  The exec-lock writer lease, the RW-lock writer flag, and the RW-lock reader ZSET
+  scores are all kept alive by `setTimeout` heartbeats that silently assume timers
+  fire on schedule. A long event-loop stall (a V8 GC pause or a pathological
+  synchronous bash stretch) can fire a renewal past the lease, voiding it — Lock 3
+  keeps Postgres consistent, so this was always an observability gap, not a
+  correctness bug, but nothing measured it.
+
+  New `src/api/event-loop-monitor.ts` (purely observational, no behavior change):
+
+  - A `perf_hooks.monitorEventLoopDelay` histogram started at boot, sampled every
+    `EVENT_LOOP_MONITOR_INTERVAL_MS` (default 10s) and logged as
+    `event:"event_loop_lag"` (`p50Ms`/`p99Ms`/`maxMs`/`meanMs`), then reset.
+  - Per-heartbeat gap measurement wired into all three lease sites: each heartbeat
+    reports actual-minus-expected fire time as `event:"heartbeat_gap"` at
+    `severity:"warn"` (gap > renewMs) or `"critical"` (gap > leaseMs), tagged with
+    the lock kind (`exec`/`rw-writer`/`rw-reader`) and key.
+
+  Alert thresholds are documented in DEVELOPER.md ("Lock observability"). End-to-end
+  smoke tests reproduce a >lease stall on each lease and assert the critical
+  heartbeat_gap fires (with a no-stall control proving no false positives).
+
+- [#156](https://github.com/Hazzng/sql-fs/pull/156) Thanks [@Hazzng](https://github.com/Hazzng)! - Heal stranded cross-replica version publishes after a Redis INCR failure (F3): a background drainer and reap-time best-effort publish flush the bump even if no further client traffic arrives or the session is idle-evicted.
+
+- [#155](https://github.com/Hazzng/sql-fs/pull/155) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(session): destroy now reaches warm sessions on other replicas (F7).
+
+  Destroying a sandbox on one replica previously left warm sessions on other
+  replicas serving ghost state: a written session would reload a deleted tree
+  into an empty pathCache (surfacing as a non-zero exit + garbage stderr inside an
+  HTTP 200 exec), and a never-written session would never reload at all because
+  the deleted version key read as 0 and matched its `lastSeenVersion === 0`.
+
+  Two layered fixes:
+
+  - Primary (Redis-independent): `SqlFs.reload()` now detects a zero-row
+    `loadAllPaths` — which for a live sandbox always returns at least its root dir
+    — and throws a typed `ESANDBOXGONE` instead of installing an empty pathCache.
+    The session manager catches it, tears the stale warm session down (drops it
+    from the pool and disconnects the per-session Postgres pool), and surfaces a
+    clean `ENOENT` → 404.
+  - Secondary (tombstone): `destroy` now writes a distinct `DESTROYED` sentinel to
+    the version key (with the version-key TTL) instead of deleting it.
+    `ensureFreshCache` recognises the sentinel before the numeric parse and tears
+    the session down — covering the never-written variant. Re-creating a
+    tombstoned sandbox clears the sentinel and starts cleanly at version 0.
+
+- [#153](https://github.com/Hazzng/sql-fs/pull/153) Thanks [@Hazzng](https://github.com/Hazzng)! - fix(lock): add bounded jitter + tunable retry to the distributed acquire loops (F9d, [#141](https://github.com/Hazzng/sql-fs/issues/141))
+
+  The distributed exec lock and RW lock polled Redis on a flat `acquireRetryMs`
+  (default 50 ms) interval, leaving competing replicas phase-aligned so a
+  cross-replica writer could be repeatedly passed over (bounded by
+  `acquireTimeoutMs`, then 503). Every acquire/drain poll now sleeps a jittered
+  `retryMs/2 + random()*retryMs/2` (range `[retryMs/2, retryMs]`) to
+  de-synchronize pollers. The retry interval is now configurable via
+  `REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS` (previously hardcoded — `server.ts` omitted
+  it). Circuit-breaker / error-budget behavior is unchanged. The FIFO ZSET ticket
+  queue is deferred as a follow-up.
+
+- [#154](https://github.com/Hazzng/sql-fs/pull/154) Thanks [@Hazzng](https://github.com/Hazzng)! - perf(cache): O(1) pathCache byte accounting to avoid full-map scans (F9e, [#142](https://github.com/Hazzng/sql-fs/issues/142))
+
+  SqlFs now maintains an incremental `#pathCacheBytes` counter, adjusted on
+  every pathCache set/delete and reset on `reload()`/`ready()`, and exposes
+  `getPathCacheBytes()`. SessionManager's path-cache memory budget calls it
+  instead of re-walking the entire pathCache (`Σ path.length + 100`) on every
+  dirty exec. The value equals the previous full-walk exactly. Falls back to
+  the full walk for backends that do not expose the counter.
+
+  The `#childrenByParent` children index (part B of [#142](https://github.com/Hazzng/sql-fs/issues/142)) is deferred to a
+  follow-up; it is benchmark-gated and (A) delivers the higher-value, lower-risk
+  win without touching readdir correctness.
+
 ## 0.9.0
 
 ### Minor Changes

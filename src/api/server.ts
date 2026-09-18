@@ -17,6 +17,7 @@ import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
 import { clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
+import { DEFAULT_SAMPLE_INTERVAL_MS, startEventLoopMonitor, stopEventLoopMonitor } from "./event-loop-monitor.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
@@ -302,11 +303,19 @@ if (isMain) {
 		sessionManager.startReaper();
 		startMcpSessionSweeper();
 
+		// F8: process-wide event-loop-lag monitor. Purely observational — surfaces
+		// the GC-pause / sync-stall class that can silently void a Redis lease
+		// (see event-loop-monitor.ts). The sampling timer is unref()'d internally.
+		startEventLoopMonitor({
+			sampleIntervalMs: parsePositiveInt("EVENT_LOOP_MONITOR_INTERVAL_MS", DEFAULT_SAMPLE_INTERVAL_MS),
+		});
+
 		let shuttingDown = false;
 		const shutdown = (): void => {
 			if (shuttingDown) return;
 			shuttingDown = true;
 			console.log(JSON.stringify({ event: "shutdown_begin" }));
+			stopEventLoopMonitor();
 			// Force-exit guard so a hung Postgres or Redis cleanup cannot keep
 			// the process alive past the orchestrator's grace period.
 			const forceExit = setTimeout(() => {
