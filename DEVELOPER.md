@@ -4,6 +4,14 @@ This document covers the internal architecture — how a request flows end-to-en
 
 ---
 
+## Production-readiness harness
+
+Reproductions for the distributed, memory, and durability issues (#164-#175) — how to stand up the
+multi-replica stack, inject the faults, and verify a fix — live in
+`thoughts/shared/research/2026-09-18_prod-readiness-harness.md`. Most of those failures are not
+reachable from the unit suite or from a single replica.
+
+
 ## Mental Model
 
 sql-fs is a **stateless HTTP server** backed by Postgres, with warm in-process state per active sandbox. The key invariant:
