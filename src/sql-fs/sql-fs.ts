@@ -64,7 +64,7 @@ type ReadFileOpts = Parameters<IFileSystem["readFile"]>[1];
 type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
-const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+export const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 
 interface SqlFsOptions<Tx> {
 	readonly dialect: SqlDialect<Tx>;
