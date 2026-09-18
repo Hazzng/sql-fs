@@ -288,6 +288,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			resolveEnd = resolve;
 			rejectEnd = reject;
 		});
+		// `#scriptTxAbort` is live from here, but the only `await endPromise` sits inside the
+		// transaction callback below and is not reached until `setSandboxContextWithLock` resolves.
+		// An abort in between — an exec timing out while the statement is queued — would otherwise
+		// reject a promise nobody is listening to and kill the process under the default
+		// `--unhandled-rejections=throw`. Behind a connection pooler that queue is seconds to
+		// minutes wide, so the window is routine rather than theoretical. The derived chain absorbs
+		// the rejection without clearing it: the `await` below still throws and still rolls back.
+		endPromise.catch(() => {});
 		this.#scriptTxEnd = resolveEnd;
 		this.#scriptTxAbort = rejectEnd;
 

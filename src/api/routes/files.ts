@@ -428,8 +428,22 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			);
 		}
 		let totalBytes = 0;
-		for (const [, content] of fileEntries) {
-			totalBytes += Buffer.byteLength(content, "utf8");
+		for (const [filePath, content] of fileEntries) {
+			const entryBytes = Buffer.byteLength(content, "utf8");
+			// The per-file cap has to hold here too, or the bulk route is a way around it: the total
+			// budget is larger, so one oversized entry would sail through and land a blob the
+			// contentCache cannot hold (see MAX_FILE_WRITE_BYTES on the retention cliff).
+			if (entryBytes > MAX_RAW_FILE_WRITE_BYTES) {
+				return c.json(
+					{
+						error: "payload_too_large",
+						code: "PAYLOAD_TOO_LARGE",
+						details: [`${filePath} is ${entryBytes} bytes; exceeds the per-file limit (${MAX_RAW_FILE_WRITE_BYTES})`],
+					},
+					413 as ContentfulStatusCode,
+				);
+			}
+			totalBytes += entryBytes;
 			if (totalBytes > MAX_BULK_WRITE_BYTES) {
 				return c.json(
 					{
