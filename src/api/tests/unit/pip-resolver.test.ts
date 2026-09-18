@@ -252,13 +252,6 @@ describe("resolver hygiene", () => {
 			}
 			// File download
 			const filename = parsed.pathname.slice(1);
-			for (const [, pkg] of Object.entries(packages)) {
-				for (const [, data] of Object.entries(pkg.versions)) {
-					if (filename.endsWith(".whl") && sha256(data.body) === filename.split("/").pop()?.replace(".whl", "")) {
-						// fall through to hash-based lookup below
-					}
-				}
-			}
 			// Match by filename pattern
 			const nameMatch = filename.match(/^([^/]+)-([^-]+)-py3-none-any\.whl$/);
 			if (nameMatch) {

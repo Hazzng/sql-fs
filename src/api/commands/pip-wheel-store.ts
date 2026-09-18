@@ -21,7 +21,7 @@
 import { createHash } from "node:crypto";
 import type { Redis } from "ioredis";
 import { MANIFEST_FORMAT } from "../../sql-fs/package-manifest.js";
-import type { IPackageStore, PackageBlob } from "../../sql-fs/package-store.js";
+import type { IPackageStore } from "../../sql-fs/package-store.js";
 import type { GraftFile, PackageManifest } from "../../sql-fs/types.js";
 import { LockLostError, wheelLockKey, withDistributedLock } from "../distributed-lock.js";
 import { logAudit } from "../lib/audit.js";
@@ -199,6 +199,7 @@ async function ingestWheel(
 	budget: InstallBudget,
 ): Promise<{ files: GraftFile[]; fileCount: number; totalBytes: number }> {
 	const files: GraftFile[] = [];
+	const seenPaths = new Set<string>();
 	const reader = readWheel(wheel, {
 		limits,
 		consumedFiles: budget.files,
@@ -207,17 +208,18 @@ async function ingestWheel(
 	let next = await reader.next();
 	while (next.done !== true) {
 		const batch = next.value;
-		const blobs: PackageBlob[] = batch.map((file) => ({ sha256: file.sha256, data: file.content }));
-		await store.ingestBlobs(blobs);
+		const kept: { file: (typeof batch)[number]; path: string }[] = [];
 		for (const file of batch) {
 			const path = spreadDataPath(file.path);
-			if (path === null) continue;
-			files.push({
-				path,
-				sha256: file.sha256,
-				mode: file.mode,
-				size: file.size,
-			});
+			if (path === null || seenPaths.has(path)) continue;
+			seenPaths.add(path);
+			kept.push({ file, path });
+		}
+		if (kept.length > 0) {
+			await store.ingestBlobs(kept.map(({ file }) => ({ sha256: file.sha256, data: file.content })));
+		}
+		for (const { file, path } of kept) {
+			files.push({ path, sha256: file.sha256, mode: file.mode, size: file.size });
 		}
 		next = await reader.next();
 	}

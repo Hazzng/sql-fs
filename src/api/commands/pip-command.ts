@@ -319,8 +319,8 @@ class InvalidTokenError(Exception):
 
 PyJWTError = InvalidTokenError
 
-def decode(_token, options=None, **_kwargs):
-    if options and options.get("verify_signature") is False:
+def decode(_token, _key=None, _algorithms=None, options=None, **_kwargs):
+    if (options and options.get("verify_signature") is False) or _kwargs.get("verify_signature") is False:
         return {}
     raise InvalidTokenError(
         "JWT verification is not available in this sandbox"
@@ -742,7 +742,7 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 	// Prune packages that are no longer reachable from any root after
 	// re-resolution cleared stale child edges.
 	const reachable = new Set<string>();
-	const walk = [...roots.map((r) => r.name), ...synthetic.keys()];
+	const walk = [...roots.map((r) => r.name)];
 	while (walk.length > 0) {
 		const n = walk.pop()!;
 		if (reachable.has(n)) continue;
@@ -751,6 +751,9 @@ async function resolvePlan(state: ResolveState, roots: readonly Requirement[]): 
 	}
 	for (const [name] of resolved) {
 		if (!reachable.has(name)) resolved.delete(name);
+	}
+	for (const [name] of synthetic) {
+		if (!reachable.has(name)) synthetic.delete(name);
 	}
 
 	return {
