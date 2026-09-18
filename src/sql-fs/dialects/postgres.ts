@@ -7,12 +7,21 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { runTrustedDbAsync } from "../defense.js";
-import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
+import {
+	createEgraftmissing,
+	createEinval,
+	createEisdir,
+	createEnoent,
+	createEnotdir,
+	translateSqlError,
+} from "../errors.js";
+import { graftPathProblem } from "../package-path.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
 import {
 	type BulkIngestFile,
 	type CreateInodeOpts,
 	type DirentRow,
+	type GraftFile,
 	INODE_KIND,
 	type InodeKind,
 	type InodeRow,
@@ -26,6 +35,27 @@ import {
 
 /** Transaction handle type used throughout this dialect. */
 type PgTx = postgres.TransactionSql;
+
+/** Postgres OID of `bytea[]`, for the explicitly typed hash-array parameter. */
+const BYTEA_ARRAY_OID = 1001;
+
+/** What the inode/dirent phases need, from either `bulkIngest` or `bulkGraft`. */
+interface PreparedBulkFile {
+	readonly path: string;
+	readonly name: string;
+	readonly parentInodeId: bigint;
+	readonly mode: number;
+	readonly size: number;
+	readonly sha256: Buffer;
+}
+
+/** Splits an absolute path into its parent directory inode and leaf name. */
+function splitPath(path: string, dirMap: Map<string, bigint>): { name: string; parentInodeId: bigint } {
+	const parts = path.split("/").filter(Boolean);
+	const name = parts[parts.length - 1]!;
+	const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
+	return { name, parentInodeId: dirMap.get(parentPath)! };
+}
 
 /**
  * Reads a positive integer env var, returns the fallback when unset / malformed.
@@ -842,27 +872,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return rows.map((r) => BigInt(r.id));
 	}
 
-	// US-017
-	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>> {
-		const result = new Map<string, PathCacheEntry>();
-		if (files.length === 0) return result;
+	// ── Shared bulk-write phases (bulkIngest / bulkGraft) ────────────────────────
 
+	/** Resolves the current sandbox + root inode from the transaction's RLS context. */
+	async #bulkContext(tx: PgTx, op: string): Promise<{ sandboxId: string; rootInodeId: bigint }> {
 		const ctxRows = await tx<{ id: string; root_inode: string }[]>`
 			SELECT id, root_inode FROM sandboxes WHERE id = current_setting('app.sandbox_id')
 		`;
 		const ctxRow = ctxRows[0];
-		if (!ctxRow?.root_inode) throw new Error("bulkIngest: sandbox not found or has no root inode");
-		const sandboxId = ctxRow.id;
-		const rootInodeId = BigInt(ctxRow.root_inode);
+		if (!ctxRow?.root_inode) throw new Error(`${op}: sandbox not found or has no root inode`);
+		return { sandboxId: ctxRow.id, rootInodeId: BigInt(ctxRow.root_inode) };
+	}
 
-		// ── Phase A: resolve/create ancestor directories by depth level ──────────
-
+	/** Phase A — resolve or create ancestor directories, one round-trip per depth. */
+	async #bulkEnsureDirs(
+		tx: PgTx,
+		op: string,
+		sandboxId: string,
+		rootInodeId: bigint,
+		paths: readonly string[],
+		result: Map<string, PathCacheEntry>,
+	): Promise<Map<string, bigint>> {
 		const dirMap = new Map<string, bigint>();
 		dirMap.set("/", rootInodeId);
 
 		const dirsByDepth = new Map<number, Set<string>>();
-		for (const f of files) {
-			const parts = f.path.split("/").filter(Boolean);
+		for (const path of paths) {
+			const parts = path.split("/").filter(Boolean);
 			for (let i = 1; i < parts.length; i++) {
 				const dirPath = `/${parts.slice(0, i).join("/")}`;
 				const depth = i;
@@ -890,7 +926,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				const name = parts[parts.length - 1]!;
 				const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
 				const parentInodeId = dirMap.get(parentPath);
-				if (!parentInodeId) throw new Error(`bulkIngest: parent dir ${parentPath} not found`);
+				if (!parentInodeId) throw new Error(`${op}: parent dir ${parentPath} not found`);
 				candidates.push({ dirPath, name, parentInodeId });
 			}
 
@@ -961,24 +997,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			}
 		}
 
-		// ── Phase B: detect existing file dirents for overwrite handling ──────────
+		return dirMap;
+	}
 
-		const filesWithHash = files.map((f) => {
-			const parts = f.path.split("/").filter(Boolean);
-			const name = parts[parts.length - 1]!;
-			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-			return {
-				path: f.path,
-				content: f.content,
-				mode: f.mode,
-				sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
-				name,
-				parentPath,
-				parentInodeId: dirMap.get(parentPath)!,
-			};
-		});
-
-		const fileCheckValues = filesWithHash.map((f) => [String(f.parentInodeId), f.name]);
+	/** Phase B — dirents that already exist at the target paths (overwrite). */
+	async #bulkExistingDirents(tx: PgTx, files: readonly PreparedBulkFile[]): Promise<Map<string, bigint>> {
+		const fileCheckValues = files.map((f) => [String(f.parentInodeId), f.name]);
 		const existingFileDirents = await tx<
 			{
 				parent_inode_id: string;
@@ -997,49 +1021,32 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		const existingFileMap = new Map<string, bigint>();
 		for (const row of existingFileDirents) {
 			if (row.kind === INODE_KIND.DIRECTORY) {
-				const match = filesWithHash.find((f) => String(f.parentInodeId) === row.parent_inode_id && f.name === row.name);
+				const match = files.find((f) => String(f.parentInodeId) === row.parent_inode_id && f.name === row.name);
 				throw createEisdir(match?.path ?? row.name);
 			}
 			existingFileMap.set(`${row.parent_inode_id}:${row.name}`, BigInt(row.inode_id));
 		}
+		return existingFileMap;
+	}
 
-		// ── Phase C: bulk insert blobs ────────────────────────────────────────────
-		// F6: commit the CAS blobs in their OWN short tx (own pool connection, no
-		// advisory lock — `blobs` is unscoped CAS) BEFORE the inode/dirent work in
-		// the script-tx, so the hot-blob `ON CONFLICT DO UPDATE` tuple lock is
-		// released at this statement's COMMIT instead of being pinned to the
-		// long-lived script-tx. The touch is unconditional so the GC grace window
-		// protects these blobs until their referencing inodes commit below.
-
-		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
-		for (const f of filesWithHash) {
-			const key = f.sha256.toString("hex");
-			if (!uniqueBlobs.has(key)) {
-				uniqueBlobs.set(key, {
-					sha256: f.sha256,
-					data: f.content,
-					size: f.content.length,
-				});
-			}
-		}
-		if (uniqueBlobs.size > 0) {
-			const blobRows = [...uniqueBlobs.values()];
-			const db = this.db();
-			await runTrustedDbAsync(
-				() => db`INSERT INTO blobs ${db(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`,
-			);
-			if (this.#blobCache !== undefined) {
-				for (const b of blobRows) void this.#blobCache.set(new Uint8Array(b.sha256), b.data);
-			}
-		}
-
+	/**
+	 * Phases D/E/F — insert inodes, (re)link dirents, drop inodes that lost their
+	 * last link, and build the path-cache entries from the RETURNING rows.
+	 */
+	async #bulkLinkFiles(
+		tx: PgTx,
+		sandboxId: string,
+		files: readonly PreparedBulkFile[],
+		existingFileMap: Map<string, bigint>,
+		result: Map<string, PathCacheEntry>,
+	): Promise<void> {
 		// ── Phase D: bulk insert file inodes ─────────────────────────────────────
 
-		const inodeInserts = filesWithHash.map((f) => ({
+		const inodeInserts = files.map((f) => ({
 			sandbox_id: sandboxId,
 			kind: INODE_KIND.FILE,
 			mode: f.mode,
-			size: f.content.length,
+			size: f.size,
 			content_sha256: f.sha256,
 		}));
 		const insertedInodes = await tx<{ id: string; mtime: string }[]>`
@@ -1057,8 +1064,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			sandbox_id: string;
 		}> = [];
 
-		for (let i = 0; i < filesWithHash.length; i++) {
-			const f = filesWithHash[i]!;
+		for (let i = 0; i < files.length; i++) {
+			const f = files[i]!;
 			const newInodeId = insertedInodes[i]!.id;
 			const key = `${String(f.parentInodeId)}:${f.name}`;
 			const oldInodeId = existingFileMap.get(key);
@@ -1106,19 +1113,181 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 		// ── Phase F: build result cache entries from INSERT RETURNING data ────────
 
-		for (let i = 0; i < filesWithHash.length; i++) {
-			const f = filesWithHash[i]!;
+		for (let i = 0; i < files.length; i++) {
+			const f = files[i]!;
 			const row = insertedInodes[i]!;
 			result.set(f.path, {
 				inodeId: BigInt(row.id),
 				kind: INODE_KIND.FILE,
 				mode: f.mode,
-				size: f.content.length,
+				size: f.size,
 				mtime: new Date(row.mtime),
 				contentSha256: f.sha256,
 				symlinkTarget: null,
 			});
 		}
+	}
+
+	// US-017
+	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>> {
+		const result = new Map<string, PathCacheEntry>();
+		if (files.length === 0) return result;
+
+		const { sandboxId, rootInodeId } = await this.#bulkContext(tx, "bulkIngest");
+
+		// ── Phase A: resolve/create ancestor directories by depth level ──────────
+
+		const dirMap = await this.#bulkEnsureDirs(
+			tx,
+			"bulkIngest",
+			sandboxId,
+			rootInodeId,
+			files.map((f) => f.path),
+			result,
+		);
+
+		// ── Phase B: detect existing file dirents for overwrite handling ──────────
+
+		const filesWithHash: PreparedBulkFile[] = files.map((f) => ({
+			path: f.path,
+			mode: f.mode,
+			size: f.content.length,
+			sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
+			...splitPath(f.path, dirMap),
+		}));
+
+		const existingFileMap = await this.#bulkExistingDirents(tx, filesWithHash);
+
+		// ── Phase C: bulk insert blobs ────────────────────────────────────────────
+		// F6: commit the CAS blobs in their OWN short tx (own pool connection, no
+		// advisory lock — `blobs` is unscoped CAS) BEFORE the inode/dirent work in
+		// the script-tx, so the hot-blob `ON CONFLICT DO UPDATE` tuple lock is
+		// released at this statement's COMMIT instead of being pinned to the
+		// long-lived script-tx. The touch is unconditional so the GC grace window
+		// protects these blobs until their referencing inodes commit below.
+
+		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
+		for (let i = 0; i < filesWithHash.length; i++) {
+			const f = filesWithHash[i]!;
+			const key = f.sha256.toString("hex");
+			if (!uniqueBlobs.has(key)) {
+				uniqueBlobs.set(key, {
+					sha256: f.sha256,
+					data: files[i]!.content,
+					size: f.size,
+				});
+			}
+		}
+		if (uniqueBlobs.size > 0) {
+			const blobRows = [...uniqueBlobs.values()];
+			const db = this.db();
+			await runTrustedDbAsync(
+				() => db`INSERT INTO blobs ${db(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`,
+			);
+			if (this.#blobCache !== undefined) {
+				for (const b of blobRows) void this.#blobCache.set(new Uint8Array(b.sha256), b.data);
+			}
+		}
+
+		// ── Phases D/E/F: inodes, dirents, result entries ────────────────────────
+
+		await this.#bulkLinkFiles(tx, sandboxId, filesWithHash, existingFileMap, result);
+
+		return result;
+	}
+
+	/**
+	 * Touch-RETURNING probe shared by `ingestBlobs` and `bulkGraft`: returns the
+	 * hex of every stored hash, having bumped and row-locked it.
+	 */
+	async #touchBlobs(hashes: readonly Buffer[]): Promise<Set<string>> {
+		const db = this.db();
+		const rows = await runTrustedDbAsync(
+			() => db<{ sha256: Buffer }[]>`
+				UPDATE blobs SET last_referenced_at = now()
+				WHERE sha256 = ANY(${db.array(hashes as Buffer[], BYTEA_ARRAY_OID)})
+				RETURNING sha256
+			`,
+		);
+		const present = new Set<string>();
+		for (const row of rows) present.add(Buffer.from(row.sha256).toString("hex"));
+		return present;
+	}
+
+	async ingestBlobs(blobs: ReadonlyArray<{ sha256: Uint8Array; data: Uint8Array }>): Promise<void> {
+		if (blobs.length === 0) return;
+
+		// Deduplicate within the batch — a wheel ships the same empty
+		// `__init__.py` many times, and one INSERT cannot conflict with itself.
+		const unique = new Map<string, { sha256: Buffer; data: Uint8Array }>();
+		for (const blob of blobs) {
+			const sha256 = Buffer.from(blob.sha256);
+			const key = sha256.toString("hex");
+			if (!unique.has(key)) unique.set(key, { sha256, data: blob.data });
+		}
+
+		// 1: touch what is stored. Returned rows are present and row-locked, so a
+		// concurrent REPEATABLE READ GC conflicts instead of deleting them.
+		const present = await this.#touchBlobs([...unique.values()].map((b) => b.sha256));
+
+		// 2: insert the rest, self-committing on the pool connection with no
+		// advisory lock (F6 — `blobs` is unscoped CAS with no RLS).
+		const missing = [...unique.entries()].filter(([key]) => !present.has(key)).map(([, b]) => b);
+		if (missing.length === 0) return;
+
+		const rows = missing.map((b) => ({ sha256: b.sha256, data: b.data, size: b.data.length }));
+		const db = this.db();
+		await runTrustedDbAsync(
+			() => db`INSERT INTO blobs ${db(rows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`,
+		);
+		// Backfill Redis only for what we inserted — see upsertBlob.
+		if (this.#blobCache !== undefined) {
+			for (const b of missing) void this.#blobCache.set(new Uint8Array(b.sha256), b.data);
+		}
+	}
+
+	async bulkGraft(tx: PgTx, files: readonly GraftFile[]): Promise<Map<string, PathCacheEntry>> {
+		const result = new Map<string, PathCacheEntry>();
+		if (files.length === 0) return result;
+
+		// These rows come from the database; a row written by an older writer must
+		// not create a dirent this writer would refuse.
+		for (const f of files) {
+			if (graftPathProblem(f.path) !== null) throw createEinval(f.path);
+		}
+
+		const { sandboxId, rootInodeId } = await this.#bulkContext(tx, "bulkGraft");
+
+		// Presence is decided before a single inode exists: an inode pointing at a
+		// collected blob would read back as an empty file.
+		const uniqueHashes = new Map<string, Buffer>();
+		for (const f of files) {
+			const sha256 = Buffer.from(f.sha256);
+			uniqueHashes.set(sha256.toString("hex"), sha256);
+		}
+		const present = await this.#touchBlobs([...uniqueHashes.values()]);
+		const missing = [...uniqueHashes.keys()].filter((hex) => !present.has(hex));
+		if (missing.length > 0) throw createEgraftmissing(missing);
+
+		const dirMap = await this.#bulkEnsureDirs(
+			tx,
+			"bulkGraft",
+			sandboxId,
+			rootInodeId,
+			files.map((f) => f.path),
+			result,
+		);
+
+		const prepared: PreparedBulkFile[] = files.map((f) => ({
+			path: f.path,
+			mode: f.mode,
+			size: f.size,
+			sha256: Buffer.from(f.sha256),
+			...splitPath(f.path, dirMap),
+		}));
+
+		const existingFileMap = await this.#bulkExistingDirents(tx, prepared);
+		await this.#bulkLinkFiles(tx, sandboxId, prepared, existingFileMap, result);
 
 		return result;
 	}

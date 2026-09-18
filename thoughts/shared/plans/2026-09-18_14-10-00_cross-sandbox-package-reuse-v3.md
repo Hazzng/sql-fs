@@ -408,6 +408,117 @@ copy for that batch (8 MB), hash and parser state. Two installs per replica is
 a lower bound of about 160 MB of buffers; the real figure is measured under
 concurrency before the default is finalised.
 
+### Phase 1 status
+
+Implemented on `experiment/pip-install-databricks-cli` (worktree
+`sqlfs-pip-experiment`). The WASM extractor is still the install path; Phase 3
+rewires it.
+
+- [x] **Wheel reader** (`src/api/commands/wheel-reader.ts`) on `yauzl` 3.4.0:
+      central-directory validation before any inflate, async batched inflate,
+      CRC-32 and RECORD verification, `WheelError` for every refusal.
+- [x] **Pre-inflate checks**: encryption flag, compression other than 0/8,
+      data descriptor with unknown sizes, NUL / backslash / absolute /
+      drive-letter / `.` / `..` / empty segment / length > 512 paths, symlinks
+      by external attributes, directory-versus-file collisions, duplicate
+      paths, declared size over `PIP_MAX_FILE_BYTES`, cumulative bytes and
+      count over `PIP_MAX_INSTALL_BYTES` / `PIP_MAX_INSTALL_FILES` (earlier
+      wheels' totals passed in as `consumedBytes` / `consumedFiles`), and the
+      archive itself over `PIP_MAX_WHEEL_BYTES`.
+- [x] **Local-versus-central header agreement** (yauzl does not check this):
+      filename bytes, compression method, CRC and both sizes, with the ZIP64
+      extra field resolved on the local side and streamed entries (bit 3)
+      exempted from the CRC/size half.
+- [x] **WHEEL and RECORD**: exactly one `*.dist-info`, `Wheel-Version` `1.x`,
+      `Root-Is-Purelib: true`, every non-RECORD entry listed with a
+      urlsafe-base64-nopad `sha256=` hash, verified per entry.
+- [x] **Bounded async inflate**: raw entry stream piped through
+      `zlib.createInflateRaw({ maxOutputLength })` plus an independent byte
+      counter; exact-size check, CRC-32 check, then the sha256. Any zlib or
+      stream failure becomes one "corrupt or hostile archive" error with no
+      error-code matching.
+- [x] **Batching**: async generator yielding ≤ 8 MB inflated or ≤ 500 entries;
+      the batch array is replaced before the next entry is inflated.
+- [x] **Modes** normalised to 0o644, or 0o755 when any x bit is set.
+      `.data/` subtrees are kept verbatim.
+- [x] **Limits in one place** (`src/api/commands/package-limits.ts`):
+      `packageLimits()` reads all seven `PIP_*` knobs once and memoises;
+      `readPipLimits()` now derives `maxDownloadBytes`,
+      `maxTotalDownloadBytes`, `maxWheelFiles` and `maxExtractedBytes` from it.
+- [x] **`SqlDialect.ingestBlobs`** on the Postgres dialect: pool connection,
+      self-committing, no advisory lock; touch-RETURNING then `INSERT ... ON
+      CONFLICT DO UPDATE` for the rest, deduplicated within the batch; Redis
+      backfill only for inserted rows; no content-cache write; wrapped in
+      `runTrustedDbAsync`.
+- [x] **`SqlDialect.bulkGraft`** + `GraftFile` + `EGRAFTMISSING`: the same
+      touch-RETURNING before any inode, then Phases A/B/D/E/F shared with
+      `bulkIngest` (extracted into `#bulkContext`, `#bulkEnsureDirs`,
+      `#bulkExistingDirents`, `#bulkLinkFiles` — `bulkIngest`'s statements and
+      their order are byte-for-byte unchanged). Paths re-validated with the
+      shared rules in `src/sql-fs/package-path.ts`.
+- [x] **`SqlFs.bulkGraft`** runs in the script tx like `bulkIngest`, updates
+      `pathCache`, evicts a replaced inode's content and inserts nothing into
+      the content cache; declared on `ICoherentFs`, so `ctx.fs` reaches it in
+      Phase 3 exactly as `bulkIngest` is reached today.
+- [x] **`REDIS_PATH_SNAPSHOT_MAX_BYTES`** (default 16 MB): an oversized encoded
+      snapshot logs `snapshot_write_skipped_too_large` and publishes nothing,
+      so the sandbox falls back to a DB reload.
+- [x] **Tests**: `wheel-fixtures.ts` builder plus well-formed, hostile and
+      fuzz suites (28 + 10 + 1); `ingestBlobs` counting-pool unit test;
+      `SqlFs.bulkGraft` cache unit test; snapshot max-bytes unit test;
+      integration tests for real `ingestBlobs` touch-then-insert and a real
+      graft round trip including `EGRAFTMISSING`.
+
+### Discoveries and Notable Information
+
+- **yauzl spike result: adopt, but do not trust it for header agreement.**
+  yauzl 3.4.0 (one dependency, `pend`; no bundled types, `@types/yauzl` 3.4.0
+  matches) parses the central directory, handles ZIP64 (EOCD locator and the
+  0x0001 extra field), rejects strong encryption (bit 6), multi-disk archives,
+  bad file names (`..`, absolute, and — with `strictFileNames: true` —
+  backslashes), stored-size mismatches, and inflates through
+  `zlib.createInflateRaw` asynchronously. It does **not** compare the local
+  file header against the central directory (`readLocalFileHeader` with
+  `{minimal: true}` checks only the signature and the data bounds) and it
+  creates its inflate stream with no `maxOutputLength`. Both gaps are closed
+  here: entries are opened with `decodeFileData: false` and inflated through
+  our own bounded stream, and `assertHeadersAgree` reads the full local header.
+- **yauzl's own refusals fire before ours for some hostile shapes** (path
+  traversal, absolute path, backslash, stored-size lie, traditional encryption
+  on a stored entry). They are remapped to `WheelError` with yauzl's wording
+  kept for diagnosis, so the caller still sees exactly one error type. The
+  hostile tests assert the resulting message, which documents which layer
+  refuses what.
+- **The fuzz test earned its place immediately**: the first run surfaced an
+  `unexpected EOF` from yauzl escaping through `readLocalFileHeaderPromise` /
+  `openReadStreamPromise`, outside the per-entry catch. The whole generator
+  body is now wrapped, so no third-party error can reach the installer.
+- **`maxOutputLength` cannot be 0**, so it is `Math.max(size, 1)` and the
+  independent counter is what enforces the exact declared size, including for
+  empty files.
+- **`ANY($1)` needs the array OID, not the element OID.** `db.array(hashes,
+  17)` produced `op ANY/ALL (array) requires array on right side`; the
+  parameter is typed `bytea[]` (OID 1001).
+- **No wrapper needed to reach `bulkGraft` from a command.** `session.fs` is
+  the `SqlFs` instance itself and `SessionScopedFs` only wraps the scope hooks,
+  so Phase 3 can duck-type `ctx.fs` exactly as `routes/ingest.ts` does for
+  `bulkIngest`.
+- **Consolidating the limits changed the old extractor's numbers** (wheel
+  16 MB → 32 MB, install download 64 MB → 256 MB, files 10 000 → 50 000,
+  extracted bytes 48 MB → 512 MB). The pip test that used to build a
+  10 001-file wheel now stubs `PIP_MAX_INSTALL_FILES=4`, which also cut that
+  suite from 9.2 s to 1.6 s.
+- **Pre-existing integration flake, unrelated to this phase.** Running the
+  integration suite with file parallelism intermittently fails
+  `rls.integration.test.ts` with `deadlock detected`: its `beforeAll` applies
+  `0005_enable_rls.sql`, whose `ALTER TABLE` takes ACCESS EXCLUSIVE locks while
+  other files are mid-transaction. Reproduced with the two new Phase 1
+  integration files excluded (2 of 3 runs), and absent under
+  `--no-file-parallelism` (14 files / 97 tests green). Worth fixing separately
+  by not running DDL from a test that shares the database.
+- **Deferred to Phase 3, as planned:** the install path still uses
+  `EXTRACT_CODE`; the post-publish content-cache warm is not implemented.
+
 ## Phase 2: migration 0007
 
 ```sql

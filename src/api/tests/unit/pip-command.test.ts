@@ -1,11 +1,17 @@
 import { Bash, InMemoryFs } from "just-bash";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { resetPackageLimits } from "../../commands/package-limits.js";
 import { pythonPackageCommands } from "../../commands/pip-command.js";
 import { fixtureFetch, makeBash, wheel } from "./pip-fixtures.js";
 
 const encoder = new TextEncoder();
 
 describe("experimental SQL-FS pip commands", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		resetPackageLimits();
+	});
+
 	it("rejects installs when network is disabled", async () => {
 		const bash = new Bash({ fs: new InMemoryFs(), python: true, customCommands: pythonPackageCommands });
 		const result = await bash.exec("pip install demo");
@@ -94,7 +100,9 @@ describe("experimental SQL-FS pip commands", () => {
 	});
 
 	it("rejects a wheel exceeding the extracted file limit", async () => {
-		const manyFiles = Object.fromEntries(Array.from({ length: 10_001 }, (_, index) => [`demo_${index}.py`, ""]));
+		vi.stubEnv("PIP_MAX_INSTALL_FILES", "4");
+		resetPackageLimits();
+		const manyFiles = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [`demo_${index}.py`, ""]));
 		const bash = makeBash({ demo: { version: "1.0", body: wheel("demo", "1.0", manyFiles) } });
 		const result = await bash.exec("pip install demo");
 		expect(result.exitCode).toBe(1);

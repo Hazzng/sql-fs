@@ -10,6 +10,7 @@ import {
 	defineCommand,
 } from "just-bash";
 import { pythonSlotAlreadyHeld } from "../python-slot-context.js";
+import { packageLimits } from "./package-limits.js";
 import {
 	compareVersions,
 	hasExplicitPrerelease,
@@ -40,11 +41,15 @@ function envNumber(name: string, fallback: number): number {
 }
 
 export interface PipLimits {
+	/** `PIP_MAX_WHEEL_BYTES`. */
 	readonly maxDownloadBytes: number;
+	/** `PIP_MAX_INSTALL_DOWNLOAD_BYTES`. */
 	readonly maxTotalDownloadBytes: number;
 	readonly maxDependencies: number;
 	readonly maxDependencyDepth: number;
+	/** `PIP_MAX_INSTALL_FILES`. */
 	readonly maxWheelFiles: number;
+	/** `PIP_MAX_INSTALL_BYTES`. */
 	readonly maxExtractedBytes: number;
 	readonly maxRedirects: number;
 	/** Cap for a single PyPI JSON response. */
@@ -56,15 +61,19 @@ export interface PipLimits {
 	readonly maxCandidateVersions: number;
 }
 
-/** These limits are deliberately conservative for the experiment. */
+/**
+ * Size limits come from `packageLimits()` so there is one place per limit;
+ * the rest are resolver knobs that only pip uses.
+ */
 export function readPipLimits(): PipLimits {
+	const shared = packageLimits();
 	return {
-		maxDownloadBytes: 16 * 1024 * 1024,
-		maxTotalDownloadBytes: 64 * 1024 * 1024,
+		maxDownloadBytes: shared.maxWheelBytes,
+		maxTotalDownloadBytes: shared.maxInstallDownloadBytes,
 		maxDependencies: 64,
 		maxDependencyDepth: envNumber("PIP_MAX_DEPENDENCY_DEPTH", 16),
-		maxWheelFiles: 10_000,
-		maxExtractedBytes: 48 * 1024 * 1024,
+		maxWheelFiles: shared.maxInstallFiles,
+		maxExtractedBytes: shared.maxInstallBytes,
 		maxRedirects: 5,
 		maxMetadataBytes: envNumber("PIP_MAX_METADATA_RESPONSE_BYTES", 16 * 1024 * 1024),
 		maxTotalMetadataBytes: envNumber("PIP_MAX_METADATA_BYTES", 32 * 1024 * 1024),

@@ -56,6 +56,7 @@ const pathSnapshot =
 	pathSnapshotEnabled && redisClient
 		? new RedisPathSnapshot(redisClient, {
 				ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
+				maxBytes: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_MAX_BYTES", 16 * 1024 * 1024),
 			})
 		: undefined;
 

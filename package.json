@@ -45,6 +45,7 @@
 		"mssql": "^11.0.0",
 		"mysql2": "^3.12.0",
 		"postgres": "^3.4.0",
+		"yauzl": "^3.4.0",
 		"zod": "^3.24.0"
 	},
 	"devDependencies": {
@@ -53,6 +54,7 @@
 		"@changesets/cli": "^2.31.0",
 		"@types/mssql": "^9.1.0",
 		"@types/node": "^22.0.0",
+		"@types/yauzl": "^3.4.0",
 		"drizzle-kit": "^0.30.0",
 		"knip": "^6.4.1",
 		"lefthook": "^1.11.0",

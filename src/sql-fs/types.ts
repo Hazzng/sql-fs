@@ -106,6 +106,14 @@ export interface BulkIngestFile {
 	readonly mode: number;
 }
 
+/** A file for `bulkGraft`: a path plus the hash of already-stored content. */
+export interface GraftFile {
+	readonly path: string;
+	readonly sha256: Uint8Array;
+	readonly mode: number;
+	readonly size: number;
+}
+
 /** Options for a transaction. */
 export interface TransactionOptions {
 	/**
@@ -322,6 +330,21 @@ export interface SqlDialect<Tx = unknown> {
 	commitBlob?(sha256: Uint8Array, data: Uint8Array): Promise<void>;
 
 	/**
+	 * Commits a batch of CAS blobs outside any caller transaction (own pool
+	 * connection, self-committing, no advisory lock — the F6 pattern) in two
+	 * statements: touch-RETURNING what is already stored, then INSERT ... ON
+	 * CONFLICT the rest, deduplicated within the batch.
+	 *
+	 * The touch row-locks the present blobs, so a concurrent REPEATABLE READ GC
+	 * either already deleted them (step 2 reinserts) or retries. Existence is
+	 * owned by the dialect: a caller-asserted "present" set can go stale before
+	 * the referencing inode exists, and a missing blob reads as an empty file.
+	 *
+	 * Populates no content cache — this runs with no sandbox.
+	 */
+	ingestBlobs(blobs: ReadonlyArray<{ sha256: Uint8Array; data: Uint8Array }>): Promise<void>;
+
+	/**
 	 * Retrieves blob content by its SHA-256 hash.
 	 * Returns null if no blob with that hash exists.
 	 */
@@ -394,6 +417,18 @@ export interface SqlDialect<Tx = unknown> {
 	 * Prefers multi-row INSERT statements for blobs and inodes.
 	 */
 	bulkIngest(tx: Tx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>>;
+
+	/**
+	 * Like `bulkIngest`, but the content is already stored: creates the missing
+	 * directories, inodes and dirents and transmits no payload.
+	 *
+	 * Every hash is touch-RETURNING'd (as in `ingestBlobs` step 1) before any
+	 * inode exists; a hash that is not returned throws `code: "EGRAFTMISSING"`
+	 * with the missing hashes as hex on `missing`, so the caller can drop the
+	 * stale manifest and re-ingest. Paths are re-validated because these rows
+	 * come from the database, not from this writer.
+	 */
+	bulkGraft(tx: Tx, files: readonly GraftFile[]): Promise<Map<string, PathCacheEntry>>;
 
 	// ── Path resolution ───────────────────────────────────────────────────────────
 

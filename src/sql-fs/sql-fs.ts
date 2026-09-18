@@ -27,7 +27,7 @@ import {
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
-import { type BulkIngestFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
+import { type BulkIngestFile, type GraftFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
 /**
  * Normalize a virtual filesystem path: resolve `.` and `..` components,
@@ -119,6 +119,12 @@ export interface ICoherentFs extends IFileSystem {
 	 * pathCache via reload() and marks the FS dirty.
 	 */
 	bulkIngest(files: BulkIngestFile[]): Promise<void>;
+	/**
+	 * Links files whose content is already stored in `blobs` into this sandbox.
+	 * Sends no payload and populates no content cache; throws EGRAFTMISSING if
+	 * any referenced blob is gone.
+	 */
+	bulkGraft(files: readonly GraftFile[]): Promise<void>;
 }
 
 export interface IScriptTxFs extends ICoherentFs {
@@ -833,6 +839,31 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			if (bytes !== undefined && bytes.byteLength > 0) {
 				this.#contentCache.set(entry.inodeId, bytes);
 			}
+		}
+		this.#dirty = true;
+	}
+
+	// Grafts files whose content is already stored as blobs: no payload is sent
+	// and nothing enters the content cache (the bytes are not in memory here).
+	// Overwritten inodes are still evicted so a stale body is never served.
+	async bulkGraft(files: readonly GraftFile[]): Promise<void> {
+		if (files.length === 0) return;
+		this.#assertWritable("/", "bulkGraft");
+		const normalized: GraftFile[] = [];
+		const seen = new Set<string>();
+		for (const file of files) {
+			const path = validatePath(file.path);
+			if (seen.has(path)) throw createEexist(path);
+			seen.add(path);
+			normalized.push({ path, sha256: file.sha256, mode: file.mode, size: file.size });
+		}
+		const newEntries = await this.#withTx((tx) => this.#dialect.bulkGraft(tx, normalized));
+		for (const [path, entry] of newEntries) {
+			const old = this.#pathCache.get(path);
+			if (old !== undefined && old.inodeId !== entry.inodeId) {
+				this.#contentCache.delete(old.inodeId);
+			}
+			this.#cacheSet(path, entry);
 		}
 		this.#dirty = true;
 	}

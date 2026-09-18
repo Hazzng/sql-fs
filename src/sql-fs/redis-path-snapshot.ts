@@ -66,18 +66,23 @@ interface Snapshot {
 }
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000; // 1h
+/** A sandbox whose encoded snapshot exceeds this skips publishing it. */
+const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 
 export interface RedisPathSnapshotOptions {
 	readonly ttlMs?: number;
+	readonly maxBytes?: number;
 }
 
 export class RedisPathSnapshot {
 	readonly #client: Redis;
 	readonly #ttlMs: number;
+	readonly #maxBytes: number;
 
 	constructor(client: Redis, opts: RedisPathSnapshotOptions = {}) {
 		this.#client = client;
 		this.#ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+		this.#maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
 	}
 
 	static key(tenantId: string, sandboxId: string): string {
@@ -106,6 +111,20 @@ export class RedisPathSnapshot {
 		const snap: Snapshot = { schemaVersion: SNAPSHOT_SCHEMA_VERSION, version, entries };
 		try {
 			const bytes = Buffer.from(encode(snap));
+			// Oversized sandboxes (a big package install) fall back to a DB reload
+			// rather than pushing one huge value through Redis every publish.
+			if (bytes.length > this.#maxBytes) {
+				console.warn(
+					JSON.stringify({
+						event: "snapshot_write_skipped_too_large",
+						sandboxId,
+						bytes: bytes.length,
+						maxBytes: this.#maxBytes,
+						knob: "REDIS_PATH_SNAPSHOT_MAX_BYTES",
+					}),
+				);
+				return;
+			}
 			await this.#client.set(RedisPathSnapshot.key(tenantId, sandboxId), bytes, "PX", this.#ttlMs);
 		} catch (err) {
 			console.error(JSON.stringify({ event: "snapshot_write_error", sandboxId, error: (err as Error).message }));

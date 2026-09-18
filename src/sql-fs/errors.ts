@@ -75,6 +75,20 @@ export function createEsandboxgone(sandboxId: string): Error {
 	return makeFsError("ESANDBOXGONE", `ESANDBOXGONE: sandbox no longer exists, '${sandboxId}'`);
 }
 
+/**
+ * EGRAFTMISSING: a `bulkGraft` referenced a blob that is no longer stored.
+ * Raised by the touch-RETURNING probe before any inode exists, so the graft is
+ * all-or-nothing; the missing hashes are attached as hex on `missing`.
+ */
+export function createEgraftmissing(missing: readonly string[]): Error & { code: string; missing: readonly string[] } {
+	const shown = missing.slice(0, 4).join(", ");
+	const suffix = missing.length > 4 ? `, and ${missing.length - 4} more` : "";
+	return Object.assign(
+		new Error(`EGRAFTMISSING: ${missing.length} referenced blob(s) are no longer stored: ${shown}${suffix}`),
+		{ code: "EGRAFTMISSING", missing },
+	);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */
