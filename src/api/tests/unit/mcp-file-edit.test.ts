@@ -7,7 +7,7 @@
 
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerTools } from "../../mcp/tools.js";
 import { SessionManager } from "../../session-manager.js";
 import { captureToolHandlers, requireHandler } from "../helpers/mcp.js";
@@ -38,10 +38,11 @@ async function makeEnv(): Promise<{
 
 describe("MCP tool — file_edit", () => {
 	beforeEach(() => {
-		process.env.AUTH_SECRET = "test-secret-mcp-file-edit-at-least-32b!!";
+		// stubEnv so the suite restores whatever AUTH_SECRET the process already had.
+		vi.stubEnv("AUTH_SECRET", "test-secret-mcp-file-edit-at-least-32b!!");
 	});
 	afterEach(() => {
-		process.env.AUTH_SECRET = "";
+		vi.unstubAllEnvs();
 	});
 
 	it("replaces a unique occurrence and reports the result", async () => {
@@ -63,6 +64,27 @@ describe("MCP tool — file_edit", () => {
 		expect(result.ok).toBe(true);
 		expect(result.path).toBe("/a.txt");
 		expect(await fs.readFile("/a.txt")).toBe("two");
+	});
+
+	it("contains a traversing path inside the sandbox", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/outside.txt", "one");
+
+		// The filesystem resolves `..` against the sandbox root, so neither form escapes it.
+		expect((await call({ path: "../outside.txt", oldString: "one", newString: "two" })).ok).toBe(true);
+		expect(await fs.readFile("/outside.txt", "utf8")).toBe("two");
+		expect((await call({ path: "/../../outside.txt", oldString: "two", newString: "three" })).ok).toBe(true);
+		expect(await fs.readFile("/outside.txt", "utf8")).toBe("three");
+	});
+
+	it("rejects a path containing a NUL byte and leaves the file untouched", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/a.txt", "one");
+
+		const result = await call({ path: "/a\0.txt", oldString: "one", newString: "two" });
+
+		expect(result).toEqual({ ok: false, error: "file not found", code: "ENOENT", path: "/a\0.txt" });
+		expect(await fs.readFile("/a.txt", "utf8")).toBe("one");
 	});
 
 	it("refuses an ambiguous match and leaves the file untouched", async () => {

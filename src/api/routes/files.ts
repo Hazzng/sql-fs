@@ -214,6 +214,20 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const tenant = c.get("tenant");
 		const filePath = `/${c.req.param("path")}`;
 
+		// Reject an oversized edit before parsing it: the strings are bounded by the same limit
+		// as the file they rewrite, and the global body cap is three orders of magnitude looser.
+		const declaredLength = Number(c.req.header("content-length"));
+		if (Number.isFinite(declaredLength) && declaredLength > MAX_RAW_FILE_WRITE_BYTES) {
+			return c.json(
+				{
+					error: "payload_too_large",
+					code: "PAYLOAD_TOO_LARGE",
+					details: [`Edit body exceeds limit (${MAX_RAW_FILE_WRITE_BYTES} bytes)`],
+				},
+				413 as ContentfulStatusCode,
+			);
+		}
+
 		let body: z.infer<typeof editBodySchema>;
 		try {
 			const result = editBodySchema.safeParse(await c.req.json());

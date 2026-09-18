@@ -294,7 +294,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 
 	server.tool(
 		"file_edit",
-		"Replace an exact string inside one existing sandbox file. Reads, patches and writes atomically, so it is the cheapest way to change code without shipping the whole file. oldString must match exactly once unless replaceAll is true — an ambiguous match is rejected rather than guessed at. Read the file first (e.g. bash_exec 'cat path') so oldString reflects current content.",
+		"Replace an exact string inside one existing sandbox file. Reads, patches and writes atomically, so it is the cheapest way to change code without shipping the whole file. oldString must match exactly once unless replaceAll is true — an ambiguous match is rejected rather than guessed at. Read the file first with file_read so oldString reflects current content — bash_exec 'cat <shell-quoted path>' only for files past file_read's limits.",
 		{
 			id: z.string(),
 			path: z.string().min(1).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),

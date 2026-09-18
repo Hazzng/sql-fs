@@ -144,6 +144,19 @@ describe("git clone cleanup", () => {
 		expect(await inner.readFile("/repo/file.txt", "utf8")).toBe("content");
 	});
 
+	it("lets git report a destination that is an existing file", async () => {
+		const fs = new InMemoryFs();
+		await fs.writeFile("/dest", "i am a file\n");
+
+		const result = await makeBash(fs, server).exec(`git clone ${BASE_URL}/project /dest`);
+
+		// The pre-clone hook must not readdir a non-directory: that threw `ENOTDIR … scandir`
+		// out of the hook before git could produce its own message.
+		expect(result.stderr).toBe("fatal: destination path '/dest' already exists and is not an empty directory.\n");
+		expect(result.exitCode).toBe(128);
+		expect(await fs.readFile("/dest", "utf8")).toBe("i am a file\n");
+	});
+
 	it("leaves no residue when the transport is refused", async () => {
 		const fs = new InMemoryFs();
 		const offline = new Bash({ fs, customCommands: [createGitCommand({ network: false })] });

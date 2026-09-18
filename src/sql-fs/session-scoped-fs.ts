@@ -39,15 +39,20 @@ export class SessionScopedFs {
 	 *
 	 * A returned value commits even when it represents a rejected outcome — a rejection writes
 	 * nothing, and the lazily-opened transaction must still be closed rather than left open.
+	 *
+	 * Nests safely: when a scope is already open, this runs inside it and leaves committing or
+	 * rolling back to whoever opened it — finalizing another caller's transaction here would
+	 * commit its half-run script.
 	 */
 	async run<T>(fn: () => Promise<T>): Promise<T> {
-		this.beginScope();
+		const ownsScope = !this.isActive;
+		if (ownsScope) this.beginScope();
 		try {
 			const result = await fn();
-			await this.endScope();
+			if (ownsScope) await this.endScope();
 			return result;
 		} catch (err) {
-			await this.abortScope();
+			if (ownsScope) await this.abortScope();
 			throw err;
 		}
 	}

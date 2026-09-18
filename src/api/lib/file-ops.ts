@@ -43,6 +43,9 @@ export type EditOutcome =
 	| { kind: "not_unique"; count: number }
 	| { kind: "too_large" };
 
+/** Mode `writeFile` assigns to a freshly created file on every backend. */
+const DEFAULT_FILE_MODE = 0o644;
+
 /** Non-overlapping occurrences of `needle`, counted without regex so the input needs no escaping. */
 function countOccurrences(haystack: string, needle: string): number {
 	let count = 0;
@@ -63,14 +66,19 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 		throw e;
 	}
 	if (stat.isDirectory) return { kind: "eisdir" };
+	// Refuse before reading: a file already past the write limit cannot be edited into a
+	// legal one without first decoding it into a string roughly twice its size.
+	if (stat.size > maxBytes) return { kind: "too_large" };
 
 	const bytes = await session.fs.readFileBuffer(filePath);
 
 	let text: string;
 	try {
 		// `fatal` rejects invalid UTF-8, so a binary file is refused rather than
-		// silently rewritten with replacement characters.
-		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		// silently rewritten with replacement characters. `ignoreBOM` keeps a leading
+		// U+FEFF in the string instead of consuming it, so re-encoding preserves the
+		// file's original byte prefix — an edit must not touch bytes it did not match.
+		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 	} catch {
 		return { kind: "binary" };
 	}
@@ -80,6 +88,15 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 	if (count === 0) return { kind: "no_match" };
 	if (count > 1 && req.replaceAll !== true) return { kind: "not_unique", count };
 
+	const replacements = req.replaceAll === true ? count : 1;
+	const encoder = new TextEncoder();
+
+	// Project the result size before building it. A fatal, BOM-preserving decode round-trips
+	// byte-for-byte, so the arithmetic is exact — and an oversized edit is rejected without
+	// ever materializing the oversized string or its encoding.
+	const delta = encoder.encode(req.newString).byteLength - encoder.encode(req.oldString).byteLength;
+	if (bytes.byteLength + replacements * delta > maxBytes) return { kind: "too_large" };
+
 	const index = text.indexOf(req.oldString);
 	const updated =
 		req.replaceAll === true
@@ -87,11 +104,13 @@ async function applyEdit(session: Session, filePath: string, req: EditRequest, m
 			: text.slice(0, index) + req.newString + text.slice(index + req.oldString.length);
 
 	// Encode once: `writeFile` would otherwise re-encode the same string internally.
-	const encoded = new TextEncoder().encode(updated);
-	if (encoded.byteLength > maxBytes) return { kind: "too_large" };
+	const encoded = encoder.encode(updated);
 
 	await session.fs.writeFile(filePath, encoded);
-	return { kind: "ok", replacements: req.replaceAll === true ? count : 1, size: encoded.byteLength };
+	// Every backend recreates the inode at the default mode on write, so an edit would
+	// otherwise strip an executable bit or widen a restricted file. Restore what stat saw.
+	if (stat.mode !== DEFAULT_FILE_MODE) await session.fs.chmod(filePath, stat.mode);
+	return { kind: "ok", replacements, size: encoded.byteLength };
 }
 
 /**

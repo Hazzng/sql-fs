@@ -10,7 +10,7 @@ import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { fileRoutes } from "../../routes/files.js";
 import { SessionManager } from "../../session-manager.js";
@@ -52,10 +52,11 @@ async function edit(
 
 describe("PATCH /v1/sandboxes/:id/files/*path", () => {
 	beforeEach(() => {
-		process.env.AUTH_SECRET = AUTH_SECRET;
+		// stubEnv so the suite restores whatever AUTH_SECRET the process already had.
+		vi.stubEnv("AUTH_SECRET", AUTH_SECRET);
 	});
 	afterEach(() => {
-		process.env.AUTH_SECRET = "";
+		vi.unstubAllEnvs();
 	});
 
 	it("replaces a unique occurrence and reports the new size", async () => {

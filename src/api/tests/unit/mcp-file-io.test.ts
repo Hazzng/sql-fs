@@ -7,7 +7,7 @@
 
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerTools } from "../../mcp/tools.js";
 import { SessionManager } from "../../session-manager.js";
 import { captureToolHandlers, requireHandler } from "../helpers/mcp.js";
@@ -39,10 +39,11 @@ async function makeEnv(): Promise<{
 
 describe("MCP tool — file_read", () => {
 	beforeEach(() => {
-		process.env.AUTH_SECRET = "test-secret-mcp-file-io-at-least-32bytes";
+		// stubEnv so the suite restores whatever AUTH_SECRET the process already had.
+		vi.stubEnv("AUTH_SECRET", "test-secret-mcp-file-io-at-least-32bytes");
 	});
 	afterEach(() => {
-		process.env.AUTH_SECRET = "";
+		vi.unstubAllEnvs();
 	});
 
 	it("returns the whole file with its size and line count", async () => {
@@ -60,6 +61,16 @@ describe("MCP tool — file_read", () => {
 			firstLine: 1,
 			truncated: false,
 		});
+	});
+
+	it("contains a traversing path inside the sandbox and rejects a NUL byte", async () => {
+		const { call, fs } = await makeEnv();
+		await fs.writeFile("/outside.txt", "contained\n");
+
+		// `..` resolves against the sandbox root, so it reads the in-sandbox file, not a host one.
+		expect(await call("file_read", { path: "../outside.txt" })).toMatchObject({ ok: true, content: "contained\n" });
+		expect(await call("file_read", { path: "/../../outside.txt" })).toMatchObject({ ok: true, content: "contained\n" });
+		expect(await call("file_read", { path: "/outside\0.txt" })).toMatchObject({ ok: false, code: "ENOENT" });
 	});
 
 	it("pages with offset and limit", async () => {
@@ -118,10 +129,11 @@ describe("MCP tool — file_read", () => {
 
 describe("MCP tool — file_write", () => {
 	beforeEach(() => {
-		process.env.AUTH_SECRET = "test-secret-mcp-file-io-at-least-32bytes";
+		// stubEnv so the suite restores whatever AUTH_SECRET the process already had.
+		vi.stubEnv("AUTH_SECRET", "test-secret-mcp-file-io-at-least-32bytes");
 	});
 	afterEach(() => {
-		process.env.AUTH_SECRET = "";
+		vi.unstubAllEnvs();
 	});
 
 	it("creates a file and its parent directories", async () => {
@@ -155,6 +167,21 @@ describe("MCP tool — file_write", () => {
 		await fs.mkdir("/dir", { recursive: true });
 
 		expect(await call("file_write", { path: "/dir", content: "x" })).toMatchObject({ ok: false, code: "EISDIR" });
+	});
+
+	it("contains a traversing path inside the sandbox", async () => {
+		const { call, fs } = await makeEnv();
+
+		expect(await call("file_write", { path: "/../../outside.txt", content: "contained" })).toMatchObject({ ok: true });
+		expect(await fs.readFile("/outside.txt")).toBe("contained");
+	});
+
+	it("rejects a path containing a NUL byte without creating a file", async () => {
+		const { call, fs } = await makeEnv();
+
+		expect(await call("file_write", { path: "/nul\0.txt", content: "x" })).toMatchObject({ ok: false });
+		// Neither the literal name nor a NUL-stripped variant may appear.
+		expect((await fs.readdir("/")).filter((name) => name.includes("nul"))).toEqual([]);
 	});
 
 	it("round-trips content through file_write and file_read", async () => {

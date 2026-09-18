@@ -178,6 +178,30 @@ const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
 	"GIT_HTTP_PASSWORD",
 ]);
 
+/**
+ * Re-derive git's HTTP credentials from a per-request `GITHUB_TOKEN`.
+ *
+ * just-bash merges the exec env over the base env key by key, so an override of `GITHUB_TOKEN`
+ * alone leaves `GIT_HTTP_PASSWORD` holding the deployment token — `git clone`/`push` would keep
+ * authenticating as the server while `curl $GITHUB_TOKEN` used the caller's. Only sandboxes that
+ * carry the credentials at all (network-enabled) are touched, and an explicit git credential in
+ * the request always wins.
+ */
+export function deriveExecGitCredentials(
+	env: Record<string, string> | undefined,
+	network: boolean,
+): Record<string, string> | undefined {
+	if (env === undefined || !network) return env;
+	if (!Object.hasOwn(env, "GITHUB_TOKEN")) return env;
+	if (["GIT_HTTP_BEARER_TOKEN", "GIT_HTTP_USER", "GIT_HTTP_PASSWORD"].some((k) => Object.hasOwn(env, k))) return env;
+	const out: Record<string, string> = Object.assign(Object.create(null), env);
+	// An empty override means "no credentials": just-git only sends basic auth when both halves
+	// are non-empty, so the pair below stays inert rather than falling back to the server token.
+	out.GIT_HTTP_USER = "x-access-token";
+	out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
+	return out;
+}
+
 function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(baseEnv)) {
@@ -1628,6 +1652,7 @@ export class SessionManager {
 		const resolvedOpts: ExecOptions = {
 			...opts,
 			cwd: opts?.cwd ?? session.cwd,
+			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
 		};
 
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via

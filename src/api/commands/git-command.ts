@@ -70,6 +70,16 @@ async function removeResidue(fs: IFileSystem, targets: readonly CloneTarget[]): 
 }
 
 /**
+ * Is `path` a directory with nothing in it? A destination that exists but is not a directory
+ * counts as non-empty: just-git refuses it with its own message, and readdir on a file would
+ * otherwise throw out of the hook before git ever got to report that.
+ */
+async function isEmptyDir(fs: IFileSystem, path: string): Promise<boolean> {
+	if (!(await fs.stat(path)).isDirectory) return false;
+	return (await fs.readdir(path)).length === 0;
+}
+
+/**
  * Build the sandbox `git` command. `defineCommand` marks it `trusted: true`, which runs it inside
  * `DefenseInDepthBox.runTrustedAsync` — git needs direct `fetch` and crypto.
  *
@@ -85,7 +95,7 @@ export function createGitCommand(options: { readonly network: GitNetworkOption }
 				const scope = scopes.getStore();
 				if (scope === undefined) return;
 				const existed = await scope.fs.exists(event.targetPath);
-				const wasEmpty = existed ? (await scope.fs.readdir(event.targetPath)).length === 0 : true;
+				const wasEmpty = existed ? await isEmptyDir(scope.fs, event.targetPath) : true;
 				scope.targets.push({ path: event.targetPath, existed, wasEmpty });
 			},
 		},

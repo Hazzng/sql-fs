@@ -1,6 +1,6 @@
 import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionManager, buildSandboxBaseEnv } from "../../session-manager.js";
+import { SessionManager, buildSandboxBaseEnv, deriveExecGitCredentials } from "../../session-manager.js";
 
 const T = "default";
 
@@ -31,6 +31,31 @@ describe("buildSandboxBaseEnv", () => {
 			GIT_AUTHOR_NAME: "Agent",
 			GIT_AUTHOR_EMAIL: "agent@example.com",
 		});
+	});
+});
+
+describe("deriveExecGitCredentials", () => {
+	it("re-points git's credentials at a per-request token", () => {
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token" }, true)).toEqual({
+			GITHUB_TOKEN: "request-token",
+			GIT_HTTP_USER: "x-access-token",
+			GIT_HTTP_PASSWORD: "request-token",
+		});
+	});
+
+	it("leaves an explicit git credential alone", () => {
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token", GIT_HTTP_PASSWORD: "explicit" }, true)).toEqual({
+			GITHUB_TOKEN: "request-token",
+			GIT_HTTP_PASSWORD: "explicit",
+		});
+	});
+
+	it("passes through an env without a token override, and a sandbox without network", () => {
+		expect(deriveExecGitCredentials({ FOO: "bar" }, true)).toEqual({ FOO: "bar" });
+		expect(deriveExecGitCredentials({ GITHUB_TOKEN: "request-token" }, false)).toEqual({
+			GITHUB_TOKEN: "request-token",
+		});
+		expect(deriveExecGitCredentials(undefined, true)).toBeUndefined();
 	});
 });
 
@@ -108,6 +133,28 @@ describe("SessionManager git command", () => {
 		await expect(
 			session.bash.exec('printf \'%s:%s:%s\' "$GITHUB_TOKEN" "$GIT_HTTP_USER" "$GIT_HTTP_PASSWORD"'),
 		).resolves.toMatchObject({
+			exitCode: 0,
+			stdout: "server-token:x-access-token:server-token",
+		});
+	});
+
+	it("routes a per-request GITHUB_TOKEN through to git's credentials on the exec path", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "server-token");
+		const sm = makeSessionManager();
+		const session = await sm.getOrCreate(T, "git-token-exec-override", {
+			python: false,
+			javascript: false,
+			network: true,
+		});
+		const probe = 'printf \'%s:%s:%s\' "$GITHUB_TOKEN" "$GIT_HTTP_USER" "$GIT_HTTP_PASSWORD"';
+
+		// An override of GITHUB_TOKEN alone must not leave git pushing as the server identity.
+		await expect(
+			sm.execWithRuntimeThrottle(session, probe, { env: { GITHUB_TOKEN: "request-token" } }),
+		).resolves.toMatchObject({ exitCode: 0, stdout: "request-token:x-access-token:request-token" });
+
+		// The next exec without an override is back on the deployment credentials.
+		await expect(sm.execWithRuntimeThrottle(session, probe)).resolves.toMatchObject({
 			exitCode: 0,
 			stdout: "server-token:x-access-token:server-token",
 		});

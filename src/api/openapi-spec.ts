@@ -501,6 +501,7 @@ export const openapiSpec = {
 							"application/json": {
 								schema: {
 									type: "object",
+									required: ["path", "replacements", "size"],
 									properties: {
 										path: { type: "string" },
 										replacements: { type: "integer" },
