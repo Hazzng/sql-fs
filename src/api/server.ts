@@ -18,7 +18,13 @@ import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
 import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError, mapFsErrorToStatus } from "./errors.js";
-import { DEFAULT_SAMPLE_INTERVAL_MS, startEventLoopMonitor, stopEventLoopMonitor } from "./event-loop-monitor.js";
+import {
+	DEFAULT_SAMPLE_INTERVAL_MS,
+	DEFAULT_STALL_THRESHOLD_MS,
+	eventLoopLagSnapshot,
+	startEventLoopMonitor,
+	stopEventLoopMonitor,
+} from "./event-loop-monitor.js";
 import { loadExecLockOptions } from "./exec-lock-config.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
@@ -253,6 +259,11 @@ app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
 app.get("/readyz", async (c) => {
+	// #168: the lag histogram had no egress but a console.log, so nothing could poll how close this
+	// replica was running to the 2 s Redis commandTimeout. Reading it does not reset the histogram,
+	// so a scraper cannot perturb the windowed `event_loop_lag` line. Absent when the monitor is not
+	// running (unit tests, and any embed that does not boot via the entry point).
+	const eventLoop = eventLoopLagSnapshot();
 	// F5: reflect Redis health. When Redis is configured but unreachable, the
 	// service is degraded (lock acquire will fast-fail 503), so /readyz must not
 	// report ready. The PING is bounded by the client's commandTimeout (2 s) and
@@ -264,13 +275,13 @@ app.get("/readyz", async (c) => {
 				new Promise<never>((_, reject) => setTimeout(() => reject(new Error("ping_timeout")), 2_000)),
 			]);
 			if (pong !== "PONG") {
-				return c.json({ status: "degraded", redis: "unexpected_reply" }, 503);
+				return c.json({ status: "degraded", redis: "unexpected_reply", ...(eventLoop && { eventLoop }) }, 503);
 			}
 		} catch (err) {
-			return c.json({ status: "degraded", redis: (err as Error).message }, 503);
+			return c.json({ status: "degraded", redis: (err as Error).message, ...(eventLoop && { eventLoop }) }, 503);
 		}
 	}
-	return c.json({ status: "ok" });
+	return c.json({ status: "ok", ...(eventLoop && { eventLoop }) });
 });
 
 // ── OpenAPI / Swagger ──────────────────────────────────────────────────────────
@@ -321,6 +332,7 @@ if (isMain) {
 		// (see event-loop-monitor.ts). The sampling timer is unref()'d internally.
 		startEventLoopMonitor({
 			sampleIntervalMs: parsePositiveInt("EVENT_LOOP_MONITOR_INTERVAL_MS", DEFAULT_SAMPLE_INTERVAL_MS),
+			stallThresholdMs: parsePositiveInt("EVENT_LOOP_STALL_THRESHOLD_MS", DEFAULT_STALL_THRESHOLD_MS),
 		});
 
 		let shuttingDown = false;
