@@ -21,6 +21,7 @@ import {
 	createEfbig,
 	createEinval,
 	createEisdir,
+	createEloop,
 	createEnobufs,
 	createEnoent,
 	createEnotdir,
@@ -857,10 +858,34 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * Throws ENOENT if the path or its symlink target is missing from cache.
 	 * Throws ELOOP (via dialect.resolvePath) if a symlink loop is detected.
 	 */
+	/**
+	 * Symlink-following resolution served entirely from the pathCache (#166).
+	 *
+	 * Inside a buffered scope `dialect.resolvePath` is wrong twice over: the database
+	 * has not seen this script's journaled mutations, and pathCache ids are provisional
+	 * placeholders that can never equal a database id, so the id match below it would
+	 * miss even if the lookup succeeded. The pathCache is authoritative for the scope,
+	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard.
+	 */
+	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry } {
+		let current = path;
+		for (let hops = 0; hops <= 40; hops++) {
+			const entry = this.#pathCache.get(current);
+			if (!entry) throw createEnoent(path);
+			if (entry.kind !== INODE_KIND.SYMLINK) return { path: current, entry };
+			const target = entry.symlinkTarget;
+			if (target === undefined || target === null) throw createEnoent(path);
+			const slash = current.lastIndexOf("/");
+			current = this.resolvePath(slash <= 0 ? "/" : current.slice(0, slash), target);
+		}
+		throw createEloop(path);
+	}
+
 	async #resolveReadEntry(path: string): Promise<PathCacheEntry> {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
+		if (this.#bufferingWrites()) return this.#resolveFromCache(path).entry;
 
 		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally.
 		// Read-only resolution: skip the per-sandbox advisory lock so reads
@@ -2293,6 +2318,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async realpath(inputPath: string): Promise<string> {
 		const path = validatePath(inputPath);
+		if (this.#bufferingWrites()) return this.#resolveFromCache(path).path;
 		// Read-only: skip the advisory lock.
 		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
