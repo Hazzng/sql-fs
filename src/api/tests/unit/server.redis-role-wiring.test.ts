@@ -48,9 +48,14 @@ afterEach(() => {
 });
 
 describe("server Redis role wiring", () => {
+	// Every test stubs every wiring var: ambient REDIS_URL / REDIS_DATA_URL /
+	// feature flags must not leak in (an exported REDIS_URL would otherwise
+	// open a control connection in the data-only test below).
 	it("opens one control connection and one data connection at boot", async () => {
 		vi.resetModules();
 		vi.stubEnv("REDIS_URL", "redis://localhost:6379");
+		vi.stubEnv("REDIS_DATA_URL", undefined);
+		vi.stubEnv("REDIS_BLOB_CACHE_ENABLED", undefined);
 		vi.stubEnv("REDIS_PATH_SNAPSHOT_ENABLED", "true");
 		await import("../../server.js");
 		expect(constructed).toEqual(["sql-fs-control", "sql-fs-data"]);
@@ -60,7 +65,9 @@ describe("server Redis role wiring", () => {
 	it("opens only the control connection when no data-plane feature is enabled", async () => {
 		vi.resetModules();
 		vi.stubEnv("REDIS_URL", "redis://localhost:6379");
+		vi.stubEnv("REDIS_DATA_URL", undefined);
 		vi.stubEnv("REDIS_BLOB_CACHE_ENABLED", "false");
+		vi.stubEnv("REDIS_PATH_SNAPSHOT_ENABLED", "false");
 		await import("../../server.js");
 		expect(constructed).toEqual(["sql-fs-control"]);
 		expect(snapshotConstructed).toHaveLength(0);
@@ -68,7 +75,9 @@ describe("server Redis role wiring", () => {
 
 	it("builds no path snapshot from a data-only connection without control", async () => {
 		vi.resetModules();
+		vi.stubEnv("REDIS_URL", undefined);
 		vi.stubEnv("REDIS_DATA_URL", "redis://localhost:6379");
+		vi.stubEnv("REDIS_BLOB_CACHE_ENABLED", undefined);
 		vi.stubEnv("REDIS_PATH_SNAPSHOT_ENABLED", "true");
 		await import("../../server.js");
 		// No REDIS_URL, so no control connection. The data connection still

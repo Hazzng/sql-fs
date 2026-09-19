@@ -14,6 +14,7 @@ import type { Redis } from "ioredis";
 import {
 	AcquireErrorBudget,
 	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	type ProbeTicketHolder,
 	type RedisCircuitBreaker,
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
@@ -181,7 +182,8 @@ async function acquireShared(
 	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 
 	while (true) {
-		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.readers);
+		const probe: ProbeTicketHolder = {};
+		if (!breaker.tryAcquire(probe)) throw new LockAcquireTimeoutError(keys.readers);
 		const now = Date.now();
 		const expireAt = now + readerLeaseMs;
 		let acquired = false;
@@ -196,10 +198,10 @@ async function acquireShared(
 				String(expireAt),
 			);
 			acquired = res === 1;
-			breaker.recordSuccess();
+			breaker.recordSuccess(probe.ticket);
 			errorBudget.reset();
 		} catch {
-			breaker.recordFailure();
+			breaker.recordFailure(probe.ticket);
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.readers);
 		}
 		if (acquired) return;
@@ -285,15 +287,16 @@ async function acquireExclusive(
 	// thrown connection-class errors advance the shared `errorBudget` and the
 	// breaker so a Redis outage fast-fails instead of hanging for the full window.
 	while (true) {
-		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.writer);
+		const probe: ProbeTicketHolder = {};
+		if (!breaker.tryAcquire(probe)) throw new LockAcquireTimeoutError(keys.writer);
 		let flagAcquired = false;
 		try {
 			const res = await redis.eval(ACQUIRE_EXCLUSIVE_FLAG_SCRIPT, 1, keys.writer, token, String(leaseMs));
 			flagAcquired = res === "OK";
-			breaker.recordSuccess();
+			breaker.recordSuccess(probe.ticket);
 			errorBudget.reset();
 		} catch {
-			breaker.recordFailure();
+			breaker.recordFailure(probe.ticket);
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.writer);
 		}
 		if (flagAcquired) break;
@@ -318,16 +321,17 @@ async function waitReadersDrained(
 	// Redis error advances the shared error budget and breaker so a mid-acquire
 	// outage fast-fails rather than hanging until the 300 s deadline.
 	while (true) {
-		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.writer);
+		const probe: ProbeTicketHolder = {};
+		if (!breaker.tryAcquire(probe)) throw new LockAcquireTimeoutError(keys.writer);
 		const now = Date.now();
 		let count: number;
 		try {
 			const res = await redis.eval(CHECK_READERS_DRAINED_SCRIPT, 2, keys.writer, keys.readers, token, String(now));
 			count = res as number;
-			breaker.recordSuccess();
+			breaker.recordSuccess(probe.ticket);
 			errorBudget.reset();
 		} catch {
-			breaker.recordFailure();
+			breaker.recordFailure(probe.ticket);
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(keys.writer);
 			// Treat Redis error like readers still present; will surface timeout if deadline exceeded
 			count = 1;

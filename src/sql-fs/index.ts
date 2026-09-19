@@ -133,8 +133,14 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			// #167: cache traffic rides the data connection; the control client
 			// stays free for the version counter and locks.
 			const redis = getRedisClient("control");
-			const redisData = getRedisClient("data");
+			// Read data-plane demand from env BEFORE opening the data connection:
+			// a lock-only deployment (blob cache off, snapshot off) must not pay
+			// for a second socket nothing will ever use. REDIS_DATA_URL falls
+			// back to REDIS_URL inside getRedisClient, so calling it
+			// unconditionally would always connect.
 			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+			const snapshotEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+			const redisData = blobCacheEnabled || snapshotEnabled ? getRedisClient("data") : undefined;
 			const blobCache =
 				redisData && blobCacheEnabled
 					? new RedisBlobCache(redisData, "default", {
@@ -145,7 +151,7 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 							breaker: getRedisCircuitBreaker("data"),
 						})
 					: undefined;
-			const pathSnapshotEnabled = redisData && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+			const pathSnapshotEnabled = redisData && snapshotEnabled;
 			const pathSnapshot =
 				pathSnapshotEnabled && redisData
 					? new RedisPathSnapshot(redisData, {

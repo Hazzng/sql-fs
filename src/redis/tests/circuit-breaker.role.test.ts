@@ -5,7 +5,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RedisCircuitBreaker, getRedisCircuitBreaker, resetRedisCircuitBreakerForTest } from "../circuit-breaker.js";
+import {
+	type ProbeTicketHolder,
+	RedisCircuitBreaker,
+	getRedisCircuitBreaker,
+	resetRedisCircuitBreakerForTest,
+} from "../circuit-breaker.js";
 
 function tripOpen(breaker: RedisCircuitBreaker, threshold = 5): void {
 	for (let i = 0; i < threshold; i++) breaker.recordFailure();
@@ -79,10 +84,13 @@ describe("RedisCircuitBreaker transition events", () => {
 		const breaker = new RedisCircuitBreaker({ threshold: 2, openMs: 100, role: "control", now: () => now });
 		tripOpen(breaker, 2);
 		now = 200;
-		expect(breaker.tryAcquire()).toBe(true); // half-open probe
-		breaker.recordSuccess();
+		const probe: ProbeTicketHolder = {};
+		expect(breaker.tryAcquire(probe)).toBe(true); // half-open probe
+		breaker.recordSuccess(probe.ticket);
 		expect(breaker.state).toBe("closed");
-		expect(loggedEvents(log)).toEqual([{ event: "redis_circuit_closed", role: "control" }]);
+		expect(loggedEvents(log)).toEqual([
+			{ event: "redis_circuit_closed", role: "control", threshold: 2, openMs: 100, openDurationMs: 200 },
+		]);
 	});
 
 	// Regression guard, not a fix-proving test: recordSuccess() runs on every
@@ -110,8 +118,9 @@ describe("RedisCircuitBreaker transition events", () => {
 		const breaker = new RedisCircuitBreaker({ threshold: 2, openMs: 100, role: "data", now: () => now });
 		tripOpen(breaker, 2);
 		now = 200;
-		expect(breaker.tryAcquire()).toBe(true); // half-open probe
-		breaker.recordFailure();
+		const probe: ProbeTicketHolder = {};
+		expect(breaker.tryAcquire(probe)).toBe(true); // half-open probe
+		breaker.recordFailure(probe.ticket);
 		expect(breaker.state).toBe("open");
 		expect(loggedEvents(err).filter((e) => e.event === "redis_circuit_open")).toHaveLength(2);
 	});

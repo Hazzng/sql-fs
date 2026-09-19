@@ -20,8 +20,11 @@
  *     half-open and lets a single probe through. Results arriving while open
  *     belong to commands admitted before it opened and are ignored — they can
  *     neither close it nor restart its cool-down (#167).
- *   - HALF_OPEN: one probe is allowed. A success closes the breaker; a failure
- *     re-opens it for another `openMs`.
+ *   - HALF_OPEN: one probe is allowed, minted with a generation ticket. Only a
+ *     settle presenting the CURRENT ticket closes or re-opens the breaker; a
+ *     pre-open straggler settling here carries no ticket (or a superseded one)
+ *     and is ignored, so it can neither close the breaker onto an untested
+ *     Redis nor restart the cool-down (#167).
  *
  * The breaker is intentionally per-role rather than per-key: a Redis outage is
  * global to a connection, so once we've seen K failures there is no value in
@@ -54,6 +57,22 @@ const DEFAULT_OPTIONS: Required<Omit<RedisCircuitBreakerOptions, "now" | "role">
 	openMs: 5_000,
 };
 
+/**
+ * Proof that the holder was admitted as the current half-open probe.
+ * Minted by `tryAcquire()` on probe admission; settles present it to
+ * `recordSuccess()` / `recordFailure()`, which honour only the current
+ * generation. A straggler admitted before the breaker opened holds no ticket
+ * (or a superseded one), so its late result cannot steer the breaker.
+ */
+export interface HalfOpenProbeTicket {
+	readonly generation: number;
+}
+
+/** Out-param receiving the probe ticket when `tryAcquire()` admits the half-open probe. */
+export interface ProbeTicketHolder {
+	ticket?: HalfOpenProbeTicket;
+}
+
 /** Thrown by `assertClosed()` when the breaker is open. Carries `code` so callers can distinguish it. */
 export class CircuitOpenError extends Error {
 	readonly code = "EREDISCIRCUITOPEN";
@@ -68,6 +87,8 @@ export class RedisCircuitBreaker {
 	#consecutiveFailures = 0;
 	#openedAt = 0;
 	#halfOpenInFlight = false;
+	/** Generation of the latest half-open probe; incremented on every probe admission. */
+	#probeGeneration = 0;
 	readonly #threshold: number;
 	readonly #openMs: number;
 	readonly #now: () => number;
@@ -101,21 +122,25 @@ export class RedisCircuitBreaker {
 	 *
 	 * When the open window has elapsed this transitions to half-open and hands the
 	 * single probe to this caller, so a recovering Redis can close the breaker.
+	 * Pass a holder to receive the probe's generation ticket, and present that
+	 * ticket when settling — only the current ticket settles while half-open.
 	 * A caller that gets `true` MUST settle it with `recordSuccess()` or
 	 * `recordFailure()` — otherwise the probe is never returned.
 	 */
-	tryAcquire(): boolean {
+	tryAcquire(ticketOut?: ProbeTicketHolder): boolean {
 		if (this.#state === "closed") return true;
 		if (this.#state === "half_open") {
 			// Only one probe at a time; everyone else keeps fast-failing.
 			if (this.#halfOpenInFlight) return false;
 			this.#halfOpenInFlight = true;
+			this.#mintProbeTicket(ticketOut);
 			return true;
 		}
 		// open: stay open until the cool-down elapses, then allow one probe.
 		if (this.#now() - this.#openedAt >= this.#openMs) {
 			this.#state = "half_open";
 			this.#halfOpenInFlight = true;
+			this.#mintProbeTicket(ticketOut);
 			return true;
 		}
 		return false;
@@ -132,10 +157,12 @@ export class RedisCircuitBreaker {
 	 * Ignored while OPEN. A success arriving then belongs to a command admitted
 	 * before the breaker opened — a straggler that proves nothing about the
 	 * present — and closing on it releases the whole herd onto a Redis nothing
-	 * has re-tested. Only the half-open probe closes the breaker.
+	 * has re-tested. While HALF_OPEN only the current probe ticket closes;
+	 * ticketless (or superseded) settles are stragglers and are ignored.
 	 */
-	recordSuccess(): void {
+	recordSuccess(probe?: HalfOpenProbeTicket): void {
 		if (this.#state === "open") return;
+		if (this.#state === "half_open" && probe?.generation !== this.#probeGeneration) return;
 		const wasHalfOpen = this.#state === "half_open";
 		this.#state = "closed";
 		this.#consecutiveFailures = 0;
@@ -143,13 +170,28 @@ export class RedisCircuitBreaker {
 		// Only a real transition is an event; the steady-state success path runs
 		// on every acquire and must not log.
 		if (wasHalfOpen) {
-			console.log(JSON.stringify({ event: "redis_circuit_closed", role: this.#role }));
+			console.log(
+				JSON.stringify({
+					event: "redis_circuit_closed",
+					role: this.#role,
+					threshold: this.#threshold,
+					openMs: this.#openMs,
+					openDurationMs: this.#now() - this.#openedAt,
+				}),
+			);
 		}
 	}
 
-	/** A thrown (connection-class) error: count it; open at threshold, or re-open a failed half-open probe. */
-	recordFailure(): void {
+	/**
+	 * A thrown (connection-class) error: count it; open at threshold, or re-open
+	 * a failed half-open probe. While HALF_OPEN only the current probe ticket
+	 * re-opens; a ticketless (or superseded) failure is a straggler admitted
+	 * before the breaker opened and must neither re-open nor restart the
+	 * cool-down — it carries no news about the present.
+	 */
+	recordFailure(probe?: HalfOpenProbeTicket): void {
 		if (this.#state === "half_open") {
+			if (probe?.generation !== this.#probeGeneration) return;
 			this.#open();
 			return;
 		}
@@ -162,6 +204,12 @@ export class RedisCircuitBreaker {
 	/** Current state, for tests/observability. */
 	get state(): BreakerState {
 		return this.#state;
+	}
+
+	/** Mint the current half-open probe's generation ticket into the holder, if given. */
+	#mintProbeTicket(ticketOut?: ProbeTicketHolder): void {
+		this.#probeGeneration += 1;
+		if (ticketOut !== undefined) ticketOut.ticket = { generation: this.#probeGeneration };
 	}
 
 	#open(): void {

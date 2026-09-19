@@ -7,14 +7,14 @@
  */
 
 import type { Redis } from "ioredis";
-import type { RedisCircuitBreaker } from "../redis/circuit-breaker.js";
+import type { ProbeTicketHolder, RedisCircuitBreaker } from "../redis/circuit-breaker.js";
 
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024; // 8 MB
 /** #167: cap concurrent backfill writes so a stalled Redis cannot grow an unbounded queue. */
 const DEFAULT_MAX_IN_FLIGHT = 32;
 const DEFAULT_MAX_IN_FLIGHT_BYTES = 32 * 1024 * 1024; // 32 MB
-/** Drops are logged at most this often, with the running total, so a storm cannot flood the log. */
+/** Drops are logged at most this often per CONNECTION, with the running total, so a storm cannot flood the log. */
 const DROP_LOG_INTERVAL_MS = 5_000;
 
 /**
@@ -33,6 +33,10 @@ interface BackfillOccupancy {
 	inFlightBytes: number;
 	maxInFlight: number;
 	maxInFlightBytes: number;
+	/** Connection-wide running drop total, so the throttled log reports the shared count. */
+	dropped: number;
+	/** Connection-wide drop-log throttle: drops are bounded per connection, not per tenant. */
+	lastDropLogAt: number;
 }
 
 const occupancyByClient = new WeakMap<Redis, BackfillOccupancy>();
@@ -49,7 +53,14 @@ function occupancyFor(client: Redis, maxInFlight: number, maxInFlightBytes: numb
 		}
 		return existing;
 	}
-	const created: BackfillOccupancy = { inFlight: 0, inFlightBytes: 0, maxInFlight, maxInFlightBytes };
+	const created: BackfillOccupancy = {
+		inFlight: 0,
+		inFlightBytes: 0,
+		maxInFlight,
+		maxInFlightBytes,
+		dropped: 0,
+		lastDropLogAt: 0,
+	};
 	occupancyByClient.set(client, created);
 	return created;
 }
@@ -77,8 +88,8 @@ export class RedisBlobCache {
 	readonly #breaker: RedisCircuitBreaker | undefined;
 	/** Shared with every other cache on `#client` — see `BackfillOccupancy`. */
 	readonly #occupancy: BackfillOccupancy;
+	/** This instance's drops, for the `stats` getter; the log total lives on the shared occupancy. */
 	#dropped = 0;
-	#lastDropLogAt = 0;
 
 	constructor(client: Redis, tenantId: string, opts: RedisBlobCacheOptions = {}) {
 		// Resolve before sharing: defaults are constants, so an explicit 32 and an
@@ -109,23 +120,26 @@ export class RedisBlobCache {
 	/**
 	 * Claim the right to issue one Redis command, honouring the data-plane
 	 * breaker. Returns `false` when the caller must skip Redis and fall back to
-	 * Postgres. A `true` MUST be settled with `recordSuccess`/`recordFailure`,
-	 * so never call this before a check that can still bail out (#167 M7).
+	 * Postgres. A `true` MUST be settled with `recordSuccess`/`recordFailure`
+	 * presenting the holder's ticket, so never call this before a check that
+	 * can still bail out (#167 M7).
 	 */
-	#tryAcquireCircuit(): boolean {
-		return this.#breaker?.tryAcquire() !== false;
+	#tryAcquireCircuit(ticketOut?: ProbeTicketHolder): boolean {
+		return this.#breaker?.tryAcquire(ticketOut) !== false;
 	}
 
 	#recordDrop(reason: string): void {
 		this.#dropped += 1;
+		this.#occupancy.dropped += 1;
 		const now = Date.now();
-		if (now - this.#lastDropLogAt < DROP_LOG_INTERVAL_MS) return;
-		this.#lastDropLogAt = now;
+		if (now - this.#occupancy.lastDropLogAt < DROP_LOG_INTERVAL_MS) return;
+		this.#occupancy.lastDropLogAt = now;
 		console.warn(
 			JSON.stringify({
 				event: "redis_blob_set_dropped",
+				tenantId: this.#tenantId,
 				reason,
-				dropped: this.#dropped,
+				dropped: this.#occupancy.dropped,
 				inFlight: this.#occupancy.inFlight,
 				inFlightBytes: this.#occupancy.inFlightBytes,
 			}),
@@ -138,13 +152,14 @@ export class RedisBlobCache {
 
 	async get(sha256: Uint8Array): Promise<Uint8Array | null> {
 		if (!this.#enabled) return null;
-		if (!this.#tryAcquireCircuit()) return null;
+		const probe: ProbeTicketHolder = {};
+		if (!this.#tryAcquireCircuit(probe)) return null;
 		try {
 			const buf = await this.#client.getBuffer(this.#key(sha256));
-			this.#breaker?.recordSuccess();
+			this.#breaker?.recordSuccess(probe.ticket);
 			return buf ? new Uint8Array(buf) : null;
 		} catch (err) {
-			this.#breaker?.recordFailure();
+			this.#breaker?.recordFailure(probe.ticket);
 			console.error(JSON.stringify({ event: "redis_blob_get_error", error: (err as Error).message }));
 			return null; // fail open
 		}
@@ -156,7 +171,8 @@ export class RedisBlobCache {
 	 */
 	async mget(sha256s: ReadonlyArray<Uint8Array>): Promise<Array<Uint8Array | null>> {
 		if (!this.#enabled || sha256s.length === 0) return sha256s.map(() => null);
-		if (!this.#tryAcquireCircuit()) return sha256s.map(() => null);
+		const probe: ProbeTicketHolder = {};
+		if (!this.#tryAcquireCircuit(probe)) return sha256s.map(() => null);
 		// Chunk MGET to bound a single round-trip's keyspace and response size.
 		// A 50k-blob warm sandbox would otherwise issue one MGET that requires
 		// Redis to assemble the entire response array before returning, spiking
@@ -176,10 +192,10 @@ export class RedisBlobCache {
 					out[i + j] = b ? new Uint8Array(b) : null;
 				}
 			}
-			this.#breaker?.recordSuccess();
+			this.#breaker?.recordSuccess(probe.ticket);
 			return out;
 		} catch (err) {
-			this.#breaker?.recordFailure();
+			this.#breaker?.recordFailure(probe.ticket);
 			console.error(JSON.stringify({ event: "redis_blob_mget_error", error: (err as Error).message }));
 			return sha256s.map(() => null); // fail open
 		}
@@ -205,17 +221,18 @@ export class RedisBlobCache {
 			return;
 		}
 		if (this.#occupancy.inFlightBytes + data.byteLength > this.#maxInFlightBytes) {
-			this.#recordDrop("max_in_flight_bytes");
+			this.#recordDrop("maxInFlightBytes");
 			return;
 		}
-		if (!this.#tryAcquireCircuit()) return;
+		const probe: ProbeTicketHolder = {};
+		if (!this.#tryAcquireCircuit(probe)) return;
 		this.#occupancy.inFlight += 1;
 		this.#occupancy.inFlightBytes += data.byteLength;
 		try {
 			await this.#client.set(this.#key(sha256), Buffer.from(data), "PX", this.#ttlMs);
-			this.#breaker?.recordSuccess();
+			this.#breaker?.recordSuccess(probe.ticket);
 		} catch (err) {
-			this.#breaker?.recordFailure();
+			this.#breaker?.recordFailure(probe.ticket);
 			console.error(JSON.stringify({ event: "redis_blob_set_error", error: (err as Error).message }));
 		} finally {
 			this.#occupancy.inFlight -= 1;

@@ -13,6 +13,7 @@ import type { Redis } from "ioredis";
 import {
 	AcquireErrorBudget,
 	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	type ProbeTicketHolder,
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
 import { recordHeartbeatGap } from "./event-loop-monitor.js";
@@ -151,15 +152,18 @@ export async function withDistributedLock<T>(
 	const breaker = getRedisCircuitBreaker();
 	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 	while (true) {
-		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(key);
+		// #167: each admission gets its own probe holder so only the current
+		// half-open probe settles the breaker; stragglers are ignored.
+		const probe: ProbeTicketHolder = {};
+		if (!breaker.tryAcquire(probe)) throw new LockAcquireTimeoutError(key);
 		let acquired = false;
 		try {
 			const ok = await redis.set(key, token, "PX", leaseMs, "NX");
 			acquired = ok === "OK";
-			breaker.recordSuccess();
+			breaker.recordSuccess(probe.ticket);
 			errorBudget.reset();
 		} catch {
-			breaker.recordFailure();
+			breaker.recordFailure(probe.ticket);
 			if (errorBudget.recordError()) throw new LockAcquireTimeoutError(key);
 		}
 		if (acquired) break;
