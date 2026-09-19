@@ -22,13 +22,13 @@ import {
 	createEinval,
 	createEisdir,
 	createEloop,
-	createEnobufs,
 	createEnoent,
 	createEnotdir,
 	createEnotempty,
 	createEperm,
 	createEreadonly,
 	createEsandboxgone,
+	createEscriptbuffer,
 	createEstale,
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
@@ -660,7 +660,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const ops = this.#mutations.length + 1;
 		const bytes = this.#mutationBytes + m.bytes;
 		if (ops > this.#scriptTxBuffer.maxOps || bytes > this.#scriptTxBuffer.maxBytes) {
-			const err = createEnobufs(ops, bytes, this.#scriptTxBuffer.maxOps, this.#scriptTxBuffer.maxBytes);
+			const err = createEscriptbuffer(ops, bytes, this.#scriptTxBuffer.maxOps, this.#scriptTxBuffer.maxBytes);
 			this.#scriptTxLost ??= err;
 			throw err;
 		}

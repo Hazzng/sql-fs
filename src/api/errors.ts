@@ -36,7 +36,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"EREADONLY_VIOLATION",
 	"EDRIVERFAULT",
 	"EFBIG",
-	"ENOBUFS",
+	"ESCRIPTBUFFER",
 ]);
 
 /**
@@ -163,7 +163,7 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * FORBIDDEN      → 403  Forbidden
  * ENOTEMPTY      → 409  Conflict
  * EFBIG          → 413  Payload Too Large (exec file-size ceiling, #168)
- * ENOBUFS        → 413  Payload Too Large, NOT retryable. The script buffered more
+ * ESCRIPTBUFFER        → 413  Payload Too Large, NOT retryable. The script buffered more
  *                       metadata mutations than the flush budget allows (#166);
  *                       nothing was applied and an identical re-run fails identically.
  * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
@@ -243,7 +243,7 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;
-		case "ENOBUFS":
+		case "ESCRIPTBUFFER":
 			// #166: the script buffered more metadata mutations than the flush budget
 			// allows. 413 for the same reason as EFBIG — the request was well-formed,
 			// the amount of work is what is too big — and it shares EFBIG's "split the

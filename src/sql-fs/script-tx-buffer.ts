@@ -75,7 +75,7 @@ export interface ScriptTxBufferConfig {
  * content eagerly on its own connection, and the 3 h GC grace window
  * (`BLOB_GC_MIN_AGE_MS`) covers a blob that is written but not yet referenced.
  *
- * At the cap the script fails closed with ENOBUFS and nothing is applied.
+ * At the cap the script fails closed with ESCRIPTBUFFER and nothing is applied.
  * Auto-flushing instead would break per-script atomicity.
  */
 export const DEFAULT_SCRIPT_TX_BUFFER_MAX_OPS = 50_000;

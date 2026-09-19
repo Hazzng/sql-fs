@@ -138,7 +138,7 @@ function configuredBytes(name: string, fallback: number): number {
 }
 
 /**
- * ENOBUFS: a script buffered more metadata mutations than the flush budget allows (#166).
+ * ESCRIPTBUFFER: a script buffered more metadata mutations than the flush budget allows (#166).
  *
  * Under the buffered script-tx a script's mutations are held in memory and replayed
  * in one short transaction at scope end, so the buffer is the only thing standing
@@ -153,11 +153,11 @@ function configuredBytes(name: string, fallback: number): number {
  * re-run hits the identical cap. The remedy is to split the script, which the
  * message says.
  */
-export function createEnobufs(ops: number, bytes: number, maxOps: number, maxBytes: number): Error {
+export function createEscriptbuffer(ops: number, bytes: number, maxOps: number, maxBytes: number): Error {
 	return makeFsError(
-		"ENOBUFS",
+		"ESCRIPTBUFFER",
 		[
-			`ENOBUFS: too many filesystem changes in one script — ${ops} operations / ${bytes} bytes buffered`,
+			`ESCRIPTBUFFER: too many filesystem changes in one script — ${ops} operations / ${bytes} bytes buffered`,
 			`against a limit of ${maxOps} operations / ${maxBytes} bytes.`,
 			"Nothing was applied: the whole script was rolled back before any of it reached the database.",
 			"This is a deliberate limit, not a transient failure — split the work across several exec calls",

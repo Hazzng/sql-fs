@@ -18,12 +18,26 @@ import { requireMigratedSchema } from "./helpers/schema-preconditions.js";
 const SKIP = !process.env.DATABASE_URL;
 const BUFFER_ON = { enabled: true, maxOps: 50_000, maxBytes: 32 * 1024 * 1024 } as const;
 
+/** Adds `application_name` to a Postgres URL so a suite can identify its own backends. */
+function taggedUrl(base: string, appName: string): string {
+	const u = new URL(base);
+	u.searchParams.set("application_name", appName);
+	return u.toString();
+}
+
 function uniqueId(label: string): string {
 	return `buf166-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
 describe.skipIf(SKIP)("#166 — buffered script-tx against Postgres", () => {
-	const url = process.env.DATABASE_URL!;
+	/**
+	 * Every connection this suite opens is tagged, so the idle-in-transaction probe
+	 * and the reap below can be scoped to our own backends. Unscoped they read and
+	 * kill every backend on the database — which on a shared DATABASE_URL means a
+	 * dev server, the load-test harness or a parallel vitest worker.
+	 */
+	const APP_NAME = `sqlfs-buf166-${process.pid}`;
+	const url = taggedUrl(process.env.DATABASE_URL!, APP_NAME);
 	const dialect = new PostgresDialect(url);
 	/** Observer connection: must be outside the dialect pool or it competes for it. */
 	const observer = postgres(url, { prepare: false, max: 1 });
@@ -55,13 +69,22 @@ describe.skipIf(SKIP)("#166 — buffered script-tx against Postgres", () => {
 		return { fs, id };
 	}
 
-	/** Oldest open transaction on this database's backends, in seconds. */
+	/**
+	 * Oldest open transaction belonging to THIS suite, in seconds.
+	 *
+	 * Scoped by `application_name`: an unqualified probe reads every backend on the
+	 * database, so a dev server, the load-test harness or a parallel vitest worker
+	 * sharing DATABASE_URL would make `toBe(0)` fail spuriously and could let the
+	 * legacy `> 0.9` assertion pass on activity this suite never caused.
+	 */
 	async function maxIdleInTxAge(): Promise<number> {
 		const rows = await observer<{ age: number; cnt: number }[]>`
 			SELECT coalesce(max(extract(epoch FROM (now() - xact_start))), 0)::float8 AS age,
 			       count(*)::int AS cnt
 			FROM pg_stat_activity
-			WHERE state = 'idle in transaction' AND datname = current_database()
+			WHERE state = 'idle in transaction'
+			  AND datname = current_database()
+			  AND application_name = ${APP_NAME}
 		`;
 		return rows[0]!.cnt === 0 ? 0 : rows[0]!.age;
 	}
@@ -237,7 +260,10 @@ describe.skipIf(SKIP)("#166 — buffered script-tx against Postgres", () => {
 				await observer`
 					SELECT pg_terminate_backend(pid)
 					FROM pg_stat_activity
-					WHERE state = 'idle in transaction' AND datname = current_database() AND pid <> pg_backend_pid()
+					WHERE state = 'idle in transaction'
+					  AND datname = current_database()
+					  AND application_name = ${APP_NAME}
+					  AND pid <> pg_backend_pid()
 				`;
 				void narrow.disconnect().catch(() => {});
 			} else {

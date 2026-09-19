@@ -27,28 +27,28 @@ describe("buffered script-tx — cap", () => {
 		probe = makeProbeDialect();
 	});
 
-	it("throws ENOBUFS on the operation that crosses the op cap", async () => {
+	it("throws ESCRIPTBUFFER on the operation that crosses the op cap", async () => {
 		const fs = await newFs(probe, 2, 1 << 20);
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/a.txt", "a");
 		await fs.writeFile("/home/user/b.txt", "b");
-		await expect(fs.writeFile("/home/user/c.txt", "c")).rejects.toMatchObject({ code: "ENOBUFS" });
+		await expect(fs.writeFile("/home/user/c.txt", "c")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
 	});
 
-	it("throws ENOBUFS on the byte cap", async () => {
+	it("throws ESCRIPTBUFFER on the byte cap", async () => {
 		const fs = await newFs(probe, 1_000_000, 300);
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/a.txt", "a");
-		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ENOBUFS" });
+		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
 	});
 
 	it("applies nothing at the cap — no transaction is ever opened", async () => {
 		const fs = await newFs(probe, 1, 1 << 20);
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/a.txt", "a");
-		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ENOBUFS" });
+		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
 
-		await expect(fs.endScriptScope()).rejects.toMatchObject({ code: "ENOBUFS" });
+		await expect(fs.endScriptScope()).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
 		expect(probe.dialect.writeFileComposite).not.toHaveBeenCalled();
 		expect(fs.getAllPaths()).not.toContain("/home/user/a.txt");
 	});
@@ -57,13 +57,13 @@ describe("buffered script-tx — cap", () => {
 		const fs = await newFs(probe, 1, 1 << 20);
 		fs.beginScriptScope();
 		await fs.writeFile("/home/user/a.txt", "a");
-		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ENOBUFS" });
+		await expect(fs.writeFile("/home/user/b.txt", "b")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
 
 		// bash swallows a rejected fs call into a nonzero exit and keeps going: every
 		// later operation in the scope, read or write, must fail too.
-		await expect(fs.writeFile("/home/user/c.txt", "c")).rejects.toMatchObject({ code: "ENOBUFS" });
-		await expect(fs.readFile("/home/user/file.txt")).rejects.toMatchObject({ code: "ENOBUFS" });
-		expect(() => fs.getAllPaths()).toThrow(/ENOBUFS/);
+		await expect(fs.writeFile("/home/user/c.txt", "c")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
+		await expect(fs.readFile("/home/user/file.txt")).rejects.toMatchObject({ code: "ESCRIPTBUFFER" });
+		expect(() => fs.getAllPaths()).toThrow(/ESCRIPTBUFFER/);
 	});
 
 	it("does not fire below the cap", async () => {
