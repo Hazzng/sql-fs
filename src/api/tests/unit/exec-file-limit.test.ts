@@ -202,6 +202,40 @@ describe("an exec that trips the ceiling fails with EFBIG, not bash's phantom EN
 		expect(err?.message).not.toContain("No such file or directory");
 	});
 
+	// #168 M11: the remedy is the part an autonomous agent acts on, and it was the part
+	// nothing asserted. `IFileSystem` has no ranged read and SqlFs implements no
+	// `readFileBytes`, so `head -c` / `tail -c` / `split -b` / `sed -n` all read the whole
+	// file and re-trip this same limit — recommending them buys a retry loop.
+	it("names only read remedies that actually work", async () => {
+		const err = await sm
+			.withSession(T, sandboxId, (session) => sm.execWithRuntimeThrottle(session, "cat /big.txt"))
+			.then(() => undefined)
+			.catch((e: Error) => e);
+		const message = err?.message ?? "";
+
+		expect(message).toContain("GET .../files/{path}");
+		// The slicing commands appear only inside the warning that they do NOT help.
+		expect(message).toContain("Slicing it in the sandbox does NOT help");
+		for (const cmd of ["head -c", "tail -c", "split -b", "sed -n"]) {
+			const idx = message.indexOf(cmd);
+			expect(idx, `${cmd} should be named`).toBeGreaterThan(-1);
+			expect(idx).toBeGreaterThan(message.indexOf("does NOT help"));
+		}
+	});
+
+	// #168 M13: MCP `file_read` is NOT an unconditional escape hatch — it refuses above
+	// MAX_MCP_READ_FILE_BYTES (16 MiB default). Only GET .../files/{path} is ungated.
+	it("qualifies MCP file_read rather than offering it unconditionally", async () => {
+		const err = await sm
+			.withSession(T, sandboxId, (session) => sm.execWithRuntimeThrottle(session, "cat /big.txt"))
+			.then(() => undefined)
+			.catch((e: Error) => e);
+		const message = err?.message ?? "";
+
+		expect(message).toContain("MAX_MCP_READ_FILE_BYTES");
+		expect(message).toContain("the one read path this limit does not apply to");
+	});
+
 	it("maps to 413 for the HTTP layer", async () => {
 		const err = await sm
 			.withSession(T, sandboxId, (session) => sm.execWithRuntimeThrottle(session, "cat /big.txt"))

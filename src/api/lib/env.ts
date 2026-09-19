@@ -95,11 +95,24 @@ export const MAX_BULK_WRITE_FILES = positiveIntEnv(process.env.MAX_BULK_WRITE_FI
  *
  * 8 MiB is chosen off the 2 s wall, not off the convenience of a round number: `src/redis/client.ts`
  * sets `commandTimeout: 2000`, so a stall longer than that times out in-flight Redis commands
- * belonging to *other* tenants — a cross-tenant correctness bug, not a latency blip. At 8 MiB the
- * worst measured utility leaves ~2.8x headroom under that wall; at 16 MiB it is already through it.
+ * belonging to *other* tenants — a cross-tenant correctness bug, not a latency blip. At 8 MiB a
+ * single in-cap file leaves ~2.8x headroom under that wall; at 16 MiB one file is already through
+ * it.
  *
- * This is a stopgap that removes a capability — a script can no longer process a file above the
- * cap at all — held until `bash.exec` moves off the main thread. Raise it only where the replica
- * is not shared, or is not backed by Redis.
+ * PER FILE ONLY — the wall is NOT held for a script (#168 M12). Verified against the installed
+ * just-bash:
+ *  - `cat /a.txt /b.txt | wc -c` with two 8 MiB files is two independent in-cap checks and 16 MiB
+ *    of pipeline work.
+ *  - `sed 's/x/xxxxxxxx/g' 8mib.txt | wc -c` builds ~64 MiB of strings off ONE in-cap input; the
+ *    4x in-memory expansion is unchecked, and with no redirect there is no write check either.
+ * The boundary that would catch those is inside just-bash's pipeline, which this repo consumes as
+ * a dependency and does not modify; a cumulative per-exec budget was considered and rejected as
+ * worse (it fails a build touching 100 x 200 KB files that never stalls at all). #198 is the
+ * structural fix — moving `bash.exec` off the main thread — which removes the wall rather than
+ * rationing against it.
+ *
+ * So this is a stopgap that removes a capability — a script can no longer read or produce a single
+ * file above the cap — and bounds the common single-file case, not the worst case. Raise it only
+ * where the replica is not shared, or is not backed by Redis.
  */
 export const MAX_EXEC_FILE_BYTES = positiveIntEnv(process.env.MAX_EXEC_FILE_BYTES, 8 * 1024 * 1024);

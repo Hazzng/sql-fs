@@ -120,14 +120,25 @@ export function createEdriverfault(cause: Error): Error {
  * calls to reach for, and the env var an operator would raise. It deliberately
  * avoids the words `sandboxes`/`/tmp`-style prefixes, which `sanitizeFsError`
  * would redact out of the remediation hint.
+ *
+ * The READ remedy names only routes that actually work. `IFileSystem` has no ranged
+ * read and SqlFs implements no `readFileBytes`, so `head -c`, `tail -c`, `split -b`
+ * and `sed -n` all reach `#readBytes`, which asserts off the whole entry size —
+ * measured against the installed just-bash with an instrumented InMemoryFs, every
+ * one of them re-trips this limit. Telling an autonomous agent "do not retry, do
+ * this instead" and then handing it four commands that fail identically buys a
+ * retry loop, so the message says so explicitly. `GET .../files/{path}` is the only
+ * ungated read; MCP `file_read` has its own 16 MiB gate (`MAX_MCP_READ_FILE_BYTES`,
+ * `mcp/tools.ts`), so it is offered with that qualification rather than as an
+ * unconditional escape hatch.
  */
 export function createEfbig(path: string, attemptedBytes: number, limitBytes: number, op: "read" | "write"): Error {
 	const preamble =
 		op === "read" ? `'${path}' is ${attemptedBytes} bytes` : `writing '${path}' would produce ${attemptedBytes} bytes`;
 	const remedy =
 		op === "read"
-			? "process a slice at a time (`head -c`, `tail -c`, `split -b`, `sed -n '1,20000p'`), or pull the whole file out over HTTP with `GET .../files/{path}` (MCP `file_read`), which this limit does not apply to"
-			: "write several smaller files (`split -b`), send large content in over HTTP with `PUT .../files/{path}` (MCP `file_write`), or change part of a file with `PATCH .../files/{path}` (MCP `file_edit`) instead of rewriting it whole";
+			? "fetch it over HTTP with `GET .../files/{path}`, the one read path this limit does not apply to; MCP `file_read` also works, but only below its own 16 MiB ceiling (`MAX_MCP_READ_FILE_BYTES`). Slicing it in the sandbox does NOT help: `head -c`, `tail -c`, `split -b` and `sed -n` all read the whole file through the same call and re-trip this same limit"
+			: "write several smaller files (`split -b`, reading from a pipe rather than the oversized file), send large content in over HTTP with `PUT .../files/{path}` (MCP `file_write`), or change part of a file with `PATCH .../files/{path}` (MCP `file_edit`) instead of rewriting it whole. Those routes have their own, larger ceiling (`MAX_FILE_WRITE_BYTES`, 50 MiB by default)";
 	return makeFsError(
 		"EFBIG",
 		[

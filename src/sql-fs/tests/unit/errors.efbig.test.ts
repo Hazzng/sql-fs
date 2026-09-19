@@ -36,15 +36,32 @@ describe("createEfbig — message content", () => {
 		expect(writeErr.message).toContain("MAX_EXEC_FILE_BYTES");
 	});
 
-	it("tells a read caller to slice the file, and names the uncapped HTTP/MCP read route", () => {
-		expect(readErr.message).toContain("process a slice at a time");
-		expect(readErr.message).toContain("`head -c`");
-		expect(readErr.message).toContain("`GET .../files/{path}` (MCP `file_read`)");
+	// #168 M11: the read remedy used to recommend `head -c` / `tail -c` / `split -b` /
+	// `sed -n`. Checked empirically against the installed just-bash with an instrumented
+	// InMemoryFs, every one of them reads the WHOLE file (`IFileSystem` has no ranged read
+	// and SqlFs implements no `readFileBytes`), so each re-trips this same limit — the
+	// message was handing an autonomous agent a retry loop.
+	it("points a read caller at the one ungated route and warns the slicing commands do not help", () => {
+		expect(readErr.message).toContain("`GET .../files/{path}`, the one read path this limit does not apply to");
+		expect(readErr.message).toContain("Slicing it in the sandbox does NOT help");
+		for (const cmd of ["`head -c`", "`tail -c`", "`split -b`", "`sed -n`"]) {
+			expect(readErr.message.indexOf(cmd)).toBeGreaterThan(readErr.message.indexOf("does NOT help"));
+		}
+	});
+
+	// #168 M13: MCP `file_read` refuses above MAX_MCP_READ_FILE_BYTES (16 MiB default), so
+	// it must not be offered as an unconditional escape hatch the way HTTP GET can be.
+	it("qualifies MCP file_read with its own ceiling", () => {
+		expect(readErr.message).toContain("MCP `file_read` also works, but only below its own 16 MiB ceiling");
+		expect(readErr.message).toContain("MAX_MCP_READ_FILE_BYTES");
 	});
 
 	it("tells a write caller to split the output, and names the write and edit routes", () => {
 		expect(writeErr.message).toContain("writing '/out.txt' would produce 52428800 bytes");
 		expect(writeErr.message).toContain("write several smaller files");
+		// `split -b` only helps a write when its INPUT is a pipe: pointed at the oversized
+		// file it re-trips the read side of the same cap.
+		expect(writeErr.message).toContain("reading from a pipe rather than the oversized file");
 		expect(writeErr.message).toContain("`PUT .../files/{path}` (MCP `file_write`)");
 		expect(writeErr.message).toContain("`PATCH .../files/{path}` (MCP `file_edit`)");
 	});
@@ -56,7 +73,7 @@ describe("createEfbig — message content", () => {
 		const asWrite = createEfbig("/x", 10, 5, "write");
 
 		expect(asRead.message).not.toBe(asWrite.message);
-		expect(asWrite.message).not.toContain("process a slice at a time");
+		expect(asWrite.message).not.toContain("Slicing it in the sandbox does NOT help");
 		expect(asRead.message).not.toContain("write several smaller files");
 	});
 
