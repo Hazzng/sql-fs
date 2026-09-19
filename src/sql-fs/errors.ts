@@ -101,6 +101,42 @@ export function createEdriverfault(cause: Error): Error {
 	return Object.assign(err, { cause });
 }
 
+/**
+ * EFBIG: sandbox exec tried to read or produce a file over the per-file ceiling (#168).
+ *
+ * The message is the recovery path for an autonomous agent — do not retry, both sizes,
+ * routes that actually work, operator env var. Avoid `sandboxes`/`/tmp` prefixes;
+ * `sanitizeFsError` would redact them. Sibling HTTP/MCP caps are independently
+ * configured, so the remedy interpolates their live values rather than hardcoded defaults.
+ */
+export function createEfbig(path: string, attemptedBytes: number, limitBytes: number, op: "read" | "write"): Error {
+	const mcpReadBytes = configuredBytes("MAX_MCP_READ_FILE_BYTES", 16 * 1024 * 1024);
+	const fileWriteBytes = configuredBytes("MAX_FILE_WRITE_BYTES", 50 * 1024 * 1024);
+	const preamble =
+		op === "read" ? `'${path}' is ${attemptedBytes} bytes` : `writing '${path}' would produce ${attemptedBytes} bytes`;
+	const remedy =
+		op === "read"
+			? `fetch it over HTTP with \`GET .../files/{path}\`, the one read path this limit does not apply to; MCP \`file_read\` is capped separately at ${mcpReadBytes} bytes (\`MAX_MCP_READ_FILE_BYTES\`). Slicing it in the sandbox does NOT help: \`head -c\`, \`tail -c\`, \`split -b\` and \`sed -n\` all read the whole file through the same call and re-trip this same limit`
+			: `write several smaller files (\`split -b\`, reading from a pipe rather than the oversized file), send large content in over HTTP with \`PUT .../files/{path}\` (MCP \`file_write\`), or change part of a file with \`PATCH .../files/{path}\` (MCP \`file_edit\`) instead of rewriting it whole. Those routes are capped independently at ${fileWriteBytes} bytes (\`MAX_FILE_WRITE_BYTES\`)`;
+	return makeFsError(
+		"EFBIG",
+		[
+			`EFBIG: file too large for sandbox exec, ${preamble} and the per-file exec limit is ${limitBytes} bytes.`,
+			`This is a deliberate limit, not a transient failure — the same command will fail again, so split the work instead of retrying it: ${remedy}.`,
+			"Operators raise the ceiling with the MAX_EXEC_FILE_BYTES environment variable.",
+		].join(" "),
+		path,
+	);
+}
+
+/** Same parse as `positiveIntEnv`. Local — importing `api/lib/env` would cycle through `sql-fs.ts`. */
+function configuredBytes(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */
