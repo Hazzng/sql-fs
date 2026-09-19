@@ -129,6 +129,7 @@ function cappedSqlFs(bigFileBytes: number): SqlFs {
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => [
 			entry("/", 1n, 2, 0),

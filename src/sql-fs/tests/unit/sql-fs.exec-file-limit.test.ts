@@ -49,6 +49,7 @@ function makeFs(entries: Array<{ path: string } & PathCacheEntry>): {
 		disconnect: vi.fn(),
 		transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => entries),
 		createSandbox: vi.fn(),
