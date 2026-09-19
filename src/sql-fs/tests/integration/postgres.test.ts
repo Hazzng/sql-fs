@@ -252,7 +252,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — inode CRUD", () 
 
 		const newMtime = new Date("2025-06-15T12:00:00.000Z");
 		await dialect.transaction(async (tx) => {
-			await dialect.updateInode(tx, inodeId, { mode: 0o600, mtime: newMtime });
+			await dialect.updateInode(tx, inodeId, { mode: 0o600, mtime: newMtime }, sandboxId);
 		});
 
 		const inode = await dialect.transaction(async (tx) => {
@@ -310,7 +310,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — incrementNlink a
 		});
 
 		await dialect.transaction(async (tx) => {
-			await dialect.incrementNlink(tx, inodeId);
+			await dialect.incrementNlink(tx, inodeId, sandboxId);
 		});
 
 		const inode = await dialect.transaction(async (tx) => {
@@ -327,7 +327,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — incrementNlink a
 
 		// Increment to nlink=2 first
 		await dialect.transaction(async (tx) => {
-			await dialect.incrementNlink(tx, inodeId);
+			await dialect.incrementNlink(tx, inodeId, sandboxId);
 		});
 
 		const newNlink = await dialect.transaction(async (tx) => {
@@ -522,7 +522,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — deleteDirent", (
 		});
 
 		const removedInodeId = await dialect.transaction(async (tx) => {
-			return await dialect.deleteDirent(tx, rootInodeId, name);
+			return await dialect.deleteDirent(tx, rootInodeId, name, sandboxId);
 		});
 
 		expect(removedInodeId).toBe(inodeId);
@@ -542,7 +542,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — deleteDirent", (
 
 		await expect(
 			dialect.transaction(async (tx) => {
-				return await dialect.deleteDirent(tx, rootInodeId, name);
+				return await dialect.deleteDirent(tx, rootInodeId, name, sandboxId);
 			}),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
@@ -656,7 +656,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () 
 		});
 
 		await dialect.transaction(async (tx) => {
-			await dialect.moveDirent(tx, rootInodeId, "old-name.txt", rootInodeId, "new-name.txt");
+			await dialect.moveDirent(tx, rootInodeId, "old-name.txt", rootInodeId, "new-name.txt", sandboxId);
 		});
 
 		// old name should be gone, new name should resolve to same inodeId
@@ -687,7 +687,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () 
 		});
 
 		await dialect.transaction(async (tx) => {
-			await dialect.moveDirent(tx, rootInodeId, "move-me.txt", destDirId, "moved.txt");
+			await dialect.moveDirent(tx, rootInodeId, "move-me.txt", destDirId, "moved.txt", sandboxId);
 		});
 
 		// old location should be gone
@@ -719,7 +719,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () 
 		});
 
 		await dialect.transaction(async (tx) => {
-			await dialect.moveDirent(tx, rootInodeId, "src-file.txt", rootInodeId, "dst-file.txt");
+			await dialect.moveDirent(tx, rootInodeId, "src-file.txt", rootInodeId, "dst-file.txt", sandboxId);
 		});
 
 		// There should be exactly one dirent named dst-file.txt, pointing to srcInodeId
@@ -737,7 +737,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — moveDirent", () 
 	it("throws ENOENT when moving a non-existent source dirent", async () => {
 		await expect(
 			dialect.transaction(async (tx) => {
-				await dialect.moveDirent(tx, rootInodeId, "does-not-exist.txt", rootInodeId, "target.txt");
+				await dialect.moveDirent(tx, rootInodeId, "does-not-exist.txt", rootInodeId, "target.txt", sandboxId);
 			}),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
@@ -1145,7 +1145,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — nlink=0 tombston
 		await dialect.transaction(async (tx) => {
 			await dialect.insertDirent(tx, rootInodeId, "link1.txt", inodeId);
 			await dialect.insertDirent(tx, rootInodeId, "link2.txt", inodeId);
-			await dialect.incrementNlink(tx, inodeId); // two links → nlink = 2
+			await dialect.incrementNlink(tx, inodeId, sandboxId); // two links → nlink = 2
 		});
 
 		await dialect.transaction(async (tx) => dialect.rmComposite(tx, sandboxId, rootInodeId, "link2.txt"));
@@ -1476,7 +1476,7 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — bulkIngest", () 
 
 		await dialect.transaction(async (tx) => {
 			await dialect.setSandboxContext(tx, sandboxId);
-			await dialect.bulkIngest(tx, files);
+			await dialect.bulkIngest(tx, files, sandboxId);
 		});
 
 		// Verify all 5 directories exist under root and each contains 10 files

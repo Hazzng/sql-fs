@@ -147,6 +147,7 @@ describe("SqlFs.mv() — pathCache rebuild", () => {
 			"a", // srcName
 			1n, // destParentInodeId (root /)
 			"x", // destName
+			sandboxId, // #192: moveDirent carries the mv fallback's fence-and-advance
 		);
 	});
 });
@@ -227,5 +228,12 @@ describe("SqlFs.mv() — move over existing destination", () => {
 		// nlink > 0 so deleteInode NOT called for the displaced inode (3n)
 		expect(deleteInodeMock).not.toHaveBeenCalled();
 		expect(moveDirentMock).toHaveBeenCalledOnce();
+	});
+
+	it("does not decrement dest nlink when moveDirent rejects ESTALE", async () => {
+		moveDirentMock.mockRejectedValueOnce(Object.assign(new Error("ESTALE"), { code: "ESTALE" }));
+		await expect(fs.mv("/src.txt", "/dest.txt")).rejects.toMatchObject({ code: "ESTALE" });
+		expect(decrementNlinkMock).not.toHaveBeenCalled();
+		expect(deleteInodeMock).not.toHaveBeenCalled();
 	});
 });

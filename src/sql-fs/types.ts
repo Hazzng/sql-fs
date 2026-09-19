@@ -211,8 +211,9 @@ export interface SqlDialect<Tx = unknown> {
 	/**
 	 * Inserts a new inode into the database.
 	 * Returns the generated bigint inode ID.
+	 * Fence carrier for inode-creating writes (`mkdir -p`, `cp`, `symlink`, fallbacks).
 	 */
-	createInode(tx: Tx, opts: CreateInodeOpts): Promise<bigint>;
+	createInode(tx: Tx, opts: CreateInodeOpts, expectedEpoch?: bigint): Promise<bigint>;
 
 	/**
 	 * Retrieves a single inode by ID.
@@ -223,8 +224,19 @@ export interface SqlDialect<Tx = unknown> {
 	/**
 	 * Updates mutable inode fields (mode, size, mtime, contentSha256).
 	 * Only the fields present in `updates` are written; others are untouched.
+	 * Fence carrier for `chmod` and `utimes`.
+	 *
+	 * Each carrier folds the composites' fence-and-advance CTEs into a statement
+	 * the path already issues. A dialect that ignores `expectedEpoch` does not
+	 * fence; throw ESTALE (not a new code) when the fence rejects.
 	 */
-	updateInode(tx: Tx, inodeId: bigint, updates: UpdateInodeOpts): Promise<void>;
+	updateInode(
+		tx: Tx,
+		inodeId: bigint,
+		updates: UpdateInodeOpts,
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<void>;
 
 	/**
 	 * Hard-deletes an inode row by ID.
@@ -235,9 +247,9 @@ export interface SqlDialect<Tx = unknown> {
 
 	/**
 	 * Atomically increments nlink by 1.
-	 * Executes UPDATE inodes SET nlink = nlink + 1 WHERE id = $1.
+	 * Fence carrier for `link`. Must run before `insertDirent`.
 	 */
-	incrementNlink(tx: Tx, inodeId: bigint): Promise<void>;
+	incrementNlink(tx: Tx, inodeId: bigint, sandboxId: string, expectedEpoch?: bigint): Promise<void>;
 
 	/**
 	 * Atomically decrements nlink by 1 and returns the new nlink value.
@@ -264,8 +276,9 @@ export interface SqlDialect<Tx = unknown> {
 	/**
 	 * Deletes the directory entry (parentId, name) and returns the removed inodeId.
 	 * Throws a translatable ENOENT error if the entry does not exist.
+	 * Fence carrier for `rm -r` and the non-composite `rm` fallback.
 	 */
-	deleteDirent(tx: Tx, parentId: bigint, name: string): Promise<bigint>;
+	deleteDirent(tx: Tx, parentId: bigint, name: string, sandboxId: string, expectedEpoch?: bigint): Promise<bigint>;
 
 	/**
 	 * Lists all directory entries under `parentId`, ordered by name.
@@ -273,12 +286,20 @@ export interface SqlDialect<Tx = unknown> {
 	listDirents(tx: Tx, parentId: bigint): Promise<DirentRow[]>;
 
 	/**
-	 * Moves/renames a directory entry in a single UPDATE.
-	 * If the destination (newParentId, newName) already exists, deletes it first
-	 * within the same transaction.
+	 * Moves/renames a directory entry. If the destination already exists, deletes
+	 * it first, gated on the same fence as the rename.
 	 * Throws a translatable ENOENT error if the source does not exist.
+	 * Fence carrier for the non-composite `mv` fallback.
 	 */
-	moveDirent(tx: Tx, oldParentId: bigint, oldName: string, newParentId: bigint, newName: string): Promise<void>;
+	moveDirent(
+		tx: Tx,
+		oldParentId: bigint,
+		oldName: string,
+		newParentId: bigint,
+		newName: string,
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<void>;
 
 	// ── Composite write operations (optional) ────────────────────────────────────
 
@@ -410,8 +431,15 @@ export interface SqlDialect<Tx = unknown> {
 	 * Bulk-inserts files into the current sandbox in minimal round-trips,
 	 * creating all missing parent directories automatically.
 	 * Prefers multi-row INSERT statements for blobs and inodes.
+	 *
+	 * Fence carrier: one bump for the whole batch, however many files.
 	 */
-	bulkIngest(tx: Tx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>>;
+	bulkIngest(
+		tx: Tx,
+		files: BulkIngestFile[],
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<Map<string, PathCacheEntry>>;
 
 	// ── Path resolution ───────────────────────────────────────────────────────────
 
