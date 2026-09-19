@@ -42,13 +42,22 @@ const tenantConfig = loadTenantConfig();
 // counter and session state; `redisDataClient` carries the blob cache and path
 // snapshot. Multi-MiB cache writes must not head-of-line block an INCR.
 const redisClient = getRedisClient("control");
-const redisDataClient = getRedisClient("data");
+// Read data-plane demand from env BEFORE opening the data connection: a
+// lock-only deployment (blob cache off, snapshot off) must not pay for a
+// second socket nothing will ever use. REDIS_DATA_URL falls back to REDIS_URL
+// inside getRedisClient, so calling it unconditionally would always connect.
+const blobCacheEnvEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const snapshotEnvEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+const redisDataClient = blobCacheEnvEnabled || snapshotEnvEnabled ? getRedisClient("data") : undefined;
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
 // them unconditionally would abort startup on a malformed Redis option even
 // in deployments that never touch Redis (REDIS_URL unset).
 const execLockOptions = redisClient ? loadExecLockOptions() : undefined;
 const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
-const pathSnapshotEnabled = redisDataClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+// Snapshots are version-checked against the control-side counter on every read
+// (and written only alongside its INCR), so without the control connection a
+// snapshot cache could never hit — require both clients.
+const pathSnapshotEnabled = redisClient !== undefined && redisDataClient !== undefined && snapshotEnvEnabled;
 const pathSnapshot =
 	pathSnapshotEnabled && redisDataClient
 		? new RedisPathSnapshot(redisDataClient, {
@@ -56,7 +65,7 @@ const pathSnapshot =
 			})
 		: undefined;
 
-const blobCacheEnabled = redisDataClient && process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const blobCacheEnabled = redisDataClient !== undefined && blobCacheEnvEnabled;
 const blobCacheOptions = blobCacheEnabled
 	? {
 			ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),

@@ -23,19 +23,33 @@ const DROP_LOG_INTERVAL_MS = 5_000;
  * #167 M6: `blobCacheFactory` runs once per TENANT, so instance-local counters
  * capped T tenants x 32 MB on a single socket — exactly the unbounded queue the
  * cap exists to prevent. The counters therefore belong to the connection, which
- * is what actually backs up, not to the cache object in front of it.
+ * is what actually backs up, not to the cache object in front of it. The limits
+ * live here too: the counters are only a single budget if every tenant checks
+ * the same cap, so a second cache on one client with different limits is a
+ * programmer error and fails fast in the constructor.
  */
 interface BackfillOccupancy {
 	inFlight: number;
 	inFlightBytes: number;
+	maxInFlight: number;
+	maxInFlightBytes: number;
 }
 
 const occupancyByClient = new WeakMap<Redis, BackfillOccupancy>();
 
-function occupancyFor(client: Redis): BackfillOccupancy {
+function occupancyFor(client: Redis, maxInFlight: number, maxInFlightBytes: number): BackfillOccupancy {
 	const existing = occupancyByClient.get(client);
-	if (existing !== undefined) return existing;
-	const created: BackfillOccupancy = { inFlight: 0, inFlightBytes: 0 };
+	if (existing !== undefined) {
+		if (existing.maxInFlight !== maxInFlight || existing.maxInFlightBytes !== maxInFlightBytes) {
+			const have = `${existing.maxInFlight}/${existing.maxInFlightBytes}`;
+			const want = `${maxInFlight}/${maxInFlightBytes}`;
+			throw new Error(
+				`RedisBlobCache: conflicting backfill limits on the same client (have ${have}, got ${want}); the budget is connection-wide, use identical limits.`,
+			);
+		}
+		return existing;
+	}
+	const created: BackfillOccupancy = { inFlight: 0, inFlightBytes: 0, maxInFlight, maxInFlightBytes };
 	occupancyByClient.set(client, created);
 	return created;
 }
@@ -67,14 +81,19 @@ export class RedisBlobCache {
 	#lastDropLogAt = 0;
 
 	constructor(client: Redis, tenantId: string, opts: RedisBlobCacheOptions = {}) {
+		// Resolve before sharing: defaults are constants, so an explicit 32 and an
+		// omitted option compare equal and production's single shared options object
+		// never trips the conflict check below.
+		const maxInFlight = opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+		const maxInFlightBytes = opts.maxInFlightBytes ?? DEFAULT_MAX_IN_FLIGHT_BYTES;
 		this.#client = client;
-		this.#occupancy = occupancyFor(client);
+		this.#occupancy = occupancyFor(client, maxInFlight, maxInFlightBytes);
 		this.#tenantId = tenantId;
 		this.#ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
 		this.#maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
 		this.#enabled = opts.enabled ?? true;
-		this.#maxInFlight = opts.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
-		this.#maxInFlightBytes = opts.maxInFlightBytes ?? DEFAULT_MAX_IN_FLIGHT_BYTES;
+		this.#maxInFlight = maxInFlight;
+		this.#maxInFlightBytes = maxInFlightBytes;
 		this.#breaker = opts.breaker;
 	}
 
@@ -179,6 +198,8 @@ export class RedisBlobCache {
 		if (data.byteLength > this.#maxBytes) return;
 		// Capacity is checked BEFORE the breaker: `tryAcquireCircuit` can claim the
 		// half-open probe, and a drop here would never settle it (#167 M7).
+		// The limits are pinned per connection in the constructor, so these
+		// per-instance reads are the connection-wide budget by construction.
 		if (this.#occupancy.inFlight >= this.#maxInFlight) {
 			this.#recordDrop("max_in_flight");
 			return;

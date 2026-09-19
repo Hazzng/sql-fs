@@ -304,4 +304,36 @@ describe("RedisBlobCache backfill cap across tenants", () => {
 		redisB.releaseAll();
 		await Promise.all(pending);
 	});
+
+	// The shared counters are only one budget if every tenant checks the same
+	// cap: a larger per-instance limit would otherwise admit writes past the cap
+	// the other tenants enforce. Production builds every tenant cache from one
+	// shared options object, so pinning the limits per connection keeps
+	// production identical and conflicting limits fail fast as programmer error.
+	it("throws when a second cache on the same client passes a different maxInFlight", () => {
+		const redis = new StallingRedis();
+		new RedisBlobCache(redis.client, "a", { maxInFlight: 2 });
+		expect(() => new RedisBlobCache(redis.client, "b", { maxInFlight: 3 })).toThrow(/conflicting backfill limits/);
+	});
+
+	it("throws when a second cache on the same client passes different maxInFlightBytes", () => {
+		const redis = new StallingRedis();
+		new RedisBlobCache(redis.client, "a", { maxInFlightBytes: 1000 });
+		expect(() => new RedisBlobCache(redis.client, "b", { maxInFlightBytes: 2000 })).toThrow(
+			/conflicting backfill limits/,
+		);
+	});
+
+	it("accepts a second cache on the same client with identical limits", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const redis = new StallingRedis();
+		const tenantA = new RedisBlobCache(redis.client, "a", { maxInFlight: 1 });
+		const tenantB = new RedisBlobCache(redis.client, "b", { maxInFlight: 1 });
+		const pending = tenantA.set(sha(1), new Uint8Array(8));
+		await tenantB.set(sha(2), new Uint8Array(8)); // same cap, same socket → still dropped
+		expect(redis.started).toHaveLength(1);
+		expect(tenantB.stats.dropped).toBe(1);
+		redis.releaseAll();
+		await pending;
+	});
 });
