@@ -98,6 +98,16 @@ function faultGraceMs(): number {
 	return graceMs;
 }
 
+/** Options for {@link raceDriverFault}. */
+export interface RaceDriverFaultOptions {
+	/**
+	 * Keep the grace timer referenced until the verdict. Default false: a fault must never hold a
+	 * serving process open. Opt in only before `serve()` listens, where no server/Redis handle
+	 * exists yet and an unref'd timer lets the process exit 0 before the verdict.
+	 */
+	readonly refTimer?: boolean;
+}
+
 /**
  * Run a driver call, failing it if it is still pending a grace window after a driver fault.
  *
@@ -107,9 +117,9 @@ function faultGraceMs(): number {
  * such a wait, which is why suppressing the crash without it just buys a silent 120s hang.
  *
  * `Promise.race` subscribes to both arms, so whichever loses cannot resurface as an unhandled
- * rejection. The grace timer is `unref`'d: a fault must never hold the process open.
+ * rejection. The grace timer is `unref`'d by default: a fault must never hold the process open.
  */
-export function raceDriverFault<T>(run: () => Promise<T>): Promise<T> {
+export function raceDriverFault<T>(run: () => Promise<T>, options?: RaceDriverFaultOptions): Promise<T> {
 	const pending = run();
 	let unsubscribe!: () => void;
 	let timer: NodeJS.Timeout | undefined;
@@ -117,7 +127,8 @@ export function raceDriverFault<T>(run: () => Promise<T>): Promise<T> {
 		unsubscribe = onDriverFault((err) => {
 			if (timer !== undefined) return;
 			timer = setTimeout(() => reject(createEdriverfault(err)), faultGraceMs());
-			timer.unref?.();
+			if (options?.refTimer === true) timer.ref?.();
+			else timer.unref?.();
 		});
 	});
 	return Promise.race([pending, fault]).finally(() => {

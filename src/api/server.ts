@@ -313,11 +313,15 @@ app.onError((err, c) => {
  * `listen` — no health check to fail, no restart, nothing in the log after startup. Suppressing
  * the crash without racing the await just trades a loud failure for a silent one.
  *
+ * The race holds the process open (`refTimer`): pre-`serve()` the loop may have no other
+ * referenced handle, so an unref'd timer exits 0 before the verdict — skipping `startup_failed`
+ * and `process.exit(1)`, which leaves restart-on-failure deployments down with no log.
+ *
  * Exported so the race is testable; the bootstrap below is the only production caller.
  */
 export async function runStartupMigrations(): Promise<void> {
 	if (process.env.SKIP_STARTUP_MIGRATIONS === "true") return;
-	await raceDriverFault(() => runMigrations(tenantConfig));
+	await raceDriverFault(() => runMigrations(tenantConfig), { refTimer: true });
 }
 
 // ── Server bootstrap (only when run as entry point) ───────────────────────────
