@@ -177,7 +177,7 @@ Key design choices:
 | `MAX_INGEST_FILES` | No | `10000` | Max number of entries (files + paths) in one `ingest-files` manifest. |
 | `MAX_INGEST_PATHS_CONCURRENCY` | No | `16` | Max concurrent host-file reads for the MCP `paths` ingest mode (bounds file descriptors / memory). |
 | `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. Carries the control plane: locks, version counter, session state. |
-| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache, path snapshot). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; point it at a different Redis only if you want physical separation too. This instance must run **`maxmemory-policy allkeys-lru`** — see [Redis eviction policy](#redis-eviction-policy). |
+| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache, path snapshot). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; point it at a different Redis only if you want physical separation too. This instance must run **`maxmemory-policy allkeys-lru`** (or `allkeys-lfu`) — see [Redis eviction policy](#redis-eviction-policy). |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No | `60000` | Distributed exec lock TTL. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No | `20000` | Lock heartbeat interval. Must be strictly less than lease. |
 | `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No | `75000` | Max wait to acquire exec lock before returning 503. Must be strictly greater than `REDIS_EXEC_LOCK_LEASE_MS` and `REDIS_RWLOCK_READER_LEASE_MS` (asserted at startup), so a crashed holder's lease can be reaped before the waiter gives up. |
@@ -254,8 +254,8 @@ For multi-replica deployments, add `REDIS_URL`. All replicas share the same Post
 
 ### Redis eviction policy
 
-Configure the Redis behind `REDIS_DATA_URL` (which defaults to `REDIS_URL`) with an
-`allkeys-*` eviction policy:
+Configure the Redis behind `REDIS_DATA_URL` (which defaults to `REDIS_URL`) with
+`allkeys-lru` (or `allkeys-lfu`):
 
 ```bash
 redis-cli CONFIG SET maxmemory-policy allkeys-lru   # and persist it in redis.conf
@@ -269,13 +269,24 @@ harness measured that as 97.6% 5xx with no recovery, against a `CLIENT PAUSE` th
 recovered the moment the pause lifted. With `allkeys-lru` the same memory pressure
 just evicts cold blobs, which costs a Postgres read.
 
-`volatile-*` is not sufficient. It evicts only keys that carry a TTL, and on the
-default single-instance setup the exec-lock leases and version counters carry one
-too, so it can reap a live lock lease to make room for a cached blob.
+`allkeys-lru` and `allkeys-lfu` are the only two accepted, because on the default
+single-instance setup this policy also governs the exec-lock leases, version
+counters and destroy tombstones. Under LRU or LFU those are effectively immune — a
+lease renewed every 20s and a counter touched on every write are the hottest keys
+in the instance, so a cold blob is always the better candidate. `allkeys-random`
+samples uniformly, so a live lease is as likely to be reaped as that cold blob.
+`volatile-*` fails for a different reason: it evicts only keys that carry a TTL, so
+once the instance fills with keys that do not, it has no candidate left and behaves
+exactly like `noeviction`.
+
+The check runs only when this client actually carries the blob cache or the path
+snapshot. With `REDIS_BLOB_CACHE_ENABLED=false` and no path snapshot the "data"
+client is the control instance via the fallback, and a control-only Redis must
+**not** be switched to `allkeys-*` — that would make its leases evictable.
 
 The server checks this at boot with `CONFIG GET maxmemory-policy` and logs
-`event:"redis_eviction_policy_unsafe"` at `severity:"critical"` if the policy is not
-`allkeys-*`. It is a warning, never a startup failure: managed Redis providers often
+`event:"redis_eviction_policy_unsafe"` at `severity:"critical"` if the policy is
+neither `allkeys-lru` nor `allkeys-lfu`. It is a warning, never a startup failure: managed Redis providers often
 forbid `CONFIG GET`, and that case logs
 `event:"redis_eviction_policy_unknown"` with `reason:"config_get_denied"` and boots
 normally. If your provider hides the setting, confirm with them that the instance

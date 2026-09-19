@@ -353,7 +353,16 @@ if (isMain) {
 		// Under `noeviction` a full instance refuses writes and never recovers,
 		// because blob entries carry a 24h TTL. Warn only, and never await: a
 		// managed Redis that refuses CONFIG GET must still boot.
-		startEvictionPolicyCheck(redisDataClient);
+		//
+		// #188 M8: only when this client actually carries data-plane state. With
+		// the blob cache off and no path snapshot, `REDIS_DATA_URL`'s fallback
+		// makes the data client the CONTROL instance, and a control-only Redis
+		// holds nothing evictable worth trading: paging its operator to switch to
+		// allkeys-* would make the exec-lock leases, version counters and destroy
+		// tombstones evictable — the remediation would be the outage.
+		startEvictionPolicyCheck(redisDataClient, {
+			carriesDataPlane: Boolean(blobCacheEnabled) || Boolean(pathSnapshotEnabled),
+		});
 
 		// F8: process-wide event-loop-lag monitor. Purely observational — surfaces
 		// the GC-pause / sync-stall class that can silently void a Redis lease

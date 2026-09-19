@@ -34,16 +34,28 @@ function sink(): { lines: string[]; log: (line: string) => void } {
 }
 
 describe("readEvictionPolicy (US-188)", () => {
-	it("accepts every allkeys policy", async () => {
-		for (const policy of ["allkeys-lru", "allkeys-lfu", "allkeys-random"]) {
+	it("accepts the two recency/frequency policies", async () => {
+		for (const policy of ["allkeys-lru", "allkeys-lfu"]) {
 			expect(await readEvictionPolicy(reader(["maxmemory-policy", policy]))).toEqual({ verdict: "safe", policy });
 		}
 	});
 
+	// #188 M9: `allkeys-random` used to be blessed by a `startsWith("allkeys-")`
+	// test. It evicts uniformly, so a lease renewed every 20s is as likely to be
+	// reaped as the cold blob beside it — which is the very thing the rejection of
+	// volatile-* was justified by. LRU/LFU are the policies for which that
+	// argument actually holds.
+	it("rejects allkeys-random — uniform sampling can reap a live lease", async () => {
+		expect(await readEvictionPolicy(reader(["maxmemory-policy", "allkeys-random"]))).toEqual({
+			verdict: "unsafe",
+			policy: "allkeys-random",
+		});
+	});
+
 	it("rejects noeviction and every volatile policy", async () => {
-		// volatile-* is rejected on purpose: it evicts only keys carrying a TTL,
-		// and the control-plane lock leases sharing the default single instance
-		// carry one, so it can reap a live lease to cache a blob.
+		// volatile-* evicts only keys carrying a TTL, so an instance that fills
+		// with keys that do not carry one has no candidate left and degrades to
+		// noeviction: writes refused, no recovery without a human.
 		for (const policy of ["noeviction", "volatile-lru", "volatile-lfu", "volatile-random", "volatile-ttl"]) {
 			expect(await readEvictionPolicy(reader(["maxmemory-policy", policy]))).toEqual({ verdict: "unsafe", policy });
 		}
@@ -101,6 +113,25 @@ describe("checkEvictionPolicy logging (US-188)", () => {
 		expect(line.message).toContain("allkeys-lru");
 	});
 
+	// The remedy line is what an operator acts on, so each family has to be told
+	// WHY its policy was refused — "not allkeys-*" is not a reason for a policy
+	// that is allkeys-*.
+	it("explains the refusal in terms of the policy it actually found", async () => {
+		const cases: Array<[string, string]> = [
+			["allkeys-random", "uniformly at random"],
+			["volatile-lru", "only keys that carry a TTL"],
+			["noeviction", "refuses every write"],
+		];
+		for (const [policy, reason] of cases) {
+			const out = sink();
+			await checkEvictionPolicy(reader(["maxmemory-policy", policy]), out.log);
+			const line = JSON.parse(out.lines[0] as string) as Record<string, string>;
+			expect(line.event).toBe("redis_eviction_policy_unsafe");
+			expect(line.message).toContain(reason);
+			expect(line.message).toContain("allkeys-lru");
+		}
+	});
+
 	it("does not emit the unsafe event when the policy is safe", async () => {
 		// Negative guard: a warning on every healthy boot would train operators to
 		// ignore the one that matters.
@@ -137,6 +168,38 @@ describe("checkEvictionPolicy logging (US-188)", () => {
 describe("startEvictionPolicyCheck (US-188)", () => {
 	it("is a no-op when no Redis is configured", () => {
 		expect(() => startEvictionPolicyCheck(undefined)).not.toThrow();
+	});
+
+	// #188 M8: `REDIS_DATA_URL` falls back to `REDIS_URL`, so with the blob cache
+	// off and no path snapshot the "data" client IS the control instance. Paging
+	// its operator to switch to allkeys-* would make the exec-lock leases and
+	// tombstones evictable — the remediation would be the outage.
+	it("does not touch Redis when the client carries no data-plane state", () => {
+		const config = vi.fn(async () => ["maxmemory-policy", "noeviction"]);
+		const client = { config } as unknown as Parameters<typeof startEvictionPolicyCheck>[0];
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		startEvictionPolicyCheck(client, { carriesDataPlane: false });
+
+		expect(config).not.toHaveBeenCalled();
+		expect(err).not.toHaveBeenCalled();
+		expect(warn).not.toHaveBeenCalled();
+		err.mockRestore();
+		warn.mockRestore();
+	});
+
+	it("still checks when the client carries data-plane state", async () => {
+		const config = vi.fn(async () => ["maxmemory-policy", "noeviction"]);
+		const client = { config } as unknown as Parameters<typeof startEvictionPolicyCheck>[0];
+		const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		startEvictionPolicyCheck(client, { carriesDataPlane: true });
+		await new Promise((r) => setImmediate(r));
+
+		expect(config).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(err.mock.calls[0]?.[0] as string).event).toBe("redis_eviction_policy_unsafe");
+		err.mockRestore();
 	});
 
 	it("returns synchronously without awaiting the Redis round trip", async () => {

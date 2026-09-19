@@ -8,9 +8,9 @@
  * does not recover on its own: waiting out a 24 h TTL is not an operational
  * strategy, so a human has to flush keys or raise the limit. The harness
  * measured that shape as 97.6% 5xx with no recovery, against a `CLIENT PAUSE`
- * that recovered the moment the pause lifted. An `allkeys-*` policy turns the
- * same event into eviction of cold blobs, which cost a Postgres read and
- * nothing else.
+ * that recovered the moment the pause lifted. An `allkeys-lru` / `allkeys-lfu` policy turns
+ * the same event into eviction of cold blobs, which cost a Postgres read and
+ * nothing else — see `SAFE_POLICIES` for why those two and not the rest.
  *
  * This is a WARNING and never a startup failure. Managed Redis providers
  * routinely refuse `CONFIG GET` (ElastiCache renames the command, Redis Cloud
@@ -76,13 +76,41 @@ export async function readEvictionPolicy(client: ConfigReader): Promise<Eviction
 	}
 	const policy = policyFromReply(reply);
 	if (policy === undefined) return { verdict: "unreadable" };
-	// `allkeys-lru`, `allkeys-lfu` and `allkeys-random` all evict blob entries
-	// under pressure, which is the property that matters. `volatile-*` is not
-	// accepted: it evicts only keys carrying a TTL, and by default the data role
-	// shares an instance with the control role (`REDIS_DATA_URL` falls back to
-	// `REDIS_URL`), whose version counters and lock leases carry a TTL too — so
-	// it can reap a live lock lease to make room for a cached blob.
-	return { verdict: policy.startsWith("allkeys-") ? "safe" : "unsafe", policy };
+	return { verdict: SAFE_POLICIES.has(policy) ? "safe" : "unsafe", policy };
+}
+
+/**
+ * The only two policies that both always have something to evict and evict the
+ * right thing.
+ *
+ * By default the data role shares an instance with the control role
+ * (`REDIS_DATA_URL` falls back to `REDIS_URL`), so whatever policy is set
+ * governs the exec-lock leases, the version counters and the destroy
+ * tombstones as well as the blob cache. Under LRU or LFU those are effectively
+ * immune: a lease renewed every `REDIS_EXEC_LOCK_RENEW_MS` (20 s) and a version
+ * counter touched on every write are the most recently and most frequently used
+ * keys in the instance, so a cold blob is always the better candidate.
+ *
+ * `allkeys-random` is NOT accepted: it samples uniformly, so a live lease is
+ * exactly as likely to be reaped as the cold blob next to it. `volatile-*` is
+ * not accepted either, but for a different reason than recency — it evicts ONLY
+ * keys carrying a TTL, so an instance that fills with keys that do not carry one
+ * (the RW-lock reader ZSETs, anything a future change adds) has no eviction
+ * candidate left and degrades to exactly the `noeviction` failure this check
+ * exists to prevent: writes refused, no recovery without a human. `allkeys-*`
+ * always has a candidate.
+ */
+const SAFE_POLICIES: ReadonlySet<string> = new Set(["allkeys-lru", "allkeys-lfu"]);
+
+/** Why this specific policy is refused — an operator log line has to be actionable. */
+function unsafeReason(policy: string | undefined): string {
+	if (policy === "allkeys-random") {
+		return "allkeys-random evicts uniformly at random, so a live exec-lock lease or version counter is as likely to be reaped as a cold blob; LRU/LFU never pick a key renewed every 20s.";
+	}
+	if (policy?.startsWith("volatile-") === true) {
+		return "volatile-* evicts only keys that carry a TTL, so once the instance fills with keys that do not, it has no candidate left and behaves exactly like noeviction: writes refused, no recovery without a human.";
+	}
+	return "under noeviction a Redis at maxmemory refuses every write and does not recover, because blob entries carry a 24h TTL.";
 }
 
 /**
@@ -107,7 +135,7 @@ export async function checkEvictionPolicy(
 					event: "redis_eviction_policy_unsafe",
 					severity: "critical",
 					policy: result.policy,
-					message: `Redis maxmemory-policy is "${result.policy}". The blob cache needs allkeys-lru: under noeviction a Redis at maxmemory refuses every write and does not recover, because blob entries carry a 24h TTL. Run CONFIG SET maxmemory-policy allkeys-lru (and persist it in redis.conf).`,
+					message: `Redis maxmemory-policy is "${result.policy}". The blob cache needs allkeys-lru (or allkeys-lfu): ${unsafeReason(result.policy)} Run CONFIG SET maxmemory-policy allkeys-lru (and persist it in redis.conf).`,
 				}),
 			);
 			break;
@@ -136,13 +164,29 @@ export async function checkEvictionPolicy(
 	return result;
 }
 
+export interface EvictionPolicyCheckOptions {
+	/**
+	 * Whether this client actually carries data-plane state (blob cache or path
+	 * snapshot). Defaults to `true`; pass `false` to skip the check entirely.
+	 *
+	 * #188 M8: `REDIS_DATA_URL` falls back to `REDIS_URL`, so with the blob cache
+	 * disabled and no path snapshot the "data" client IS the control instance. A
+	 * control-only Redis holds leases, version counters and destroy tombstones and
+	 * no cache at all — nothing there is worth evicting, and the remediation this
+	 * check pages for (switch to `allkeys-*`) would make all of it evictable. So a
+	 * correctly-configured control-only deployment must not be paged at all.
+	 */
+	readonly carriesDataPlane?: boolean;
+}
+
 /**
  * Fire-and-forget boot hook. Deliberately not awaited by the caller: a Redis
  * that answers slowly must not hold up `listen`, and a rejection here must not
  * become an unhandled rejection.
  */
-export function startEvictionPolicyCheck(client: Redis | undefined): void {
+export function startEvictionPolicyCheck(client: Redis | undefined, opts: EvictionPolicyCheckOptions = {}): void {
 	if (client === undefined) return;
+	if (opts.carriesDataPlane === false) return;
 	void checkEvictionPolicy(client).catch(() => {
 		// checkEvictionPolicy already swallows; this is belt-and-braces so a
 		// future change there can never crash boot.
