@@ -12,11 +12,13 @@ import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
+import { execContext } from "../api/exec-context.js";
 import { readOnlyContext } from "../api/read-only-context.js";
 import { runTrustedDbAsync } from "./defense.js";
 import { raceDriverFault } from "./driver-fault.js";
 import {
 	createEexist,
+	createEfbig,
 	createEinval,
 	createEisdir,
 	createEnoent,
@@ -856,6 +858,30 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#readOnlyDepth--;
 	}
 
+	/**
+	 * #168: bound the file size a *bash script* may read whole or produce.
+	 *
+	 * Only script-issued calls are bounded — `execContext` is set around `bash.exec`
+	 * only — because the cost being bounded is just-bash's synchronous string
+	 * rebuilding, not the bytes themselves. The HTTP/MCP routes reach the same
+	 * methods and keep their own (much looser) caps; capping them here would make a
+	 * 50 MiB `PUT` illegal to read back, and would leak one exec's ceiling onto a
+	 * `GET` running concurrently under the same shared session lock.
+	 *
+	 * Checked against the *declared* size before the blob is fetched or the
+	 * concatenation is built, so tripping the cap costs neither the round trip nor
+	 * the allocation the cap exists to prevent.
+	 */
+	#assertExecFileSize(path: string, bytes: number, op: "read" | "write"): void {
+		const ctx = execContext.getStore();
+		if (ctx === undefined || bytes <= ctx.maxFileBytes) return;
+		const err = createEfbig(path, bytes, ctx.maxFileBytes, op);
+		// Recorded as well as thrown: bash swallows a read rejection into a phantom
+		// "No such file or directory". See ExecContext.exceeded.
+		if (ctx.exceeded === undefined) ctx.exceeded = err;
+		throw err;
+	}
+
 	#assertWritable(path: string, op: string): void {
 		if (this.#readOnlyDepth > 0) {
 			const ctx = readOnlyContext.getStore();
@@ -1024,6 +1050,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const { name, parentEntry } = this.#requireParentDir(path);
 
 		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+		this.#assertExecFileSize(path, bytes.byteLength, "write");
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
 		const mtime = new Date();
 
@@ -1100,6 +1127,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const mtime = new Date();
 
 		const existing = this.#pathCache.get(path);
+		// The resulting size, not the appended chunk: `appendFile` materializes base+chunk in
+		// one buffer, and a file grown past the cap by repeated appends would then be unreadable
+		// from the same script. Checked off the cached size so the base blob is never fetched.
+		const appendedTotal = (existing?.kind === INODE_KIND.FILE ? existing.size : 0) + bytes.byteLength;
+		this.#assertExecFileSize(path, appendedTotal, "write");
 		let fullBytes: Uint8Array;
 
 		if (existing && existing.kind === INODE_KIND.FILE && existing.contentSha256 !== null) {
@@ -1360,6 +1392,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
+		// Before the cache lookup on purpose: a warm cache makes the DB round trip free
+		// but not the megabytes of string work the caller is about to do with the bytes.
+		this.#assertExecFileSize(path, entry.size, "read");
 
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;

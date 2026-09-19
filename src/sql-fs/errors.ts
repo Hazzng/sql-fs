@@ -101,6 +101,44 @@ export function createEdriverfault(cause: Error): Error {
 	return Object.assign(err, { cause });
 }
 
+/**
+ * EFBIG: a sandbox `exec` tried to read or produce a file larger than the
+ * per-file exec ceiling (#168).
+ *
+ * The ceiling exists because just-bash's text utilities do their work as
+ * synchronous string building on the main thread: measured, `sed s///g` blocks
+ * the event loop 706 ms at 8 MiB and 2238 ms at 16 MiB, and 62.8% of that is GC
+ * from allocation pressure, so yielding cannot help. Past ~2 s the stall stops
+ * being a latency problem and becomes someone else's correctness problem —
+ * `src/redis/client.ts` sets `commandTimeout: 2000`, so in-flight Redis commands
+ * belonging to *other* tenants time out (observed as `rw_lock_writer_release_error`
+ * against an unrelated sandbox).
+ *
+ * The message is a deliverable, not a label: the caller is an AI agent that has
+ * to recover without a human, so it states that this is a limit rather than a
+ * fault (do not retry the identical call), both numbers, the concrete smaller
+ * calls to reach for, and the env var an operator would raise. It deliberately
+ * avoids the words `sandboxes`/`/tmp`-style prefixes, which `sanitizeFsError`
+ * would redact out of the remediation hint.
+ */
+export function createEfbig(path: string, attemptedBytes: number, limitBytes: number, op: "read" | "write"): Error {
+	const preamble =
+		op === "read" ? `'${path}' is ${attemptedBytes} bytes` : `writing '${path}' would produce ${attemptedBytes} bytes`;
+	const remedy =
+		op === "read"
+			? "process a slice at a time (`head -c`, `tail -c`, `split -b`, `sed -n '1,20000p'`), or pull the whole file out over HTTP with `GET .../files/{path}` (MCP `file_read`), which this limit does not apply to"
+			: "write several smaller files (`split -b`), send large content in over HTTP with `PUT .../files/{path}` (MCP `file_write`), or change part of a file with `PATCH .../files/{path}` (MCP `file_edit`) instead of rewriting it whole";
+	return makeFsError(
+		"EFBIG",
+		[
+			`EFBIG: file too large for sandbox exec, ${preamble} and the per-file exec limit is ${limitBytes} bytes.`,
+			`This is a deliberate limit, not a transient failure — the same command will fail again, so split the work instead of retrying it: ${remedy}.`,
+			"Operators raise the ceiling with the MAX_EXEC_FILE_BYTES environment variable.",
+		].join(" "),
+		path,
+	);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */

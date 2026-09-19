@@ -83,3 +83,23 @@ export const MAX_BULK_WRITE_BODY_BYTES = MAX_BULK_WRITE_BYTES * 2;
  * would make every comparison false and remove it.
  */
 export const MAX_BULK_WRITE_FILES = positiveIntEnv(process.env.MAX_BULK_WRITE_FILES, 1000);
+
+/**
+ * Largest file a sandbox `exec` script may read whole, or produce with one write (#168).
+ *
+ * Distinct from {@link MAX_FILE_WRITE_BYTES}, which bounds a single HTTP/MCP write body: that
+ * path measured 158–254 ms at its 50 MiB cap, because it moves bytes. A bash script does not move
+ * bytes, it rebuilds strings — `sed s///g` blocked the event loop 85 ms at 1 MiB, 706 ms at 8 MiB
+ * and 2238 ms at 16 MiB, and 62.8% of that is GC from allocation pressure rather than CPU work,
+ * so neither yielding nor a faster loop helps. The curve turns superlinear after 8 MiB.
+ *
+ * 8 MiB is chosen off the 2 s wall, not off the convenience of a round number: `src/redis/client.ts`
+ * sets `commandTimeout: 2000`, so a stall longer than that times out in-flight Redis commands
+ * belonging to *other* tenants — a cross-tenant correctness bug, not a latency blip. At 8 MiB the
+ * worst measured utility leaves ~2.8x headroom under that wall; at 16 MiB it is already through it.
+ *
+ * This is a stopgap that removes a capability — a script can no longer process a file above the
+ * cap at all — held until `bash.exec` moves off the main thread. Raise it only where the replica
+ * is not shared, or is not backed by Redis.
+ */
+export const MAX_EXEC_FILE_BYTES = positiveIntEnv(process.env.MAX_EXEC_FILE_BYTES, 8 * 1024 * 1024);

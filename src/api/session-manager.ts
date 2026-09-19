@@ -26,7 +26,9 @@ import { createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
+import { type ExecContext, execContext } from "./exec-context.js";
 import { logAudit } from "./lib/audit.js";
+import { MAX_EXEC_FILE_BYTES } from "./lib/env.js";
 import { posixNormalizePath } from "./lib/paths.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
@@ -1840,7 +1842,7 @@ export class SessionManager {
 		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
 		// would race across concurrent parallel readers.
 		const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
-		const execFn = async (): Promise<BashExecResult> => {
+		const runExec = async (ctx: ExecContext): Promise<BashExecResult> => {
 			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
@@ -1857,6 +1859,14 @@ export class SessionManager {
 						await session.scriptTx.abortScope();
 						throw new LockLostError("exec aborted: distributed exec lock lost mid-script");
 					}
+					// #168: bash normalized the EFBIG into a phantom "No such file or directory"
+					// and a plain exit 1, so the script "succeeded" and is about to commit.
+					// Roll it back and surface the real error — partially applying a script whose
+					// failure the client was told was a missing file is the worse outcome.
+					if (ctx.exceeded !== undefined) {
+						await session.scriptTx.abortScope();
+						throw ctx.exceeded;
+					}
 					await session.scriptTx.endScope();
 					return result;
 				} catch (err) {
@@ -1864,7 +1874,18 @@ export class SessionManager {
 					throw err;
 				}
 			}
-			return session.bash.exec(script, resolvedOpts);
+			const readOnlyResult = await session.bash.exec(script, resolvedOpts);
+			if (ctx.exceeded !== undefined) throw ctx.exceeded;
+			return readOnlyResult;
+		};
+
+		// #168: the one chokepoint every exec surface (sync, SSE, batch, MCP) funnels
+		// through, so the script's file-size ceiling is established here and nowhere
+		// else. Scoped to the call rather than set on the shared session FS — see
+		// `exec-context.ts` for why a flag would be wrong.
+		const execFn = (): Promise<BashExecResult> => {
+			const ctx: ExecContext = { maxFileBytes: MAX_EXEC_FILE_BYTES };
+			return execContext.run(ctx, () => runExec(ctx));
 		};
 
 		const updateCwd = (result: BashExecResult): BashExecResult => {
