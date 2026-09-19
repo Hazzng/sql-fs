@@ -73,7 +73,7 @@ describe("SessionManager ECOHERENCE contract (US-175)", () => {
 		await sm.withSession("default", "sbx", async () => {});
 
 		// Turn 1 mutates and its INCR fails: ECOHERENCE is correct here.
-		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValue(new Error("ERR value is not an integer"));
+		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValue(new Error("Command timed out"));
 		await expect(
 			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true;
@@ -96,7 +96,7 @@ describe("SessionManager ECOHERENCE contract (US-175)", () => {
 		const sm = new SessionManager({ createFs: makeFsFactory(stub), redis: asRedis(redis) });
 
 		await sm.withSession("default", "sbx", async () => {});
-		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValue(new Error("ERR value is not an integer"));
+		const incrSpy = vi.spyOn(redis, "incr").mockRejectedValue(new Error("Command timed out"));
 		await expect(
 			sm.withSession("default", "sbx", async () => {
 				stub.dirty = true;
@@ -125,7 +125,7 @@ describe("SessionManager ECOHERENCE contract (US-175)", () => {
 		const sm = new SessionManager({ createFs: makeFsFactory(stub), redis: asRedis(redis) });
 
 		await sm.withSession("default", "sbx", async () => {});
-		vi.spyOn(redis, "incr").mockRejectedValue(new Error("ERR value is not an integer"));
+		vi.spyOn(redis, "incr").mockRejectedValue(new Error("Command timed out"));
 
 		for (let i = 0; i < 2; i++) {
 			await expect(

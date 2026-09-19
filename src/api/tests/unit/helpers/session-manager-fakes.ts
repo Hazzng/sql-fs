@@ -23,6 +23,8 @@ export class FakeRedis {
 	store = new Map<string, Entry>(); // version keys
 	strings = new Map<string, Entry>(); // lock writer keys
 	zsets = new Map<string, Map<string, number>>();
+	/** Keys holding a non-string type: GET/INCR reply WRONGTYPE, SET heals. */
+	wrongTypeKeys = new Set<string>();
 
 	private gc(): void {
 		const now = Date.now();
@@ -45,17 +47,47 @@ export class FakeRedis {
 		return z;
 	}
 
+	async set(key: string, value: string, unit: "PX" | "EX", amount: number): Promise<"OK"> {
+		this.gc();
+		this.wrongTypeKeys.delete(key);
+		this.store.set(key, { value, expiresAt: Date.now() + (unit === "EX" ? amount * 1000 : amount) });
+		return "OK";
+	}
+
+	async get(key: string): Promise<string | null> {
+		this.gc();
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
+		return this.store.get(key)?.value ?? null;
+	}
+
 	async getex(key: string, _ex: "EX", seconds: number): Promise<string | null> {
 		this.gc();
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
 		const e = this.store.get(key);
 		if (e === undefined) return null;
 		e.expiresAt = Date.now() + seconds * 1000;
 		return e.value;
 	}
 
+	/**
+	 * Faithful to real Redis on the point #187 turns on: INCR against a key whose
+	 * value is not an integer is a command error, not a clamp to 0. Tests poison a
+	 * key by writing a non-numeric value into `store` and let this throw.
+	 */
 	async incr(key: string): Promise<number> {
 		this.gc();
-		const current = Number(this.store.get(key)?.value ?? "0") || 0;
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
+		const raw = this.store.get(key)?.value;
+		if (raw !== undefined && !/^-?\d+$/.test(raw)) {
+			throw new Error("ERR value is not an integer or out of range");
+		}
+		const current = Number(raw ?? "0") || 0;
 		const next = current + 1;
 		this.store.set(key, { value: String(next), expiresAt: Date.now() + 60_000 });
 		return next;
@@ -76,6 +108,24 @@ export class FakeRedis {
 		this.gc();
 		const keys = args.slice(0, numKeys);
 		const argv = args.slice(numKeys);
+		if (script.includes("US-187 poison reset")) {
+			const [vkey] = keys as [string];
+			const [reset, ttlSec, tombstone] = argv as [string, string, string];
+			if (this.wrongTypeKeys.has(vkey)) {
+				this.wrongTypeKeys.delete(vkey);
+				this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+				return reset;
+			}
+			const cur = this.store.get(vkey)?.value ?? null;
+			if (cur === null) {
+				this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+				return reset;
+			}
+			if (cur === tombstone) return "TOMBSTONE";
+			if (/^-?\d+$/.test(cur)) return `HEALTHY:${cur}`;
+			this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+			return reset;
+		}
 		if (script.includes("ZREMRANGEBYSCORE") && script.includes("EXISTS")) {
 			const [writerKey, readersKey] = keys as [string, string];
 			const [token, nowStr, expireAtStr] = argv as [string, string, string];
