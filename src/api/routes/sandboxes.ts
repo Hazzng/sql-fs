@@ -9,6 +9,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
+import { MAX_BULK_WRITE_BYTES, MAX_BULK_WRITE_FILES, MAX_FILE_WRITE_BYTES } from "../lib/env.js";
 import { forbiddenResponse, isForbiddenError, isOwnedBy, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
 
@@ -23,9 +24,15 @@ const createBodySchema = z.object({
 });
 
 // Audit H11 (#2): bound the optional initial-files map so a single create can't
-// buffer an unbounded number of files / bytes. Shares the bulk-write env knobs.
-const MAX_INITIAL_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
-const MAX_INITIAL_FILE_BYTES = Number(process.env.MAX_BULK_WRITE_BYTES ?? `${128 * 1024 * 1024}`);
+// buffer an unbounded number of files / bytes.
+//
+// #168 M10: these are now the SAME constants `POST /writeFiles` enforces, read from lib/env.ts.
+// They were re-derived here from the same env vars but with their own defaults — with the knobs
+// unset, /writeFiles capped a batch at 50 MiB while create still accepted 128 MiB of identical
+// synchronous work, and neither went through `positiveIntEnv`, so `MAX_BULK_WRITE_BYTES=fifty`
+// made the cap `NaN` and removed it. The per-entry cap is enforced here too, for the same reason
+// the bulk route enforces it: the total budget is larger, so one oversized entry would otherwise
+// sail past the per-file limit every other write surface applies.
 
 export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -56,25 +63,36 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 
 		if (files !== undefined) {
 			const entries = Object.entries(files);
-			if (entries.length > MAX_INITIAL_FILES) {
+			if (entries.length > MAX_BULK_WRITE_FILES) {
 				return c.json(
 					{
 						error: "payload_too_large",
 						code: "PAYLOAD_TOO_LARGE",
-						details: [`Initial files exceed count limit (${MAX_INITIAL_FILES})`],
+						details: [`Initial files exceed count limit (${MAX_BULK_WRITE_FILES})`],
 					},
 					413 as ContentfulStatusCode,
 				);
 			}
 			let totalBytes = 0;
-			for (const [, content] of entries) {
-				totalBytes += Buffer.byteLength(content, "utf8");
-				if (totalBytes > MAX_INITIAL_FILE_BYTES) {
+			for (const [filePath, content] of entries) {
+				const entryBytes = Buffer.byteLength(content, "utf8");
+				if (entryBytes > MAX_FILE_WRITE_BYTES) {
 					return c.json(
 						{
 							error: "payload_too_large",
 							code: "PAYLOAD_TOO_LARGE",
-							details: [`Initial files exceed total byte limit (${MAX_INITIAL_FILE_BYTES})`],
+							details: [`${filePath} is ${entryBytes} bytes; exceeds the per-file limit (${MAX_FILE_WRITE_BYTES})`],
+						},
+						413 as ContentfulStatusCode,
+					);
+				}
+				totalBytes += entryBytes;
+				if (totalBytes > MAX_BULK_WRITE_BYTES) {
+					return c.json(
+						{
+							error: "payload_too_large",
+							code: "PAYLOAD_TOO_LARGE",
+							details: [`Initial files exceed total byte limit (${MAX_BULK_WRITE_BYTES})`],
 						},
 						413 as ContentfulStatusCode,
 					);

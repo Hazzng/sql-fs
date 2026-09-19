@@ -230,3 +230,103 @@ describe("PUT raw file body limit", () => {
 		expect(res.status).toBe(204);
 	});
 });
+
+/**
+ * #168: the bulk route was a wider door than the single-file route it batches — a 128 MiB total
+ * against a 50 MiB per-file cap, and no body cap at all, so an over-declared or chunked body was
+ * JSON-parsed before anything looked at it.
+ */
+describe("POST /writeFiles limits", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		vi.resetModules();
+	});
+
+	// The total is derived from the per-file cap, so stubbing MAX_FILE_WRITE_BYTES moves both.
+	const BULK_BODY_LIMIT = LIMIT * 2;
+
+	it("caps the batch total at the per-file limit", async () => {
+		const app = await makeApp();
+		const files = {
+			"/home/user/a.txt": "a".repeat(500),
+			"/home/user/b.txt": "b".repeat(500),
+			"/home/user/c.txt": "c".repeat(500),
+		};
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/writeFiles`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ files }),
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(await res.json()).toEqual({
+			error: "payload_too_large",
+			code: "PAYLOAD_TOO_LARGE",
+			details: [`Bulk write exceeds total byte limit (${LIMIT})`],
+		});
+	});
+
+	it("rejects an oversized body streamed without a Content-Length", async () => {
+		const app = await makeApp();
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/writeFiles`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: chunked(BULK_BODY_LIMIT * 2),
+				// Node requires `duplex` for a streamed request body.
+				duplex: "half",
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(await res.json()).toEqual({
+			error: "payload_too_large",
+			code: "PAYLOAD_TOO_LARGE",
+			details: [`Bulk write body exceeds limit (${BULK_BODY_LIMIT} bytes)`],
+		});
+	});
+
+	it("rejects an oversized body that under-declares its Content-Length", async () => {
+		const app = await makeApp();
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/writeFiles`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "Content-Length": "12" },
+				body: chunked(BULK_BODY_LIMIT * 2),
+				// Node requires `duplex` for a streamed request body.
+				duplex: "half",
+			}),
+		);
+
+		expect(res.status).toBe(413);
+		expect(await res.json()).toEqual({
+			error: "payload_too_large",
+			code: "PAYLOAD_TOO_LARGE",
+			details: [`Bulk write body exceeds limit (${BULK_BODY_LIMIT} bytes)`],
+		});
+	});
+
+	// Guards the other direction: the tightened caps must still admit a legal batch.
+	it("writes a batch under both caps", async () => {
+		const app = await makeApp();
+		const files = {
+			"/home/user/a.txt": "a".repeat(200),
+			"/home/user/b.txt": "b".repeat(200),
+		};
+
+		const res = await app.fetch(
+			new Request(`http://localhost/v1/sandboxes/${SANDBOX_ID}/writeFiles`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ files }),
+			}),
+		);
+
+		expect(res.status).toBe(204);
+	});
+});
