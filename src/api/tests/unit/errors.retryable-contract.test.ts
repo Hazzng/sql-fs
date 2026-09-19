@@ -9,6 +9,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { isRetryableError, mapFsErrorToStatus } from "../../errors.js";
+import { openapiSpec } from "../../openapi-spec.js";
 import { app } from "../../server.js";
 
 function errWithCode(code: string, message = "boom"): Error {
@@ -25,6 +26,12 @@ describe("isRetryableError", () => {
 
 	it("reports ECOHERENCE as NOT retryable — the write committed", () => {
 		expect(isRetryableError(errWithCode("ECOHERENCE"))).toBe(false);
+	});
+
+	// #175 M1: the lease lapsed only AFTER the guarded work returned, so the
+	// script transaction is already durable — retrying re-applies it.
+	it("reports ELOCKLOST_APPLIED as NOT retryable — the lease lapsed after the commit", () => {
+		expect(isRetryableError(errWithCode("ELOCKLOST_APPLIED"))).toBe(false);
 	});
 
 	it.each(["53300", "53400", "57P03"])("reports capacity SQLSTATE %s as retryable", (sqlstate) => {
@@ -68,6 +75,36 @@ describe("mapFsErrorToStatus — coherence codes", () => {
 	it("maps ECOHERENCE_UNAPPLIED to 503", () => {
 		expect(mapFsErrorToStatus(errWithCode("ECOHERENCE_UNAPPLIED"))).toBe(503);
 	});
+
+	it("maps ELOCKLOST_APPLIED to 503", () => {
+		expect(mapFsErrorToStatus(errWithCode("ELOCKLOST_APPLIED"))).toBe(503);
+	});
+});
+
+/**
+ * #175 M2: `retryable: true` is a claim about the operation that threw, not
+ * about the whole request. `POST /v1/sandboxes` runs at least three separate
+ * transactions and `withSession` opens no script transaction, so a capacity
+ * SQLSTATE on a later step answers `retryable: true` with the sandbox row
+ * already durable. The published contract has to say so, or a client that obeys
+ * it orphans sandboxes.
+ */
+describe("the published retryable contract states its per-operation scope", () => {
+	const description = openapiSpec.components.schemas.Error.properties.retryable.description;
+
+	it("scopes the guarantee to the failing operation, not the request", () => {
+		expect(description).toMatch(/operation that failed|per operation/i);
+		expect(description).toMatch(/THAT OPERATION applied nothing/);
+	});
+
+	it("names the multi-transaction routes the guarantee does not cover", () => {
+		expect(description).toContain("POST /v1/sandboxes");
+		expect(description).toContain("ingest");
+	});
+
+	it("names ELOCKLOST_APPLIED among the non-retryable 503s", () => {
+		expect(description).toContain("ELOCKLOST_APPLIED");
+	});
 });
 
 // Exercises the real `app.onError` in server.ts via a throwing probe route
@@ -110,6 +147,14 @@ describe("app.onError — retryable field", () => {
 		expect(await probe(errWithCode("ELOCKLOST", "ELOCKLOST: exec lock lease lost"))).toEqual({
 			status: 503,
 			body: { error: "ELOCKLOST: exec lock lease lost", code: "ELOCKLOST", retryable: true },
+		});
+	});
+
+	it("marks a 503 ELOCKLOST_APPLIED not retryable, distinguishing it from ELOCKLOST", async () => {
+		const message = "ELOCKLOST_APPLIED: lock vfs:t:lock:s was lost, but the operation had already completed";
+		expect(await probe(errWithCode("ELOCKLOST_APPLIED", message))).toEqual({
+			status: 503,
+			body: { error: message, code: "ELOCKLOST_APPLIED", retryable: false },
 		});
 	});
 });

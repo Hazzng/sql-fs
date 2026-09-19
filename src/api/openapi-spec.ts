@@ -13,7 +13,7 @@ const errorSchema = {
 			type: "boolean",
 			example: false,
 			description:
-				"Durability discriminator. `true` means the server knows the request applied NOTHING and the condition is transient, so an automatic retry is safe (`ELOCKTIMEOUT`, `ELOCKLOST`, `ECOHERENCE_UNAPPLIED`, `ESESSIONCLOSING`, `ESHUTTINGDOWN`, `ERUNTIME_BUSY`, and the Postgres capacity refusals). `false` means the effect may already be durable, or a retry would fail identically — retry only if the call is idempotent. Notably `503 ECOHERENCE` is `false`: the write committed and only the cross-replica version publish failed. Emitted on every error raised through the global handler; when absent, treat it as `false`.",
+				"Durability discriminator for the operation that failed. `true` means the server knows THAT OPERATION applied nothing and the condition is transient, so an automatic retry is safe (`ELOCKTIMEOUT`, `ELOCKLOST`, `ECOHERENCE_UNAPPLIED`, `ESESSIONCLOSING`, `ESHUTTINGDOWN`, `ERUNTIME_BUSY`, and the Postgres capacity refusals). `false` means the effect may already be durable, or a retry would fail identically — retry only if the call is idempotent. Notably `503 ECOHERENCE` is `false` (the write committed and only the cross-replica version publish failed) and so is `503 ELOCKLOST_APPLIED` (the lease lapsed only after the write had committed). SCOPE: the guarantee is per operation, not per request. Routes that run several independent transactions — `POST /v1/sandboxes` (sandbox row, then FS, then initial files) and the ingest routes — can have committed an earlier step before a later one fails with `retryable: true`; retrying those re-creates rather than resumes, so reconcile with `GET /v1/sandboxes` instead of retrying blind. Single-transaction routes (exec, the file routes) are fully covered. Emitted on every error raised through the global handler; when absent, treat it as `false`.",
 		},
 	},
 	required: ["error", "code"],
@@ -95,7 +95,7 @@ const sandboxIdParam = {
  */
 const execUnavailableResponse = {
 	description:
-		"Service unavailable. Check `retryable` before retrying: `true` (ELOCKTIMEOUT, ELOCKLOST, ECOHERENCE_UNAPPLIED, ESESSIONCLOSING, ESHUTTINGDOWN, ERUNTIME_BUSY, EUNAVAILABLE capacity refusals) means nothing was applied and an automatic retry is safe. `ECOHERENCE` is `retryable: false` — the script ran and its writes COMMITTED; only the cross-replica cache-invalidation publish failed, so retrying re-applies a non-idempotent script. Treat an ECOHERENCE exec as applied-but-unacknowledged: re-read state, or retry only if the script is idempotent.",
+		"Service unavailable. Check `retryable` before retrying: `true` (ELOCKTIMEOUT, ELOCKLOST, ECOHERENCE_UNAPPLIED, ESESSIONCLOSING, ESHUTTINGDOWN, ERUNTIME_BUSY, EUNAVAILABLE capacity refusals) means nothing was applied and an automatic retry is safe. Two codes are `retryable: false` because the script ran and its writes COMMITTED: `ECOHERENCE` (only the cross-replica cache-invalidation publish failed) and `ELOCKLOST_APPLIED` (the exec lock lease lapsed, but only after the commit — a heartbeat tick can land during the COMMIT itself or the version INCR that follows). Treat both as applied-but-unacknowledged: re-read state, or retry only if the script is idempotent.",
 	content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 } as const;
 

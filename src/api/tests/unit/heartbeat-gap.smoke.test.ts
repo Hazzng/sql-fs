@@ -6,8 +6,8 @@
  * expiry / ZSET TTL reaping, then blocks the event loop synchronously for longer
  * than the lease. This is the genuine failure mode (a GC pause / pathological
  * sync bash stretch): the renewal timer cannot fire, Redis expires the
- * key/reaps the reader entry, and the late renew returns 0 → a real
- * `LockLostError`. The assertions then REQUIRE the new `heartbeat_gap` critical
+ * key/reaps the reader entry, and the late renew returns 0 → a real lease loss
+ * (surfaced as `ELOCKLOST_APPLIED`, since `fn` had already returned). The assertions then REQUIRE the new `heartbeat_gap` critical
  * event (with the correct `lock` tag + gap ≥ lease). Delete the emit calls in
  * the heartbeats and these tests go red.
  *
@@ -17,7 +17,7 @@
 import type { Redis } from "ioredis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetRedisCircuitBreakerForTest } from "../../../redis/circuit-breaker.js";
-import { LockLostError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import { execLockKey, withDistributedLock } from "../../distributed-lock.js";
 import { type RWLockKeys, rwLockKeys, withDistributedRWLock } from "../../distributed-rw-lock.js";
 
 // Lease floor small enough to cross with a short busy-loop, large enough that a
@@ -221,7 +221,7 @@ describe("F8 heartbeat-gap smoke: a >lease stall is reproduced and observed", ()
 					},
 					{ leaseMs: LEASE_MS, renewMs: RENEW_MS, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
 				),
-			).rejects.toBeInstanceOf(LockLostError);
+			).rejects.toMatchObject({ code: "ELOCKLOST_APPLIED" });
 		} finally {
 			cap.restore();
 		}
@@ -248,7 +248,7 @@ describe("F8 heartbeat-gap smoke: a >lease stall is reproduced and observed", ()
 					},
 					{ leaseMs: LEASE_MS, renewMs: RENEW_MS, acquireTimeoutMs: 5_000, acquireRetryMs: 10, readerLeaseMs: 5_000 },
 				),
-			).rejects.toBeInstanceOf(LockLostError);
+			).rejects.toMatchObject({ code: "ELOCKLOST_APPLIED" });
 		} finally {
 			cap.restore();
 		}

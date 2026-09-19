@@ -740,7 +740,12 @@ export class SessionManager {
 		// in-memory cache mid-script (F4). It is intentionally less parallel than
 		// the RW lock; flag-off is a transient deploy state.
 		if (!this.rwlockEnabled) {
-			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+			// readOnly: the shared entry points run under a read-only scope, so a
+			// lease lost after `fn` returned still means "nothing applied" (#175 M1).
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, {
+				...this.execLockOptions,
+				readOnly: true,
+			});
 		}
 		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
 	}
