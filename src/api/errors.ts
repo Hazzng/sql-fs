@@ -28,6 +28,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ELOCKTIMEOUT",
 	"ELOCKLOST",
 	"ECOHERENCE",
+	"ESTALE",
 	"ERUNTIME_BUSY",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
@@ -102,6 +103,10 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ECOHERENCE":
 			return 503;
+		case "ESTALE":
+			// Fencing epoch mismatch: a concurrent writer committed first.
+			// Safe to retry with a fresh scope.
+			return 409;
 		case "ERUNTIME_BUSY":
 			return 503;
 		default:

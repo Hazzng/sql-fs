@@ -52,6 +52,7 @@ function makeDialect(): {
 		loadAllPaths: vi.fn(async () => [dirEntry("/", 1n), dirEntry("/dir", 2n)]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async () => 10n),
 		getInode: vi.fn(),
 		updateInode: vi.fn(),

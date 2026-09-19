@@ -56,6 +56,7 @@ describe("cp single symlink preserves the link (M8 regression)", () => {
 			]),
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			getSandboxEpoch: vi.fn(async () => 0n),
 			createInode: createInodeMock,
 			getInode: vi.fn(),
 			updateInode: vi.fn(),

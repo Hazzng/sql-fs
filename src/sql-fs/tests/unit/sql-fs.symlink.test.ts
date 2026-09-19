@@ -25,6 +25,7 @@ function makeDialect(overrides: Partial<SqlDialect<unknown>> = {}): SqlDialect<u
 		loadAllPaths: vi.fn(async () => [dirEntry("/", 1n), dirEntry("/home", 2n)]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async () => 10n),
 		getInode: vi.fn(),
 		updateInode: vi.fn(),

@@ -42,6 +42,7 @@ describe("SqlFs.link() — hardlink creation", () => {
 			loadAllPaths: vi.fn(async () => [dirEntry("/", 1n), dirEntry("/home", 2n), fileEntry("/home/file.txt", 3n)]),
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			getSandboxEpoch: vi.fn(async () => 0n),
 			createInode: vi.fn(),
 			getInode: vi.fn(),
 			updateInode: vi.fn(),

@@ -24,6 +24,7 @@ import {
 	createEperm,
 	createEreadonly,
 	createEsandboxgone,
+	createEstale,
 } from "./errors.js";
 import type { RedisBlobCache } from "./redis-blob-cache.js";
 import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
@@ -188,6 +189,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
 	#scriptTxPromise: Promise<void> | undefined;
+	/** Durable sandbox epoch pinned while the writer lock is held for this scope. */
+	#scriptEpoch: bigint | undefined;
+	/** Epoch observed after the last completed write outside a script scope. */
+	#lastKnownEpoch: bigint | undefined;
 	/**
 	 * Set once the script-tx's connection is gone, and sticky for the rest of the scope.
 	 *
@@ -340,6 +345,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (generation !== this.#scriptTxGeneration || !this.#scriptScope) {
 					throw new Error("script-tx abandoned: scope ended while the transaction was opening");
 				}
+				// Pin + compare inside the locked tx; a separate pre-read would TOCTOU.
+				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				if (this.#lastKnownEpoch !== undefined && epoch !== this.#lastKnownEpoch) {
+					throw createEstale(this.#sandboxId);
+				}
+				this.#scriptEpoch = epoch;
 				this.#scriptTx = tx;
 				resolveTxReady();
 				await endPromise;
@@ -362,6 +373,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		await Promise.race([txReady, this.#scriptTxPromise]);
 	}
 
+	#expectedEpochArgs(): [bigint] | [] {
+		return this.#scriptEpoch === undefined ? [] : [this.#scriptEpoch];
+	}
+
+	/** Records the live epoch for freshly installed cache state (F2-L2). */
+	async #refreshKnownEpoch(): Promise<void> {
+		this.#lastKnownEpoch = await runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+				return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+			}),
+		);
+	}
+
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
 		// Inside a script scope every write MUST run on the single script-tx so the
@@ -377,11 +402,26 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.#openScriptTx();
 			}
 			const scriptTx = this.#scriptTx as Tx;
-			return runTrustedDbAsync(() => fn(scriptTx));
+			const value = await runTrustedDbAsync(() => fn(scriptTx));
+			// Refresh tx-local epoch; composites advance version (mv twice).
+			if (this.#scriptEpoch !== undefined) {
+				this.#scriptEpoch = await runTrustedDbAsync(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+			}
+			return value;
 		}
 		// No active scope — use a fresh, self-committing transaction (original
-		// behavior, no extra round-trip).
-		return runTrustedDbAsync(() => this.#dialect.transaction(fn));
+		// behavior, no extra round-trip for the mutation itself).
+		let observedEpoch: bigint | undefined;
+		const result = await runTrustedDbAsync(() =>
+			this.#dialect.transaction(async (tx) => {
+				const value = await fn(tx);
+				// Publish only after COMMIT; a failed COMMIT must not poison the cache.
+				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				return value;
+			}),
+		);
+		if (observedEpoch !== undefined) this.#lastKnownEpoch = observedEpoch;
+		return result;
 	}
 
 	// ── Path helpers ──────────────────────────────────────────────────────────────
@@ -651,6 +691,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		for (const [p, e] of entries) this.#cacheSet(p, e);
 		// Initial load established committed state; the cache is not poisoned (F1).
 		this.#cachePoisoned = false;
+		// Baseline the fence token for the state just installed; without this a
+		// later scope cannot tell a cross-replica write from its own (F2-L2).
+		await this.#refreshKnownEpoch();
 
 		// On snapshot hit: synchronous Redis mget pre-populates contentCache before
 		// this method returns, eliminating the race window for Redis-cached blobs.
@@ -710,6 +753,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				// A successful reload re-established committed state in the caches,
 				// so any prior poison is resolved (F1).
 				this.#cachePoisoned = false;
+				await this.#refreshKnownEpoch();
 				this.#startPrewarm(true);
 			} finally {
 				this.#pendingReload = undefined;
@@ -777,11 +821,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
+		let committed = false;
 		try {
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				await this.#scriptTxPromise;
 			}
+			committed = true;
 		} catch (err) {
 			// COMMIT failed — Postgres rolled the transaction back, but the
 			// in-memory caches still hold this script's uncommitted mutations.
@@ -804,10 +850,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			throw err;
 		} finally {
+			if (committed && this.#scriptEpoch !== undefined) this.#lastKnownEpoch = this.#scriptEpoch;
 			this.#scriptTx = undefined;
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
 			this.#scriptTxPromise = undefined;
+			this.#scriptEpoch = undefined;
 		}
 	}
 
@@ -822,6 +870,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptTxEnd = undefined;
 		this.#scriptTxAbort = undefined;
 		this.#scriptTxPromise = undefined;
+		this.#scriptEpoch = undefined;
 
 		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
 		// and releases the connection/advisory lock. Without this the callback awaits
@@ -930,6 +979,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						bytes.length,
 						sha256,
 						bytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1010,6 +1060,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						fullBytes.length,
 						sha256,
 						fullBytes,
+						...this.#expectedEpochArgs(),
 					),
 				)
 			: await this.#withTx(async (tx) => {
@@ -1096,7 +1147,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const inodeId = this.#dialect.mkdirComposite
 			? await this.#withBareTx((tx) =>
-					this.#dialect.mkdirComposite!(tx, this.#sandboxId, parentEntry.inodeId, name, 0o755),
+					this.#dialect.mkdirComposite!(
+						tx,
+						this.#sandboxId,
+						parentEntry.inodeId,
+						name,
+						0o755,
+						...this.#expectedEpochArgs(),
+					),
 				)
 			: await this.#withTx(async (tx) => {
 					const id = await this.#dialect.createInode(tx, {
@@ -1179,7 +1237,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 
 		if (this.#dialect.rmComposite) {
-			await this.#withBareTx((tx) => this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name));
+			await this.#withBareTx((tx) =>
+				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, ...this.#expectedEpochArgs()),
+			);
 		} else {
 			await this.#withTx(async (tx) => {
 				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
@@ -1476,6 +1536,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					srcName,
 					destParentEntry.inodeId,
 					destName,
+					...this.#expectedEpochArgs(),
 				),
 			);
 		} else {

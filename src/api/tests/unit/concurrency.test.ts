@@ -496,6 +496,7 @@ describe("SqlFs contentCache stays in sync after N overwrites via API", () => {
 			}),
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			getSandboxEpoch: vi.fn(async () => 0n),
 			createInode: vi.fn(async () => {
 				const id = nextInodeId.value;
 				nextInodeId.value += 1n;

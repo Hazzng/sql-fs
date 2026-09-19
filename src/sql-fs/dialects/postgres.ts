@@ -89,6 +89,20 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 
 	// ── Sandbox context ───────────────────────────────────────────────────────────
 
+	/** Fence param: null skips the check; `>` accepts this tx's own advances. */
+	private static epochParam(expectedEpoch?: bigint): string | null {
+		return expectedEpoch === undefined ? null : String(expectedEpoch);
+	}
+
+	/**
+	 * Takes the per-sandbox writer lock as its own statement. The fenced CTEs
+	 * below must run after this: their snapshot would otherwise predate the
+	 * lock wait and fence on a stale version.
+	 */
+	private static async takeWriterLock(tx: PgTx, sandboxId: string): Promise<void> {
+		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+	}
+
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
 		// RLS context only — no advisory lock. Read-only paths (cold-start load,
 		// cache reload) use this to avoid serializing against unrelated writers.
@@ -96,20 +110,71 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
-		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true), pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+		const rows = await tx<{ epoch: string }[]>`
+			SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+			       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+			       set_config('app.sandbox_epoch', s.version::text, true),
+			       s.version AS epoch
+			FROM sandboxes s
+			WHERE s.id = ${sandboxId}
+		`;
+		// Fake tx handles resolve non-arrays; zero rows on a real conn means gone.
+		if (Array.isArray(rows) && rows.length === 0) throw createEnoent(sandboxId);
+	}
+
+	async getSandboxEpoch(tx: PgTx, sandboxId: string): Promise<bigint> {
+		const rows = await tx<{ version: string }[]>`
+			SELECT version FROM sandboxes WHERE id = ${sandboxId}
+		`;
+		const row = rows[0];
+		if (row === undefined) throw createEnoent(sandboxId);
+		return BigInt(row.version);
 	}
 
 	// ── Composite write operations ────────────────────────────────────────────────
 
-	async mkdirComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string, mode: number): Promise<bigint> {
+	async mkdirComposite(
+		tx: PgTx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		mode: number,
+		expectedEpoch?: bigint,
+	): Promise<bigint> {
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+				       s.version AS epoch
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				SELECT ${sandboxId}, 2, ${mode}, 0 FROM ctx
+				SELECT ${sandboxId}, 2, ${mode}, 0 FROM epoch
 				RETURNING id
 			)
 			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -122,16 +187,48 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return BigInt(row.id);
 	}
 
-	async rmComposite(tx: PgTx, sandboxId: string, parentId: bigint, name: string): Promise<bigint> {
+	async rmComposite(
+		tx: PgTx,
+		sandboxId: string,
+		parentId: bigint,
+		name: string,
+		expectedEpoch?: bigint,
+	): Promise<bigint> {
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ removed_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+				       s.version AS epoch
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			removed_dirent AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM epoch) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Delete and decrement are split into two mutually-exclusive CTEs
@@ -166,23 +263,51 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		size: number,
 		sha256: Uint8Array,
 		data: Uint8Array,
+		expectedEpoch?: bigint,
 	): Promise<bigint> {
 		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ new_inode_id: string }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+				       s.version AS epoch
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM ctx
+				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM epoch
 				RETURNING id
 			),
 			old_dirent AS (
 				SELECT inode_id FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+				  AND (SELECT 1 FROM ctx) IS NOT NULL
 			),
 			upserted AS (
 				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
@@ -222,6 +347,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		expectedEpoch?: bigint,
 	): Promise<void> {
 		// Audit M10: a single wCTE that both DELETEs the destination dirent and
 		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
@@ -231,15 +357,43 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// 1 frees the destination slot (and cleans its inode), statement 2 renames
 		// the source into it. Statement 1's effects are visible to statement 2, so
 		// the rename can no longer collide. Atomicity is preserved by the tx.
+		// Both statements fence and advance the version; the tx-local epoch
+		// refresh in SqlFs absorbs the double bump.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		await tx`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+				       s.version AS epoch
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
 			),
 			old_dest AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM ctx) IS NOT NULL
+					AND (SELECT 1 FROM epoch) IS NOT NULL
 				RETURNING inode_id
 			),
 			-- Split delete/decrement by snapshot nlink so the overwritten
@@ -255,11 +409,43 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			SET nlink = nlink - 1
 			WHERE id IN (SELECT inode_id FROM old_dest)
 				AND nlink > 1
-		`;
+			`;
+		// Re-take for snapshot ordering; re-entrant within this tx.
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ inode_id: string }[]>`
+			WITH ctx AS (
+				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
+				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+				       s.version AS epoch
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
+						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
+			)
 			UPDATE dirents
 			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
 			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			  AND (SELECT 1 FROM epoch) IS NOT NULL
 			RETURNING inode_id
 		`;
 		if (rows.length === 0) throw createEnoent(oldName);
@@ -275,18 +461,33 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	// ── Stubs — implemented in subsequent user stories ────────────────────────────
 
 	// US-005
-	async createSandbox(tx: PgTx, sandboxId: string, owner = ""): Promise<{ rootInodeId: bigint; createdAt: string }> {
-		// 1. Insert sandbox row first (root_inode is NULL initially) to satisfy FK.
-		//    RETURNING created_at gives us the DB-generated timestamp for byte-for-byte
-		//    agreement between POST response, GET, and LIST.
+	async createSandbox(
+		tx: PgTx,
+		sandboxId: string,
+		owner = "",
+	): Promise<{ rootInodeId: bigint; createdAt: string; epoch: bigint }> {
+		// Serialize lifecycle transitions with all composite writers. The first
+		// incarnation starts at zero; every recreation advances the tombstone.
+		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+		const epochRows = await tx<{ epoch: string }[]>`
+			INSERT INTO sandbox_epochs (sandbox_id, epoch)
+			VALUES (${sandboxId}, 0)
+			ON CONFLICT (sandbox_id) DO UPDATE
+			SET epoch = sandbox_epochs.epoch + 1, deleted_at = NOW()
+			RETURNING epoch
+		`;
+		const epochRow = epochRows[0];
+		if (!epochRow) throw new Error("createSandbox: failed to allocate epoch");
+		const epoch = BigInt(epochRow.epoch);
+
 		const sandboxRows = await tx<{ created_at: Date }[]>`
-			INSERT INTO sandboxes (id, root_inode, owner) VALUES (${sandboxId}, NULL, ${owner}) RETURNING created_at
+			INSERT INTO sandboxes (id, root_inode, owner, version)
+			VALUES (${sandboxId}, NULL, ${owner}, ${String(epoch)}) RETURNING created_at
 		`;
 		const sandboxRow = sandboxRows[0];
 		if (!sandboxRow) throw new Error("createSandbox: failed to insert sandbox row");
 		const createdAt = sandboxRow.created_at.toISOString();
 
-		// 2. Insert root directory inode (kind=2, mode=0o755)
 		const rootRows = await tx<{ id: string }[]>`
 			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
 			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
@@ -296,25 +497,36 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		if (!rootRow) throw new Error("createSandbox: failed to create root inode");
 		const rootInodeId = BigInt(rootRow.id);
 
-		// 3. Update sandbox with root_inode reference
 		await tx`UPDATE sandboxes SET root_inode = ${String(rootInodeId)} WHERE id = ${sandboxId}`;
 
-		// 4. Create default directories under root: /home, /tmp, /bin
 		const homeInodeId = await this.#createDirInode(tx, sandboxId, rootInodeId, "home");
 		await this.#createDirInode(tx, sandboxId, rootInodeId, "tmp");
 		await this.#createDirInode(tx, sandboxId, rootInodeId, "bin");
-
-		// 5. Create /home/user under /home
 		await this.#createDirInode(tx, sandboxId, homeInodeId, "user");
 
-		return { rootInodeId, createdAt };
+		return { rootInodeId, createdAt, epoch };
 	}
 
-	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<void> {
-		// Acquire advisory lock before any destructive SQL so in-flight writes
-		// (from other replicas or code paths that bypass withSession) serialize first.
+	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<bigint> {
 		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
-		await tx`DELETE FROM sandboxes WHERE id = ${sandboxId}`;
+		const rows = await tx<{ epoch: string }[]>`
+			WITH deleted AS (
+				DELETE FROM sandboxes
+				WHERE id = ${sandboxId}
+				RETURNING id, version
+			), tombstone AS (
+				INSERT INTO sandbox_epochs (sandbox_id, epoch)
+				SELECT id, version + 1 FROM deleted
+				ON CONFLICT (sandbox_id) DO UPDATE
+				SET epoch = GREATEST(sandbox_epochs.epoch, EXCLUDED.epoch), deleted_at = NOW()
+				RETURNING epoch
+			)
+			SELECT epoch FROM tombstone
+			UNION ALL
+			SELECT epoch FROM sandbox_epochs
+			WHERE sandbox_id = ${sandboxId} AND NOT EXISTS (SELECT 1 FROM tombstone)
+		`;
+		return BigInt(rows[0]?.epoch ?? 0);
 	}
 
 	async sandboxExists(tx: PgTx, sandboxId: string): Promise<boolean> {

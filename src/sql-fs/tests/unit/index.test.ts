@@ -21,6 +21,7 @@ vi.mock("../../dialects/postgres.js", () => ({
 		setSandboxContextWithLock: vi.fn().mockResolvedValue(undefined),
 		createSandbox: vi.fn().mockResolvedValue({ rootInodeId: 1n, createdAt: new Date().toISOString() }),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn().mockResolvedValue(0n),
 		createInode: vi.fn(),
 		getInode: vi.fn(),
 		updateInode: vi.fn(),

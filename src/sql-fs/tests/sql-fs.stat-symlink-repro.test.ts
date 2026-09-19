@@ -69,6 +69,7 @@ function makeDialect(): SqlDialect<unknown> {
 		]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(async (_tx: unknown, args: { kind: number; symlinkTarget?: string }) => {
 			nextInodeId += 1n;
 			inodes.set(nextInodeId, { kind: args.kind, target: args.symlinkTarget });

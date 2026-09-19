@@ -33,6 +33,7 @@ function makeFs() {
 		loadAllPaths: vi.fn(async () => [FILE]),
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		createInode: vi.fn(),
 		getInode: vi.fn(),
 		updateInode: updateInodeMock,

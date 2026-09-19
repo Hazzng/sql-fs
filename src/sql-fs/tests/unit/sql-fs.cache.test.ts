@@ -62,6 +62,7 @@ describe("SqlFs.ready() — pathCache initialization", () => {
 			loadAllPaths: loadAllPathsMock,
 			createSandbox: vi.fn(),
 			deleteSandbox: vi.fn(),
+			getSandboxEpoch: vi.fn(async () => 0n),
 			sandboxExists: vi.fn(),
 			getSandboxMeta: vi.fn(),
 			updateSandboxMeta: vi.fn(),
@@ -91,8 +92,10 @@ describe("SqlFs.ready() — pathCache initialization", () => {
 	it("calls setSandboxContext then loadAllPaths inside a transaction", async () => {
 		await fs.ready();
 
-		expect(transactionMock).toHaveBeenCalledOnce();
-		expect(setSandboxContextMock).toHaveBeenCalledOnce();
+		// ready() uses one tx for the path load and a second to baseline the
+		// fencing epoch for the state just installed (F2-L2).
+		expect(transactionMock).toHaveBeenCalledTimes(2);
+		expect(setSandboxContextMock).toHaveBeenCalledTimes(2);
 		expect(loadAllPathsMock).toHaveBeenCalledOnce();
 
 		// setSandboxContext must be called with the correct sandboxId

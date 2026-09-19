@@ -61,6 +61,7 @@ function makeDialect(overrides?: Partial<{ bulkIngestImpl: SqlDialect<unknown>["
 		loadAllPaths: loadAllPathsMock,
 		createSandbox: vi.fn(),
 		deleteSandbox: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		sandboxExists: vi.fn(),
 		getSandboxMeta: vi.fn(),
 		updateSandboxMeta: vi.fn(),
