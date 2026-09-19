@@ -65,6 +65,21 @@ describe("loadExecLockOptions", () => {
 		process.env.REDIS_RWLOCK_READER_LEASE_MS = "90000";
 		expect(() => loadExecLockOptions()).toThrow(/must be strictly greater than REDIS_RWLOCK_READER_LEASE_MS/);
 	});
+
+	it("refuses to boot when the lease is zero instead of failing on the first contended exec", () => {
+		process.env.REDIS_EXEC_LOCK_LEASE_MS = "0";
+		expect(() => loadExecLockOptions()).toThrow(/REDIS_EXEC_LOCK_LEASE_MS.*positive integer/);
+	});
+
+	it("refuses to boot when the renewal interval is zero", () => {
+		process.env.REDIS_EXEC_LOCK_RENEW_MS = "0";
+		expect(() => loadExecLockOptions()).toThrow(/REDIS_EXEC_LOCK_RENEW_MS.*positive integer/);
+	});
+
+	it("refuses to boot when the reader lease is zero", () => {
+		process.env.REDIS_RWLOCK_READER_LEASE_MS = "0";
+		expect(() => loadExecLockOptions()).toThrow(/REDIS_RWLOCK_READER_LEASE_MS.*positive integer/);
+	});
 });
 
 describe("assertAcquireTimeoutAboveLeases", () => {

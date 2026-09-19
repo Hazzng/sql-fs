@@ -53,12 +53,17 @@ export function assertAcquireTimeoutAboveLeases(opts: ExecLockOptions): void {
 /** Reads the exec-lock env vars and validates them; throws on a config that breaks the invariant above. */
 export function loadExecLockOptions(): ExecLockOptions {
 	const opts: ExecLockOptions = {
-		leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
-		renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
+		// A zero lease/renewal interval passes the acquire-timeout invariant
+		// above but is rejected by the lock validators at request time, so
+		// fail fast here instead of booting a deployment whose first
+		// contended exec 503s. acquireTimeoutMs stays non-negative: 0 is
+		// already refused below with the invariant message.
+		leaseMs: parsePositiveInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
+		renewMs: parsePositiveInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
 		acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", DEFAULT_ACQUIRE_TIMEOUT_MS),
 		// F9d: tunable acquire poll interval (jittered to [retryMs/2, retryMs]).
 		acquireRetryMs: parsePositiveInt("REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS", 50),
-		readerLeaseMs: parseNonNegativeInt("REDIS_RWLOCK_READER_LEASE_MS", 60_000),
+		readerLeaseMs: parsePositiveInt("REDIS_RWLOCK_READER_LEASE_MS", 60_000),
 	};
 	assertAcquireTimeoutAboveLeases(opts);
 	return opts;
