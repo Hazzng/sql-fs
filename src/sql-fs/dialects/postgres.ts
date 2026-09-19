@@ -301,7 +301,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		mode: number,
 		size: number,
 		sha256: Uint8Array,
-		data: Uint8Array,
+		data?: Uint8Array,
 		expectedEpoch?: bigint,
 	): Promise<bigint> {
 		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
@@ -373,7 +373,8 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		`;
 		const row = rows[0];
 		if (!row) throw new Error("writeFileComposite: INSERT returned no rows");
-		if (this.#blobCache !== undefined) {
+		// Omitted `data` means the caller already backfilled (see the interface note).
+		if (this.#blobCache !== undefined && data !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
 		return BigInt(row.new_inode_id);

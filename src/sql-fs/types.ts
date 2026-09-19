@@ -314,6 +314,15 @@ export interface SqlDialect<Tx = unknown> {
 
 	rmComposite?(tx: Tx, sandboxId: string, parentId: bigint, name: string, expectedEpoch?: bigint): Promise<bigint>;
 
+	/**
+	 * `data` carries the bytes ONLY so the dialect can backfill its blob cache; the
+	 * statement itself writes inode + dirent and never the blob (`commitBlob` did
+	 * that, on its own connection, before this call). Omit it when the caller has
+	 * already backfilled — the buffered script-tx does, because retaining file bytes
+	 * in the mutation buffer is exactly the memory cost #166's design exists to
+	 * avoid. Never pass an empty array as a stand-in: that caches a zero-length blob
+	 * under a real sha and later reads serve it.
+	 */
 	writeFileComposite?(
 		tx: Tx,
 		sandboxId: string,
@@ -322,7 +331,7 @@ export interface SqlDialect<Tx = unknown> {
 		mode: number,
 		size: number,
 		sha256: Uint8Array,
-		data: Uint8Array,
+		data?: Uint8Array,
 		expectedEpoch?: bigint,
 	): Promise<bigint>;
 
