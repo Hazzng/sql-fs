@@ -18,6 +18,7 @@ import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
 import { clientSafeErrorCode, clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
 import { DEFAULT_SAMPLE_INTERVAL_MS, startEventLoopMonitor, stopEventLoopMonitor } from "./event-loop-monitor.js";
+import { loadExecLockOptions } from "./exec-lock-config.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
@@ -40,16 +41,7 @@ const redisClient = getRedisClient();
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
 // them unconditionally would abort startup on a malformed Redis option even
 // in deployments that never touch Redis (REDIS_URL unset).
-const execLockOptions = redisClient
-	? {
-			leaseMs: parseNonNegativeInt("REDIS_EXEC_LOCK_LEASE_MS", 60_000),
-			renewMs: parseNonNegativeInt("REDIS_EXEC_LOCK_RENEW_MS", 20_000),
-			acquireTimeoutMs: parseNonNegativeInt("REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS", 300_000),
-			// F9d: tunable acquire poll interval (jittered to [retryMs/2, retryMs]).
-			acquireRetryMs: parsePositiveInt("REDIS_EXEC_LOCK_ACQUIRE_RETRY_MS", 50),
-			readerLeaseMs: parseNonNegativeInt("REDIS_RWLOCK_READER_LEASE_MS", 60_000),
-		}
-	: undefined;
+const execLockOptions = redisClient ? loadExecLockOptions() : undefined;
 const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
 const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
 const pathSnapshot =
