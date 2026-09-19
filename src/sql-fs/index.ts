@@ -15,8 +15,9 @@
 import type { Redis } from "ioredis";
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
+import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
 import { getRedisClient } from "../redis/client.js";
-import { parseNonNegativeInt } from "../redis/config.js";
+import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
 import { RedisPathSnapshot } from "./redis-path-snapshot.js";
@@ -129,21 +130,34 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			if (!databaseUrl) {
 				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
 			}
-			const redis = getRedisClient();
+			// #167: cache traffic rides the data connection; the control client
+			// stays free for the version counter and locks.
+			const redis = getRedisClient("control");
+			// Read data-plane demand from env BEFORE opening the data connection:
+			// a lock-only deployment (blob cache off, snapshot off) must not pay
+			// for a second socket nothing will ever use. REDIS_DATA_URL falls
+			// back to REDIS_URL inside getRedisClient, so calling it
+			// unconditionally would always connect.
 			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+			const snapshotEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+			const redisData = blobCacheEnabled || snapshotEnabled ? getRedisClient("data") : undefined;
 			const blobCache =
-				redis && blobCacheEnabled
-					? new RedisBlobCache(redis, "default", {
+				redisData && blobCacheEnabled
+					? new RedisBlobCache(redisData, "default", {
 							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
 							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
+							maxInFlight: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT", 32),
+							maxInFlightBytes: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES", 32 * 1024 * 1024),
+							breaker: getRedisCircuitBreaker("data"),
 						})
 					: undefined;
-			const pathSnapshotEnabled = redis && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
-			const pathSnapshot = pathSnapshotEnabled
-				? new RedisPathSnapshot(redis, {
-						ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
-					})
-				: undefined;
+			const pathSnapshotEnabled = redisData && snapshotEnabled;
+			const pathSnapshot =
+				pathSnapshotEnabled && redisData
+					? new RedisPathSnapshot(redisData, {
+							ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
+						})
+					: undefined;
 			const { fs } = await createPostgresSandboxFs(
 				{ connectionString: databaseUrl, blobCache, pathSnapshot, redis: redis ?? undefined },
 				sandboxId,

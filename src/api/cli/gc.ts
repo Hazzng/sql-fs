@@ -74,7 +74,8 @@ async function main(): Promise<void> {
 		tenantIds = [tenant];
 	}
 
-	const redis = getRedisClient();
+	// #167: blob-cache invalidation is data-plane traffic.
+	const redis = getRedisClient("data");
 	const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
 
 	const results = await runBlobGc(tenantConfig, {

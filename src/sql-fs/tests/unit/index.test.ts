@@ -11,6 +11,33 @@ import { PostgresDialect } from "../../dialects/postgres.js";
 import { createSandboxFs, destroySandbox, loadBackendConfig } from "../../index.js";
 import { SqlFs } from "../../sql-fs.js";
 
+const constructed: string[] = [];
+
+// Fake ioredis so role assertions never open a real socket.
+vi.mock("ioredis", () => {
+	class FakeRedis {
+		constructor(_url: string, options: { connectionName?: string }) {
+			constructed.push(options.connectionName ?? "unnamed");
+		}
+		on(): this {
+			return this;
+		}
+		async quit(): Promise<"OK"> {
+			return "OK";
+		}
+		disconnect(): void {}
+	}
+	return { Redis: FakeRedis };
+});
+
+beforeEach(() => {
+	constructed.length = 0;
+});
+
+afterEach(() => {
+	vi.unstubAllEnvs();
+});
+
 // Mock the PostgresDialect so no real DB connection is made.
 vi.mock("../../dialects/postgres.js", () => ({
 	PostgresDialect: vi.fn().mockImplementation(() => ({
@@ -64,6 +91,26 @@ describe("createSandboxFs", () => {
 		it("returns SqlFs instance", async () => {
 			const fs = await createSandboxFs("postgres", "test-sandbox");
 			expect(fs).toBeInstanceOf(SqlFs);
+		});
+
+		it("opens no data connection when lock-only (blob cache off, snapshot off)", async () => {
+			// #167: REDIS_DATA_URL falls back to REDIS_URL inside getRedisClient,
+			// so requesting the data client would always connect — the factory
+			// must not request it when no data-plane feature is enabled.
+			// Fresh module import: getRedisClient memoizes per role per process.
+			vi.resetModules();
+			vi.stubEnv("REDIS_URL", "redis://localhost:6379");
+			vi.stubEnv("REDIS_DATA_URL", undefined);
+			vi.stubEnv("REDIS_BLOB_CACHE_ENABLED", "false");
+			vi.stubEnv("REDIS_PATH_SNAPSHOT_ENABLED", "false");
+			vi.stubEnv("DATABASE_URL", "postgres://localhost/test");
+			const { createSandboxFs: freshCreateSandboxFs } = await import("../../index.js");
+			// Fresh class identity: resetModules re-evaluates sql-fs.js, so the
+			// static SqlFs binding no longer matches for instanceof.
+			const { SqlFs: FreshSqlFs } = await import("../../sql-fs.js");
+			const fs = await freshCreateSandboxFs("postgres", "lock-only-sandbox");
+			expect(fs).toBeInstanceOf(FreshSqlFs);
+			expect(constructed).toEqual(["sql-fs-control"]);
 		});
 
 		it("throws if DATABASE_URL is not set", async () => {
