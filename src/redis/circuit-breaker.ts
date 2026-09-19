@@ -17,7 +17,9 @@
  *     consecutive-failure counter; a success resets it. At `threshold`
  *     consecutive failures the breaker opens.
  *   - OPEN: acquire fast-fails immediately. After `openMs` the breaker becomes
- *     half-open and lets a single probe through.
+ *     half-open and lets a single probe through. Results arriving while open
+ *     belong to commands admitted before it opened and are ignored — they can
+ *     neither close it nor restart its cool-down (#167).
  *   - HALF_OPEN: one probe is allowed. A success closes the breaker; a failure
  *     re-opens it for another `openMs`.
  *
@@ -124,15 +126,23 @@ export class RedisCircuitBreaker {
 		if (!this.tryAcquire()) throw new CircuitOpenError();
 	}
 
-	/** A successful PING / eval / set: close the breaker and clear the failure run. */
+	/**
+	 * A successful PING / eval / set: close the breaker and clear the failure run.
+	 *
+	 * Ignored while OPEN. A success arriving then belongs to a command admitted
+	 * before the breaker opened — a straggler that proves nothing about the
+	 * present — and closing on it releases the whole herd onto a Redis nothing
+	 * has re-tested. Only the half-open probe closes the breaker.
+	 */
 	recordSuccess(): void {
-		const wasOpen = this.#state !== "closed";
+		if (this.#state === "open") return;
+		const wasHalfOpen = this.#state === "half_open";
 		this.#state = "closed";
 		this.#consecutiveFailures = 0;
 		this.#halfOpenInFlight = false;
 		// Only a real transition is an event; the steady-state success path runs
 		// on every acquire and must not log.
-		if (wasOpen) {
+		if (wasHalfOpen) {
 			console.log(JSON.stringify({ event: "redis_circuit_closed", role: this.#role }));
 		}
 	}
@@ -157,7 +167,13 @@ export class RedisCircuitBreaker {
 	#open(): void {
 		const reopened = this.#state === "open";
 		this.#state = "open";
-		this.#openedAt = this.#now();
+		// Restart the cool-down only on a fresh declaration (closed → open) or a
+		// failed half-open probe. A failure arriving while already open is a
+		// straggler admitted before the breaker opened; restarting the clock on
+		// each one lets a burst of them (up to the blob-cache backfill cap, all
+		// expiring on the same `commandTimeout`) push the recovery probe out of
+		// reach for as long as they keep landing (#167).
+		if (!reopened) this.#openedAt = this.#now();
 		this.#halfOpenInFlight = false;
 		this.#consecutiveFailures = this.#threshold;
 		if (!reopened) {

@@ -215,6 +215,43 @@ describe("RedisBlobCache data-plane breaker", () => {
 		expect(breaker.state).toBe("closed");
 	});
 
+	// #167: a backfill admitted while the breaker was closed can still be in
+	// flight when the breaker opens. Its late success says nothing about the
+	// present, and closing on it puts the whole replica back onto a Redis that
+	// nothing has re-tested.
+	it("a backfill that completes after the breaker opened does not re-close it", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const breaker = new RedisCircuitBreaker({ threshold: 1, openMs: 60_000, role: "data" });
+		const redis = new StallingRedis();
+		const cache = new RedisBlobCache(redis.client, "t1", { breaker });
+		const inFlight = cache.set(sha(1), new Uint8Array(8)); // admitted while closed
+		breaker.recordFailure(); // a concurrent data-plane call fails → breaker opens
+		expect(breaker.state).toBe("open");
+
+		redis.releaseAll();
+		await inFlight; // the straggler succeeds
+		expect(breaker.state).toBe("open");
+		expect(await cache.get(sha(2))).toBeNull();
+		expect(redis.getKeys).toEqual([]); // still fast-failing to Postgres
+	});
+
+	// Regression guard, not a fix-proving test. Rejected fix for #167: making a
+	// capacity drop record a breaker failure. The backfill queue saturates under
+	// ordinary high-throughput writes (measured: 411 drops in a run with zero
+	// 5xx), so drops are backpressure, not evidence that Redis is unreachable.
+	it("does not record a breaker failure when a write is dropped for capacity", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const breaker = new RedisCircuitBreaker({ threshold: 1, openMs: 60_000, role: "data" });
+		const redis = new StallingRedis();
+		const cache = new RedisBlobCache(redis.client, "t1", { maxInFlight: 1, breaker });
+		const first = cache.set(sha(1), new Uint8Array(8));
+		for (let i = 0; i < 10; i++) await cache.set(sha(2), new Uint8Array(8));
+		expect(cache.stats.dropped).toBe(10);
+		expect(breaker.state).toBe("closed");
+		redis.releaseAll();
+		await first;
+	});
+
 	// Regression guard, not a fix-proving test: the breaker is optional, and a
 	// cache constructed without one must behave exactly as it did before #167.
 	it("leaves Redis reachable when no breaker is supplied", async () => {

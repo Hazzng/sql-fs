@@ -120,3 +120,59 @@ describe("RedisCircuitBreaker", () => {
 		expect(b.state).toBe("open");
 	});
 });
+
+// #167: both of these are the same class of defect M7 fixed — a breaker that
+// cannot hand out its recovery probe. M7 removed a permanent wedge; these remove
+// the two ways a stalled Redis's own in-flight traffic can stall recovery.
+describe("RedisCircuitBreaker recovery is driven only by the half-open probe", () => {
+	// A command admitted while the breaker was still CLOSED reports its failure
+	// after the breaker has opened. That straggler carries no news about the
+	// present, and restarting the cool-down on it lets a burst of them push the
+	// probe out of reach for as long as they keep landing.
+	it("a straggler failure while open does not restart the cool-down", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure(); // opens at t=0
+		clock.advance(4_999);
+		b.recordFailure(); // straggler admitted before the open, failing now
+		clock.advance(1); // t=5000: openMs has elapsed since the breaker opened
+		expect(b.tryAcquire()).toBe(true);
+		expect(b.state).toBe("half_open");
+	});
+
+	it("a stream of straggler failures cannot hold the breaker past one cool-down", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure(); // opens at t=0
+		// 16 in-flight commands (the blob-cache backfill cap) time out one per second.
+		for (let i = 0; i < 16; i++) {
+			clock.advance(1_000);
+			b.recordFailure();
+		}
+		// t=16_000 — more than three cool-downs after the breaker opened.
+		expect(b.tryAcquire()).toBe(true);
+	});
+
+	// A straggler that SUCCEEDS is the mirror image: it proves nothing about the
+	// present either, and closing on it releases the whole herd onto a Redis that
+	// nothing has re-tested.
+	it("a straggler success while open does not close the breaker", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure(); // opens at t=0
+		b.recordSuccess(); // straggler admitted before the open, succeeding now
+		expect(b.state).toBe("open");
+		expect(b.tryAcquire()).toBe(false);
+	});
+
+	it("still closes on the half-open probe's success after a straggler success", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure();
+		b.recordSuccess(); // straggler — ignored
+		clock.advance(5_000);
+		expect(b.tryAcquire()).toBe(true); // probe
+		b.recordSuccess();
+		expect(b.state).toBe("closed");
+	});
+});
