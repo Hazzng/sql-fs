@@ -110,11 +110,17 @@ describe("driver fault during a SqlFs operation", () => {
 
 		vi.useRealTimers();
 		// Cache-served reads and further writes are both refused, and no further statement reaches
-		// the dialect.
-		const callsAfterLoss = (dialect.writeFileComposite as ReturnType<typeof vi.fn>).mock.calls.length;
+		// the dialect. `commitBlob` is asserted alongside the composite because it is the FIRST
+		// statement a write issues and it runs on the root `sql`, not the scope's tx (#169 M4) —
+		// asserting only the composite left that hole open while claiming it was closed.
+		const composite = dialect.writeFileComposite as ReturnType<typeof vi.fn>;
+		const blob = dialect.commitBlob as ReturnType<typeof vi.fn>;
+		const compositeAfterLoss = composite.mock.calls.length;
+		const blobAfterLoss = blob.mock.calls.length;
 		await expect(fs.writeFile("/f2.txt", "b")).rejects.toMatchObject({ code: "EDRIVERFAULT" });
 		await expect(fs.readFile("/f1.txt")).rejects.toMatchObject({ code: "EDRIVERFAULT" });
-		expect((dialect.writeFileComposite as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsAfterLoss);
+		expect(composite.mock.calls.length).toBe(compositeAfterLoss);
+		expect(blob.mock.calls.length).toBe(blobAfterLoss);
 	});
 
 	it("leaves an unaffected later scope working", async () => {

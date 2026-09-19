@@ -47,7 +47,10 @@ function makeDialect(): {
 			armed = false;
 			return new Promise((_resolve, reject) => {
 				rejectTx = reject;
-				void fn({});
+				// The real dialect awaits the callback and surfaces its rejection as the
+				// transaction's own, which is what consumes the ROLLBACK the abort path triggers.
+				// Without that here, aborting the scope leaves the callback rejection unhandled.
+				void fn({}).catch(reject);
 			});
 		}),
 		setSandboxContext: vi.fn(),

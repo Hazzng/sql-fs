@@ -415,7 +415,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	/** Records the live epoch for freshly installed cache state (F2-L2). */
 	async #refreshKnownEpoch(): Promise<void> {
-		this.#lastKnownEpoch = await runTrustedDbAsync(() =>
+		// #169 M4: `#db` rather than a bare `runTrustedDbAsync` — unraced, a driver fault leaves
+		// this await pending for the life of the session.
+		this.#lastKnownEpoch = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
 				return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
@@ -632,10 +634,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 		}
 		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
-		const rows = await this.#dialect.transaction(async (tx) => {
-			await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-			return await this.#dialect.loadAllPaths(tx);
-		});
+		// #169 M4: routed through `#db` like every other driver await — a bare `dialect.transaction`
+		// here is neither raced (a fault leaves the reload pending forever) nor inside the
+		// defense-in-depth escape hatch.
+		const rows = await this.#db(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+				return await this.#dialect.loadAllPaths(tx);
+			}),
+		);
 		const fresh = new Map<string, PathCacheEntry>();
 		for (const { path, ...entry } of rows) {
 			fresh.set(path, entry);
@@ -859,6 +866,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async endScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
+
+		// #169 M3: never COMMIT a condemned scope. After a driver fault every later fs op throws
+		// via `#assertScriptTxAlive`, but bash swallows those into a nonzero exit rather than
+		// rejecting, so control still arrives here — and `#scriptTxEnd()` would commit whatever
+		// part of the script did land and report success. Delegate to the single abort path
+		// (reject endPromise → ROLLBACK → reload) and surface the fault.
+		const lost = this.#scriptTxLost;
+		if (lost !== undefined) {
+			await this.abortScriptScope();
+			throw lost;
+		}
+
 		this.#scriptScope = false;
 
 		const hadTx = this.#scriptTx !== undefined;
@@ -1011,7 +1030,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// F6: commit the CAS blob in its own short tx FIRST, so the composite
 		// (which runs on the long-lived script-tx) no longer holds the hot-blob
 		// tuple lock for the script duration.
-		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, bytes);
+		//
+		// #169 M4: this is a root-`sql` statement and it runs BEFORE `#withBareTx` reaches
+		// `#assertScriptTxAlive`, so a condemned scope would still put it on the wire — the exact
+		// hazard `#scriptTxLost` exists to prevent. Assert first, and route it through `#db` so a
+		// fault during the blob write is raced (it never settles on its own) and condemns the scope.
+		this.#assertScriptTxAlive();
+		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, bytes));
 
 		const inodeId = this.#dialect.writeFileComposite
 			? await this.#withBareTx((tx) =>
@@ -1091,8 +1116,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const sha256 = new Uint8Array(createHash("sha256").update(fullBytes).digest());
 		const { name, parentEntry } = this.#requireParentDir(path);
 
-		// F6: commit the CAS blob in its own short tx FIRST (see writeFile).
-		if (this.#dialect.commitBlob) await this.#dialect.commitBlob(sha256, fullBytes);
+		// F6: commit the CAS blob in its own short tx FIRST (see writeFile), under the same
+		// liveness assert and the same driver-fault race (#169 M4).
+		this.#assertScriptTxAlive();
+		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, fullBytes));
 
 		const inodeId = this.#dialect.writeFileComposite
 			? await this.#withBareTx((tx) =>
