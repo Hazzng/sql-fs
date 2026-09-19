@@ -34,6 +34,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
 	"EDRIVERFAULT",
+	"EFBIG",
 ]);
 
 /**
@@ -139,6 +140,7 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * EPERM          → 403  Forbidden
  * FORBIDDEN      → 403  Forbidden
  * ENOTEMPTY      → 409  Conflict
+ * EFBIG          → 413  Payload Too Large (exec file-size ceiling, #168)
  * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
  * ELOOP          → 400  Bad Request (symlink loop)
  * EINVAL         → 400  Bad Request (invalid argument)
@@ -209,6 +211,13 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;
+		case "EFBIG":
+			// #168: the script asked to read or produce a file above the exec ceiling.
+			// 413, not 400: the request was well-formed, the content is what is too big —
+			// and it is the same status the HTTP write caps already return, so a client
+			// handling "too large" has one branch rather than two. Never retryable; the
+			// identical call fails identically until the caller splits the work.
+			return 413;
 		default:
 			return isConnectionClassSqlState(code) ? 503 : 500;
 	}
