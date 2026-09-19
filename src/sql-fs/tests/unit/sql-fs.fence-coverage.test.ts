@@ -363,6 +363,20 @@ describe("#192 — pin bookkeeping around the advancing writes", () => {
 		expect(mock(fake.dialect, "getSandboxEpoch").mock.calls.length).toBe(before);
 	});
 
+	it("aborts the scope when the end-of-scope epoch read fails", async () => {
+		const fake = makeFake({ startVersion: 4n });
+		const fs = await readyFs(fake);
+
+		fs.beginScriptScope();
+		await fs.chmod("/home/file.txt", 0o600);
+		expect(fs.wasDirty()).toBe(true);
+		mock(fake.dialect, "getSandboxEpoch").mockRejectedValueOnce(new Error("epoch read failed"));
+		await expect(fs.endScriptScope()).rejects.toThrow(/epoch read failed/);
+		expect(fs.scriptScopeActive).toBe(false);
+		expect(fs.scriptTxOpen).toBe(false);
+		expect(fs.wasDirty()).toBe(false);
+	});
+
 	it("a bump from a peer between two scopes still fences this session", async () => {
 		const fake = makeFake({ startVersion: 4n });
 		const fs = await readyFs(fake);

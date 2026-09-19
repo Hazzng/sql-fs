@@ -104,26 +104,10 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	/**
-	 * The composites' fence-and-advance CTEs, for the writes that are not one
-	 * composite statement (#192).
-	 *
-	 * Same gate as `mkdirComposite`, minus its `set_config`/`pg_advisory_xact_lock`:
-	 * every caller arrives through `SqlFs.#withWriteTx`, which has already issued
-	 * `setSandboxContextWithLock` on this transaction, so re-taking the lock and
-	 * rewriting `app.sandbox_id` would cost two evaluations for nothing.
-	 *
-	 * The bump is what makes the fence work at all — a live writer that only ever
-	 * used these paths left `version` unmoved, so the next genuinely stale writer's
-	 * pin still matched. `set_config(..., is_local = true)` keeps the refreshed GUC
-	 * transaction-scoped, so it rolls back with the write and is pooler-safe; the
-	 * pin in `SqlFs` may lag it, which is exactly what the `version > expectedEpoch`
-	 * branch exists to admit.
-	 *
-	 * Callers MUST reference the `epoch` CTE from their own statement: an
-	 * unreferenced non-modifying CTE is not guaranteed to execute, and the
-	 * `set_config` would silently not happen. Gate the mutation on it
-	 * (`(SELECT 1 FROM epoch) IS NOT NULL`, or `FROM epoch`) so the write is
-	 * unreachable when the fence rejects, and report a zero-row `epoch` as ESTALE.
+	 * Composites' fence-and-advance CTEs for writes that are not one statement.
+	 * Omits `set_config('app.sandbox_id')` and `pg_advisory_xact_lock`: callers
+	 * already locked via `#withWriteTx`. Callers MUST reference the `epoch` CTE
+	 * (unreferenced non-modifying CTEs may not run) and gate the mutation on it.
 	 */
 	private static fenceAndAdvance(tx: PgTx, sandboxId: string, expectedEpoch?: bigint) {
 		const epoch = PostgresDialect.epochParam(expectedEpoch);
@@ -701,13 +685,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-006
-	/**
-	 * #192: carries the fence for every write that creates an inode — `mkdir -p`
-	 * (once per segment created), `cp`, `cp -r`, `symlink`, and the non-composite
-	 * `writeFile`/`appendFile`/`mkdir` fallbacks. Those paths issue two or three
-	 * statements; folding the fence into the first one costs no round trip and
-	 * makes the rest unreachable when it rejects.
-	 */
+	/** Fence carrier for inode-creating writes (`mkdir -p`, `cp`, `symlink`, fallbacks). */
 	async createInode(tx: PgTx, opts: CreateInodeOpts, expectedEpoch?: bigint): Promise<bigint> {
 		const rows = await tx<{ fenced: number; id: string | null }[]>`
 			WITH ${PostgresDialect.fenceAndAdvance(tx, opts.sandboxId, expectedEpoch)},
@@ -759,7 +737,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		};
 	}
 
-	/** #192: the whole of `chmod` and `utimes` is this one statement, so it carries the fence. */
+	/** Fence carrier for `chmod` and `utimes`. */
 	async updateInode(
 		tx: PgTx,
 		inodeId: bigint,
@@ -794,7 +772,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-007
-	/** #192: `link`'s second and last statement, so it carries the fence for that path. */
+	/** Fence carrier for `link`. Must run before `insertDirent` so ESTALE cannot leave a dangling dirent. */
 	async incrementNlink(tx: PgTx, inodeId: bigint, sandboxId: string, expectedEpoch?: bigint): Promise<void> {
 		const rows = await tx<{ fenced: number }[]>`
 			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
@@ -847,11 +825,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-010
-	/**
-	 * #192: carries the fence for `rm -r` (which unlinks the subtree root first,
-	 * then walks it) and for the non-composite `rm` fallback. The `fenced` column
-	 * keeps a rejected fence distinguishable from an entry that was simply absent.
-	 */
+	/** Fence carrier for `rm -r` and the non-composite `rm` fallback. */
 	async deleteDirent(
 		tx: PgTx,
 		parentId: bigint,
@@ -892,7 +866,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-012
-	/** #192: carries the fence for the non-composite `mv` fallback, on the rename itself. */
+	/** Fence carrier for the non-composite `mv` fallback. Dest delete is gated on the fence. */
 	async moveDirent(
 		tx: PgTx,
 		oldParentId: bigint,
@@ -902,28 +876,27 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		sandboxId: string,
 		expectedEpoch?: bigint,
 	): Promise<void> {
-		// If destination already exists, delete it first (within the same transaction)
-		await tx`
-			DELETE FROM dirents
-			WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-		`;
-
-		// Move the source dirent via a single UPDATE
-		const rows = await tx<{ fenced: number; moved: number }[]>`
+		// DELETE and UPDATE cannot share one WITH: data-modifying CTEs see the same
+		// snapshot, so the UPDATE would unique-conflict on a dest that still exists.
+		// Fence the DELETE first; the UPDATE only runs after the pin is accepted.
+		const fenced = await tx<{ fenced: number }[]>`
 			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
-			moved AS (
-				UPDATE dirents
-				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			cleared AS (
+				DELETE FROM dirents
+				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
 					AND (SELECT 1 FROM epoch) IS NOT NULL
-				RETURNING inode_id
 			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT count(*) FROM moved)::int AS moved
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced
 		`;
+		if (fenced[0]?.fenced === 0) throw createEstale(sandboxId);
 
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.moved === 0) throw createEnoent(oldName);
+		const moved = await tx<{ inode_id: string }[]>`
+			UPDATE dirents
+			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+			RETURNING inode_id
+		`;
+		if (!moved[0]) throw createEnoent(oldName);
 	}
 
 	// US-013
@@ -1177,11 +1150,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-017
-	/**
-	 * #192: the fence rides the preamble that already reads the sandbox row, so a
-	 * whole batch costs one bump and no extra round trip — and, being the first
-	 * statement, it rejects before any of Phase A-E is issued.
-	 */
+	/** Fence carrier: one bump for the whole batch, on the preamble it already ran. */
 	async bulkIngest(
 		tx: PgTx,
 		files: BulkIngestFile[],

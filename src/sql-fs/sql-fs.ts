@@ -197,16 +197,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	/** Epoch observed after the last completed write outside a script scope. */
 	#lastKnownEpoch: bigint | undefined;
 	/**
-	 * Set when a non-composite write advanced `version` inside this scope (#192).
-	 *
-	 * Those writes fence off the transaction-local `app.sandbox_epoch` GUC rather
-	 * than a JS round trip, so `#scriptEpoch` is left behind by exactly the bumps
-	 * they made. Harmless while the scope runs — the composites' `version >
-	 * expectedEpoch` branch admits a pin that lags the GUC — but `endScriptScope`
-	 * publishes `#scriptEpoch` as `#lastKnownEpoch`, and a pin short of what
-	 * COMMIT durably left behind would fence this session out of its own next
-	 * scope. So the pin is re-read once, at the end, and only when one of these
-	 * writes actually ran.
+	 * Set when a scoped `#withWriteTx` ran. Those writes bump `version` via SQL
+	 * without a JS round trip, so `#scriptEpoch` lags until `endScriptScope`
+	 * re-reads it. A composite-only scope never sets this.
 	 */
 	#scriptEpochLagging = false;
 	/**
@@ -478,17 +471,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	/**
-	 * `#withTx` for the mutations that are not one composite CTE (#192):
-	 * `bulkIngest`, `mkdir -p`, `rm -r`, `cp`, `cp -r`, `link`, `symlink`,
-	 * `chmod`, `utimes`, and the non-composite `writeFile`/`appendFile`/`mkdir`/
-	 * `rm`/`mv` fallbacks.
-	 *
-	 * The fence itself rides inside one statement each path already issues (see
-	 * `PostgresDialect.fenceAndAdvance`), so this adds no round trip to the script
-	 * path. What it adds is the bookkeeping the composites get from `#withBareTx`:
-	 * outside a scope, re-read the epoch the write just produced, or the next
-	 * scope opens against a pin the sandbox has already moved past and throws
-	 * ESTALE at a session that did nothing wrong.
+	 * Transaction helper for mutations that are not one composite CTE.
+	 * Outside a scope, re-reads the epoch after the write so the next scope
+	 * does not ESTALE itself. Inside a scope the pin is allowed to lag until
+	 * `#settleLaggingScriptEpoch`.
 	 */
 	async #withWriteTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
@@ -938,25 +924,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	/**
-	 * Re-reads the pin once, before COMMIT, when a non-composite write moved
-	 * `version` without moving `#scriptEpoch` (#192 — see `#scriptEpochLagging`).
-	 *
-	 * One round trip per scope that used one of those paths, not per write. A
-	 * failed read is swallowed and clears the pin instead: `endScriptScope`'s
-	 * `finally` then leaves `#lastKnownEpoch` where it was, so the next scope
-	 * re-opens onto ESTALE and reloads — the conservative direction. Throwing
-	 * here would be the dangerous one, because `#scriptTxEnd` would never run and
-	 * the transaction callback would stay parked on a leaked connection.
+	 * Re-read the pin once before COMMIT when a non-composite write may have
+	 * moved `version`. A failed read must abort the scope: a SQL error aborts
+	 * the Postgres transaction, and swallowing it would let `#scriptTxEnd`
+	 * COMMIT (or appear to) while the caches still hold this script's writes.
 	 */
 	async #settleLaggingScriptEpoch(): Promise<void> {
 		const scriptTx = this.#scriptTx;
 		if (!this.#scriptEpochLagging || scriptTx === undefined || this.#scriptEpoch === undefined) return;
 		this.#scriptEpochLagging = false;
-		try {
-			this.#scriptEpoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
-		} catch {
-			this.#scriptEpoch = undefined;
-		}
+		this.#scriptEpoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
 	}
 
 	async endScriptScope(): Promise<void> {
@@ -989,22 +966,30 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			committed = true;
 		} catch (err) {
-			// COMMIT failed — Postgres rolled the transaction back, but the
-			// in-memory caches still hold this script's uncommitted mutations.
-			// Discard them by reloading the committed state and clearing the dirty
-			// flag, so the session does NOT publish a version bump / path snapshot
-			// of data that never landed in Postgres (audit H7). Re-throw so the
-			// caller learns the write failed.
+			// Settlement or COMMIT failed. If we never resolved `#scriptTxEnd`, the
+			// transaction callback is still parked — abort it so the dialect issues
+			// ROLLBACK. A failed COMMIT already rolled back; abort is then a no-op
+			// on the already-settled endPromise. Reload discards phantom cache
+			// entries (audit H7) either way.
 			if (hadTx) {
+				if (!committed) {
+					const abort = this.#scriptTxAbort;
+					const txPromise = this.#scriptTxPromise;
+					if (abort !== undefined) {
+						abort(err instanceof Error ? err : new Error("script-tx aborted"));
+					}
+					if (txPromise !== undefined) {
+						try {
+							await txPromise;
+						} catch {
+							// rollback of the parked callback, or the COMMIT that already failed
+						}
+					}
+				}
 				try {
 					await this.reload();
 					this.clearDirty();
 				} catch {
-					// Reload also failed (correlated PG outage): the in-memory caches
-					// still hold this script's uncommitted mutations. Mark the cache
-					// poisoned so publishVersionIfDirty refuses to authenticate the
-					// phantom state (F1). The next ensureFreshCache probe will reload.
-					// Fall through to surface the original COMMIT error.
 					this.#cachePoisoned = true;
 				}
 			}
@@ -1300,10 +1285,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					// mkdir -p /a/b with /a as a file would silently insert a
 					// dirent under the file's inode (dirents has no FK on kind).
 					if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
-					// One fence and one bump per segment actually created: outside a
-					// scope each segment is its own transaction anyway, and batching
-					// them would change `mkdir -p`'s partial-failure behaviour. A
-					// `mkdir -p` over an existing tree creates nothing and costs nothing.
+					// One self-committing write per created segment. Batching them
+					// would change `mkdir -p`'s partial-failure behaviour.
 					const inodeId = await this.#withWriteTx(async (tx) => {
 						const id = await this.#dialect.createInode(
 							tx,
@@ -1768,10 +1751,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			);
 		} else {
 			await this.#withWriteTx(async (tx) => {
-				if (destEntry) {
-					const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
-					if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
-				}
 				await this.#dialect.moveDirent(
 					tx,
 					srcParentEntry.inodeId,
@@ -1781,6 +1760,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					this.#sandboxId,
 					...this.#expectedEpochArgs(),
 				);
+				if (destEntry) {
+					const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
+					if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
+				}
 			});
 		}
 
@@ -1863,8 +1846,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(newPath);
 
 		await this.#withWriteTx(async (tx) => {
-			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
 			await this.#dialect.incrementNlink(tx, srcEntry.inodeId, this.#sandboxId, ...this.#expectedEpochArgs());
+			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
 		});
 
 		this.#cacheSet(newPath, { ...srcEntry });

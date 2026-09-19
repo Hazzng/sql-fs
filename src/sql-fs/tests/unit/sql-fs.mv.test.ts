@@ -229,4 +229,11 @@ describe("SqlFs.mv() — move over existing destination", () => {
 		expect(deleteInodeMock).not.toHaveBeenCalled();
 		expect(moveDirentMock).toHaveBeenCalledOnce();
 	});
+
+	it("does not decrement dest nlink when moveDirent rejects ESTALE", async () => {
+		moveDirentMock.mockRejectedValueOnce(Object.assign(new Error("ESTALE"), { code: "ESTALE" }));
+		await expect(fs.mv("/src.txt", "/dest.txt")).rejects.toMatchObject({ code: "ESTALE" });
+		expect(decrementNlinkMock).not.toHaveBeenCalled();
+		expect(deleteInodeMock).not.toHaveBeenCalled();
+	});
 });

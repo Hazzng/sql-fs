@@ -92,14 +92,21 @@ describe("SqlFs.link() — hardlink creation", () => {
 		);
 	});
 
-	it("calls incrementNlink with src inodeId", async () => {
+	it("calls incrementNlink with src inodeId before insertDirent", async () => {
 		await fs.link("/home/file.txt", "/home/link.txt");
 
 		expect(incrementNlinkMock).toHaveBeenCalledWith(
 			expect.anything(), // tx
 			3n, // srcInodeId
-			sandboxId, // #192: incrementNlink carries link's fence-and-advance
+			sandboxId, // incrementNlink carries link's fence-and-advance
 		);
+		expect(incrementNlinkMock.mock.invocationCallOrder[0]!).toBeLessThan(insertDirentMock.mock.invocationCallOrder[0]!);
+	});
+
+	it("does not insert a dirent when incrementNlink rejects ESTALE", async () => {
+		incrementNlinkMock.mockRejectedValueOnce(Object.assign(new Error("ESTALE"), { code: "ESTALE" }));
+		await expect(fs.link("/home/file.txt", "/home/link.txt")).rejects.toMatchObject({ code: "ESTALE" });
+		expect(insertDirentMock).not.toHaveBeenCalled();
 	});
 
 	it("throws ENOENT when source does not exist", async () => {

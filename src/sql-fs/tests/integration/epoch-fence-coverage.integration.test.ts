@@ -23,6 +23,23 @@ function uniqueId(label: string): string {
 	return `fence192-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+async function destroySandbox(dialect: PostgresDialect, id: string): Promise<void> {
+	try {
+		await dialect.transaction(async (tx) => {
+			await dialect.deleteSandbox(tx, id);
+			await tx`DELETE FROM sandbox_epochs WHERE sandbox_id = ${id}`;
+		});
+	} catch {
+		try {
+			await dialect.transaction(async (tx) => {
+				await tx`DELETE FROM sandbox_epochs WHERE sandbox_id = ${id}`;
+			});
+		} catch {
+			// best effort
+		}
+	}
+}
+
 describe.skipIf(SKIP)("#192 — every mutation advances the sandbox epoch", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
 	const sandboxIds = new Set<string>();
@@ -32,13 +49,7 @@ describe.skipIf(SKIP)("#192 — every mutation advances the sandbox epoch", () =
 	});
 
 	afterAll(async () => {
-		for (const id of sandboxIds) {
-			try {
-				await dialect.transaction((tx) => dialect.deleteSandbox(tx, id));
-			} catch {
-				// A failed test may already have removed the row; cleanup is best effort.
-			}
-		}
+		for (const id of sandboxIds) await destroySandbox(dialect, id);
 		await dialect.disconnect();
 	});
 
@@ -155,13 +166,7 @@ describe.skipIf(SKIP)("#192 — a stale pin is rejected by every carrier", () =>
 	});
 
 	afterAll(async () => {
-		for (const id of sandboxIds) {
-			try {
-				await dialect.transaction((tx) => dialect.deleteSandbox(tx, id));
-			} catch {
-				// best effort
-			}
-		}
+		for (const id of sandboxIds) await destroySandbox(dialect, id);
 		await dialect.disconnect();
 	});
 
@@ -248,6 +253,7 @@ describe.skipIf(SKIP)("#192 — a stale pin is rejected by every carrier", () =>
 				() => dialect.updateInode(tx, fileInodeId, { mode: 0o600 }, id, stale),
 				() => dialect.incrementNlink(tx, fileInodeId, id, stale),
 				() => dialect.deleteDirent(tx, rootInodeId, "q.txt", id, stale),
+				() => dialect.moveDirent(tx, rootInodeId, "a.txt", rootInodeId, "q.txt", id, stale),
 			]) {
 				await expect(run()).rejects.toMatchObject({ code: "ESTALE" });
 			}
@@ -262,13 +268,17 @@ describe.skipIf(SKIP)("#192 — a stale pin is rejected by every carrier", () =>
 			const dirent = await tx<{ n: number }[]>`
 				SELECT count(*)::int AS n FROM dirents WHERE parent_inode_id = ${String(rootInodeId)} AND name = 'q.txt'
 			`;
+			const source = await tx<{ n: number }[]>`
+				SELECT count(*)::int AS n FROM dirents WHERE parent_inode_id = ${String(rootInodeId)} AND name = 'a.txt'
+			`;
 			const sandbox = await tx<{ version: string }[]>`SELECT version FROM sandboxes WHERE id = ${id}`;
-			return { inode: inode[0]!, dirents: dirent[0]!.n, version: sandbox[0]!.version };
+			return { inode: inode[0]!, dirents: dirent[0]!.n, source: source[0]!.n, version: sandbox[0]!.version };
 		});
 
 		expect(after.inode.mode).toBe(0o644);
 		expect(after.inode.nlink).toBe(1);
 		expect(after.dirents).toBe(1);
+		expect(after.source).toBe(1);
 		expect(after.version).toBe(live.toString());
 	});
 });
