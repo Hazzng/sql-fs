@@ -16,7 +16,7 @@ import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
-import { clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
+import { clientSafeErrorCode, clientSafeErrorMessage, mapFsErrorToStatus } from "./errors.js";
 import { DEFAULT_SAMPLE_INTERVAL_MS, startEventLoopMonitor, stopEventLoopMonitor } from "./event-loop-monitor.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
@@ -273,7 +273,7 @@ app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 
 app.onError((err, c) => {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
-	const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
+	const code = clientSafeErrorCode(err);
 	const message = clientSafeErrorMessage(err);
 
 	return c.json({ error: message, code }, status);

@@ -10,7 +10,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
-import { clientSafeErrorMessage } from "../errors.js";
+import { clientSafeErrorCode, clientSafeErrorMessage } from "../errors.js";
 import { type BatchScriptResult, type ExecuteBatchOptions, executeBatch } from "../lib/batch-exec.js";
 import {
 	forbiddenResponse,
@@ -372,6 +372,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				// otherwise the client cannot distinguish a failed exec from a
 				// truncated success. Emit a sanitized error + exit event. Writing may
 				// itself fail if the client already disconnected; ignore that.
+				// The server-side log keeps the raw driver code/message for diagnosis; the
+				// SSE frame carries only the allowlisted code (#174).
 				const errCode = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
 				console.error(
 					JSON.stringify({ event: "exec_sse_error", sandboxId, code: errCode, error: (err as Error).message }),
@@ -379,7 +381,11 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				try {
 					await stream.writeSSE({
 						event: "error",
-						data: JSON.stringify({ t: "error", code: errCode, error: clientSafeErrorMessage(err, "internal error") }),
+						data: JSON.stringify({
+							t: "error",
+							code: clientSafeErrorCode(err),
+							error: clientSafeErrorMessage(err, "internal error"),
+						}),
 					});
 					await stream.writeSSE({
 						event: "exit",
