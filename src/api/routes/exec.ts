@@ -181,6 +181,17 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				let timedOut = false;
 				const startMs = Date.now();
 
+				// #172: a client that gives up must not leave the script running, holding the
+				// sandbox's exclusive exec lock for the rest of its timeout. Same wiring as
+				// /exec and /exec-sync-batch, including the already-aborted pre-check — the
+				// client can disconnect while this handler waits for the lock. Semantics match
+				// the timeout path: abort only, work already committed stays committed.
+				if (c.req.raw.signal.aborted) {
+					controller.abort();
+				} else {
+					c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
+				}
+
 				const timer = setTimeout(() => {
 					timedOut = true;
 					controller.abort();
@@ -281,10 +292,8 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			let timedOut = false;
 			const startMs = Date.now();
 
-			// Cancel on client disconnect
-			c.req.raw.signal.addEventListener("abort", () => {
-				controller.abort();
-			});
+			// Cancel on client disconnect ({ once: true }: the listener is never removed).
+			c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
 
 			const timer = setTimeout(() => {
 				timedOut = true;
