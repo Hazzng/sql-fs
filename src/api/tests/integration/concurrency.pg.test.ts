@@ -462,10 +462,15 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 							}),
 						] as const);
 
+			// Issue order is NOT admission order: both requests verify their JWT
+			// asynchronously before they reach the session lock, so either can win.
+			// The order-independent invariant is that the PUT always succeeds (it
+			// mkdir -p's its own parent) and only the explicit mkdir can lose, with
+			// EEXIST.
 			const [r1, r2] = await Promise.all(ops);
-			expect(r1.status, `${label} op1`).toBe(204);
-			// mkdir may return 409 EEXIST if write auto-created the dir first
-			expect([204, 409], `${label} op2`).toContain(r2.status);
+			const [mkdirRes, putRes] = label === "mkdir-first" ? [r1, r2] : [r2, r1];
+			expect(putRes.status, `${label} put`).toBe(204);
+			expect([204, 409], `${label} mkdir`).toContain(mkdirRes.status);
 
 			const paths = await treePaths(app, sbId, "/home/user/a", token);
 			expect(paths).toContain("/home/user/a/x.txt");
@@ -589,16 +594,17 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 							}),
 						] as const);
 
+			// Issue order is NOT admission order (both requests verify their JWT
+			// asynchronously before reaching the session lock), which is what
+			// "whichever runs first" means: the DELETE always succeeds, and the GET
+			// either sees the whole pre-delete file or sees it gone — never a torn
+			// or partial read.
 			const [first, second] = await Promise.all(ops);
+			const [deleteRes, readRes] = label === "delete-first" ? [first, second] : [second, first];
 
-			if (label === "delete-first") {
-				expect(first.status).toBe(204); // delete
-				expect(second.status).toBe(404); // read sees deleted file
-			} else {
-				expect(first.status).toBe(200); // read
-				expect(await first.text()).toBe("original");
-				expect(second.status).toBe(204); // delete
-			}
+			expect(deleteRes.status, `${label} delete`).toBe(204);
+			expect([200, 404], `${label} read`).toContain(readRes.status);
+			if (readRes.status === 200) expect(await readRes.text()).toBe("original");
 
 			const final = await app.request(`/v1/sandboxes/${sbId}/files/home/user/f.txt`, {
 				headers: { Authorization: `Bearer ${token}` },

@@ -134,10 +134,13 @@ describe.skipIf(SKIP)("Phase 5 — multi-tenant Postgres routing", () => {
 		if (tenantBSql) await tenantBSql.end({ timeout: 5 });
 		if (admin) {
 			try {
+				// `usename = current_user`: an autovacuum worker on a scratch database
+				// runs as superuser and cannot be terminated by the test role — only
+				// our own connections need evicting before the DROP.
 				await admin`
 					SELECT pg_terminate_backend(pid)
 					FROM pg_stat_activity
-					WHERE (datname = ${dbA} OR datname = ${dbB}) AND pid <> pg_backend_pid()
+					WHERE (datname = ${dbA} OR datname = ${dbB}) AND pid <> pg_backend_pid() AND usename = current_user
 				`;
 				await admin.unsafe(`DROP DATABASE IF EXISTS ${dbA}`);
 				await admin.unsafe(`DROP DATABASE IF EXISTS ${dbB}`);
