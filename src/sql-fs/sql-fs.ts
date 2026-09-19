@@ -197,6 +197,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	/** Epoch observed after the last completed write outside a script scope. */
 	#lastKnownEpoch: bigint | undefined;
 	/**
+	 * Set when a non-composite write advanced `version` inside this scope (#192).
+	 *
+	 * Those writes fence off the transaction-local `app.sandbox_epoch` GUC rather
+	 * than a JS round trip, so `#scriptEpoch` is left behind by exactly the bumps
+	 * they made. Harmless while the scope runs — the composites' `version >
+	 * expectedEpoch` branch admits a pin that lags the GUC — but `endScriptScope`
+	 * publishes `#scriptEpoch` as `#lastKnownEpoch`, and a pin short of what
+	 * COMMIT durably left behind would fence this session out of its own next
+	 * scope. So the pin is re-read once, at the end, and only when one of these
+	 * writes actually ran.
+	 */
+	#scriptEpochLagging = false;
+	/**
 	 * Set once the script-tx's connection is gone, and sticky for the rest of the scope.
 	 *
 	 * postgres.js keeps the scope's `sql` bound to one connection OBJECT, and the pool reconnects
@@ -456,6 +469,39 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#dialect.transaction(async (tx) => {
 				const value = await fn(tx);
 				// Publish only after COMMIT; a failed COMMIT must not poison the cache.
+				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				return value;
+			}),
+		);
+		if (observedEpoch !== undefined) this.#lastKnownEpoch = observedEpoch;
+		return result;
+	}
+
+	/**
+	 * `#withTx` for the mutations that are not one composite CTE (#192):
+	 * `bulkIngest`, `mkdir -p`, `rm -r`, `cp`, `cp -r`, `link`, `symlink`,
+	 * `chmod`, `utimes`, and the non-composite `writeFile`/`appendFile`/`mkdir`/
+	 * `rm`/`mv` fallbacks.
+	 *
+	 * The fence itself rides inside one statement each path already issues (see
+	 * `PostgresDialect.fenceAndAdvance`), so this adds no round trip to the script
+	 * path. What it adds is the bookkeeping the composites get from `#withBareTx`:
+	 * outside a scope, re-read the epoch the write just produced, or the next
+	 * scope opens against a pin the sandbox has already moved past and throws
+	 * ESTALE at a session that did nothing wrong.
+	 */
+	async #withWriteTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+		if (this.#scriptScope) {
+			const value = await this.#withTx(fn);
+			this.#scriptEpochLagging = true;
+			return value;
+		}
+		let observedEpoch: bigint | undefined;
+		const result = await this.#db(() =>
+			this.#dialect.transaction(async (tx) => {
+				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				const value = await fn(tx);
+				// Publish only after COMMIT; a failed COMMIT must not poison the pin.
 				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				return value;
 			}),
@@ -828,6 +874,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
 		this.#scriptTxLost = undefined;
+		this.#scriptEpochLagging = false;
 		// Any open still in flight from a previous scope belongs to an older generation and will
 		// abandon itself rather than adopt into this one.
 		this.#scriptTxGeneration += 1;
@@ -890,6 +937,28 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 	}
 
+	/**
+	 * Re-reads the pin once, before COMMIT, when a non-composite write moved
+	 * `version` without moving `#scriptEpoch` (#192 — see `#scriptEpochLagging`).
+	 *
+	 * One round trip per scope that used one of those paths, not per write. A
+	 * failed read is swallowed and clears the pin instead: `endScriptScope`'s
+	 * `finally` then leaves `#lastKnownEpoch` where it was, so the next scope
+	 * re-opens onto ESTALE and reloads — the conservative direction. Throwing
+	 * here would be the dangerous one, because `#scriptTxEnd` would never run and
+	 * the transaction callback would stay parked on a leaked connection.
+	 */
+	async #settleLaggingScriptEpoch(): Promise<void> {
+		const scriptTx = this.#scriptTx;
+		if (!this.#scriptEpochLagging || scriptTx === undefined || this.#scriptEpoch === undefined) return;
+		this.#scriptEpochLagging = false;
+		try {
+			this.#scriptEpoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+		} catch {
+			this.#scriptEpoch = undefined;
+		}
+	}
+
 	async endScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
 
@@ -909,6 +978,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const hadTx = this.#scriptTx !== undefined;
 		let committed = false;
 		try {
+			await this.#settleLaggingScriptEpoch();
 			if (this.#scriptTxEnd !== undefined) {
 				this.#scriptTxEnd();
 				// The COMMIT is the last driver await of the scope and hangs the same way on a
@@ -946,6 +1016,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#scriptTxAbort = undefined;
 			this.#scriptTxPromise = undefined;
 			this.#scriptEpoch = undefined;
+			this.#scriptEpochLagging = false;
 		}
 	}
 
@@ -961,6 +1032,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#scriptTxAbort = undefined;
 		this.#scriptTxPromise = undefined;
 		this.#scriptEpoch = undefined;
+		this.#scriptEpochLagging = false;
 
 		// Reject endPromise so the transaction callback throws → dialect issues ROLLBACK
 		// and releases the connection/advisory lock. Without this the callback awaits
@@ -1015,7 +1087,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			normalized.push({ path, content: file.content, mode: file.mode });
 			bytesByPath.set(path, file.content);
 		}
-		const newEntries = await this.#withTx((tx) => this.#dialect.bulkIngest(tx, normalized));
+		const newEntries = await this.#withWriteTx((tx) =>
+			this.#dialect.bulkIngest(tx, normalized, this.#sandboxId, ...this.#expectedEpochArgs()),
+		);
 		// Evict overwritten inodes from contentCache so stale content is never served.
 		// Populate #contentCache with the bytes already in memory — next readFile is a Map lookup.
 		for (const [path, entry] of newEntries) {
@@ -1079,15 +1153,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						...this.#expectedEpochArgs(),
 					),
 				)
-			: await this.#withTx(async (tx) => {
+			: await this.#withWriteTx(async (tx) => {
 					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, bytes);
-					const id = await this.#dialect.createInode(tx, {
-						sandboxId: this.#sandboxId,
-						kind: INODE_KIND.FILE,
-						mode: 0o644,
-						size: bytes.length,
-						contentSha256: sha256,
-					});
+					const id = await this.#dialect.createInode(
+						tx,
+						{
+							sandboxId: this.#sandboxId,
+							kind: INODE_KIND.FILE,
+							mode: 0o644,
+							size: bytes.length,
+							contentSha256: sha256,
+						},
+						...this.#expectedEpochArgs(),
+					);
 					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
 					if (oldInodeId !== null) {
 						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
@@ -1167,15 +1245,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						...this.#expectedEpochArgs(),
 					),
 				)
-			: await this.#withTx(async (tx) => {
+			: await this.#withWriteTx(async (tx) => {
 					if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, fullBytes);
-					const id = await this.#dialect.createInode(tx, {
-						sandboxId: this.#sandboxId,
-						kind: INODE_KIND.FILE,
-						mode: 0o644,
-						size: fullBytes.length,
-						contentSha256: sha256,
-					});
+					const id = await this.#dialect.createInode(
+						tx,
+						{
+							sandboxId: this.#sandboxId,
+							kind: INODE_KIND.FILE,
+							mode: 0o644,
+							size: fullBytes.length,
+							contentSha256: sha256,
+						},
+						...this.#expectedEpochArgs(),
+					);
 					const oldInodeId = await this.#dialect.upsertDirent(tx, parentEntry.inodeId, name, id);
 					if (oldInodeId !== null) {
 						const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
@@ -1218,13 +1300,21 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					// mkdir -p /a/b with /a as a file would silently insert a
 					// dirent under the file's inode (dirents has no FK on kind).
 					if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
-					const inodeId = await this.#withTx(async (tx) => {
-						const id = await this.#dialect.createInode(tx, {
-							sandboxId: this.#sandboxId,
-							kind: INODE_KIND.DIRECTORY,
-							mode: 0o755,
-							size: 0,
-						});
+					// One fence and one bump per segment actually created: outside a
+					// scope each segment is its own transaction anyway, and batching
+					// them would change `mkdir -p`'s partial-failure behaviour. A
+					// `mkdir -p` over an existing tree creates nothing and costs nothing.
+					const inodeId = await this.#withWriteTx(async (tx) => {
+						const id = await this.#dialect.createInode(
+							tx,
+							{
+								sandboxId: this.#sandboxId,
+								kind: INODE_KIND.DIRECTORY,
+								mode: 0o755,
+								size: 0,
+							},
+							...this.#expectedEpochArgs(),
+						);
 						await this.#dialect.insertDirent(tx, parentEntry.inodeId, seg, id);
 						return id;
 					});
@@ -1260,13 +1350,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						...this.#expectedEpochArgs(),
 					),
 				)
-			: await this.#withTx(async (tx) => {
-					const id = await this.#dialect.createInode(tx, {
-						sandboxId: this.#sandboxId,
-						kind: INODE_KIND.DIRECTORY,
-						mode: 0o755,
-						size: 0,
-					});
+			: await this.#withWriteTx(async (tx) => {
+					const id = await this.#dialect.createInode(
+						tx,
+						{
+							sandboxId: this.#sandboxId,
+							kind: INODE_KIND.DIRECTORY,
+							mode: 0o755,
+							size: 0,
+						},
+						...this.#expectedEpochArgs(),
+					);
 					await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
 					return id;
 				});
@@ -1303,10 +1397,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			const subtreePaths = this.#allPathsUnder(path);
 			subtreePaths.sort((a, b) => b.split("/").length - a.split("/").length);
 
-			await this.#withTx(async (tx) => {
+			await this.#withWriteTx(async (tx) => {
 				// Step 1: unlink the subtree root from its parent
 				if (parentEntry) {
-					await this.#dialect.deleteDirent(tx, parentEntry.inodeId, name);
+					await this.#dialect.deleteDirent(
+						tx,
+						parentEntry.inodeId,
+						name,
+						this.#sandboxId,
+						...this.#expectedEpochArgs(),
+					);
 				}
 				// Step 2: process each entry in post-order —
 				//   • delete its internal dirent (for non-root entries)
@@ -1317,7 +1417,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					if (p !== path) {
 						const pParentEntry = this.#pathCache.get(this.#parentOf(p));
 						if (pParentEntry) {
-							await this.#dialect.deleteDirent(tx, pParentEntry.inodeId, this.#nameOf(p));
+							await this.#dialect.deleteDirent(
+								tx,
+								pParentEntry.inodeId,
+								this.#nameOf(p),
+								this.#sandboxId,
+								...this.#expectedEpochArgs(),
+							);
 						}
 					}
 					const newNlink = await this.#dialect.decrementNlink(tx, e.inodeId);
@@ -1345,8 +1451,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				this.#dialect.rmComposite!(tx, this.#sandboxId, parentEntry!.inodeId, name, ...this.#expectedEpochArgs()),
 			);
 		} else {
-			await this.#withTx(async (tx) => {
-				const removedInodeId = await this.#dialect.deleteDirent(tx, parentEntry!.inodeId, name);
+			await this.#withWriteTx(async (tx) => {
+				const removedInodeId = await this.#dialect.deleteDirent(
+					tx,
+					parentEntry!.inodeId,
+					name,
+					this.#sandboxId,
+					...this.#expectedEpochArgs(),
+				);
 				const newNlink = await this.#dialect.decrementNlink(tx, removedInodeId);
 				if (newNlink === 0) await this.#dialect.deleteInode(tx, removedInodeId);
 			});
@@ -1363,8 +1475,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
-		await this.#withTx(async (tx) => {
-			await this.#dialect.updateInode(tx, entry.inodeId, { mode });
+		await this.#withWriteTx(async (tx) => {
+			await this.#dialect.updateInode(tx, entry.inodeId, { mode }, this.#sandboxId, ...this.#expectedEpochArgs());
 		});
 
 		this.#updateCacheByInode(entry.inodeId, { mode });
@@ -1377,8 +1489,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
-		await this.#withTx(async (tx) => {
-			await this.#dialect.updateInode(tx, entry.inodeId, { mtime });
+		await this.#withWriteTx(async (tx) => {
+			await this.#dialect.updateInode(tx, entry.inodeId, { mtime }, this.#sandboxId, ...this.#expectedEpochArgs());
 		});
 
 		this.#updateCacheByInode(entry.inodeId, { mtime });
@@ -1520,7 +1632,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			// Maps destPath → new inodeId so children can look up their parent's new id
 			const newInodeIds = new Map<string, bigint>();
 
-			await this.#withTx(async (tx) => {
+			await this.#withWriteTx(async (tx) => {
 				for (const srcPath of srcPaths) {
 					const entry = this.#pathCache.get(srcPath)!;
 					const destPath = dest + srcPath.slice(src.length);
@@ -1531,14 +1643,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					const parentInodeId = newInodeIds.get(entryParent) ?? this.#pathCache.get(entryParent)?.inodeId;
 					if (parentInodeId === undefined) throw createEnoent(entryParent);
 
-					const newId = await this.#dialect.createInode(tx, {
-						sandboxId: this.#sandboxId,
-						kind: entry.kind,
-						mode: entry.mode,
-						size: entry.size,
-						contentSha256: entry.contentSha256,
-						symlinkTarget: entry.symlinkTarget,
-					});
+					const newId = await this.#dialect.createInode(
+						tx,
+						{
+							sandboxId: this.#sandboxId,
+							kind: entry.kind,
+							mode: entry.mode,
+							size: entry.size,
+							contentSha256: entry.contentSha256,
+							symlinkTarget: entry.symlinkTarget,
+						},
+						...this.#expectedEpochArgs(),
+					);
 					await this.#dialect.insertDirent(tx, parentInodeId, entryName, newId);
 					newInodeIds.set(destPath, newId);
 				}
@@ -1565,15 +1681,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// a copied symlink into a corrupt FILE inode (non-zero size, NULL content).
 		// Copying a symlink preserves the link (target + size), matching the
 		// recursive-cp path above.
-		const newInodeId = await this.#withTx(async (tx) => {
-			const id = await this.#dialect.createInode(tx, {
-				sandboxId: this.#sandboxId,
-				kind: srcEntry.kind,
-				mode: srcEntry.mode,
-				size: srcEntry.size,
-				contentSha256: srcEntry.contentSha256,
-				symlinkTarget: srcEntry.symlinkTarget,
-			});
+		const newInodeId = await this.#withWriteTx(async (tx) => {
+			const id = await this.#dialect.createInode(
+				tx,
+				{
+					sandboxId: this.#sandboxId,
+					kind: srcEntry.kind,
+					mode: srcEntry.mode,
+					size: srcEntry.size,
+					contentSha256: srcEntry.contentSha256,
+					symlinkTarget: srcEntry.symlinkTarget,
+				},
+				...this.#expectedEpochArgs(),
+			);
 			const oldInodeId = await this.#dialect.upsertDirent(tx, destParentEntry.inodeId, destName, id);
 			if (oldInodeId !== null) {
 				const newNlink = await this.#dialect.decrementNlink(tx, oldInodeId);
@@ -1647,12 +1767,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				),
 			);
 		} else {
-			await this.#withTx(async (tx) => {
+			await this.#withWriteTx(async (tx) => {
 				if (destEntry) {
 					const newNlink = await this.#dialect.decrementNlink(tx, destEntry.inodeId);
 					if (newNlink === 0) await this.#dialect.deleteInode(tx, destEntry.inodeId);
 				}
-				await this.#dialect.moveDirent(tx, srcParentEntry.inodeId, srcName, destParentEntry.inodeId, destName);
+				await this.#dialect.moveDirent(
+					tx,
+					srcParentEntry.inodeId,
+					srcName,
+					destParentEntry.inodeId,
+					destName,
+					this.#sandboxId,
+					...this.#expectedEpochArgs(),
+				);
 			});
 		}
 
@@ -1695,14 +1823,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const mtime = new Date();
 
-		const inodeId = await this.#withTx(async (tx) => {
-			const id = await this.#dialect.createInode(tx, {
-				sandboxId: this.#sandboxId,
-				kind: INODE_KIND.SYMLINK,
-				mode: 0o777,
-				size: target.length,
-				symlinkTarget: target,
-			});
+		const inodeId = await this.#withWriteTx(async (tx) => {
+			const id = await this.#dialect.createInode(
+				tx,
+				{
+					sandboxId: this.#sandboxId,
+					kind: INODE_KIND.SYMLINK,
+					mode: 0o777,
+					size: target.length,
+					symlinkTarget: target,
+				},
+				...this.#expectedEpochArgs(),
+			);
 			await this.#dialect.insertDirent(tx, parentEntry.inodeId, name, id);
 			return id;
 		});
@@ -1730,9 +1862,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		const { name: destName, parentEntry: destParentEntry } = this.#requireParentDir(newPath);
 
-		await this.#withTx(async (tx) => {
+		await this.#withWriteTx(async (tx) => {
 			await this.#dialect.insertDirent(tx, destParentEntry.inodeId, destName, srcEntry.inodeId);
-			await this.#dialect.incrementNlink(tx, srcEntry.inodeId);
+			await this.#dialect.incrementNlink(tx, srcEntry.inodeId, this.#sandboxId, ...this.#expectedEpochArgs());
 		});
 
 		this.#cacheSet(newPath, { ...srcEntry });

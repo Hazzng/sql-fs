@@ -147,6 +147,7 @@ describe("SqlFs.mv() — pathCache rebuild", () => {
 			"a", // srcName
 			1n, // destParentInodeId (root /)
 			"x", // destName
+			sandboxId, // #192: moveDirent carries the mv fallback's fence-and-advance
 		);
 	});
 });

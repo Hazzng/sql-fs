@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { runTrustedDbAsync } from "../defense.js";
-import { createEisdir, createEnoent, createEnotdir, translateSqlError } from "../errors.js";
+import { createEisdir, createEnoent, createEnotdir, createEstale, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
 import {
 	type BulkIngestFile,
@@ -101,6 +101,61 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	 */
 	private static async takeWriterLock(tx: PgTx, sandboxId: string): Promise<void> {
 		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
+	}
+
+	/**
+	 * The composites' fence-and-advance CTEs, for the writes that are not one
+	 * composite statement (#192).
+	 *
+	 * Same gate as `mkdirComposite`, minus its `set_config`/`pg_advisory_xact_lock`:
+	 * every caller arrives through `SqlFs.#withWriteTx`, which has already issued
+	 * `setSandboxContextWithLock` on this transaction, so re-taking the lock and
+	 * rewriting `app.sandbox_id` would cost two evaluations for nothing.
+	 *
+	 * The bump is what makes the fence work at all — a live writer that only ever
+	 * used these paths left `version` unmoved, so the next genuinely stale writer's
+	 * pin still matched. `set_config(..., is_local = true)` keeps the refreshed GUC
+	 * transaction-scoped, so it rolls back with the write and is pooler-safe; the
+	 * pin in `SqlFs` may lag it, which is exactly what the `version > expectedEpoch`
+	 * branch exists to admit.
+	 *
+	 * Callers MUST reference the `epoch` CTE from their own statement: an
+	 * unreferenced non-modifying CTE is not guaranteed to execute, and the
+	 * `set_config` would silently not happen. Gate the mutation on it
+	 * (`(SELECT 1 FROM epoch) IS NOT NULL`, or `FROM epoch`) so the write is
+	 * unreachable when the fence rejects, and report a zero-row `epoch` as ESTALE.
+	 */
+	private static fenceAndAdvance(tx: PgTx, sandboxId: string, expectedEpoch?: bigint) {
+		const epoch = PostgresDialect.epochParam(expectedEpoch);
+		return tx`
+			ctx AS (
+				SELECT s.version
+				FROM sandboxes s
+				WHERE s.id = ${sandboxId}
+				  AND (
+					s.version = COALESCE(
+						${epoch}::bigint,
+						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
+						s.version
+					)
+					OR (
+						${epoch}::bigint IS NOT NULL
+						AND s.version > ${epoch}::bigint
+						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
+					)
+				  )
+			),
+			advanced AS (
+				UPDATE sandboxes s
+				SET version = s.version + 1
+				FROM ctx
+				WHERE s.id = ${sandboxId}
+				RETURNING s.version
+			),
+			epoch AS (
+				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
+			)
+		`;
 	}
 
 	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
@@ -646,14 +701,28 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-006
-	async createInode(tx: PgTx, opts: CreateInodeOpts): Promise<bigint> {
-		const rows = await tx<{ id: string }[]>`
-			INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256, symlink_target)
-			VALUES (${opts.sandboxId}, ${opts.kind}, ${opts.mode}, ${opts.size}, ${opts.contentSha256 ?? null}, ${opts.symlinkTarget ?? null})
-			RETURNING id
+	/**
+	 * #192: carries the fence for every write that creates an inode — `mkdir -p`
+	 * (once per segment created), `cp`, `cp -r`, `symlink`, and the non-composite
+	 * `writeFile`/`appendFile`/`mkdir` fallbacks. Those paths issue two or three
+	 * statements; folding the fence into the first one costs no round trip and
+	 * makes the rest unreachable when it rejects.
+	 */
+	async createInode(tx: PgTx, opts: CreateInodeOpts, expectedEpoch?: bigint): Promise<bigint> {
+		const rows = await tx<{ fenced: number; id: string | null }[]>`
+			WITH ${PostgresDialect.fenceAndAdvance(tx, opts.sandboxId, expectedEpoch)},
+			inserted AS (
+				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256, symlink_target)
+				SELECT ${opts.sandboxId}, ${opts.kind}, ${opts.mode}, ${opts.size}, ${opts.contentSha256 ?? null}, ${opts.symlinkTarget ?? null}
+				FROM epoch
+				RETURNING id
+			)
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM inserted) AS id
 		`;
 		const row = rows[0];
 		if (!row) throw new Error("createInode: INSERT returned no rows");
+		if (row.fenced === 0) throw createEstale(opts.sandboxId);
+		if (row.id === null) throw new Error("createInode: INSERT returned no rows");
 		return BigInt(row.id);
 	}
 
@@ -690,7 +759,14 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		};
 	}
 
-	async updateInode(tx: PgTx, inodeId: bigint, updates: UpdateInodeOpts): Promise<void> {
+	/** #192: the whole of `chmod` and `utimes` is this one statement, so it carries the fence. */
+	async updateInode(
+		tx: PgTx,
+		inodeId: bigint,
+		updates: UpdateInodeOpts,
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<void> {
 		// Build a snake_case patch object for postgres.js dynamic sql(obj) helper
 		const patch: Record<string, string | number | Date | Uint8Array | null> = Object.create(null);
 		if (updates.mode !== undefined) patch.mode = updates.mode;
@@ -698,9 +774,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		if (updates.mtime !== undefined) patch.mtime = updates.mtime;
 		if ("contentSha256" in updates) patch.content_sha256 = updates.contentSha256 ?? null;
 
+		// No patch is no mutation: bumping here would advance the epoch for a no-op.
 		if (Object.keys(patch).length === 0) return;
 
-		await tx`UPDATE inodes SET ${tx(patch)} WHERE id = ${String(inodeId)}`;
+		const rows = await tx<{ fenced: number }[]>`
+			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
+			updated AS (
+				UPDATE inodes SET ${tx(patch)}
+				WHERE id = ${String(inodeId)} AND (SELECT 1 FROM epoch) IS NOT NULL
+			)
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced
+		`;
+		// A missing inode stays a silent no-op, as before; only the fence throws.
+		if (rows[0]?.fenced === 0) throw createEstale(sandboxId);
 	}
 
 	async deleteInode(tx: PgTx, inodeId: bigint): Promise<void> {
@@ -708,8 +794,17 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-007
-	async incrementNlink(tx: PgTx, inodeId: bigint): Promise<void> {
-		await tx`UPDATE inodes SET nlink = nlink + 1 WHERE id = ${String(inodeId)}`;
+	/** #192: `link`'s second and last statement, so it carries the fence for that path. */
+	async incrementNlink(tx: PgTx, inodeId: bigint, sandboxId: string, expectedEpoch?: bigint): Promise<void> {
+		const rows = await tx<{ fenced: number }[]>`
+			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
+			bumped AS (
+				UPDATE inodes SET nlink = nlink + 1
+				WHERE id = ${String(inodeId)} AND (SELECT 1 FROM epoch) IS NOT NULL
+			)
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced
+		`;
+		if (rows[0]?.fenced === 0) throw createEstale(sandboxId);
 	}
 
 	async decrementNlink(tx: PgTx, inodeId: bigint): Promise<number> {
@@ -752,14 +847,31 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-010
-	async deleteDirent(tx: PgTx, parentId: bigint, name: string): Promise<bigint> {
-		const rows = await tx<{ inode_id: string }[]>`
-			DELETE FROM dirents
-			WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-			RETURNING inode_id
+	/**
+	 * #192: carries the fence for `rm -r` (which unlinks the subtree root first,
+	 * then walks it) and for the non-composite `rm` fallback. The `fenced` column
+	 * keeps a rejected fence distinguishable from an entry that was simply absent.
+	 */
+	async deleteDirent(
+		tx: PgTx,
+		parentId: bigint,
+		name: string,
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<bigint> {
+		const rows = await tx<{ fenced: number; inode_id: string | null }[]>`
+			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
+			removed AS (
+				DELETE FROM dirents
+				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
+					AND (SELECT 1 FROM epoch) IS NOT NULL
+				RETURNING inode_id
+			)
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT inode_id FROM removed) AS inode_id
 		`;
 		const row = rows[0];
-		if (!row) throw createEnoent(name);
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.inode_id === null) throw createEnoent(name);
 		return BigInt(row.inode_id);
 	}
 
@@ -780,12 +892,15 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-012
+	/** #192: carries the fence for the non-composite `mv` fallback, on the rename itself. */
 	async moveDirent(
 		tx: PgTx,
 		oldParentId: bigint,
 		oldName: string,
 		newParentId: bigint,
 		newName: string,
+		sandboxId: string,
+		expectedEpoch?: bigint,
 	): Promise<void> {
 		// If destination already exists, delete it first (within the same transaction)
 		await tx`
@@ -794,14 +909,21 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		`;
 
 		// Move the source dirent via a single UPDATE
-		const rows = await tx<{ inode_id: string }[]>`
-			UPDATE dirents
-			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-			RETURNING inode_id
+		const rows = await tx<{ fenced: number; moved: number }[]>`
+			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
+			moved AS (
+				UPDATE dirents
+				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+					AND (SELECT 1 FROM epoch) IS NOT NULL
+				RETURNING inode_id
+			)
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT count(*) FROM moved)::int AS moved
 		`;
 
-		if (rows.length === 0) throw createEnoent(oldName);
+		const row = rows[0];
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.moved === 0) throw createEnoent(oldName);
 	}
 
 	// US-013
@@ -1055,16 +1177,31 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	// US-017
-	async bulkIngest(tx: PgTx, files: BulkIngestFile[]): Promise<Map<string, PathCacheEntry>> {
+	/**
+	 * #192: the fence rides the preamble that already reads the sandbox row, so a
+	 * whole batch costs one bump and no extra round trip — and, being the first
+	 * statement, it rejects before any of Phase A-E is issued.
+	 */
+	async bulkIngest(
+		tx: PgTx,
+		files: BulkIngestFile[],
+		sandboxId: string,
+		expectedEpoch?: bigint,
+	): Promise<Map<string, PathCacheEntry>> {
 		const result = new Map<string, PathCacheEntry>();
 		if (files.length === 0) return result;
 
-		const ctxRows = await tx<{ id: string; root_inode: string }[]>`
-			SELECT id, root_inode FROM sandboxes WHERE id = current_setting('app.sandbox_id')
+		const ctxRows = await tx<{ root_inode: string | null; fenced: number }[]>`
+			WITH sandbox AS (
+				SELECT id, root_inode FROM sandboxes WHERE id = ${sandboxId}
+			),
+			${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)}
+			SELECT sandbox.root_inode, (SELECT count(*) FROM epoch)::int AS fenced
+			FROM sandbox
 		`;
 		const ctxRow = ctxRows[0];
+		if (ctxRow !== undefined && ctxRow.fenced === 0) throw createEstale(sandboxId);
 		if (!ctxRow?.root_inode) throw new Error("bulkIngest: sandbox not found or has no root inode");
-		const sandboxId = ctxRow.id;
 		const rootInodeId = BigInt(ctxRow.root_inode);
 
 		// ── Phase A: resolve/create ancestor directories by depth level ──────────

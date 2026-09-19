@@ -98,6 +98,7 @@ describe("SqlFs.link() — hardlink creation", () => {
 		expect(incrementNlinkMock).toHaveBeenCalledWith(
 			expect.anything(), // tx
 			3n, // srcInodeId
+			sandboxId, // #192: incrementNlink carries link's fence-and-advance
 		);
 	});
 

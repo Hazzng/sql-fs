@@ -100,13 +100,13 @@ describe("SqlFs.rm (recursive) — post-order hardlink-safe deletion", () => {
 
 		// 4 deleteDirent calls: root unlink + one per non-root entry
 		// root unlink: (parentOf /deep = /) inodeId=1n, name="deep"
-		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 1n, "deep");
+		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 1n, "deep", "s1");
 		// leaf.txt: parent is /deep/mid (inodeId=11n)
-		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 11n, "leaf.txt");
+		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 11n, "leaf.txt", "s1");
 		// other.txt: parent is /deep/mid (inodeId=11n)
-		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 11n, "other.txt");
+		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 11n, "other.txt", "s1");
 		// mid: parent is /deep (inodeId=10n)
-		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 10n, "mid");
+		expect(deleteDirentMock).toHaveBeenCalledWith(expect.anything(), 10n, "mid", "s1");
 		expect(deleteDirentMock).toHaveBeenCalledTimes(4);
 	});
 

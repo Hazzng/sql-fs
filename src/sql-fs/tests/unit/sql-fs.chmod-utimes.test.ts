@@ -72,7 +72,7 @@ describe("SqlFs.chmod", () => {
 		await fs.chmod("/file.txt", 0o600);
 
 		expect(updateInodeMock).toHaveBeenCalledOnce();
-		expect(updateInodeMock).toHaveBeenCalledWith(expect.anything(), 10n, { mode: 0o600 });
+		expect(updateInodeMock).toHaveBeenCalledWith(expect.anything(), 10n, { mode: 0o600 }, "s1");
 
 		const s = await fs.stat("/file.txt");
 		expect(s.mode).toBe(0o600);
@@ -99,7 +99,7 @@ describe("SqlFs.utimes", () => {
 		await fs.utimes("/file.txt", newMtime, newMtime);
 
 		expect(updateInodeMock).toHaveBeenCalledOnce();
-		expect(updateInodeMock).toHaveBeenCalledWith(expect.anything(), 10n, { mtime: newMtime });
+		expect(updateInodeMock).toHaveBeenCalledWith(expect.anything(), 10n, { mtime: newMtime }, "s1");
 
 		const s = await fs.stat("/file.txt");
 		expect(s.mtime).toEqual(newMtime);
