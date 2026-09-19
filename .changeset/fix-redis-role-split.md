@@ -18,4 +18,13 @@ Four changes, all aimed at that chain:
 
 **The cost, and what this does not fix.** A second connection is a second socket, a second TCP keepalive and a second entry in Redis's `maxclients` per replica — negligible per process, worth knowing at high replica counts. More importantly, 54% is not 0%: a `CLIENT PAUSE` stalls the *server*, so both connections stall together and the control breaker still opens. The split removes the coupling through the client-side command queue, not the coupling through a single Redis server — separating those requires `REDIS_DATA_URL` pointing at a different instance, which is now possible but is a deployment decision, not a default. Requiring `allkeys-lru` on the cache Redis (recommendation 4 in the issue, and the reason the `maxmemory`+`noeviction` variant never recovered) is not in this change.
 
-Not verified: behaviour against a genuine network partition or a real two-Redis deployment — the harness runs both roles against one local instance, and the `maxmem` and `freeze` storm variants were not re-measured.
+**What separation actually buys, measured.** Pointing `REDIS_DATA_URL` at a second instance was then tested directly: one replica with the control plane on one Redis and the data plane on another, mixed reads and writes, pausing each plane in turn.
+
+| paused plane | ops | 5xx / timeout | max |
+|---|---|---|---|
+| data (blob cache, path snapshot) | 12,584 | **0 — every request 200** | 2,014 ms |
+| control (exec lock, RW lock, version counter) | 26,643 | 25,248 (**94.8%**) | 4,086 ms |
+
+A data-plane outage is invisible to clients: the blob cache fails open, so a miss falls through to Postgres, and writes never needed it — `commitBlob` goes to Postgres and the Redis `set` is a fire-and-forget backfill. A control-plane outage fails ~95% of requests and *must*: a write that cannot take its lock has no safe outcome but to fail, and since reads take the shared RW lock they block too. So the ~54% measured on the single-instance harness is a property of sharing one Redis, not a ceiling on this change — with `REDIS_DATA_URL` split, the data plane can be down entirely and nobody notices.
+
+Not verified: behaviour against a genuine network partition, or against Azure's managed Redis — the two-instance test above used two local containers. The `maxmem` and `freeze` storm variants were not re-measured after the split.
