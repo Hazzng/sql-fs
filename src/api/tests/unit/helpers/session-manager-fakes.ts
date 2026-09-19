@@ -23,6 +23,8 @@ export class FakeRedis {
 	store = new Map<string, Entry>(); // version keys
 	strings = new Map<string, Entry>(); // lock writer keys
 	zsets = new Map<string, Map<string, number>>();
+	/** Keys holding a non-string type: GET/INCR reply WRONGTYPE, SET heals. */
+	wrongTypeKeys = new Set<string>();
 
 	private gc(): void {
 		const now = Date.now();
@@ -47,17 +49,24 @@ export class FakeRedis {
 
 	async set(key: string, value: string, unit: "PX" | "EX", amount: number): Promise<"OK"> {
 		this.gc();
+		this.wrongTypeKeys.delete(key);
 		this.store.set(key, { value, expiresAt: Date.now() + (unit === "EX" ? amount * 1000 : amount) });
 		return "OK";
 	}
 
 	async get(key: string): Promise<string | null> {
 		this.gc();
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
 		return this.store.get(key)?.value ?? null;
 	}
 
 	async getex(key: string, _ex: "EX", seconds: number): Promise<string | null> {
 		this.gc();
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
 		const e = this.store.get(key);
 		if (e === undefined) return null;
 		e.expiresAt = Date.now() + seconds * 1000;
@@ -71,6 +80,9 @@ export class FakeRedis {
 	 */
 	async incr(key: string): Promise<number> {
 		this.gc();
+		if (this.wrongTypeKeys.has(key)) {
+			throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+		}
 		const raw = this.store.get(key)?.value;
 		if (raw !== undefined && !/^-?\d+$/.test(raw)) {
 			throw new Error("ERR value is not an integer or out of range");
@@ -96,6 +108,24 @@ export class FakeRedis {
 		this.gc();
 		const keys = args.slice(0, numKeys);
 		const argv = args.slice(numKeys);
+		if (script.includes("US-187 poison reset")) {
+			const [vkey] = keys as [string];
+			const [reset, ttlSec, tombstone] = argv as [string, string, string];
+			if (this.wrongTypeKeys.has(vkey)) {
+				this.wrongTypeKeys.delete(vkey);
+				this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+				return reset;
+			}
+			const cur = this.store.get(vkey)?.value ?? null;
+			if (cur === null) {
+				this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+				return reset;
+			}
+			if (cur === tombstone) return "TOMBSTONE";
+			if (/^-?\d+$/.test(cur)) return `HEALTHY:${cur}`;
+			this.store.set(vkey, { value: reset, expiresAt: Date.now() + Number(ttlSec) * 1000 });
+			return reset;
+		}
 		if (script.includes("ZREMRANGEBYSCORE") && script.includes("EXISTS")) {
 			const [writerKey, readersKey] = keys as [string, string];
 			const [token, nowStr, expireAtStr] = argv as [string, string, string];

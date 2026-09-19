@@ -80,13 +80,9 @@ describe("SessionManager poisoned version key recovery (US-187)", () => {
 		const sm = new SessionManager({ createFs: makeFsFactory(stub), redis: asRedis(redis) });
 
 		await sm.withSession("default", "sbx", async () => {});
-		// A hash/list at this key makes both INCR and GET reply WRONGTYPE.
-		vi.spyOn(redis, "incr").mockRejectedValueOnce(
-			new Error("WRONGTYPE Operation against a key holding the wrong kind of value"),
-		);
-		vi.spyOn(redis, "get").mockRejectedValueOnce(
-			new Error("WRONGTYPE Operation against a key holding the wrong kind of value"),
-		);
+		// A hash/list at this key makes INCR reply WRONGTYPE; the atomic script heals it.
+		redis.store.delete(VKEY);
+		redis.wrongTypeKeys.add(VKEY);
 
 		await expect(
 			sm.withSession("default", "sbx", async () => {
@@ -156,6 +152,7 @@ describe("SessionManager poisoned version key recovery (US-187)", () => {
 			stub.dirty = true;
 		});
 		const setSpy = vi.spyOn(redis, "set");
+		const evalSpy = vi.spyOn(redis, "eval");
 		vi.spyOn(redis, "incr").mockRejectedValueOnce(new Error("Command timed out"));
 
 		await expect(
@@ -165,6 +162,7 @@ describe("SessionManager poisoned version key recovery (US-187)", () => {
 		).rejects.toMatchObject({ code: "ECOHERENCE" });
 
 		expect(setSpy).not.toHaveBeenCalled();
+		expect(evalSpy.mock.calls.some(([script]) => (script as string).includes("US-187 poison reset"))).toBe(false);
 		expect(redis.store.get(VKEY)?.value).toBe("1");
 		expect(sm.getSession("default", "sbx")?.publishPending).toBe(true);
 		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(-1);
@@ -199,7 +197,11 @@ describe("SessionManager poisoned version key recovery (US-187)", () => {
 
 		await sm.withSession("default", "sbx", async () => {});
 		poison(redis, "not-an-integer");
-		vi.spyOn(redis, "set").mockRejectedValueOnce(new Error("Command timed out"));
+		const realEval = redis.eval.bind(redis);
+		vi.spyOn(redis, "eval").mockImplementation(async (script: string, numKeys: number, ...args: string[]) => {
+			if (script.includes("US-187 poison reset")) throw new Error("Command timed out");
+			return realEval(script, numKeys, ...args);
+		});
 
 		await expect(
 			sm.withSession("default", "sbx", async () => {
@@ -209,5 +211,31 @@ describe("SessionManager poisoned version key recovery (US-187)", () => {
 
 		expect(redis.store.get(VKEY)?.value).toBe("not-an-integer");
 		expect(sm.getSession("default", "sbx")?.publishPending).toBe(true);
+	});
+
+	it("reloads and bumps instead of overwriting when a concurrent repair already won", async () => {
+		// Codex P1 (#195): the loser must not SET over the winner's version and
+		// record it without the winner's write. It reloads, then INCRs past it.
+		const redis = new FakeRedis();
+		const stub = new StubCoherentFs();
+		const sm = new SessionManager({ createFs: makeFsFactory(stub), redis: asRedis(redis) });
+
+		await sm.withSession("default", "sbx", async () => {});
+		poison(redis, "not-an-integer");
+		vi.spyOn(redis, "incr").mockImplementationOnce(async () => {
+			redis.store.set(VKEY, { value: "42", expiresAt: Date.now() + 60_000 });
+			throw new Error("ERR value is not an integer or out of range");
+		});
+
+		await expect(
+			sm.withSession("default", "sbx", async () => {
+				stub.dirty = true;
+			}),
+		).resolves.toBeUndefined();
+
+		expect(redis.store.get(VKEY)?.value).toBe("43");
+		expect(stub.reloadCount).toBeGreaterThanOrEqual(1);
+		expect(sm.getSession("default", "sbx")?.lastSeenVersion).toBe(43);
+		expect(sm.getSession("default", "sbx")?.publishPending).toBe(false);
 	});
 });
