@@ -92,3 +92,60 @@ describe("buffered script-tx — realpath reads the pathCache, not the database"
 		expect(probe.dialect.resolvePath).toHaveBeenCalled();
 	});
 });
+
+describe("buffered script-tx — the cache walker resolves intermediate symlinks", () => {
+	let probe: DialectProbe;
+
+	beforeEach(() => {
+		probe = makeProbeDialect();
+	});
+
+	async function symlinkFs(): Promise<SqlFs> {
+		const fs = new SqlFs({
+			dialect: probe.dialect,
+			sandboxId: "s-166-symlink",
+			allowSymlinks: true,
+			scriptTxBuffer: BUFFER_ON,
+		});
+		await fs.ready();
+		probe.calls.length = 0;
+		return fs;
+	}
+
+	it("resolves a symlink in an INTERMEDIATE component, not just the leaf", async () => {
+		const fs = await symlinkFs();
+		fs.beginScriptScope();
+		await fs.mkdir("/home/user/dir", { recursive: true });
+		await fs.writeFile("/home/user/dir/file.txt", "x");
+		await fs.symlink("/home/user/dir", "/home/user/link");
+
+		// /home/user/link/file.txt is NOT a pathCache key — only the resolved
+		// /home/user/dir/file.txt is. A leaf-only walker throws ENOENT here.
+		await expect(fs.realpath("/home/user/link/file.txt")).resolves.toBe("/home/user/dir/file.txt");
+		expect(probe.dialect.resolvePath).not.toHaveBeenCalled();
+
+		await fs.endScriptScope();
+	});
+
+	it("resolves a symlinked directory itself", async () => {
+		const fs = await symlinkFs();
+		fs.beginScriptScope();
+		await fs.mkdir("/home/user/dir", { recursive: true });
+		await fs.symlink("/home/user/dir", "/home/user/link");
+
+		await expect(fs.realpath("/home/user/link")).resolves.toBe("/home/user/dir");
+
+		await fs.endScriptScope();
+	});
+
+	it("throws ELOOP on a symlink cycle rather than hanging", async () => {
+		const fs = await symlinkFs();
+		fs.beginScriptScope();
+		await fs.symlink("/home/user/b", "/home/user/a");
+		await fs.symlink("/home/user/a", "/home/user/b");
+
+		await expect(fs.realpath("/home/user/a")).rejects.toMatchObject({ code: "ELOOP" });
+
+		await fs.endScriptScope();
+	});
+});

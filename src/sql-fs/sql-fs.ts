@@ -868,17 +868,37 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard.
 	 */
 	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry } {
-		let current = path;
-		for (let hops = 0; hops <= 40; hops++) {
-			const entry = this.#pathCache.get(current);
-			if (!entry) throw createEnoent(path);
-			if (entry.kind !== INODE_KIND.SYMLINK) return { path: current, entry };
-			const target = entry.symlinkTarget;
-			if (target === undefined || target === null) throw createEnoent(path);
-			const slash = current.lastIndexOf("/");
-			current = this.resolvePath(slash <= 0 ? "/" : current.slice(0, slash), target);
-		}
-		throw createEloop(path);
+		// Walks component by component, exactly as the dialect's `fs_resolve` does: a
+		// symlink in an INTERMEDIATE component has to be resolved and the remaining
+		// suffix continued from the target, because `/a/link/f` is never itself a
+		// pathCache key — only the resolved `/a/dir/f` is. `hops` is shared across the
+		// whole resolution so a cycle cannot escape by recursing.
+		let hops = 0;
+		const walk = (target: string): { path: string; entry: PathCacheEntry } => {
+			const root = this.#pathCache.get("/");
+			if (!root) throw createEnoent(path);
+			let current = "/";
+			let entry: PathCacheEntry = root;
+			for (const part of target.split("/")) {
+				if (part.length === 0) continue;
+				const candidate = current === "/" ? `/${part}` : `${current}/${part}`;
+				const next = this.#pathCache.get(candidate);
+				if (!next) throw createEnoent(path);
+				if (next.kind === INODE_KIND.SYMLINK) {
+					if (++hops > 40) throw createEloop(path);
+					const link = next.symlinkTarget;
+					if (link === undefined || link === null) throw createEnoent(path);
+					const resolved = walk(this.resolvePath(current, link));
+					current = resolved.path;
+					entry = resolved.entry;
+					continue;
+				}
+				current = candidate;
+				entry = next;
+			}
+			return { path: current, entry };
+		};
+		return walk(path);
 	}
 
 	async #resolveReadEntry(path: string): Promise<PathCacheEntry> {
