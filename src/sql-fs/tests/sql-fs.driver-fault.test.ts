@@ -48,6 +48,7 @@ function makeDialect(): { dialect: SqlDialect<unknown>; armStuckWrite: () => voi
 		disconnect: vi.fn(),
 		transaction: vi.fn((fn: (tx: unknown) => Promise<unknown>) => fn({})),
 		setSandboxContext: vi.fn(),
+		getSandboxEpoch: vi.fn(async () => 0n),
 		setSandboxContextWithLock: vi.fn(),
 		loadAllPaths: vi.fn(async () => [rootDir()]),
 		getBlobsForSandbox: vi.fn(async () => []),
