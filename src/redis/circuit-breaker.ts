@@ -79,32 +79,49 @@ export class RedisCircuitBreaker {
 	}
 
 	/**
-	 * Returns `true` when acquire should fast-fail without touching Redis.
+	 * PURE predicate: `true` when Redis is currently considered unreachable.
 	 *
-	 * When the open window has elapsed this transitions to half-open and lets a
-	 * single probe through (returns `false` for that one caller), so a recovering
-	 * Redis can close the breaker.
+	 * Never mutates — in particular it never claims the half-open probe, so it is
+	 * safe for a caller that may decide not to touch Redis after asking (#167 M7:
+	 * a claimed-but-never-settled probe wedges the breaker for the process
+	 * lifetime, because the half_open branch never re-checks the clock). Callers
+	 * that are about to issue a Redis command must use `tryAcquire()` instead.
 	 */
 	isOpen(): boolean {
 		if (this.#state === "closed") return false;
+		if (this.#state === "half_open") return this.#halfOpenInFlight;
+		return this.#now() - this.#openedAt < this.#openMs;
+	}
+
+	/**
+	 * Claim the right to issue one Redis command. Returns `false` when the caller
+	 * must fast-fail.
+	 *
+	 * When the open window has elapsed this transitions to half-open and hands the
+	 * single probe to this caller, so a recovering Redis can close the breaker.
+	 * A caller that gets `true` MUST settle it with `recordSuccess()` or
+	 * `recordFailure()` — otherwise the probe is never returned.
+	 */
+	tryAcquire(): boolean {
+		if (this.#state === "closed") return true;
 		if (this.#state === "half_open") {
 			// Only one probe at a time; everyone else keeps fast-failing.
-			if (this.#halfOpenInFlight) return true;
+			if (this.#halfOpenInFlight) return false;
 			this.#halfOpenInFlight = true;
-			return false;
+			return true;
 		}
 		// open: stay open until the cool-down elapses, then allow one probe.
 		if (this.#now() - this.#openedAt >= this.#openMs) {
 			this.#state = "half_open";
 			this.#halfOpenInFlight = true;
-			return false;
+			return true;
 		}
-		return true;
+		return false;
 	}
 
 	/** Throw `CircuitOpenError` when the breaker is open (and not letting a probe through). */
 	assertClosed(): void {
-		if (this.isOpen()) throw new CircuitOpenError();
+		if (!this.tryAcquire()) throw new CircuitOpenError();
 	}
 
 	/** A successful PING / eval / set: close the breaker and clear the failure run. */

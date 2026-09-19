@@ -164,6 +164,57 @@ describe("RedisBlobCache data-plane breaker", () => {
 		expect(breaker.state).toBe("open");
 	});
 
+	// #167 M7: the capacity checks used to sit BELOW the breaker check, and
+	// `isOpen()` claimed the half-open probe. A capacity drop then returned
+	// without recording success or failure, so the probe was never handed back and
+	// the data breaker fast-failed for the rest of the process lifetime.
+	it("does not consume the half-open probe when the write is dropped for capacity", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		let now = 0;
+		const breaker = new RedisCircuitBreaker({ threshold: 1, openMs: 100, role: "data", now: () => now });
+		breaker.recordFailure(); // → open
+		const redis = new StallingRedis();
+		const cache = new RedisBlobCache(redis.client, "t1", { maxInFlight: 1, breaker });
+		now = 200; // cool-down elapsed: a probe is available
+
+		const first = cache.set(sha(1), new Uint8Array(8)); // takes the probe, stalls in flight
+		await cache.set(sha(2), new Uint8Array(8)); // over maxInFlight → dropped
+		expect(cache.stats.dropped).toBe(1);
+
+		redis.releaseAll();
+		await first; // the probe settles → recordSuccess → breaker closed
+		expect(breaker.state).toBe("closed");
+
+		const third = cache.set(sha(3), new Uint8Array(8));
+		expect(redis.started).toHaveLength(2); // the post-drop write reached Redis
+		redis.releaseAll();
+		await third;
+	});
+
+	// #167 M7 (same shape, second site): `mdel` never records success or failure,
+	// so it must read the breaker purely and never take the probe.
+	it("mdel does not consume the half-open probe", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		let now = 0;
+		const breaker = new RedisCircuitBreaker({ threshold: 1, openMs: 100, role: "data", now: () => now });
+		breaker.recordFailure(); // → open
+		const redis = new StallingRedis();
+		const cache = new RedisBlobCache(redis.client, "t1", { breaker });
+
+		await cache.mdel([sha(1)]);
+		expect(redis.unlinked).toEqual([]); // inside the open window → skipped
+
+		now = 200; // cool-down elapsed: a probe is available
+		await cache.mdel([sha(2)]);
+		expect(redis.unlinked).toHaveLength(1); // best-effort delete proceeds
+		expect(breaker.state).toBe("open"); // but it did NOT take the probe
+
+		expect(await cache.get(sha(3))).toBeNull();
+		expect(redis.getKeys).toHaveLength(1); // the probe went to a caller that settles it
+		expect(breaker.state).toBe("closed");
+	});
+
 	// Regression guard, not a fix-proving test: the breaker is optional, and a
 	// cache constructed without one must behave exactly as it did before #167.
 	it("leaves Redis reachable when no breaker is supplied", async () => {
@@ -171,5 +222,49 @@ describe("RedisBlobCache data-plane breaker", () => {
 		const cache = new RedisBlobCache(redis.client, "t1");
 		expect(await cache.get(sha(1))).toBeNull();
 		expect(redis.getKeys).toEqual([`vfs:t1:blob:${Buffer.from(sha(1)).toString("hex")}`]);
+	});
+});
+
+// #167 M6: `blobCacheFactory` builds one RedisBlobCache per TENANT over the one
+// shared data connection, so instance-local counters let T tenants put T x the
+// cap on a single socket. The budget belongs to the connection.
+describe("RedisBlobCache backfill cap across tenants", () => {
+	it("shares the in-flight count cap between caches on the same client", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const redis = new StallingRedis();
+		const tenantA = new RedisBlobCache(redis.client, "a", { maxInFlight: 2 });
+		const tenantB = new RedisBlobCache(redis.client, "b", { maxInFlight: 2 });
+		const pending = [tenantA.set(sha(1), new Uint8Array(8)), tenantA.set(sha(2), new Uint8Array(8))];
+		await tenantB.set(sha(3), new Uint8Array(8)); // a different tenant, same socket → dropped
+		expect(redis.started).toHaveLength(2);
+		expect(tenantB.stats.dropped).toBe(1);
+		redis.releaseAll();
+		await Promise.all(pending);
+	});
+
+	it("shares the in-flight byte cap between caches on the same client", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+		const redis = new StallingRedis();
+		const tenantA = new RedisBlobCache(redis.client, "a", { maxInFlight: 100, maxInFlightBytes: 1000 });
+		const tenantB = new RedisBlobCache(redis.client, "b", { maxInFlight: 100, maxInFlightBytes: 1000 });
+		const pending = tenantA.set(sha(1), new Uint8Array(900));
+		await tenantB.set(sha(2), new Uint8Array(200)); // 900 + 200 > 1000 → dropped
+		expect(redis.started).toHaveLength(1);
+		expect(tenantB.stats.dropped).toBe(1);
+		redis.releaseAll();
+		await pending;
+	});
+
+	it("keeps caches on DIFFERENT clients independent", async () => {
+		const redisA = new StallingRedis();
+		const redisB = new StallingRedis();
+		const tenantA = new RedisBlobCache(redisA.client, "a", { maxInFlight: 1 });
+		const tenantB = new RedisBlobCache(redisB.client, "b", { maxInFlight: 1 });
+		const pending = [tenantA.set(sha(1), new Uint8Array(8)), tenantB.set(sha(2), new Uint8Array(8))];
+		expect(redisA.started).toHaveLength(1);
+		expect(redisB.started).toHaveLength(1);
+		redisA.releaseAll();
+		redisB.releaseAll();
+		await Promise.all(pending);
 	});
 });

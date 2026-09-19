@@ -178,8 +178,8 @@ Key design choices:
 | `REDIS_BLOB_CACHE_ENABLED` | No | `true` | Set `false` to disable Redis blob cache. |
 | `REDIS_BLOB_CACHE_TTL_MS` | No | `86400000` | Blob cache entry TTL (24h). |
 | `REDIS_BLOB_MAX_BYTES` | No | `8388608` | Blobs larger than this bypass Redis entirely (8 MB). |
-| `REDIS_BLOB_SET_MAX_IN_FLIGHT` | No | `32` | Max concurrent blob-cache backfill writes. Writes over the cap are dropped (the cache is fail-open), not queued. |
-| `REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES` | No | `33554432` | Max total bytes of concurrent blob-cache backfill writes (32 MB). Same drop-not-queue rule. |
+| `REDIS_BLOB_SET_MAX_IN_FLIGHT` | No | `32` | Max concurrent blob-cache backfill writes, per data connection and shared across all tenants on it. Writes over the cap are dropped (the cache is fail-open), not queued. |
+| `REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES` | No | `33554432` | Max total bytes of concurrent blob-cache backfill writes (32 MB), likewise per data connection and shared across tenants. Same drop-not-queue rule. |
 | `REDIS_PATH_SNAPSHOT_ENABLED` | No | `false` | Cache full path tree in Redis for faster cold starts. |
 | `REDIS_PATH_SNAPSHOT_TTL_MS` | No | `3600000` | Path snapshot TTL (1h). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No | `false` | Monkey-patches host globals during exec for extra isolation. |

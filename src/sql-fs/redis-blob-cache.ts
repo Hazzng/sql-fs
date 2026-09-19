@@ -17,6 +17,29 @@ const DEFAULT_MAX_IN_FLIGHT_BYTES = 32 * 1024 * 1024; // 32 MB
 /** Drops are logged at most this often, with the running total, so a storm cannot flood the log. */
 const DROP_LOG_INTERVAL_MS = 5_000;
 
+/**
+ * Backfill occupancy shared by every cache instance on one Redis connection.
+ *
+ * #167 M6: `blobCacheFactory` runs once per TENANT, so instance-local counters
+ * capped T tenants x 32 MB on a single socket — exactly the unbounded queue the
+ * cap exists to prevent. The counters therefore belong to the connection, which
+ * is what actually backs up, not to the cache object in front of it.
+ */
+interface BackfillOccupancy {
+	inFlight: number;
+	inFlightBytes: number;
+}
+
+const occupancyByClient = new WeakMap<Redis, BackfillOccupancy>();
+
+function occupancyFor(client: Redis): BackfillOccupancy {
+	const existing = occupancyByClient.get(client);
+	if (existing !== undefined) return existing;
+	const created: BackfillOccupancy = { inFlight: 0, inFlightBytes: 0 };
+	occupancyByClient.set(client, created);
+	return created;
+}
+
 export interface RedisBlobCacheOptions {
 	readonly ttlMs?: number;
 	readonly maxBytes?: number;
@@ -38,13 +61,14 @@ export class RedisBlobCache {
 	readonly #maxInFlight: number;
 	readonly #maxInFlightBytes: number;
 	readonly #breaker: RedisCircuitBreaker | undefined;
-	#inFlight = 0;
-	#inFlightBytes = 0;
+	/** Shared with every other cache on `#client` — see `BackfillOccupancy`. */
+	readonly #occupancy: BackfillOccupancy;
 	#dropped = 0;
 	#lastDropLogAt = 0;
 
 	constructor(client: Redis, tenantId: string, opts: RedisBlobCacheOptions = {}) {
 		this.#client = client;
+		this.#occupancy = occupancyFor(client);
 		this.#tenantId = tenantId;
 		this.#ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
 		this.#maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
@@ -54,14 +78,23 @@ export class RedisBlobCache {
 		this.#breaker = opts.breaker;
 	}
 
-	/** Current backfill occupancy, for tests and observability. */
+	/**
+	 * Current backfill occupancy, for tests and observability. `inFlight` /
+	 * `inFlightBytes` are connection-wide (shared across tenants); `dropped`
+	 * counts this instance's drops.
+	 */
 	get stats(): { readonly inFlight: number; readonly inFlightBytes: number; readonly dropped: number } {
-		return { inFlight: this.#inFlight, inFlightBytes: this.#inFlightBytes, dropped: this.#dropped };
+		return { inFlight: this.#occupancy.inFlight, inFlightBytes: this.#occupancy.inFlightBytes, dropped: this.#dropped };
 	}
 
-	/** True when the data-plane breaker says Redis is unreachable — skip I/O and fall back to Postgres. */
-	#circuitOpen(): boolean {
-		return this.#breaker?.isOpen() === true;
+	/**
+	 * Claim the right to issue one Redis command, honouring the data-plane
+	 * breaker. Returns `false` when the caller must skip Redis and fall back to
+	 * Postgres. A `true` MUST be settled with `recordSuccess`/`recordFailure`,
+	 * so never call this before a check that can still bail out (#167 M7).
+	 */
+	#tryAcquireCircuit(): boolean {
+		return this.#breaker?.tryAcquire() !== false;
 	}
 
 	#recordDrop(reason: string): void {
@@ -74,8 +107,8 @@ export class RedisBlobCache {
 				event: "redis_blob_set_dropped",
 				reason,
 				dropped: this.#dropped,
-				inFlight: this.#inFlight,
-				inFlightBytes: this.#inFlightBytes,
+				inFlight: this.#occupancy.inFlight,
+				inFlightBytes: this.#occupancy.inFlightBytes,
 			}),
 		);
 	}
@@ -86,7 +119,7 @@ export class RedisBlobCache {
 
 	async get(sha256: Uint8Array): Promise<Uint8Array | null> {
 		if (!this.#enabled) return null;
-		if (this.#circuitOpen()) return null;
+		if (!this.#tryAcquireCircuit()) return null;
 		try {
 			const buf = await this.#client.getBuffer(this.#key(sha256));
 			this.#breaker?.recordSuccess();
@@ -104,7 +137,7 @@ export class RedisBlobCache {
 	 */
 	async mget(sha256s: ReadonlyArray<Uint8Array>): Promise<Array<Uint8Array | null>> {
 		if (!this.#enabled || sha256s.length === 0) return sha256s.map(() => null);
-		if (this.#circuitOpen()) return sha256s.map(() => null);
+		if (!this.#tryAcquireCircuit()) return sha256s.map(() => null);
 		// Chunk MGET to bound a single round-trip's keyspace and response size.
 		// A 50k-blob warm sandbox would otherwise issue one MGET that requires
 		// Redis to assemble the entire response array before returning, spiking
@@ -138,22 +171,25 @@ export class RedisBlobCache {
 	 * here: over the in-flight count or byte cap the write is DROPPED, not
 	 * queued. The cache is fail-open by contract, so a dropped backfill costs
 	 * one later Postgres read — an unbounded queue against a stalled Redis costs
-	 * the replica.
+	 * the replica. The occupancy is per Redis CONNECTION, so the cap holds across
+	 * every tenant sharing the data client, not per tenant.
 	 */
 	async set(sha256: Uint8Array, data: Uint8Array): Promise<void> {
 		if (!this.#enabled) return;
 		if (data.byteLength > this.#maxBytes) return;
-		if (this.#circuitOpen()) return;
-		if (this.#inFlight >= this.#maxInFlight) {
+		// Capacity is checked BEFORE the breaker: `tryAcquireCircuit` can claim the
+		// half-open probe, and a drop here would never settle it (#167 M7).
+		if (this.#occupancy.inFlight >= this.#maxInFlight) {
 			this.#recordDrop("max_in_flight");
 			return;
 		}
-		if (this.#inFlightBytes + data.byteLength > this.#maxInFlightBytes) {
+		if (this.#occupancy.inFlightBytes + data.byteLength > this.#maxInFlightBytes) {
 			this.#recordDrop("max_in_flight_bytes");
 			return;
 		}
-		this.#inFlight += 1;
-		this.#inFlightBytes += data.byteLength;
+		if (!this.#tryAcquireCircuit()) return;
+		this.#occupancy.inFlight += 1;
+		this.#occupancy.inFlightBytes += data.byteLength;
 		try {
 			await this.#client.set(this.#key(sha256), Buffer.from(data), "PX", this.#ttlMs);
 			this.#breaker?.recordSuccess();
@@ -161,8 +197,8 @@ export class RedisBlobCache {
 			this.#breaker?.recordFailure();
 			console.error(JSON.stringify({ event: "redis_blob_set_error", error: (err as Error).message }));
 		} finally {
-			this.#inFlight -= 1;
-			this.#inFlightBytes -= data.byteLength;
+			this.#occupancy.inFlight -= 1;
+			this.#occupancy.inFlightBytes -= data.byteLength;
 		}
 	}
 
@@ -174,7 +210,9 @@ export class RedisBlobCache {
 	 */
 	async mdel(sha256s: ReadonlyArray<Uint8Array>): Promise<void> {
 		if (!this.#enabled || sha256s.length === 0) return;
-		if (this.#circuitOpen()) return;
+		// PURE read of the breaker: `mdel` never records success/failure, so it must
+		// not claim the half-open probe (#167 M7).
+		if (this.#breaker?.isOpen() === true) return;
 		const CHUNK = 1024;
 		try {
 			for (let i = 0; i < sha256s.length; i += CHUNK) {

@@ -79,7 +79,7 @@ describe("RedisCircuitBreaker transition events", () => {
 		const breaker = new RedisCircuitBreaker({ threshold: 2, openMs: 100, role: "control", now: () => now });
 		tripOpen(breaker, 2);
 		now = 200;
-		expect(breaker.isOpen()).toBe(false); // half-open probe
+		expect(breaker.tryAcquire()).toBe(true); // half-open probe
 		breaker.recordSuccess();
 		expect(breaker.state).toBe("closed");
 		expect(loggedEvents(log)).toEqual([{ event: "redis_circuit_closed", role: "control" }]);
@@ -110,7 +110,7 @@ describe("RedisCircuitBreaker transition events", () => {
 		const breaker = new RedisCircuitBreaker({ threshold: 2, openMs: 100, role: "data", now: () => now });
 		tripOpen(breaker, 2);
 		now = 200;
-		expect(breaker.isOpen()).toBe(false); // half-open probe
+		expect(breaker.tryAcquire()).toBe(true); // half-open probe
 		breaker.recordFailure();
 		expect(breaker.state).toBe("open");
 		expect(loggedEvents(err).filter((e) => e.event === "redis_circuit_open")).toHaveLength(2);

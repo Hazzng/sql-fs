@@ -181,7 +181,7 @@ async function acquireShared(
 	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 
 	while (true) {
-		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.readers);
+		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.readers);
 		const now = Date.now();
 		const expireAt = now + readerLeaseMs;
 		let acquired = false;
@@ -285,7 +285,7 @@ async function acquireExclusive(
 	// thrown connection-class errors advance the shared `errorBudget` and the
 	// breaker so a Redis outage fast-fails instead of hanging for the full window.
 	while (true) {
-		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.writer);
+		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.writer);
 		let flagAcquired = false;
 		try {
 			const res = await redis.eval(ACQUIRE_EXCLUSIVE_FLAG_SCRIPT, 1, keys.writer, token, String(leaseMs));
@@ -318,7 +318,7 @@ async function waitReadersDrained(
 	// Redis error advances the shared error budget and breaker so a mid-acquire
 	// outage fast-fails rather than hanging until the 300 s deadline.
 	while (true) {
-		if (breaker.isOpen()) throw new LockAcquireTimeoutError(keys.writer);
+		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(keys.writer);
 		const now = Date.now();
 		let count: number;
 		try {

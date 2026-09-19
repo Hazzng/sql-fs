@@ -52,14 +52,14 @@ describe("RedisCircuitBreaker", () => {
 		const clock = fixedClock();
 		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
 		b.recordFailure();
-		expect(b.isOpen()).toBe(true);
+		expect(b.tryAcquire()).toBe(false);
 
 		clock.advance(5_000);
-		// First probe is allowed through (isOpen false), state goes half-open.
-		expect(b.isOpen()).toBe(false);
+		// First probe is allowed through, state goes half-open.
+		expect(b.tryAcquire()).toBe(true);
 		expect(b.state).toBe("half_open");
 		// Concurrent callers still fast-fail while the probe is in flight.
-		expect(b.isOpen()).toBe(true);
+		expect(b.tryAcquire()).toBe(false);
 	});
 
 	it("a successful probe closes the breaker", () => {
@@ -67,7 +67,7 @@ describe("RedisCircuitBreaker", () => {
 		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
 		b.recordFailure();
 		clock.advance(5_000);
-		expect(b.isOpen()).toBe(false); // probe allowed
+		expect(b.tryAcquire()).toBe(true); // probe allowed
 		b.recordSuccess();
 		expect(b.state).toBe("closed");
 		expect(b.isOpen()).toBe(false);
@@ -78,15 +78,38 @@ describe("RedisCircuitBreaker", () => {
 		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
 		b.recordFailure();
 		clock.advance(5_000);
-		expect(b.isOpen()).toBe(false); // probe allowed
+		expect(b.tryAcquire()).toBe(true); // probe allowed
 		b.recordFailure(); // probe failed
 		expect(b.state).toBe("open");
-		expect(b.isOpen()).toBe(true);
+		expect(b.tryAcquire()).toBe(false);
 		// Still open before the new cool-down elapses.
 		clock.advance(4_999);
-		expect(b.isOpen()).toBe(true);
+		expect(b.tryAcquire()).toBe(false);
 		clock.advance(1);
-		expect(b.isOpen()).toBe(false); // next probe allowed
+		expect(b.tryAcquire()).toBe(true); // next probe allowed
+	});
+
+	// #167 M7: `isOpen()` used to hand out the half-open probe, so a caller that
+	// asked and then decided not to touch Redis wedged the breaker forever.
+	it("isOpen() is pure: asking does not consume the half-open probe", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure();
+		clock.advance(5_000);
+		expect(b.isOpen()).toBe(false);
+		expect(b.isOpen()).toBe(false);
+		expect(b.state).toBe("open"); // still open — no transition was made
+		expect(b.tryAcquire()).toBe(true); // the probe is still there for a real caller
+		expect(b.state).toBe("half_open");
+	});
+
+	it("isOpen() reports an in-flight half-open probe as open", () => {
+		const clock = fixedClock();
+		const b = new RedisCircuitBreaker({ threshold: 1, openMs: 5_000, now: clock.now });
+		b.recordFailure();
+		clock.advance(5_000);
+		expect(b.tryAcquire()).toBe(true);
+		expect(b.isOpen()).toBe(true);
 	});
 
 	it("uses default threshold of 5 when constructed with no options", () => {

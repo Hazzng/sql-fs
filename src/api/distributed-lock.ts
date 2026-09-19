@@ -151,7 +151,7 @@ export async function withDistributedLock<T>(
 	const breaker = getRedisCircuitBreaker();
 	const errorBudget = new AcquireErrorBudget(errorBudgetMs);
 	while (true) {
-		if (breaker.isOpen()) throw new LockAcquireTimeoutError(key);
+		if (!breaker.tryAcquire()) throw new LockAcquireTimeoutError(key);
 		let acquired = false;
 		try {
 			const ok = await redis.set(key, token, "PX", leaseMs, "NX");
