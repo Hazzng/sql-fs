@@ -21,6 +21,7 @@ import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
 import { RedisPathSnapshot } from "./redis-path-snapshot.js";
+import { loadScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
@@ -80,6 +81,9 @@ export async function createPostgresSandboxFs(
 			redis: opts.redis,
 			pathSnapshot: opts.pathSnapshot,
 			blobCache: opts.blobCache,
+			// #166: the deployment default lives here rather than in SqlFs, so a bare
+			// `new SqlFs(...)` in a test keeps the legacy script-long-transaction shape.
+			scriptTxBuffer: loadScriptTxBufferConfig(),
 		});
 		await fs.ready();
 		return { fs, resolvedOwner, createdAt };

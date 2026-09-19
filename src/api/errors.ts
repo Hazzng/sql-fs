@@ -36,6 +36,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"EREADONLY_VIOLATION",
 	"EDRIVERFAULT",
 	"EFBIG",
+	"ESCRIPTBUFFER",
 ]);
 
 /**
@@ -162,6 +163,9 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * FORBIDDEN      → 403  Forbidden
  * ENOTEMPTY      → 409  Conflict
  * EFBIG          → 413  Payload Too Large (exec file-size ceiling, #168)
+ * ESCRIPTBUFFER        → 413  Payload Too Large, NOT retryable. The script buffered more
+ *                       metadata mutations than the flush budget allows (#166);
+ *                       nothing was applied and an identical re-run fails identically.
  * ESESSIONCLOSING→ 503  Service Unavailable (session being destroyed)
  * ELOOP          → 400  Bad Request (symlink loop)
  * EINVAL         → 400  Bad Request (invalid argument)
@@ -239,6 +243,15 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;
+		case "ESCRIPTBUFFER":
+			// #166: the script buffered more metadata mutations than the flush budget
+			// allows. 413 for the same reason as EFBIG — the request was well-formed,
+			// the amount of work is what is too big — and it shares EFBIG's "split the
+			// work, do not retry" remedy, so clients need one branch, not two.
+			// Known-not-applied (the buffer is discarded before any transaction opens)
+			// but absent from RETRY_SAFE_ERROR_CODES: that set also promises the
+			// condition is transient, and an identical re-run hits the identical cap.
+			return 413;
 		case "EFBIG":
 			// #168: the script asked to read or produce a file above the exec ceiling.
 			// 413, not 400: the request was well-formed, the content is what is too big —

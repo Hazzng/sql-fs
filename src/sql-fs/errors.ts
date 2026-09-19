@@ -137,6 +137,36 @@ function configuredBytes(name: string, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/**
+ * ESCRIPTBUFFER: a script buffered more metadata mutations than the flush budget allows (#166).
+ *
+ * Under the buffered script-tx a script's mutations are held in memory and replayed
+ * in one short transaction at scope end, so the buffer is the only thing standing
+ * between an unbounded `for` loop in bash and an unbounded heap. At the cap the
+ * script fails and **nothing is applied** — the buffer is discarded without a
+ * transaction ever opening. Auto-flushing instead would silently convert the scope
+ * into two commits and break the per-script all-or-nothing guarantee that
+ * `ELOCKLOST`'s "not committed" claim rests on.
+ *
+ * Known-not-applied, but deliberately NOT advertised `retryable`: the repo defines
+ * that flag as "applied nothing AND the condition is transient", and an identical
+ * re-run hits the identical cap. The remedy is to split the script, which the
+ * message says.
+ */
+export function createEscriptbuffer(ops: number, bytes: number, maxOps: number, maxBytes: number): Error {
+	return makeFsError(
+		"ESCRIPTBUFFER",
+		[
+			`ESCRIPTBUFFER: too many filesystem changes in one script — ${ops} operations / ${bytes} bytes buffered`,
+			`against a limit of ${maxOps} operations / ${maxBytes} bytes.`,
+			"Nothing was applied: the whole script was rolled back before any of it reached the database.",
+			"This is a deliberate limit, not a transient failure — split the work across several exec calls",
+			"(or use the bulk ingest route for large file sets) rather than retrying the same script.",
+			"Operators raise the ceiling with SCRIPT_TX_BUFFER_MAX_OPS / SCRIPT_TX_BUFFER_MAX_BYTES.",
+		].join(" "),
+	);
+}
+
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────
 
 /** Patterns whose matches are replaced with [redacted] in sanitized error messages. */
