@@ -73,3 +73,13 @@ export const MAX_BULK_WRITE_BYTES = positiveIntEnv(process.env.MAX_BULK_WRITE_BY
  * actually enforces.
  */
 export const MAX_BULK_WRITE_BODY_BYTES = MAX_BULK_WRITE_BYTES * 2;
+
+/**
+ * Max number of entries in one batch write.
+ *
+ * Shared by `POST /writeFiles` and the optional `files` map on `POST /v1/sandboxes` (#168 M10):
+ * both buffer every entry and write them in one synchronous run, so one owner keeps them from
+ * drifting. Parsed with {@link positiveIntEnv} so a typo cannot turn the cap into `NaN`, which
+ * would make every comparison false and remove it.
+ */
+export const MAX_BULK_WRITE_FILES = positiveIntEnv(process.env.MAX_BULK_WRITE_FILES, 1000);

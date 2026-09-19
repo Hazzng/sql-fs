@@ -19,6 +19,7 @@ import { extractErrCode } from "../errors.js";
 import {
 	MAX_BULK_WRITE_BODY_BYTES,
 	MAX_BULK_WRITE_BYTES,
+	MAX_BULK_WRITE_FILES,
 	MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES,
 } from "../lib/env.js";
 import { type EditOutcome, type WriteOutcome, editFile, ensureParentDir, writeFileAtPath } from "../lib/file-ops.js";
@@ -73,7 +74,6 @@ function toKind(stat: FsStat): string {
 	return "symlink";
 }
 
-const MAX_BULK_WRITE_FILES = Number(process.env.MAX_BULK_WRITE_FILES ?? "1000");
 // Audit H11 (#27): cap the number of entries a single /tree response materializes.
 const MAX_TREE_ENTRIES = Number(process.env.MAX_TREE_ENTRIES ?? "50000");
 
