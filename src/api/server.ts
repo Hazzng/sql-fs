@@ -318,7 +318,6 @@ app.onError((err, c) => {
  * referenced handle, so an unref'd timer exits 0 before the verdict — skipping `startup_failed`
  * and `process.exit(1)`, which leaves restart-on-failure deployments down with no log.
  *
-
  * Exported so the race is testable; the bootstrap below is the only production caller.
  */
 export async function runStartupMigrations(): Promise<void> {
