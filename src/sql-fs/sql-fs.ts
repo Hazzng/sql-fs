@@ -2162,11 +2162,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						kind: "mv",
 						composite: false,
 						run: async (tx) => {
-							if (destEntry) {
-								const destInodeId = this.#realId(destEntry.inodeId);
-								const newNlink = await this.#dialect.decrementNlink(tx, destInodeId);
-								if (newNlink === 0) await this.#dialect.deleteInode(tx, destInodeId);
-							}
+							// moveDirent carries mv's fence-and-advance, so it must run FIRST:
+							// an ESTALE has to abort before the destination's nlink is touched (#204).
 							await this.#dialect.moveDirent(
 								tx,
 								this.#realId(srcParentEntry.inodeId),
@@ -2176,6 +2173,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 								this.#sandboxId,
 								...this.#expectedEpochArgs(),
 							);
+							if (destEntry) {
+								const destInodeId = this.#realId(destEntry.inodeId);
+								const newNlink = await this.#dialect.decrementNlink(tx, destInodeId);
+								if (newNlink === 0) await this.#dialect.deleteInode(tx, destInodeId);
+							}
 							return [];
 						},
 					},
@@ -2269,8 +2271,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			composite: false,
 			run: async (tx) => {
 				const targetInodeId = this.#realId(srcEntry.inodeId);
-				await this.#dialect.insertDirent(tx, this.#realId(destParentEntry.inodeId), destName, targetInodeId);
+				// incrementNlink carries link's fence-and-advance, so it must run FIRST:
+				// an ESTALE has to abort before any dirent exists (#204).
 				await this.#dialect.incrementNlink(tx, targetInodeId, this.#sandboxId, ...this.#expectedEpochArgs());
+				await this.#dialect.insertDirent(tx, this.#realId(destParentEntry.inodeId), destName, targetInodeId);
 				return [];
 			},
 		});
