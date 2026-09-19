@@ -66,6 +66,26 @@ if (mode === "absorb-uncaught") {
 		process.stdout.write(`SURVIVED ${(err as Error & { code?: string }).code}\n`);
 		process.exit(0);
 	}
+} else if (mode === "startup-ref" || mode === "startup-unref") {
+	// Boot shape: floating promise like the server bootstrap, no keepalive. `startup-ref` holds
+	// the loop on the grace timer; `startup-unref` pins the default, which exits 0 pre-verdict.
+	const hung = raceDriverFault(
+		() => new Promise<never>(() => {}),
+		mode === "startup-ref" ? { refTimer: true } : undefined,
+	);
+	setImmediate(() => {
+		throw driverFault();
+	});
+	void (async () => {
+		try {
+			await hung;
+			process.stdout.write("NO-REJECTION\n");
+			process.exit(3);
+		} catch (err) {
+			process.stdout.write(`SURVIVED ${(err as Error & { code?: string }).code}\n`);
+			process.exit(0);
+		}
+	})();
 } else if (mode === "absorb-rejection") {
 	void Promise.reject(driverFault());
 	await new Promise((r) => setTimeout(r, 200));
