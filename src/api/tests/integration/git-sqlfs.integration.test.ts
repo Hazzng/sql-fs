@@ -3,7 +3,7 @@ import { readCommit, resolveRef } from "just-git/repo";
 import { type Auth, createServer } from "just-git/server";
 import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { runMigrations } from "../../migrations.js";
+import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
 import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
 
@@ -35,7 +35,11 @@ describe.skipIf(SKIP)("git through SessionManager and Postgres SqlFs", () => {
 
 	beforeAll(async () => {
 		tenantConfig = loadTenantConfig();
-		await runMigrations(tenantConfig);
+		// Assert the schema rather than migrating the shared database here: the
+		// runner holds one transaction over every file, and 0005's ALTER TABLE …
+		// ENABLE ROW LEVEL SECURITY deadlocked against the INSERTs the rest of the
+		// parallel integration run was issuing.
+		await requireMigratedSchema(tenantConfig.getConnectionString(TENANT_ID));
 		database = postgres(tenantConfig.getConnectionString(TENANT_ID), { prepare: false, max: 1 });
 	});
 

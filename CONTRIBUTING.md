@@ -47,9 +47,9 @@ isolation. The connecting role therefore has hard requirements that aren't obvio
   confusing errors — under "sandbox A's context", queries return rows from *every*
   sandbox.
 - **Owns the schema and tables.** The boot-time migration runner creates objects in
-  `public`, and `rls.integration.test.ts` re-applies `0005`'s
-  `ALTER TABLE … FORCE ROW LEVEL SECURITY`, which requires table ownership (a
-  non-owner fails with `must be owner of table inodes` / `permission denied for schema public`).
+  `public` and runs `0005`'s `ALTER TABLE … FORCE ROW LEVEL SECURITY`, which requires
+  table ownership (a non-owner fails with `must be owner of table inodes` /
+  `permission denied for schema public`).
 - **`CREATEDB`.** The multi-tenant and migrations suites create ephemeral databases
   at runtime from `DATABASE_URL`.
 
@@ -83,13 +83,19 @@ REDIS_URL=redis://localhost:6379 \
 pnpm test:integration
 ```
 
-All suites share one database, so a fully parallel run can occasionally hit transient
-`deadlock detected` errors (DDL-vs-DML lock contention between files). If you see one,
-re-run serialized — it's not a real failure:
+`REDIS_URL` is not optional in practice: without it seven files — the five
+cross-replica/multi-tenant API suites plus `path-snapshot` and `redis-blob-cache` —
+skip in full, 29 tests that look like coverage and provide none. Set it.
 
-```bash
-pnpm test:integration -- --no-file-parallelism --poolOptions.forks.singleFork
-```
+Every suite shares one database and one `max_connections` budget, so
+`pnpm test:integration` runs the files **serially** (`--no-file-parallelism`). Running
+them fully parallel oversubscribes the connection pool
+(`remaining connection slots are reserved for …`); do it only with a raised
+`max_connections`.
+
+No suite applies migration DDL to the shared database any more — they assert the schema
+is migrated instead (`requireMigratedSchema`). A `deadlock detected` in an integration
+run is therefore a real finding, not background noise to re-run past.
 
 Reset the database to a clean slate (re-runs the `initdb` script) with
 `docker compose -f docker-compose.local.yml down -v`.

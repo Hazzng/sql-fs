@@ -9,16 +9,11 @@
  * Skipped when DATABASE_URL is not set so local/unit-only runs remain useful.
  */
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
+import { requireMigratedSchema } from "./helpers/schema-preconditions.js";
 
 const SKIP = !process.env.DATABASE_URL;
-const RLS_MIGRATION = fileURLToPath(new URL("../../migrations/postgres/0005_enable_rls.sql", import.meta.url));
-const FENCING_MIGRATION = fileURLToPath(
-	new URL("../../migrations/postgres/0007_fence_sandbox_epochs.sql", import.meta.url),
-);
 
 type Sandbox = Awaited<ReturnType<PostgresDialect["createSandbox"]>> & { id: string };
 
@@ -32,10 +27,10 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 
 	beforeAll(async () => {
 		await dialect.connect();
-		const rlsDdl = readFileSync(RLS_MIGRATION, "utf8");
-		await dialect.transaction((tx) => tx.unsafe(rlsDdl));
-		const fencingDdl = readFileSync(FENCING_MIGRATION, "utf8");
-		await dialect.transaction((tx) => tx.unsafe(fencingDdl));
+		// Assert 0005/0007 rather than re-applying them: the DDL takes an
+		// AccessExclusiveLock on inodes/dirents/sandboxes and deadlocked the
+		// parallel integration run.
+		await requireMigratedSchema(process.env.DATABASE_URL!);
 	});
 
 	afterAll(async () => {
@@ -66,11 +61,10 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 		return { ...created, id };
 	}
 
-	it("applies migration 0007 idempotently and gives a fresh sandbox epoch zero", async () => {
-		const ddl = readFileSync(FENCING_MIGRATION, "utf8");
-		await dialect.transaction((tx) => tx.unsafe(ddl));
-		await dialect.transaction((tx) => tx.unsafe(ddl));
-
+	// Migration 0007's own idempotency is covered against an isolated scratch
+	// database by `src/api/tests/integration/migrations.integration.test.ts`;
+	// re-applying the DDL here locked the shared tables the rest of the run uses.
+	it("gives a fresh sandbox epoch zero on a 0007-shaped sandboxes.version column", async () => {
 		const columns = await dialect.transaction(
 			(tx) => tx<{ data_type: string; column_default: string | null; is_nullable: string }[]>`
 				SELECT data_type, column_default, is_nullable

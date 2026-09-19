@@ -84,8 +84,10 @@ describe.skipIf(SKIP)("PostgresDialect — F6 decoupled blob commit", () => {
 		// Set up sandbox A with a root dir we can write into.
 		const sandboxId = `f6-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 		createdSandboxIds.push(sandboxId);
+		// `setSandboxContextWithLock` pins the sandbox's epoch off its row (#161), so
+		// it cannot precede the INSERT that creates it — createSandbox sets the
+		// context itself.
 		const rootInodeId = await dialectA.transaction(async (tx) => {
-			await dialectA.setSandboxContextWithLock(tx, sandboxId);
 			const { rootInodeId } = await dialectA.createSandbox(tx, sandboxId);
 			return rootInodeId;
 		});

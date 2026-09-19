@@ -53,8 +53,23 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 		await Promise.all([dialectA.disconnect(), dialectB.disconnect(), dialectC.disconnect()]);
 	});
 
+	/**
+	 * The epoch fence (#161) made `setSandboxContextWithLock` read the sandbox row
+	 * to pin `app.sandbox_epoch`, so it raises ENOENT — and never reaches
+	 * `pg_advisory_xact_lock` — for an id that was never inserted. Every lock test
+	 * must therefore run against a real sandbox row.
+	 */
+	async function newSandbox(prefix: string): Promise<string> {
+		const sandboxId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		await dialectC.transaction(async (tx) => {
+			await dialectC.createSandbox(tx, sandboxId);
+		});
+		createdSandboxIds.push(sandboxId);
+		return sandboxId;
+	}
+
 	it("concurrent transactions on the same sandboxId serialize on the advisory lock", async () => {
-		const sandboxId = `lock-same-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const sandboxId = await newSandbox("lock-same");
 		const holdMs = 500;
 
 		// Gate A: the first transaction signals once it has the lock; then holds for holdMs.
@@ -72,7 +87,9 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 		});
 
 		// Wait until the first transaction definitely holds the lock before starting the second.
-		await firstHasLockPromise;
+		// Gate through `timed` so a setup regression (e.g. the lock call throwing
+		// before it signals) fails with a named timeout instead of hanging the runner.
+		await timed("first acquires lock", firstHasLockPromise);
 
 		const secondStart = Date.now();
 		const second = dialectB.transaction(async (tx) => {
@@ -92,8 +109,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 	});
 
 	it("different sandboxIds do not contend on the advisory lock", async () => {
-		const sandboxA = `lock-diff-a-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-		const sandboxB = `lock-diff-b-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const [sandboxA, sandboxB] = await Promise.all([newSandbox("lock-diff-a"), newSandbox("lock-diff-b")]);
 		const holdMs = 400;
 
 		const started = Date.now();
@@ -123,11 +139,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 
 	it("destroy-vs-write race: deleteSandbox blocks on an in-flight writer holding the lock", async () => {
 		// Create a sandbox first so the DELETE has something to remove.
-		const sandboxId = `lock-destroy-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-		await dialectC.transaction(async (tx) => {
-			await dialectC.createSandbox(tx, sandboxId);
-		});
-		createdSandboxIds.push(sandboxId);
+		const sandboxId = await newSandbox("lock-destroy");
 
 		const holdMs = 400;
 		let writerHasLock!: () => void;
@@ -142,7 +154,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 			return "writer-done";
 		});
 
-		await writerHasLockPromise;
+		await timed("writer acquires lock", writerHasLockPromise);
 
 		const destroyStart = Date.now();
 		const destroyer = dialectB.transaction(async (tx) => {
@@ -163,7 +175,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 	});
 
 	it("advisory lock is released on ROLLBACK so subsequent writers proceed immediately", async () => {
-		const sandboxId = `lock-rollback-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const sandboxId = await newSandbox("lock-rollback");
 
 		// First transaction acquires the lock then throws, forcing a ROLLBACK.
 		await expect(
@@ -186,7 +198,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 	});
 
 	it("read-only setSandboxContext does NOT block a concurrent writer", async () => {
-		const sandboxId = `lock-read-free-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const sandboxId = await newSandbox("lock-read-free");
 		const holdMs = 500;
 
 		// Reader acquires lock-free context and holds the transaction open.
@@ -200,7 +212,7 @@ describe.skipIf(SKIP)("PostgresDialect — per-sandbox advisory lock", () => {
 			await new Promise((r) => setTimeout(r, holdMs));
 		});
 
-		await readerReadyPromise;
+		await timed("reader opens context", readerReadyPromise);
 
 		// Writer must proceed without waiting on the reader.
 		const writerStart = Date.now();

@@ -5,7 +5,8 @@
  * simulate two API replicas. Verifies:
  *   1. Write on A → version bumps → next exec on B reloads and sees the write.
  *   2. Back-to-back execs on B with no intervening A write → no spurious reload.
- *   3. destroy() clears the version key so a re-created sandbox starts fresh.
+ *   3. destroy() tombstones the version key so a warm peer replica tears its
+ *      session down instead of serving ghost state (F7).
  *   4. Two alternating writes converge both replicas on the latest version.
  *
  * Skipped unless both DATABASE_URL and REDIS_URL are set.
@@ -14,6 +15,7 @@
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../sql-fs/index.js";
+import { VERSION_TOMBSTONE } from "../../../sql-fs/redis-path-snapshot.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
@@ -150,19 +152,37 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 		expect(sm.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(lsvBefore);
 	});
 
-	it("destroy clears the Redis version key", async () => {
+	it("destroy tombstones the version key and tears down a peer replica's warm session", async () => {
 		const sandboxId = newId();
-		const sm = makeSm();
+		const smA = makeSm();
+		const smB = makeSm();
 
-		await sm.withSession(TENANT, sandboxId, async (s) => {
+		await smA.withSession(TENANT, sandboxId, async (s) => {
 			await s.bash.exec("echo bye > /x.txt");
+		});
+		// B warms a session against the live sandbox before A destroys it.
+		await smB.withSession(TENANT, sandboxId, async (s) => {
+			expect(String(await s.fs.readFile("/x.txt")).trim()).toBe("bye");
 		});
 
 		expect(await redis.get(versionKey(sandboxId))).not.toBeNull();
 
-		await sm.destroy(TENANT, sandboxId);
+		await smA.destroy(TENANT, sandboxId);
 
-		expect(await redis.get(versionKey(sandboxId))).toBeNull();
+		// F7: a bare DEL would conflate "absent" with version 0, so a warm peer
+		// holding lastSeenVersion 0 would never reload and would serve ghost state
+		// forever. The sentinel is distinct and non-numeric, and inherits the
+		// version-key TTL so it self-cleans.
+		expect(await redis.get(versionKey(sandboxId))).toBe(VERSION_TOMBSTONE);
+		expect(await redis.ttl(versionKey(sandboxId))).toBeGreaterThan(0);
+
+		// The sentinel is what B's freshness probe keys off: its warm session is
+		// torn down and the request surfaces a clean ENOENT instead of ghost state.
+		await expect(
+			smB.withSession(TENANT, sandboxId, async (s) => {
+				await s.fs.readFile("/x.txt");
+			}),
+		).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("alternating writes across replicas converge on the latest version", async () => {

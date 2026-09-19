@@ -5,9 +5,12 @@
  * proves the same behaviour end-to-end against a live Redis server, exercising
  * real `SET NX PX` expiry and real Lua renew scripts:
  *
- *  1. A synchronous event-loop stall longer than the lease causes a genuine
- *     `LockLostError` (real Redis PX-expired the key) AND emits a `critical`
+ *  1. A synchronous event-loop stall longer than the lease genuinely loses the
+ *     lease (real Redis PX-expired the key) AND emits a `critical`
  *     `heartbeat_gap` — the previously-silent failure is now observable.
+ *     The guarded `fn` here returns before the overdue heartbeat fires, so the
+ *     loss surfaces as #175 M1's non-retryable `LockLostAfterCommitError`
+ *     (`ELOCKLOST_APPLIED`), not the retryable `LockLostError`.
  *  2. A second connection (a "peer replica") can acquire the lease that the
  *     stalled holder still believes it owns — the real split-brain window.
  *  3. The RW-lock writer flag behaves identically.
@@ -17,7 +20,7 @@
 
 import { Redis } from "ioredis";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { LockLostError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import { LockLostAfterCommitError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
 import { type RWLockKeys, rwLockKeys, withDistributedRWLock } from "../../distributed-rw-lock.js";
 
 const SKIP = !process.env.REDIS_URL;
@@ -109,7 +112,7 @@ describe.skipIf(SKIP)("F8 Layer-2 — heartbeat gap against real Redis", () => {
 					},
 					LOCK_OPTS,
 				),
-			).rejects.toBeInstanceOf(LockLostError);
+			).rejects.toBeInstanceOf(LockLostAfterCommitError);
 		} finally {
 			cap.restore();
 		}
@@ -149,7 +152,7 @@ describe.skipIf(SKIP)("F8 Layer-2 — heartbeat gap against real Redis", () => {
 				{ leaseMs: 2_000, renewMs: 500, acquireTimeoutMs: 8_000, acquireRetryMs: 50 },
 			);
 
-			await expect(holder).rejects.toBeInstanceOf(LockLostError);
+			await expect(holder).rejects.toBeInstanceOf(LockLostAfterCommitError);
 			await peerLock;
 		} finally {
 			cap.restore();
@@ -176,7 +179,7 @@ describe.skipIf(SKIP)("F8 Layer-2 — heartbeat gap against real Redis", () => {
 					},
 					{ ...LOCK_OPTS, readerLeaseMs: 5_000 },
 				),
-			).rejects.toBeInstanceOf(LockLostError);
+			).rejects.toBeInstanceOf(LockLostAfterCommitError);
 		} finally {
 			cap.restore();
 		}

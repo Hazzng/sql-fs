@@ -61,10 +61,14 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 		}
 		try {
 			for (const name of [dbName, ...scratchDbs]) {
+				// `usename = current_user`: an autovacuum worker attached to the scratch
+				// database runs as superuser, and a non-superuser test role terminating
+				// it raises — failing the suite in teardown. Only our own connections
+				// need evicting before the DROP.
 				await admin`
 					SELECT pg_terminate_backend(pid)
 					FROM pg_stat_activity
-					WHERE datname = ${name} AND pid <> pg_backend_pid()
+					WHERE datname = ${name} AND pid <> pg_backend_pid() AND usename = current_user
 				`;
 				await admin.unsafe(`DROP DATABASE IF EXISTS ${name}`);
 			}

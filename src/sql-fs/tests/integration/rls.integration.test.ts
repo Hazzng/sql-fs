@@ -11,12 +11,9 @@
  * Skipped when DATABASE_URL is not set so CI without a DB still passes.
  */
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
-
-const RLS_MIGRATION = fileURLToPath(new URL("../../migrations/postgres/0005_enable_rls.sql", import.meta.url));
+import { requireMigratedSchema } from "./helpers/schema-preconditions.js";
 
 describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — RLS sandbox isolation (0005)", () => {
 	const dialect = new PostgresDialect(process.env.DATABASE_URL!);
@@ -26,12 +23,9 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — RLS sandbox isol
 
 	beforeAll(async () => {
 		await dialect.connect();
-		// Apply the RLS migration idempotently so the test is valid even on a DB
-		// that was migrated before 0005 existed.
-		const ddl = readFileSync(RLS_MIGRATION, "utf8");
-		await dialect.transaction(async (tx) => {
-			await tx.unsafe(ddl);
-		});
+		// Assert 0005 rather than re-applying it: the DDL takes an AccessExclusiveLock
+		// on inodes/dirents/sandboxes and deadlocked the parallel integration run.
+		await requireMigratedSchema(process.env.DATABASE_URL!);
 		await dialect.transaction((tx) => dialect.createSandbox(tx, sandboxA, "owner-a"));
 		await dialect.transaction((tx) => dialect.createSandbox(tx, sandboxB, "owner-b"));
 	});
