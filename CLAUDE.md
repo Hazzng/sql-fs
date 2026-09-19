@@ -208,7 +208,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 |---|---|---|
 | `FS_BACKEND` | Yes | `postgres` | `memory` |
 | `DATABASE_URL` | SQL backends | Connection string (use pooler endpoint for Neon) |
-| `DATABASE_DIRECT_URL` | Postgres (migrations) | Direct connection (not pooler) for DDL |
+| `DATABASE_DIRECT_URL` | No | Direct (non-pooler) connection used **only** by drizzle-kit (`pnpm db:generate`). The boot-time migration runner uses `DATABASE_URL` and is pooler-safe. Falls back to `DATABASE_URL`. |
 | `FS_MOUNT_PATH` | FileShare backend | Mount path for Azure FileShare |
 | `PORT` | No (default: 8080) | HTTP server port |
 | `AUTH_SECRET` | Yes | Secret for Bearer token validation |

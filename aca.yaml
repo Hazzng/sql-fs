@@ -15,8 +15,6 @@ properties:
     secrets:
       - name: database-url
         value: "<POOLER_URL>"
-      - name: database-direct-url
-        value: "<DIRECT_URL>"
       - name: auth-secret
         value: "<AUTH_SECRET>"
       - name: redis-url
@@ -35,8 +33,6 @@ properties:
             value: postgres
           - name: DATABASE_URL
             secretRef: database-url
-          - name: DATABASE_DIRECT_URL
-            secretRef: database-direct-url
           - name: AUTH_SECRET
             secretRef: auth-secret
           - name: REDIS_URL
