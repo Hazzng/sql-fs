@@ -11,6 +11,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
+import { startEvictionPolicyCheck } from "../redis/eviction-policy.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
 import { installDriverFaultGuard, raceDriverFault } from "../sql-fs/driver-fault.js";
 import { translateSqlError } from "../sql-fs/errors.js";
@@ -351,6 +352,21 @@ if (isMain) {
 		// sweeper evicts idle MCP transports.
 		sessionManager.startReaper();
 		startMcpSessionSweeper();
+
+		// #188: the Redis backing the blob cache must evict under memory pressure.
+		// Under `noeviction` a full instance refuses writes and never recovers,
+		// because blob entries carry a 24h TTL. Warn only, and never await: a
+		// managed Redis that refuses CONFIG GET must still boot.
+		//
+		// #188 M8: only when this client actually carries data-plane state. With
+		// the blob cache off and no path snapshot, `REDIS_DATA_URL`'s fallback
+		// makes the data client the CONTROL instance, and a control-only Redis
+		// holds nothing evictable worth trading: paging its operator to switch to
+		// allkeys-* would make the exec-lock leases, version counters and destroy
+		// tombstones evictable — the remediation would be the outage.
+		startEvictionPolicyCheck(redisDataClient, {
+			carriesDataPlane: Boolean(blobCacheEnabled) || Boolean(pathSnapshotEnabled),
+		});
 
 		// F8: process-wide event-loop-lag monitor. Purely observational — surfaces
 		// the GC-pause / sync-stall class that can silently void a Redis lease
