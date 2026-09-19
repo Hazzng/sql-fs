@@ -8,6 +8,7 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
@@ -37,25 +38,41 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 
 const tenantConfig = loadTenantConfig();
 
-const redisClient = getRedisClient();
+// #167: two connections. `redisClient` (control) carries the locks, the version
+// counter and session state; `redisDataClient` carries the blob cache and path
+// snapshot. Multi-MiB cache writes must not head-of-line block an INCR.
+const redisClient = getRedisClient("control");
+// Read data-plane demand from env BEFORE opening the data connection: a
+// lock-only deployment (blob cache off, snapshot off) must not pay for a
+// second socket nothing will ever use. REDIS_DATA_URL falls back to REDIS_URL
+// inside getRedisClient, so calling it unconditionally would always connect.
+const blobCacheEnvEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const snapshotEnvEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+const redisDataClient = blobCacheEnvEnabled || snapshotEnvEnabled ? getRedisClient("data") : undefined;
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
 // them unconditionally would abort startup on a malformed Redis option even
 // in deployments that never touch Redis (REDIS_URL unset).
 const execLockOptions = redisClient ? loadExecLockOptions() : undefined;
 const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
-const pathSnapshotEnabled = redisClient && process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
+// Snapshots are version-checked against the control-side counter on every read
+// (and written only alongside its INCR), so without the control connection a
+// snapshot cache could never hit — require both clients.
+const pathSnapshotEnabled = redisClient !== undefined && redisDataClient !== undefined && snapshotEnvEnabled;
 const pathSnapshot =
-	pathSnapshotEnabled && redisClient
-		? new RedisPathSnapshot(redisClient, {
+	pathSnapshotEnabled && redisDataClient
+		? new RedisPathSnapshot(redisDataClient, {
 				ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
 			})
 		: undefined;
 
-const blobCacheEnabled = redisClient && process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
+const blobCacheEnabled = redisDataClient !== undefined && blobCacheEnvEnabled;
 const blobCacheOptions = blobCacheEnabled
 	? {
 			ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
 			maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
+			maxInFlight: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT", 32),
+			maxInFlightBytes: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES", 32 * 1024 * 1024),
+			breaker: getRedisCircuitBreaker("data"),
 		}
 	: undefined;
 
@@ -141,8 +158,8 @@ const sessionManager = new SessionManager({
 	rwlockEnabled,
 	pathSnapshot,
 	blobCacheFactory:
-		redisClient && blobCacheOptions
-			? (tenantId: string) => new RedisBlobCache(redisClient, tenantId, blobCacheOptions)
+		redisDataClient && blobCacheOptions
+			? (tenantId: string) => new RedisBlobCache(redisDataClient, tenantId, blobCacheOptions)
 			: undefined,
 	getSandboxMetaFn,
 	persistSandboxMetaFn,
