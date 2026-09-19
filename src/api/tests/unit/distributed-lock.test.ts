@@ -6,7 +6,13 @@
 
 import type { Redis } from "ioredis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LockAcquireTimeoutError, LockLostError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import {
+	LockAcquireTimeoutError,
+	LockLostAfterCommitError,
+	LockLostError,
+	execLockKey,
+	withDistributedLock,
+} from "../../distributed-lock.js";
 
 interface Entry {
 	value: string;
@@ -171,7 +177,9 @@ describe("withDistributedLock", () => {
 		expect(r.store.has(KEY)).toBe(false);
 	});
 
-	it("heartbeat failure surfaces as LockLostError", async () => {
+	// #175 M1: `fn` RETURNS here, so the guarded work is already durable — the
+	// loss must surface as the NON-retryable ELOCKLOST_APPLIED, not ELOCKLOST.
+	it("heartbeat failure after fn returns surfaces as LockLostAfterCommitError", async () => {
 		const r = fake();
 		r.forceRenewLost = true;
 		await expect(
@@ -185,7 +193,23 @@ describe("withDistributedLock", () => {
 				},
 				{ leaseMs: 5_000, renewMs: 20, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
 			),
-		).rejects.toBeInstanceOf(LockLostError);
+		).rejects.toMatchObject({ code: "ELOCKLOST_APPLIED" });
+	});
+
+	it("a heartbeat failure whose fn THREW still surfaces the retryable LockLostError", async () => {
+		const r = fake();
+		r.forceRenewLost = true;
+		const err = await withDistributedLock(
+			asRedis(r),
+			KEY,
+			async () => {
+				await new Promise((res) => setTimeout(res, 80));
+				throw new Error("aborted mid-script");
+			},
+			{ leaseMs: 5_000, renewMs: 20, acquireTimeoutMs: 5_000, acquireRetryMs: 10 },
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(LockLostError);
+		expect(err).not.toBeInstanceOf(LockLostAfterCommitError);
 	});
 
 	it("a transient renew failure that recovers does NOT lose the lock (H4)", async () => {

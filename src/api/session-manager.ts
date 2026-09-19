@@ -295,6 +295,11 @@ export interface Session {
 	 *    reaper would otherwise evict (discarding this in-memory flag) is healed
 	 *    first. The reaper also makes a best-effort publish before disconnect.
 	 *
+	 * #175: a turn that publishes only because this flag is set (it mutated
+	 * nothing of its own) never surfaces the failure — the retry is the drainer's
+	 * job, not that request's, and 503-ing it would blame a read for a write it
+	 * did not make.
+	 *
 	 * Cleared after a successful publish.
 	 */
 	publishPending: boolean;
@@ -735,7 +740,12 @@ export class SessionManager {
 		// in-memory cache mid-script (F4). It is intentionally less parallel than
 		// the RW lock; flag-off is a transient deploy state.
 		if (!this.rwlockEnabled) {
-			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+			// readOnly: the shared entry points run under a read-only scope, so a
+			// lease lost after `fn` returned still means "nothing applied" (#175 M1).
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, {
+				...this.execLockOptions,
+				readOnly: true,
+			});
 		}
 		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
 	}
@@ -1070,16 +1080,22 @@ export class SessionManager {
 		// publish a version/snapshot of it — that would authenticate the lie under a
 		// fresh stamp. Suppress INCR + snapshot, force the next ensureFreshCache to
 		// reload from Postgres (lastSeenVersion = -1), drop the pending publish, and
-		// surface ECOHERENCE so the client retries.
+		// surface ECOHERENCE_UNAPPLIED.
+		//
+		// #175: this is the NOT-APPLIED half of the coherence contract and must not
+		// share a code with the applied half below. Poison is only ever set after a
+		// failed COMMIT or an aborted script-tx — Postgres rolled the mutation back —
+		// so a retry cannot double-apply anything.
 		if (coherent.poisoned()) {
 			session.lastSeenVersion = -1;
 			session.publishPending = false;
 			// The reload that follows will fetch the truth from Postgres; there is
 			// nothing valid left to publish, so drop any pending retry for this key.
 			this.pendingPublishes.delete(this.sessionKey(tenantId, sandboxId));
-			throw Object.assign(new Error("ECOHERENCE: cache poisoned by failed reload; publish suppressed"), {
-				code: "ECOHERENCE",
-			});
+			throw Object.assign(
+				new Error("ECOHERENCE_UNAPPLIED: cache poisoned by failed reload; nothing was applied, retry is safe"),
+				{ code: "ECOHERENCE_UNAPPLIED" },
+			);
 		}
 		const dirty = coherent.wasDirty();
 		if (!dirty && !session.publishPending) return;
@@ -1102,9 +1118,27 @@ export class SessionManager {
 			// even if no further client traffic arrives on this replica (and before
 			// the reaper would evict the session, discarding `publishPending`).
 			this.pendingPublishes.set(this.sessionKey(tenantId, sandboxId), { tenantId, sandboxId });
-			throw Object.assign(new Error("ECOHERENCE: write committed but version publish failed; client should retry"), {
-				code: "ECOHERENCE",
-			});
+			// #175: this turn mutated nothing — it only piggy-backed a previous turn's
+			// stranded bump. Its own result is correct and durable, so it must not
+			// inherit that turn's 503; the drainer (and the next writer) heals the
+			// bump. Without this, a pure read on a session with `publishPending` set
+			// returns "write committed but version publish failed", which is a lie
+			// about a request that wrote nothing.
+			if (!dirty) {
+				console.error(JSON.stringify({ event: "version_incr_error_deferred", sandboxId }));
+				return;
+			}
+			// #175: the mutation IS committed in Postgres. Retrying re-applies a
+			// non-idempotent script, so the message must not instruct a retry — the
+			// old wording ("client should retry") contradicted the OpenAPI contract
+			// and told clients to do the one unsafe thing.
+			throw Object.assign(
+				new Error(
+					"ECOHERENCE: write committed but cross-replica version publish failed; " +
+						"the write IS applied — do not blindly retry",
+				),
+				{ code: "ECOHERENCE" },
+			);
 		}
 		try {
 			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);

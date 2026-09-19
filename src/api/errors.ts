@@ -27,8 +27,10 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"EINVAL",
 	"ELOCKTIMEOUT",
 	"ELOCKLOST",
+	"ELOCKLOST_APPLIED",
 	"ECOHERENCE",
 	"ESTALE",
+	"ECOHERENCE_UNAPPLIED",
 	"ERUNTIME_BUSY",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
@@ -75,6 +77,65 @@ function isConnectionClassSqlState(code: string | undefined): boolean {
 const UNAVAILABLE_ERROR_CODE = "EUNAVAILABLE";
 
 /**
+ * #175: codes for which the server *knows* the request applied nothing and the
+ * condition is transient — the breaker threw before the handler ran, or the
+ * script transaction was definitively rolled back. These are the only errors we
+ * advertise as `retryable: true`.
+ *
+ * `ECOHERENCE` is deliberately absent: the write committed to Postgres and only
+ * the cross-replica version publish failed, so a blind retry re-applies a
+ * non-idempotent script. So is `ELOCKLOST_APPLIED` — the lease lapsed only
+ * *after* the guarded work returned, so its transaction is already durable
+ * (#175 M1). So is the `08xxx` connection-exception class — a connection lost
+ * mid-COMMIT leaves the outcome in doubt, which is not the same as
+ * known-not-applied.
+ *
+ * `ELOCKLOST` is listed, and that is a claim about the FAILING OPERATION only:
+ * the F2-L1 guard rolls the script transaction back before COMMIT, and the
+ * read paths commit nothing. It is NOT a claim that the whole HTTP request
+ * applied nothing — see `isRetryableError`.
+ */
+const RETRY_SAFE_ERROR_CODES: ReadonlySet<string> = new Set([
+	"ESESSIONCLOSING",
+	"ESHUTTINGDOWN",
+	"ELOCKTIMEOUT",
+	"ELOCKLOST",
+	"ECOHERENCE_UNAPPLIED",
+	"ERUNTIME_BUSY",
+]);
+
+/**
+ * Whether a retry of the FAILING OPERATION is known to be both safe (that
+ * operation applied nothing) and worthwhile (the condition is transient).
+ * Surfaced to clients as the `retryable` field on every error body so a 503 no
+ * longer has to be disambiguated by enumerating `code` values (#175). `false`
+ * means "the effect may already be durable, or a retry will fail identically" —
+ * retry only when the call is idempotent.
+ *
+ * #175 M2 — SCOPE. The guarantee covers the single operation that threw, not
+ * the whole request. Routes that run several independent transactions can have
+ * committed an earlier one before a later one fails retryably: `POST
+ * /v1/sandboxes` persists the sandbox row, then creates the FS, then writes any
+ * initial files, each in its own transaction, and `withSession` opens no script
+ * transaction at all. A `53300` on a later step therefore answers
+ * `retryable: true` with the sandbox row already durable, so a blind retry
+ * orphans a sandbox that still shows in `GET /v1/sandboxes`. The same holds for
+ * ingest and for `ESESSIONCLOSING` raised between steps. For those
+ * non-idempotent multi-step routes, treat `retryable: true` as "retry, then
+ * reconcile" — list and clean up, or retry with an idempotency key of your own.
+ * Single-transaction routes (exec, the file routes) are fully covered.
+ */
+export function isRetryableError(err: unknown): boolean {
+	if (!(err instanceof Error)) return false;
+	const code = (err as Error & { code?: string }).code;
+	if (code === undefined) return false;
+	if (RETRY_SAFE_ERROR_CODES.has(code)) return true;
+	// Capacity refusals never got as far as running a statement. The 08xxx class
+	// is excluded on purpose — see RETRY_SAFE_ERROR_CODES.
+	return RETRYABLE_SQLSTATES.has(code);
+}
+
+/**
  * Returns a client-safe error `code`, the counterpart to `clientSafeErrorMessage`.
  * Use the two together: leaking the code while redacting the message still hands
  * clients raw driver identifiers (`ECONNRESET`, `CONNECTION_CLOSED`) and Postgres
@@ -102,13 +163,25 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * ELOOP          → 400  Bad Request (symlink loop)
  * EINVAL         → 400  Bad Request (invalid argument)
  * ELOCKTIMEOUT   → 503  Service Unavailable (distributed lock acquire timed out)
- * ELOCKLOST      → 503  Service Unavailable, RETRYABLE. As of F2-L1 the exec is
- *                       aborted (script-tx rolled back) BEFORE any commit when the
- *                       lease is definitively lost, so ELOCKLOST now genuinely
- *                       means "not committed" — safe for the client to retry.
- * 08xxx/53300/  → 503  Service Unavailable, RETRYABLE — the DB refused the
- * 53400/57P03          connection or is out of capacity, not a caller bug (#174).
+ * ELOCKLOST      → 503  Service Unavailable, RETRYABLE. F2-L1 aborts the exec
+ *                       (script-tx rolled back) BEFORE any commit when the lease is
+ *                       definitively lost, and the read paths commit nothing, so
+ *                       ELOCKLOST means "not committed" — safe to retry.
+ * ELOCKLOST_     → 503  Service Unavailable, NOT retryable. The lease was lost only
+ *   APPLIED             after the guarded work RETURNED — the heartbeat tick can land
+ *                       during the COMMIT itself or the INCR after it — so the write
+ *                       is durable and a retry re-applies it (#175 M1).
+ * ECOHERENCE     → 503  Service Unavailable, NOT retryable. The write COMMITTED;
+ *                       only the cross-replica version publish failed (#175).
+ * ECOHERENCE_    → 503  Service Unavailable, RETRYABLE. Coherence is broken but
+ *   UNAPPLIED           the transaction was rolled back, so nothing was applied.
+ * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
+ * 53400/57P03          out of capacity, not a caller bug (#174). Only the
+ *                      capacity SQLSTATEs are advertised retryable (#175).
  * others         → 500  Internal Server Error
+ *
+ * Status alone never answers "is a retry safe?" — six distinct codes share 503.
+ * `isRetryableError` is the discriminator, surfaced as the `retryable` field.
  */
 export function mapFsErrorToStatus(err: Error): number {
 	const code = (err as Error & { code?: string }).code;
@@ -142,12 +215,17 @@ export function mapFsErrorToStatus(err: Error): number {
 			// F2-L1: the exec is aborted + rolled back before any commit on a
 			// definitive lease loss, so ELOCKLOST is now retryable (not committed).
 			return 503;
+		case "ELOCKLOST_APPLIED":
+			// #175 M1: lease lost AFTER the work committed — 503, but not retryable.
+			return 503;
 		case "ECOHERENCE":
 			return 503;
 		case "ESTALE":
 			// Fencing epoch mismatch: a concurrent writer committed first.
 			// Safe to retry with a fresh scope.
 			return 409;
+		case "ECOHERENCE_UNAPPLIED":
+			return 503;
 		case "ERUNTIME_BUSY":
 			return 503;
 		default:

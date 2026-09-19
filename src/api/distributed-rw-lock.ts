@@ -18,8 +18,14 @@ import {
 	type RedisCircuitBreaker,
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
-export { LockAcquireTimeoutError, LockLostError } from "./distributed-lock.js";
-import { LockAcquireTimeoutError, LockLostError, jitteredDelayMs } from "./distributed-lock.js";
+export { LockAcquireTimeoutError, LockLostAfterCommitError, LockLostError } from "./distributed-lock.js";
+import {
+	LockAcquireTimeoutError,
+	LockLostAfterCommitError,
+	LockLostError,
+	jitteredDelayMs,
+	logLockLostAfterCommit,
+} from "./distributed-lock.js";
 import { recordHeartbeatGap } from "./event-loop-monitor.js";
 
 // ── Lua scripts ──────────────────────────────────────────────────────────────
@@ -469,7 +475,13 @@ async function runShared<T>(
 			if (lost) throw new LockLostError(keys.readers);
 			throw err;
 		}
-		if (lost) throw new LockLostError(keys.readers);
+		// #175 M1: the read completed. A shared holder runs under a read-only scope
+		// and commits nothing, so ELOCKLOST (retryable) is still the honest answer —
+		// but the lapse is worth a log line, since the result may be pre-writer.
+		if (lost) {
+			logLockLostAfterCommit(keys.readers, true);
+			throw new LockLostError(keys.readers);
+		}
 		return result;
 	} finally {
 		stopHeartbeat();
@@ -527,7 +539,13 @@ async function runExclusive<T>(
 			if (lost) throw new LockLostError(keys.writer);
 			throw err;
 		}
-		if (lost) throw new LockLostError(keys.writer);
+		// #175 M1: `fn` RETURNED, so the script transaction COMMITted and the
+		// version INCR already ran. Retryable ELOCKLOST here re-applies a durable
+		// non-idempotent write on any auto-retrying client.
+		if (lost) {
+			logLockLostAfterCommit(keys.writer, false);
+			throw new LockLostAfterCommitError(keys.writer);
+		}
 		return result;
 	} finally {
 		stopHeartbeat();

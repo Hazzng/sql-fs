@@ -44,6 +44,13 @@ export interface DistributedLockOptions {
 	 * lock is never cut short by the breaker.
 	 */
 	readonly errorBudgetMs: number;
+	/**
+	 * #175 M1: the guarded `fn` cannot produce durable effects (a read path under
+	 * a read-only scope). Only affects what is thrown when the lease is lost
+	 * *after* `fn` returned: read paths keep the retryable `ELOCKLOST`, write
+	 * paths get the non-retryable `ELOCKLOST_APPLIED`. Defaults to write.
+	 */
+	readonly readOnly?: boolean;
 }
 
 const DEFAULTS: DistributedLockOptions = {
@@ -113,6 +120,43 @@ export class LockLostError extends Error {
 }
 
 /**
+ * The lease was lost, but `fn` had ALREADY RETURNED — so the work it guarded is
+ * finished and, on a write path, its transaction has COMMITted.
+ *
+ * #175 M1: this used to surface as plain `LockLostError`, which the #175
+ * contract advertises `retryable: true` ("the server knows the request applied
+ * nothing"). The F2-L1 pre-commit guard closes the common case by keying off
+ * `lockLostSignal` before `endScope`, but `markLost()` fires from a heartbeat
+ * tick and can land during the COMMIT itself or the Redis INCR that follows it.
+ * Telling an auto-retrying client that a committed `echo L >> /counter.txt`
+ * applied nothing double-applies it. Distinct, non-retryable code instead.
+ *
+ * Only raised on paths whose `fn` can produce durable effects; the read paths
+ * (shared lock, read-only scope) keep the retryable `LockLostError`.
+ */
+export class LockLostAfterCommitError extends Error {
+	readonly code = "ELOCKLOST_APPLIED";
+	constructor(key: string) {
+		super(
+			`ELOCKLOST_APPLIED: lock ${key} was lost, but the operation had already completed — its effects are durable. Do not blindly retry.`,
+		);
+		this.name = "LockLostAfterCommitError";
+	}
+}
+
+/** Structured record of a lease lost after the guarded work already completed (#175 M1). */
+export function logLockLostAfterCommit(key: string, readOnly: boolean): void {
+	console.error(
+		JSON.stringify({
+			event: "lock_lost_post_commit",
+			key,
+			readOnly,
+			severity: readOnly ? "warn" : "critical",
+		}),
+	);
+}
+
+/**
  * Runs `fn` while holding the distributed lock identified by `key`.
  *
  * `fn` receives a `lostSignal` (`AbortSignal`) that aborts on a DEFINITIVE
@@ -124,7 +168,12 @@ export class LockLostError extends Error {
  * - Throws `LockAcquireTimeoutError` when the acquire loop exceeds
  *   `acquireTimeoutMs` without obtaining the lock.
  * - Throws `LockLostError` when the heartbeat discovers the lease is no
- *   longer owned by this caller (Redis returned non-1 or threw).
+ *   longer owned by this caller (Redis returned non-1 or threw) BEFORE `fn`
+ *   finished — nothing was committed, so the client may retry.
+ * - Throws `LockLostAfterCommitError` when the loss is only observed after `fn`
+ *   already returned: the work is durable, so the error must not be advertised
+ *   retryable (#175 M1). `opts.readOnly` keeps the retryable `LockLostError` on
+ *   paths that cannot write.
  *
  * The lock is always released in a `finally` branch; release errors are
  * logged but not rethrown (the lease will expire on its own).
@@ -259,7 +308,13 @@ export async function withDistributedLock<T>(
 			if (lost) throw new LockLostError(key);
 			throw err;
 		}
-		if (lost) throw new LockLostError(key);
+		// #175 M1: `fn` RETURNED, so its transaction already committed. A retryable
+		// ELOCKLOST here tells an auto-retrying client to re-apply a durable write.
+		if (lost) {
+			logLockLostAfterCommit(key, merged.readOnly === true);
+			if (merged.readOnly === true) throw new LockLostError(key);
+			throw new LockLostAfterCommitError(key);
+		}
 		return result;
 	} finally {
 		stopped = true;

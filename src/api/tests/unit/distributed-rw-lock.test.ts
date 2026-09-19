@@ -451,7 +451,10 @@ describe("withDistributedRWLock", () => {
 		).rejects.toBeInstanceOf(LockLostError);
 	});
 
-	it("exclusive: surfaces LockLostError when writer flag is force-deleted mid-fn", async () => {
+	// #175 M1: the writer's `fn` returns, so its transaction committed — the loss
+	// surfaces as the NON-retryable ELOCKLOST_APPLIED. The shared case above keeps
+	// ELOCKLOST: a reader commits nothing.
+	it("exclusive: surfaces ELOCKLOST_APPLIED when the flag is force-deleted after fn returns", async () => {
 		const r = fake();
 		// Force the heartbeat to detect loss
 		r.forceExclusiveRenewLost = true;
@@ -467,7 +470,7 @@ describe("withDistributedRWLock", () => {
 				},
 				{ ...FAST, renewMs: 20, leaseMs: 5_000 },
 			),
-		).rejects.toBeInstanceOf(LockLostError);
+		).rejects.toMatchObject({ code: "ELOCKLOST_APPLIED" });
 	});
 
 	// ── LockAcquireTimeoutError ───────────────────────────────────────────────
