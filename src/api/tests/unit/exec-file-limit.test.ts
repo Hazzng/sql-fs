@@ -223,8 +223,6 @@ describe("an exec that trips the ceiling fails with EFBIG, not bash's phantom EN
 		}
 	});
 
-	// #168 M13: MCP `file_read` is NOT an unconditional escape hatch — it refuses above
-	// MAX_MCP_READ_FILE_BYTES (16 MiB default). Only GET .../files/{path} is ungated.
 	it("qualifies MCP file_read rather than offering it unconditionally", async () => {
 		const err = await sm
 			.withSession(T, sandboxId, (session) => sm.execWithRuntimeThrottle(session, "cat /big.txt"))

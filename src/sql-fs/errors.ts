@@ -102,43 +102,22 @@ export function createEdriverfault(cause: Error): Error {
 }
 
 /**
- * EFBIG: a sandbox `exec` tried to read or produce a file larger than the
- * per-file exec ceiling (#168).
+ * EFBIG: sandbox exec tried to read or produce a file over the per-file ceiling (#168).
  *
- * The ceiling exists because just-bash's text utilities do their work as
- * synchronous string building on the main thread: measured, `sed s///g` blocks
- * the event loop 706 ms at 8 MiB and 2238 ms at 16 MiB, and 62.8% of that is GC
- * from allocation pressure, so yielding cannot help. Past ~2 s the stall stops
- * being a latency problem and becomes someone else's correctness problem —
- * `src/redis/client.ts` sets `commandTimeout: 2000`, so in-flight Redis commands
- * belonging to *other* tenants time out (observed as `rw_lock_writer_release_error`
- * against an unrelated sandbox).
- *
- * The message is a deliverable, not a label: the caller is an AI agent that has
- * to recover without a human, so it states that this is a limit rather than a
- * fault (do not retry the identical call), both numbers, the concrete smaller
- * calls to reach for, and the env var an operator would raise. It deliberately
- * avoids the words `sandboxes`/`/tmp`-style prefixes, which `sanitizeFsError`
- * would redact out of the remediation hint.
- *
- * The READ remedy names only routes that actually work. `IFileSystem` has no ranged
- * read and SqlFs implements no `readFileBytes`, so `head -c`, `tail -c`, `split -b`
- * and `sed -n` all reach `#readBytes`, which asserts off the whole entry size —
- * measured against the installed just-bash with an instrumented InMemoryFs, every
- * one of them re-trips this limit. Telling an autonomous agent "do not retry, do
- * this instead" and then handing it four commands that fail identically buys a
- * retry loop, so the message says so explicitly. `GET .../files/{path}` is the only
- * ungated read; MCP `file_read` has its own 16 MiB gate (`MAX_MCP_READ_FILE_BYTES`,
- * `mcp/tools.ts`), so it is offered with that qualification rather than as an
- * unconditional escape hatch.
+ * The message is the recovery path for an autonomous agent — do not retry, both sizes,
+ * routes that actually work, operator env var. Avoid `sandboxes`/`/tmp` prefixes;
+ * `sanitizeFsError` would redact them. Sibling HTTP/MCP caps are independently
+ * configured, so the remedy interpolates their live values rather than hardcoded defaults.
  */
 export function createEfbig(path: string, attemptedBytes: number, limitBytes: number, op: "read" | "write"): Error {
+	const mcpReadBytes = configuredBytes("MAX_MCP_READ_FILE_BYTES", 16 * 1024 * 1024);
+	const fileWriteBytes = configuredBytes("MAX_FILE_WRITE_BYTES", 50 * 1024 * 1024);
 	const preamble =
 		op === "read" ? `'${path}' is ${attemptedBytes} bytes` : `writing '${path}' would produce ${attemptedBytes} bytes`;
 	const remedy =
 		op === "read"
-			? "fetch it over HTTP with `GET .../files/{path}`, the one read path this limit does not apply to; MCP `file_read` also works, but only below its own 16 MiB ceiling (`MAX_MCP_READ_FILE_BYTES`). Slicing it in the sandbox does NOT help: `head -c`, `tail -c`, `split -b` and `sed -n` all read the whole file through the same call and re-trip this same limit"
-			: "write several smaller files (`split -b`, reading from a pipe rather than the oversized file), send large content in over HTTP with `PUT .../files/{path}` (MCP `file_write`), or change part of a file with `PATCH .../files/{path}` (MCP `file_edit`) instead of rewriting it whole. Those routes have their own, larger ceiling (`MAX_FILE_WRITE_BYTES`, 50 MiB by default)";
+			? `fetch it over HTTP with \`GET .../files/{path}\`, the one read path this limit does not apply to; MCP \`file_read\` is capped separately at ${mcpReadBytes} bytes (\`MAX_MCP_READ_FILE_BYTES\`). Slicing it in the sandbox does NOT help: \`head -c\`, \`tail -c\`, \`split -b\` and \`sed -n\` all read the whole file through the same call and re-trip this same limit`
+			: `write several smaller files (\`split -b\`, reading from a pipe rather than the oversized file), send large content in over HTTP with \`PUT .../files/{path}\` (MCP \`file_write\`), or change part of a file with \`PATCH .../files/{path}\` (MCP \`file_edit\`) instead of rewriting it whole. Those routes are capped independently at ${fileWriteBytes} bytes (\`MAX_FILE_WRITE_BYTES\`)`;
 	return makeFsError(
 		"EFBIG",
 		[
@@ -148,6 +127,14 @@ export function createEfbig(path: string, attemptedBytes: number, limitBytes: nu
 		].join(" "),
 		path,
 	);
+}
+
+/** Same parse as `positiveIntEnv`. Local — importing `api/lib/env` would cycle through `sql-fs.ts`. */
+function configuredBytes(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
 // ── Sensitive-pattern stripping ───────────────────────────────────────────────

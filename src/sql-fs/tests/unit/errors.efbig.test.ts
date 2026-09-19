@@ -8,11 +8,18 @@
  * later refactor cannot quietly degrade it back into a bare code.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { clientSafeErrorMessage } from "../../../api/errors.js";
 import { createEfbig, sanitizeFsError } from "../../errors.js";
 
+const DEFAULT_MCP_READ_BYTES = 16 * 1024 * 1024;
+const DEFAULT_FILE_WRITE_BYTES = 50 * 1024 * 1024;
+
 describe("createEfbig — message content", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
 	const readErr = createEfbig("/data/big.log", 17_825_792, 8_388_608, "read");
 	const writeErr = createEfbig("/out.txt", 52_428_800, 8_388_608, "write");
 
@@ -36,11 +43,6 @@ describe("createEfbig — message content", () => {
 		expect(writeErr.message).toContain("MAX_EXEC_FILE_BYTES");
 	});
 
-	// #168 M11: the read remedy used to recommend `head -c` / `tail -c` / `split -b` /
-	// `sed -n`. Checked empirically against the installed just-bash with an instrumented
-	// InMemoryFs, every one of them reads the WHOLE file (`IFileSystem` has no ranged read
-	// and SqlFs implements no `readFileBytes`), so each re-trips this same limit — the
-	// message was handing an autonomous agent a retry loop.
 	it("points a read caller at the one ungated route and warns the slicing commands do not help", () => {
 		expect(readErr.message).toContain("`GET .../files/{path}`, the one read path this limit does not apply to");
 		expect(readErr.message).toContain("Slicing it in the sandbox does NOT help");
@@ -49,21 +51,31 @@ describe("createEfbig — message content", () => {
 		}
 	});
 
-	// #168 M13: MCP `file_read` refuses above MAX_MCP_READ_FILE_BYTES (16 MiB default), so
-	// it must not be offered as an unconditional escape hatch the way HTTP GET can be.
-	it("qualifies MCP file_read with its own ceiling", () => {
-		expect(readErr.message).toContain("MCP `file_read` also works, but only below its own 16 MiB ceiling");
+	it("qualifies MCP file_read with the configured ceiling, not a hardcoded default", () => {
+		expect(readErr.message).toContain(`MCP \`file_read\` is capped separately at ${DEFAULT_MCP_READ_BYTES} bytes`);
 		expect(readErr.message).toContain("MAX_MCP_READ_FILE_BYTES");
+		expect(readErr.message).not.toContain("16 MiB");
 	});
 
 	it("tells a write caller to split the output, and names the write and edit routes", () => {
 		expect(writeErr.message).toContain("writing '/out.txt' would produce 52428800 bytes");
 		expect(writeErr.message).toContain("write several smaller files");
-		// `split -b` only helps a write when its INPUT is a pipe: pointed at the oversized
-		// file it re-trips the read side of the same cap.
 		expect(writeErr.message).toContain("reading from a pipe rather than the oversized file");
 		expect(writeErr.message).toContain("`PUT .../files/{path}` (MCP `file_write`)");
 		expect(writeErr.message).toContain("`PATCH .../files/{path}` (MCP `file_edit`)");
+		expect(writeErr.message).toContain(`capped independently at ${DEFAULT_FILE_WRITE_BYTES} bytes`);
+		expect(writeErr.message).toContain("MAX_FILE_WRITE_BYTES");
+		expect(writeErr.message).not.toContain("larger");
+		expect(writeErr.message).not.toContain("50 MiB");
+	});
+
+	it("interpolates overridden sibling caps so the remedy matches this process", () => {
+		vi.stubEnv("MAX_MCP_READ_FILE_BYTES", `${8 * 1024 * 1024}`);
+		vi.stubEnv("MAX_FILE_WRITE_BYTES", `${10 * 1024 * 1024}`);
+		const read = createEfbig("/x", 12 * 1024 * 1024, 10 * 1024 * 1024, "read");
+		const write = createEfbig("/x", 12 * 1024 * 1024, 10 * 1024 * 1024, "write");
+		expect(read.message).toContain(`capped separately at ${8 * 1024 * 1024} bytes`);
+		expect(write.message).toContain(`capped independently at ${10 * 1024 * 1024} bytes`);
 	});
 
 	// Same path, same numbers — only the direction differs, so a generic message that
