@@ -1,14 +1,13 @@
 import { Hono } from "hono";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
-import { mapFsErrorToStatus } from "../../errors.js";
 import { execRoutes } from "../../routes/exec.js";
 import { SessionManager } from "../../session-manager.js";
+import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "test-secret-for-exec-batch-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -30,11 +29,7 @@ function makeTestApp(sessionManager: SessionManager) {
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", execRoutes(sessionManager));
-	app.onError((err, c) => {
-		const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
-		const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-		return c.json({ error: err.message, code }, status);
-	});
+	app.onError(testErrorHandler);
 	return app;
 }
 

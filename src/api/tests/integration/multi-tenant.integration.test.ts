@@ -10,13 +10,11 @@
  */
 import { randomBytes, randomUUID } from "node:crypto";
 import { Hono } from "hono";
-import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { Redis } from "ioredis";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RedisPathSnapshot } from "../../../sql-fs/redis-path-snapshot.js";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
-import { mapFsErrorToStatus } from "../../errors.js";
 import { signToken } from "../../lib/jwt.js";
 import { runMigrations } from "../../migrations.js";
 import { execRoutes } from "../../routes/exec.js";
@@ -25,6 +23,7 @@ import { ingestRoutes } from "../../routes/ingest.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
 import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
+import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "phase-5-multi-tenant-secret-at-least-32b";
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;
@@ -73,13 +72,9 @@ function makeApp(tenantConfig: TenantConfig, redis: Redis) {
 	app.route("/v1/sandboxes", fileRoutes(sessionManager));
 	app.route("/v1/sandboxes", execRoutes(sessionManager));
 	app.route("/v1/sandboxes", ingestRoutes(sessionManager));
-	// Mirror server.ts global error handler so FS error codes (ENOENT etc.) map
-	// to the correct HTTP status instead of bubbling up as 500.
-	app.onError((err, c) => {
-		const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
-		const code = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-		return c.json({ error: err.message, code }, status);
-	});
+	// Shares server.ts's handler so FS error codes (ENOENT etc.) map to the
+	// correct HTTP status instead of bubbling up as 500.
+	app.onError(testErrorHandler);
 	return { app, sessionManager };
 }
 
