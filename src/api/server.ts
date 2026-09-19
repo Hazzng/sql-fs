@@ -12,6 +12,7 @@ import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
+import { installDriverFaultGuard, raceDriverFault } from "../sql-fs/driver-fault.js";
 import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
@@ -303,16 +304,40 @@ app.onError((err, c) => {
 	return c.json({ error: message, code, retryable }, status);
 });
 
+/**
+ * Boot migrations, behind the same driver-fault race as every other DB await (#169 M5).
+ *
+ * Before the guard, a driver fault here was an uncaught exception: loud, exit 1, the orchestrator
+ * restarts the replica. With the guard absorbing that frame and nothing ever settling the query
+ * the driver dropped, an unraced `runMigrations` hangs forever and the process never reaches
+ * `listen` — no health check to fail, no restart, nothing in the log after startup. Suppressing
+ * the crash without racing the await just trades a loud failure for a silent one.
+ *
+ * The race holds the process open (`refTimer`): pre-`serve()` the loop may have no other
+ * referenced handle, so an unref'd timer exits 0 before the verdict — skipping `startup_failed`
+ * and `process.exit(1)`, which leaves restart-on-failure deployments down with no log.
+ *
+ * Exported so the race is testable; the bootstrap below is the only production caller.
+ */
+export async function runStartupMigrations(): Promise<void> {
+	if (process.env.SKIP_STARTUP_MIGRATIONS === "true") return;
+	await raceDriverFault(() => runMigrations(tenantConfig), { refTimer: true });
+}
+
 // ── Server bootstrap (only when run as entry point) ───────────────────────────
 
 const isMain = process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/^.*\//, ""));
 
 if (isMain) {
+	// Before anything opens a connection: postgres.js can throw a fatal TypeError out of its own
+	// socket-write path when a backend is reaped mid-transaction, killing the replica and every
+	// other in-flight request on it (#169). The guard absorbs exactly that frame and fails the
+	// in-flight DB awaits with EDRIVERFAULT; everything else still crashes the process.
+	installDriverFaultGuard();
+
 	void (async () => {
 		try {
-			if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
-				await runMigrations(tenantConfig);
-			}
+			await runStartupMigrations();
 		} catch (err) {
 			console.error(JSON.stringify({ event: "startup_failed", error: (err as Error).message }));
 			process.exit(1);
