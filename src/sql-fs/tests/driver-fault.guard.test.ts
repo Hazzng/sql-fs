@@ -55,6 +55,22 @@ describe("driver fault guard (child process)", () => {
 		expect(code).toBe(0);
 	}, 60_000);
 
+	// Boot shape: no server handle yet, so the startup race refs its grace timer to reach the verdict.
+	it("holds a handle-less process open until the grace verdict when the startup race opts in", async () => {
+		const { code, stdout } = await runFixture("startup-ref");
+
+		expect(stdout).toContain("SURVIVED EDRIVERFAULT");
+		expect(code).toBe(0);
+	}, 60_000);
+
+	// Pins the default the opt-in avoids: unref'd exits a handle-less process 0 pre-verdict.
+	it("exits silently before the verdict when a handle-less race uses the default unref'd timer", async () => {
+		const { code, stdout } = await runFixture("startup-unref");
+
+		expect(stdout).not.toContain("SURVIVED");
+		expect(code).toBe(0);
+	}, 60_000);
+
 	// NEGATIVE GUARD: same error class, same message, our stack. Must still kill the process.
 	it("still dies on a look-alike TypeError thrown from our own code", async () => {
 		const { code, stdout, stderr } = await runFixture("lookalike-uncaught");
