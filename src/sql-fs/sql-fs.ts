@@ -55,6 +55,15 @@ function normalizeFsPath(p: string): string {
 
 const NEW_FILE_MODE = 0o644;
 
+/**
+ * `stat().identity`: just-bash 3.6's mv/cp refuse to replace an existing target unless they can
+ * prove it is a different file. Buffered placeholder ids are negative and real ids positive, so
+ * an id is unique within a scope, which is as long as one mv/cp compares them.
+ */
+function inodeIdentity(inodeId: bigint): string {
+	return inodeId.toString();
+}
+
 // just-bash seeds /dev only through sync fs methods, which SqlFs lacks, and routes
 // `> /dev/null` through the fs (vercel-labs/just-bash#558). Serving it virtually keeps
 // discarded output out of the journal and the DB.
@@ -66,6 +75,7 @@ const DEV_NULL_STAT: FsStat = {
 	mode: 0o666,
 	size: 0,
 	mtime: new Date(0),
+	identity: DEV_NULL,
 };
 
 /**
@@ -84,6 +94,7 @@ function validatePath(p: string): string {
 // publicly re-exported from the just-bash main entry point).
 type ReadFileOpts = Parameters<IFileSystem["readFile"]>[1];
 type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
+type CreateExclusiveOpts = Parameters<NonNullable<IFileSystem["createExclusive"]>>[1];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
 export const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
@@ -283,6 +294,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#scriptTxGeneration = 0;
 	#readOnlyDepth = 0;
+	/** Paths a `createExclusive` has claimed but not yet created. */
+	readonly #exclusiveClaims = new Set<string>();
 	/**
 	 * Buffered script-tx state (#166). `#mutations` is the ordered journal replayed
 	 * by `#flushMutations`; `#idRemap` binds the provisional ids the script handed
@@ -1524,6 +1537,34 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return;
+		await this.#writeFileAt(path, content, undefined);
+	}
+
+	/**
+	 * Atomically create an entry that must not exist, as just-bash 3.6's `mktemp` requires (it
+	 * refuses with ENOSYS otherwise). The check and the claim happen with no `await` between them,
+	 * so a concurrent create in the same script sees EEXIST; other writers are already excluded
+	 * by the sandbox exec lock. A directory gets its mode by chmod right after mkdir, which no
+	 * other reader can observe for the same reason.
+	 */
+	async createExclusive(inputPath: string, options: CreateExclusiveOpts): Promise<void> {
+		const path = validatePath(inputPath);
+		if (path === DEV_NULL || this.#pathCache.has(path) || this.#exclusiveClaims.has(path)) throw createEexist(path);
+		this.#requireParentDir(path);
+		this.#exclusiveClaims.add(path);
+		try {
+			if (options.directory) {
+				await this.mkdir(path);
+				await this.chmod(path, options.mode);
+			} else {
+				await this.#writeFileAt(path, new Uint8Array(0), options.mode);
+			}
+		} finally {
+			this.#exclusiveClaims.delete(path);
+		}
+	}
+
+	async #writeFileAt(path: string, content: FileContent, createMode: number | undefined): Promise<void> {
 		this.#assertWritable(path, "writeFile");
 		// Refuse to clobber an existing directory with a file (audit H2 #13). This
 		// also rejects writing to "/" (the root is a directory), closing #25.
@@ -1553,7 +1594,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// The write replaces the inode; carry the old file's mode onto the new one, as
 		// overwriting a file in place does.
 		const prior = this.#pathCache.get(path);
-		const mode = prior?.kind === INODE_KIND.FILE ? prior.mode : NEW_FILE_MODE;
+		const mode = createMode ?? (prior?.kind === INODE_KIND.FILE ? prior.mode : NEW_FILE_MODE);
 		const inodeId = await this.#mutateOne(
 			this.#putFileOp("writeFile", parentEntry.inodeId, name, mode, bytes.length, sha256, this.#blobArgFor(bytes)),
 		);
@@ -2003,6 +2044,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			mode: entry.mode,
 			size: entry.size,
 			mtime: entry.mtime,
+			identity: inodeIdentity(entry.inodeId),
 		};
 	}
 
@@ -2020,6 +2062,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			mode: entry.mode,
 			size: entry.size,
 			mtime: entry.mtime,
+			identity: inodeIdentity(entry.inodeId),
 		};
 	}
 
