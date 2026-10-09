@@ -22,7 +22,7 @@ import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
-import { createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
+import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -226,11 +226,18 @@ export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Recor
 		out.GIT_HTTP_USER = "x-access-token";
 		out.GIT_HTTP_PASSWORD = token;
 	}
-	for (const key of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] as const) {
-		const value = env[key];
-		if (value) out[key] = value;
-	}
 	return out;
+}
+
+/**
+ * The deployment's default commit identity. It goes to just-git as its fallback identity rather
+ * than into the sandbox env: GIT_AUTHOR_* env outranks `git -c user.*` and repo config, so as
+ * env it silently overrode both. Author values win; committer values fill in.
+ */
+export function buildGitIdentity(env: NodeJS.ProcessEnv = process.env): GitIdentity | undefined {
+	const name = env.GIT_AUTHOR_NAME || env.GIT_COMMITTER_NAME;
+	const email = env.GIT_AUTHOR_EMAIL || env.GIT_COMMITTER_EMAIL;
+	return name && email ? { name, email } : undefined;
 }
 
 const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
@@ -515,6 +522,7 @@ export class SessionManager {
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
 	private readonly sandboxBaseEnv: Record<string, string>;
+	private readonly gitIdentity: GitIdentity | undefined;
 	private shuttingDown = false;
 
 	constructor({
@@ -578,6 +586,7 @@ export class SessionManager {
 		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 		this.sandboxBaseEnv = buildSandboxBaseEnv();
+		this.gitIdentity = buildGitIdentity();
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -692,6 +701,7 @@ export class SessionManager {
 				// so a refused symlink cannot leave a poisoned index behind.
 				const gitCommand = createGitCommand({
 					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
+					identity: this.gitIdentity,
 				});
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
