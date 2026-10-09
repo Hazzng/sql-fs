@@ -13,10 +13,8 @@
  * is the path just-git actually resolved. A script may background several clones, so each
  * invocation gets its own scope via AsyncLocalStorage.
  *
- * Two more just-git gaps are covered here until upstream fixes them. Checkout never sets the
- * executable bit (blindmansion/just-git#10), so every file git writes is given the mode its index
- * entry records. And leading global options such as `-c` printed the help text and exited 0
- * without running the command (blindmansion/just-git#11), so they are handled before dispatch.
+ * just-git's checkout also never sets the executable bit (blindmansion/just-git#10), so every
+ * file git writes is given the mode its index entry records until upstream fixes that.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -27,6 +25,9 @@ import { createGit } from "just-git";
 
 /** just-git's network option: a policy object grants outbound transport, `false` blocks it. */
 type GitNetworkOption = NonNullable<Parameters<typeof createGit>[0]>["network"];
+
+/** just-git's identity override, derived because its type is not exported under a stable name. */
+export type GitIdentity = NonNullable<NonNullable<Parameters<typeof createGit>[0]>["identity"]>;
 
 /** just-git's custom transport hook — not exported from the package root, so derive it. */
 type GitFetchFunction = NonNullable<Exclude<GitNetworkOption, false | undefined>["fetch"]>;
@@ -85,74 +86,6 @@ async function removeResidue(fs: IFileSystem, targets: readonly CloneTarget[]): 
 async function isEmptyDir(fs: IFileSystem, path: string): Promise<boolean> {
 	if (!(await fs.stat(path)).isDirectory) return false;
 	return (await fs.readdir(path)).length === 0;
-}
-
-/** Leading options with nothing to do in a sandbox: there is no pager and no lock contention. */
-const NO_OP_GLOBAL_OPTIONS = new Set([
-	"--no-pager",
-	"-P",
-	"--paginate",
-	"-p",
-	"--no-optional-locks",
-	"--no-replace-objects",
-]);
-
-/** Leading options just-git answers itself. */
-const PASS_THROUGH_OPTIONS = new Set(["--version", "--help", "-h"]);
-
-/** `-c` keys whose value changes nothing here: no pager, editor, signing, colour or credential helper. */
-const NO_OP_CONFIG_KEY =
-	/^(?:commit\.gpgsign|tag\.gpgsign|core\.pager|core\.editor|sequence\.editor|safe\.directory|credential\.helper|protocol\.version|color\..+|advice\..+|pager\..+)$/;
-
-/**
- * `-c` identity keys and the env vars just-git reads for them. Real git lets an explicit
- * GIT_AUTHOR_* env beat `-c user.*`; here the sandbox's GIT_* defaults are fallbacks, so the `-c`
- * the caller typed wins.
- */
-const IDENTITY_CONFIG_ENV = new Map<string, readonly string[]>([
-	["user.name", ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"]],
-	["user.email", ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"]],
-]);
-
-interface GlobalOptions {
-	readonly args: string[];
-	readonly cwd: string;
-	readonly env: Map<string, string>;
-}
-
-/** Strip git's global options off the front of `args`, or explain which one cannot be honoured. */
-function parseGlobalOptions(args: string[], cwd: string, env: Map<string, string>): GlobalOptions | { error: string } {
-	let dir = cwd;
-	const overrides = new Map(env);
-	let i = 0;
-	while (i < args.length) {
-		const arg = args[i] as string;
-		if (arg === "-c") {
-			const pair = args[i + 1];
-			const eq = pair?.indexOf("=") ?? -1;
-			const key = pair === undefined ? "" : (eq < 0 ? pair : pair.slice(0, eq)).toLowerCase();
-			if (key === "") return { error: "git: -c needs a name=value argument\n" };
-			const vars = IDENTITY_CONFIG_ENV.get(key);
-			if (vars !== undefined) {
-				for (const name of vars) overrides.set(name, eq < 0 ? "" : (pair as string).slice(eq + 1));
-			} else if (!NO_OP_CONFIG_KEY.test(key)) {
-				return { error: `git: -c ${key} is not supported here; set it with \`git config ${key} <value>\` instead\n` };
-			}
-			i += 2;
-		} else if (arg === "-C") {
-			const path = args[i + 1];
-			if (path === undefined) return { error: "git: -C needs a path argument\n" };
-			if (path !== "") dir = posix.resolve(dir, path);
-			i += 2;
-		} else if (NO_OP_GLOBAL_OPTIONS.has(arg)) {
-			i += 1;
-		} else if (arg.startsWith("-") && !PASS_THROUGH_OPTIONS.has(arg)) {
-			return { error: `git: unknown option: ${arg}\n` };
-		} else {
-			break;
-		}
-	}
-	return { args: args.slice(i), cwd: dir, env: overrides };
 }
 
 /** `fs` with every path written through it added to `written`. */
@@ -321,10 +254,15 @@ function requireHttps(url: string, reason: string): void {
  *   {@link httpsOnlyGitFetch}), `false` blocks clone/fetch/push while leaving local git intact.
  *   Tests pass an in-process transport to run hermetically.
  */
-export function createGitCommand(options: { readonly network: GitNetworkOption }): Command {
+export function createGitCommand(options: {
+	readonly network: GitNetworkOption;
+	/** The deployment's commit identity: just-git's fallback, below env, `-c` and repo config. */
+	readonly identity?: GitIdentity;
+}): Command {
 	const scopes = new AsyncLocalStorage<CloneScope>();
 	const git = createGit({
 		network: options.network,
+		identity: options.identity,
 		hooks: {
 			preClone: async (event) => {
 				const scope = scopes.getStore();
@@ -339,16 +277,13 @@ export function createGitCommand(options: { readonly network: GitNetworkOption }
 	type GitContext = Parameters<typeof git.execute>[1];
 
 	return defineCommand("git", async (args, ctx): Promise<ExecResult> => {
-		const parsed = parseGlobalOptions(args, ctx.cwd, ctx.env as Map<string, string>);
-		if ("error" in parsed) return { stdout: "", stderr: parsed.error, exitCode: 129 };
-
 		const scope: CloneScope = { fs: ctx.fs, targets: [] };
 		const written = new Set<string>();
-		const gitCtx = { ...ctx, cwd: parsed.cwd, env: parsed.env } as GitContext;
+		const gitCtx = ctx as GitContext;
 		let result: ExecResult;
 		try {
 			result = await scopes.run(scope, () =>
-				git.execute(parsed.args, { ...gitCtx, fs: recordingWrites(ctx.fs, parsed.cwd, written) } as GitContext),
+				git.execute(args, { ...gitCtx, fs: recordingWrites(ctx.fs, ctx.cwd, written) } as GitContext),
 			);
 		} catch (err) {
 			// A throw skips the exit-code path below, and just-bash still commits the script.
