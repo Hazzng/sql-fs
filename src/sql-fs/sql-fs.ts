@@ -53,6 +53,21 @@ function normalizeFsPath(p: string): string {
 	return `/${stack.join("/")}`;
 }
 
+const NEW_FILE_MODE = 0o644;
+
+// just-bash seeds /dev only through sync fs methods, which SqlFs lacks, and routes
+// `> /dev/null` through the fs (vercel-labs/just-bash#558). Serving it virtually keeps
+// discarded output out of the journal and the DB.
+const DEV_NULL = "/dev/null";
+const DEV_NULL_STAT: FsStat = {
+	isFile: true,
+	isDirectory: false,
+	isSymbolicLink: false,
+	mode: 0o666,
+	size: 0,
+	mtime: new Date(0),
+};
+
 /**
  * Normalize and validate a path. Rejects null bytes (security risk).
  * Throws EINVAL for invalid paths.
@@ -1449,7 +1464,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * The scope matters as much as the sharing: a closure created inside `writeFile`
 	 * would sit in a context object holding every variable any sibling closure there
 	 * captures — the file's bytes included — and a journal entry that lives for the
-	 * whole script would keep them alive. Here it captures these six values and
+	 * whole script would keep them alive. Here it captures these seven values and
 	 * nothing else. `blobBytes` is undefined exactly when the caller already
 	 * committed and backfilled the blob.
 	 */
@@ -1457,6 +1472,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		kind: "writeFile" | "appendFile",
 		parentInodeId: bigint,
 		name: string,
+		mode: number,
 		size: number,
 		sha256: Uint8Array,
 		blobBytes: Uint8Array | undefined,
@@ -1471,7 +1487,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						this.#sandboxId,
 						this.#realId(parentInodeId),
 						name,
-						0o644,
+						mode,
 						size,
 						sha256,
 						blobBytes,
@@ -1490,7 +1506,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, blobBytes!);
 				const id = await this.#dialect.createInode(
 					tx,
-					{ sandboxId: this.#sandboxId, kind: INODE_KIND.FILE, mode: 0o644, size, contentSha256: sha256 },
+					{ sandboxId: this.#sandboxId, kind: INODE_KIND.FILE, mode, size, contentSha256: sha256 },
 					...this.#expectedEpochArgs(),
 				);
 				const oldInodeId = await this.#dialect.upsertDirent(tx, this.#realId(parentInodeId), name, id);
@@ -1507,6 +1523,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return;
 		this.#assertWritable(path, "writeFile");
 		// Refuse to clobber an existing directory with a file (audit H2 #13). This
 		// also rejects writing to "/" (the root is a directory), closing #25.
@@ -1527,10 +1544,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// hazard `#scriptTxLost` exists to prevent. Assert first, and route it through `#db` so a
 		// fault during the blob write is raced (it never settles on its own) and condemns the scope.
 		this.#assertScriptTxAlive();
-		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, bytes));
+		// An empty file needs no blob row (readers map a missing blob to empty bytes), and
+		// just-bash 3.6 truncates every `>` target with one before writing the output.
+		if (this.#dialect.commitBlob && bytes.byteLength > 0) {
+			await this.#db(() => this.#dialect.commitBlob!(sha256, bytes));
+		}
 
+		// The write replaces the inode; carry the old file's mode onto the new one, as
+		// overwriting a file in place does.
+		const prior = this.#pathCache.get(path);
+		const mode = prior?.kind === INODE_KIND.FILE ? prior.mode : NEW_FILE_MODE;
 		const inodeId = await this.#mutateOne(
-			this.#putFileOp("writeFile", parentEntry.inodeId, name, bytes.length, sha256, this.#blobArgFor(bytes)),
+			this.#putFileOp("writeFile", parentEntry.inodeId, name, mode, bytes.length, sha256, this.#blobArgFor(bytes)),
 		);
 
 		// Evict the displaced inode's bytes from contentCache so the dead entry
@@ -1544,7 +1569,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
-			mode: 0o644,
+			mode,
 			size: bytes.length,
 			mtime,
 			contentSha256: sha256,
@@ -1556,6 +1581,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return;
 		this.#assertWritable(path, "appendFile");
 		// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
@@ -1564,6 +1590,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const mtime = new Date();
 
 		const existing = this.#pathCache.get(path);
+		// Appending nothing changes nothing. just-bash 3.6 pre-opens every `>>` target with
+		// an empty append, which would otherwise read and rewrite the whole file.
+		if (bytes.byteLength === 0 && existing?.kind === INODE_KIND.FILE) return;
 		// The resulting size, not the appended chunk: `appendFile` materializes base+chunk in
 		// one buffer, and a file grown past the cap by repeated appends would then be unreadable
 		// from the same script. Checked off the cached size so the base blob is never fetched.
@@ -1595,10 +1624,21 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// F6: commit the CAS blob in its own short tx FIRST (see writeFile), under the same
 		// liveness assert and the same driver-fault race (#169 M4).
 		this.#assertScriptTxAlive();
-		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, fullBytes));
+		if (this.#dialect.commitBlob && fullBytes.byteLength > 0) {
+			await this.#db(() => this.#dialect.commitBlob!(sha256, fullBytes));
+		}
 
+		const mode = existing?.kind === INODE_KIND.FILE ? existing.mode : NEW_FILE_MODE;
 		const inodeId = await this.#mutateOne(
-			this.#putFileOp("appendFile", parentEntry.inodeId, name, fullBytes.length, sha256, this.#blobArgFor(fullBytes)),
+			this.#putFileOp(
+				"appendFile",
+				parentEntry.inodeId,
+				name,
+				mode,
+				fullBytes.length,
+				sha256,
+				this.#blobArgFor(fullBytes),
+			),
 		);
 
 		if (existing) this.#contentCache.delete(existing.inodeId);
@@ -1606,7 +1646,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
-			mode: 0o644,
+			mode,
 			size: fullBytes.length,
 			mtime,
 			contentSha256: sha256,
@@ -1901,6 +1941,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #readBytes(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return new Uint8Array(0);
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
@@ -1938,12 +1979,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async exists(inputPath: string): Promise<boolean> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
-		return this.#pathCache.has(path);
+		return path === DEV_NULL || this.#pathCache.has(path);
 	}
 
 	async stat(inputPath: string): Promise<FsStat> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return { ...DEV_NULL_STAT };
 		const lentry = this.#pathCache.get(path);
 		if (!lentry) throw createEnoent(path);
 
@@ -1967,6 +2009,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async lstat(inputPath: string): Promise<FsStat> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return { ...DEV_NULL_STAT };
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -2338,6 +2381,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async realpath(inputPath: string): Promise<string> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return path;
 		if (this.#bufferingWrites()) return this.#resolveFromCache(path).path;
 		// Read-only: skip the advisory lock.
 		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
