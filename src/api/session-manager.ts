@@ -274,18 +274,6 @@ export function deriveExecGitCredentials(
 
 const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/**
- * Export the per-request env names at the top of `script`. just-bash 3.6 sets `exec` env as
- * shell variables without exporting them, so `bash -c` and `bash script.sh` saw them empty
- * (vercel-labs/just-bash#439, unreleased); drop this once a release carries that fix. The
- * prefix shares the script's first line so `$LINENO` and error line numbers stay put, and only
- * valid names are emitted, so a request key can never become shell code.
- */
-export function exportExecEnv(script: string, env: Record<string, string> | undefined): string {
-	const names = env === undefined ? [] : Object.keys(env).filter((name) => SHELL_NAME.test(name));
-	return names.length === 0 ? script : `export ${names.join(" ")}; ${script}`;
-}
-
 function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(baseEnv)) {
@@ -1860,7 +1848,16 @@ export class SessionManager {
 			cwd: opts?.cwd ?? session.cwd,
 			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
 		};
-		const execScript = exportExecEnv(script, resolvedOpts.env);
+		// Bash cannot export these names. Keep them available to direct commands, but
+		// report the child-shell limitation without ever logging request values.
+		const unsupportedNames = Object.keys(resolvedOpts.env ?? {}).filter((name) => !SHELL_NAME.test(name));
+		if (unsupportedNames.length > 0) {
+			logAudit("exec_env_not_exported", {
+				tenantId: session.tenantId,
+				variableNames: unsupportedNames,
+				severity: "warn",
+			});
+		}
 
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
 		// EREADONLY before any DB call, so the per-script transaction has
@@ -1871,7 +1868,7 @@ export class SessionManager {
 			if (!inReadOnlyScope && session.scriptTx !== undefined) {
 				session.scriptTx.beginScope();
 				try {
-					const result = await session.bash.exec(execScript, resolvedOpts);
+					const result = await session.bash.exec(script, resolvedOpts);
 					// F2-L1: just-bash treats an aborted run as a RESOLVED result (exit
 					// 124), not a rejection — so a definitive lock loss would otherwise
 					// fall through to endScope() and COMMIT a partially-run script under a
@@ -1899,7 +1896,7 @@ export class SessionManager {
 					throw err;
 				}
 			}
-			const readOnlyResult = await session.bash.exec(execScript, resolvedOpts);
+			const readOnlyResult = await session.bash.exec(script, resolvedOpts);
 			if (ctx.exceeded !== undefined) throw ctx.exceeded;
 			return readOnlyResult;
 		};
