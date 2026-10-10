@@ -174,6 +174,38 @@ async function applyIndexModes(fs: IFileSystem, written: ReadonlySet<string>, li
 	}
 }
 
+/**
+ * just-git interprets a bare `-c user.name`/`user.email` as the string "true". Reject effective
+ * bare identity overrides conservatively, before they can author a commit with that identity.
+ * All other config validation and command dispatch stay with just-git.
+ */
+function missingIdentityConfigValue(args: readonly string[]): string | undefined {
+	const missing = new Set<string>();
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		let pair: string | undefined;
+		if (arg === "-c") {
+			pair = args[++i];
+			if (pair === undefined) break;
+		} else if (arg.startsWith("-c") && arg.length > 2) {
+			pair = arg.slice(2);
+		} else if (arg === "-C") {
+			i++;
+			continue;
+		} else if (arg === "-p" || arg === "-P" || arg === "--paginate" || arg === "--no-pager") {
+			continue;
+		} else {
+			break;
+		}
+		const equals = pair.indexOf("=");
+		const key = (equals < 0 ? pair : pair.slice(0, equals)).toLowerCase();
+		if (key !== "user.name" && key !== "user.email") continue;
+		if (equals < 0) missing.add(key);
+		else missing.delete(key);
+	}
+	return missing.values().next().value;
+}
+
 /** Redirect chains a git remote may send us through before we call it a loop. */
 const MAX_GIT_REDIRECTS = 5;
 
@@ -277,25 +309,39 @@ export function createGitCommand(options: {
 	type GitContext = Parameters<typeof git.execute>[1];
 
 	return defineCommand("git", async (args, ctx): Promise<ExecResult> => {
+		const missingIdentity = missingIdentityConfigValue(args);
+		if (missingIdentity !== undefined) {
+			return {
+				stdout: "",
+				stderr: `git: -c ${missingIdentity} requires an explicit value; use ${missingIdentity}=<value>\n`,
+				exitCode: 129,
+			};
+		}
 		const scope: CloneScope = { fs: ctx.fs, targets: [] };
 		const written = new Set<string>();
 		const gitCtx = ctx as GitContext;
 		let result: ExecResult;
+		let removed: string[];
 		try {
 			result = await scopes.run(scope, () =>
 				git.execute(args, { ...gitCtx, fs: recordingWrites(ctx.fs, ctx.cwd, written) } as GitContext),
 			);
+			removed = result.exitCode === 0 ? [] : await removeResidue(ctx.fs, scope.targets);
 		} catch (err) {
 			// A throw skips the exit-code path below, and just-bash still commits the script.
 			await removeResidue(ctx.fs, scope.targets);
 			throw err;
+		} finally {
+			// Cleanup runs first. Thrown checkouts and conflicted merges can still have written files.
+			try {
+				await applyIndexModes(ctx.fs, written, (root) =>
+					git.execute(["ls-files", "-s", "-z"], { ...gitCtx, cwd: root } as GitContext),
+				);
+			} catch {
+				// Best-effort: a mode-repair failure must not replace git's own result or exception.
+			}
 		}
 
-		const removed = result.exitCode === 0 ? [] : await removeResidue(ctx.fs, scope.targets);
-		// After the residue is gone, and on a non-zero exit too: a conflicted merge still wrote files.
-		await applyIndexModes(ctx.fs, written, (root) =>
-			git.execute(["ls-files", "-s", "-z"], { ...gitCtx, cwd: root } as GitContext),
-		);
 		if (removed.length === 0) return result;
 
 		// git's own stderr does not reliably end in a newline.

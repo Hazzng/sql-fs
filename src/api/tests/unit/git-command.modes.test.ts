@@ -78,7 +78,11 @@ describe("git wrapper — index modes on files git writes", () => {
 	});
 
 	it("leaves a file git did not write alone", async () => {
-		await sh("git clone -q src dst && cd dst && chmod 755 README.md && rm run.sh && git checkout -- run.sh");
+		const result = await sh(
+			"git clone -q src dst && cd dst && chmod 755 README.md && rm run.sh && git checkout -- run.sh",
+		);
+		expect(result.exitCode, result.stderr).toBe(0);
 		expect((await sh("stat -c %a dst/README.md")).stdout).toBe("755\n");
+		expect((await sh("stat -c %a dst/run.sh")).stdout).toBe("755\n");
 	});
 });

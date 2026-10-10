@@ -18,13 +18,18 @@ describe("git identity precedence", () => {
 	let env: BashOverSqlFs;
 
 	async function authorOf(commit: string, execEnv?: Record<string, string>): Promise<string> {
-		await env.bash.exec(`cd r && echo $RANDOM >> f && git add f && ${commit}`, execEnv ? { env: execEnv } : undefined);
+		const result = await env.bash.exec(
+			`cd r && echo $RANDOM >> f && git add f && ${commit}`,
+			execEnv ? { env: execEnv } : undefined,
+		);
+		expect(result.exitCode, result.stderr).toBe(0);
 		return (await env.bash.exec("cd r && git log -1 --format='%an <%ae>'")).stdout;
 	}
 
 	beforeEach(async () => {
 		env = await bashOverSqlFs({ customCommands: [createGitCommand({ network: false, identity: DEPLOYMENT })] });
-		await env.bash.exec("mkdir r && cd r && git init -q");
+		const result = await env.bash.exec("mkdir r && cd r && git init -q");
+		expect(result.exitCode, result.stderr).toBe(0);
 	});
 
 	it("falls back to the deployment identity", async () => {
@@ -33,6 +38,48 @@ describe("git identity precedence", () => {
 
 	it("lets git -c user.* beat the deployment identity", async () => {
 		expect(await authorOf("git -c user.name=x -c user.email=x@y.z commit -q -m m")).toBe("x <x@y.z>\n");
+	});
+
+	// Native git rejects valueless user.* when resolving commit identity. The sandbox rejects
+	// these effective bare overrides up front with usage exit 129, instead of authoring as "true".
+	it.each(["-c user.name", "-c user.email", "-c USER.NaMe", "-cUsEr.EmAiL"])(
+		"rejects a bare identity override %s before creating a commit",
+		async (override) => {
+			const result = await env.bash.exec(`cd r && echo hi > f && git add f && git ${override} commit -q -m m`);
+			expect(result.exitCode).toBe(129);
+			expect(result.stderr).toMatch(/user\.(name|email) requires an explicit value/);
+			expect((await env.bash.exec("cd r && git log --oneline")).exitCode).not.toBe(0);
+		},
+	);
+
+	it("validates identity overrides after leading directory and pager options", async () => {
+		const result = await env.bash.exec(
+			"echo hi > r/f && git -C r add f && git -C r --no-pager -c user.name commit -q -m m",
+		);
+		expect(result.exitCode).toBe(129);
+		expect(result.stderr).toContain("user.name requires an explicit value");
+	});
+
+	it("accepts a later explicit override of the same identity key", async () => {
+		expect(await authorOf("git -c USER.Name -c user.name=Chosen commit -q -m m")).toBe("Chosen <deploy@example.com>\n");
+	});
+
+	it("rejects a bare override after an explicit value", async () => {
+		const result = await env.bash.exec(
+			"cd r && echo hi > f && git add f && git -c user.name=Chosen -c USER.Name commit -q -m m",
+		);
+		expect(result.exitCode).toBe(129);
+		expect(result.stderr).toContain("user.name requires an explicit value");
+	});
+
+	it("leaves explicit empty identity values for just-git to reject", async () => {
+		const result = await env.bash.exec("cd r && echo hi > f && git add f && git -c user.name= commit -q -m m");
+		expect(result.exitCode).toBe(128);
+		expect(result.stderr).toContain("identity unknown");
+	});
+
+	it("still accepts bare boolean config keys", async () => {
+		expect(await authorOf("git -c core.filemode commit -q -m m")).toBe("Deploy Default <deploy@example.com>\n");
 	});
 
 	it("lets repo config beat the deployment identity", async () => {
