@@ -81,6 +81,26 @@ describe("per-request env reaches child shells", () => {
 		});
 	});
 
+	it.each([
+		["SHELLOPTS", "set -e", "braceexpand:errexit:hashall:interactive-comments"],
+		["BASHOPTS", "shopt -s nullglob", "globskipdots:nullglob"],
+	] as const)("keeps exported %s in a child shell", async (name, configure, inherited) => {
+		expect(await exec(`${configure}; export ${name}; bash -c 'echo "$${name}"'`, { FOO: "bar" })).toEqual({
+			stdout: `${inherited}\n`,
+			stderr: "",
+		});
+	});
+
+	it.each([
+		["SHELLOPTS", "set -e", "braceexpand:hashall:interactive-comments"],
+		["BASHOPTS", "shopt -s nullglob", "globskipdots"],
+	] as const)("uses the startup default for unexported %s", async (name, configure, defaultValue) => {
+		expect(await exec(`${configure}; bash -c 'echo "$${name}"'`, { FOO: "bar" })).toEqual({
+			stdout: `${defaultValue}\n`,
+			stderr: "",
+		});
+	});
+
 	it("keeps default PATH available after env -i starts a child shell", async () => {
 		expect(await exec('env -i bash -c \'printf "%s\\n" "$PATH"; echo usable\'', { FOO: "bar" })).toEqual({
 			stdout: "/usr/bin:/bin\nusable\n",
@@ -177,11 +197,68 @@ describe("per-request env reaches child shells", () => {
 			[
 				JSON.stringify({
 					tenantId: T,
+					sandboxId,
 					variableNames: ["A-B"],
+					omittedNameCount: 0,
+					truncatedNameCount: 0,
 					severity: "warn",
 					event: "exec_env_not_exported",
 				}),
 			],
+		]);
+	});
+
+	it("bounds the number and length of unsupported names in its audit warning", async () => {
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		const names = Array.from({ length: 100 }, (_, i) => `invalid-${i}-${"x".repeat(1000)}`);
+		const env = Object.fromEntries(names.map((name) => [name, "secret-value"]));
+		expect(await exec("echo ran", env)).toEqual({ stdout: "ran\n", stderr: "" });
+		expect(log).toHaveBeenCalledTimes(1);
+		const warning = JSON.parse(log.mock.calls[0]![0] as string);
+		expect(warning).toEqual({
+			tenantId: T,
+			sandboxId,
+			variableNames: names.slice(0, 20).map((name) => name.slice(0, 128)),
+			omittedNameCount: 80,
+			truncatedNameCount: 20,
+			severity: "warn",
+			event: "exec_env_not_exported",
+		});
+		expect(JSON.stringify(warning)).not.toContain("secret-value");
+		expect(JSON.stringify(warning).length).toBeLessThan(4000);
+	});
+
+	it("warns only once per warm session, even for later unsupported names", async () => {
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		await exec("true", { FOO: "valid" });
+		await exec("true", { "A-B": "secret-value" });
+		await exec("true", { "A-B": "another-secret" });
+		await exec("true", { "C-D": "different-name" });
+		expect(log).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(log.mock.calls[0]![0] as string).variableNames).toEqual(["A-B"]);
+	});
+
+	it("warns independently for separate sandboxes and tenants", async () => {
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		await exec("true", { "A-B": "secret-value" });
+		const otherSandboxId = `${sandboxId}-other`;
+		for (const [tenantId, id] of [
+			[T, otherSandboxId],
+			["other-tenant", sandboxId],
+		]) {
+			await sm.withSession(tenantId!, id!, (session) =>
+				sm.execWithRuntimeThrottle(session, "true", { env: { "A-B": "secret-value" } }),
+			);
+		}
+		expect(
+			log.mock.calls.map(([line]) => {
+				const warning = JSON.parse(line as string);
+				return [warning.tenantId, warning.sandboxId];
+			}),
+		).toEqual([
+			[T, sandboxId],
+			[T, otherSandboxId],
+			["other-tenant", sandboxId],
 		]);
 	});
 });

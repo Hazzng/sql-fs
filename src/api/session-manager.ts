@@ -266,6 +266,8 @@ export function deriveExecGitCredentials(
 }
 
 const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_ENV_AUDIT_NAMES = 20;
+const MAX_ENV_AUDIT_NAME_LENGTH = 128;
 
 function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
@@ -305,6 +307,7 @@ export interface Session {
 	readonly bash: Bash;
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
+	readonly sandboxId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
 	lastUsed: number;
 	inFlight: number;
@@ -471,6 +474,8 @@ export class RuntimeBackpressureError extends Error {
 export class SessionManager {
 	/** Keyed by `${tenantId}:${sandboxId}` to isolate colliding sandbox ids across tenants. */
 	private readonly sessions: Map<string, Session> = new Map();
+	/** Weak references keep warning deduplication bounded by the warm session lifetime. */
+	private readonly unsupportedEnvWarned = new WeakSet<Session>();
 	private readonly pending: Map<string, Promise<Session>> = new Map();
 	private readonly backends: Map<string, PerTenantBackend> = new Map();
 	private readonly tenantConfig: TenantConfig | undefined;
@@ -741,6 +746,7 @@ export class SessionManager {
 					bash,
 					runtimeOptions: resolvedRuntime,
 					tenantId,
+					sandboxId,
 					scriptTx,
 					lastUsed: Date.now(),
 					inFlight: 0,
@@ -1838,15 +1844,32 @@ export class SessionManager {
 			cwd: opts?.cwd ?? session.cwd,
 			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
 		};
-		// Bash cannot export these names. Keep them available to direct commands, but
-		// report the child-shell limitation without ever logging request values.
-		const unsupportedNames = Object.keys(resolvedOpts.env ?? {}).filter((name) => !SHELL_NAME.test(name));
-		if (unsupportedNames.length > 0) {
-			logAudit("exec_env_not_exported", {
-				tenantId: session.tenantId,
-				variableNames: unsupportedNames,
-				severity: "warn",
-			});
+		// Bash cannot export these names. Warn once per warm session with a bounded
+		// sample, without ever logging values or retaining caller-controlled names.
+		if (!this.unsupportedEnvWarned.has(session) && resolvedOpts.env !== undefined) {
+			const variableNames: string[] = [];
+			let omittedNameCount = 0;
+			let truncatedNameCount = 0;
+			for (const name in resolvedOpts.env) {
+				if (!Object.hasOwn(resolvedOpts.env, name) || SHELL_NAME.test(name)) continue;
+				if (variableNames.length >= MAX_ENV_AUDIT_NAMES) {
+					omittedNameCount++;
+					continue;
+				}
+				variableNames.push(name.slice(0, MAX_ENV_AUDIT_NAME_LENGTH));
+				if (name.length > MAX_ENV_AUDIT_NAME_LENGTH) truncatedNameCount++;
+			}
+			if (variableNames.length > 0) {
+				this.unsupportedEnvWarned.add(session);
+				logAudit("exec_env_not_exported", {
+					tenantId: session.tenantId,
+					sandboxId: session.sandboxId,
+					variableNames,
+					omittedNameCount,
+					truncatedNameCount,
+					severity: "warn",
+				});
+			}
 		}
 
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
