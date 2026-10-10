@@ -397,10 +397,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
+			this.#assertScriptGeneration(scopeGeneration);
 			const tx = this.#scriptTx as Tx;
 			return this.#db(() => fn(tx));
 		}
@@ -544,15 +546,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// scope is active would (a) auto-commit the write outside the scope — breaking
 		// atomicity — and (b) deadlock against the script-tx's advisory lock.
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
+			this.#assertScriptGeneration(scopeGeneration);
 			const scriptTx = this.#scriptTx as Tx;
 			const value = await this.#db(() => fn(scriptTx));
+			this.#assertScriptGeneration(scopeGeneration);
 			// Refresh tx-local epoch; composites advance version (mv twice).
 			if (this.#scriptEpoch !== undefined) {
-				this.#scriptEpoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+				const epoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+				this.#assertScriptGeneration(scopeGeneration);
+				this.#scriptEpoch = epoch;
 			}
 			return value;
 		}
@@ -579,7 +586,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	async #withWriteTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			const value = await this.#withTx(fn);
+			this.#assertScriptGeneration(scopeGeneration);
 			this.#scriptEpochLagging = true;
 			return value;
 		}
@@ -650,6 +659,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * mutated by its own call. Capture what it needs before returning it.
 	 */
 	async #mutate(op: MutationSpec<Tx>): Promise<readonly bigint[]> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		const mints = op.mints ?? 0;
 		if (this.#bufferingWrites()) {
 			this.#assertScriptTxAlive();
@@ -659,6 +669,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return minted;
 		}
 		const produced = op.composite ? await this.#withBareTx(op.run) : await this.#withWriteTx(op.run);
+		// An old transaction's late result must not publish rolled-back inodes to either cache.
+		if (scopeGeneration !== undefined) this.#assertScriptGeneration(scopeGeneration);
 		// The `undefined` slot exists only for the buffered replay, where a path the
 		// database produced no row for must be caught by the provisional sweep. Running
 		// eagerly the dialect contract is "return the id or throw", so the value passes
@@ -674,7 +686,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * same `undefined` into the cache rather than throwing.
 	 */
 	async #mutateOne(op: Omit<MutationSpec<Tx>, "mints">): Promise<bigint> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		const produced = await this.#mutate({ ...op, mints: 1 });
+		if (scopeGeneration !== undefined) this.#assertScriptGeneration(scopeGeneration);
 		return produced[0] as bigint;
 	}
 
@@ -885,34 +899,33 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	/**
-	 * Resolves a path to a readable inode entry, following symlinks.
-	 * Returns the final (non-symlink) PathCacheEntry.
-	 * Throws ENOENT if the path or its symlink target is missing from cache.
-	 * Throws ELOOP (via dialect.resolvePath) if a symlink loop is detected.
-	 */
-	/**
 	 * Symlink-following resolution served entirely from the pathCache (#166).
 	 *
 	 * Inside a buffered scope `dialect.resolvePath` is wrong twice over: the database
 	 * has not seen this script's journaled mutations, and pathCache ids are provisional
 	 * placeholders that can never equal a database id, so the id match below it would
 	 * miss even if the lookup succeeded. The pathCache is authoritative for the scope,
-	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard.
+	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard. A null entry
+	 * identifies the virtual device, which has no stored inode or cache entry.
 	 */
-	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry } {
+	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry | null } {
 		// Walks component by component, exactly as the dialect's `fs_resolve` does: a
 		// symlink in an INTERMEDIATE component has to be resolved and the remaining
 		// suffix continued from the target, because `/a/link/f` is never itself a
 		// pathCache key — only the resolved `/a/dir/f` is. `hops` is shared across the
 		// whole resolution so a cycle cannot escape by recursing.
 		let hops = 0;
-		const walk = (target: string): { path: string; entry: PathCacheEntry } => {
+		const walk = (target: string): { path: string; entry: PathCacheEntry | null } => {
+			if (target === DEV_NULL) return { path: target, entry: null };
+			if (target.startsWith(`${DEV_NULL}/`)) throw createEnotdir(DEV_NULL);
 			const root = this.#pathCache.get("/");
 			if (!root) throw createEnoent(path);
 			let current = "/";
 			let entry: PathCacheEntry = root;
-			for (const part of target.split("/")) {
-				if (part.length === 0) continue;
+			const parts = target.split("/").filter((part) => part.length > 0);
+			for (let i = 0; i < parts.length; i++) {
+				if (entry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
+				const part = parts[i]!;
 				const candidate = current === "/" ? `/${part}` : `${current}/${part}`;
 				const next = this.#pathCache.get(candidate);
 				if (!next) throw createEnoent(path);
@@ -920,10 +933,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					if (++hops > 40) throw createEloop(path);
 					const link = next.symlinkTarget;
 					if (link === undefined || link === null) throw createEnoent(path);
-					const resolved = walk(this.resolvePath(current, link));
-					current = resolved.path;
-					entry = resolved.entry;
-					continue;
+					// Resolve the remaining suffix with the target. `/dev` need not have an
+					// inode when a directory alias leads directly to the virtual `/dev/null`.
+					const resolved = this.resolvePath(current, link);
+					const suffix = parts.slice(i + 1).join("/");
+					return walk(suffix.length > 0 ? this.resolvePath(resolved, suffix) : resolved);
 				}
 				current = candidate;
 				entry = next;
@@ -933,11 +947,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return walk(path);
 	}
 
-	async #resolveReadEntry(path: string): Promise<PathCacheEntry> {
+	/** Resolve ordinary symlinks through the dialect, but virtual targets entirely from the cache. */
+	async #resolveReadEntry(path: string): Promise<PathCacheEntry | null> {
 		const entry = this.#pathCache.get(path);
-		if (!entry) throw createEnoent(path);
-		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
-		if (this.#bufferingWrites()) return this.#resolveFromCache(path).entry;
+		if (entry !== undefined && entry.kind !== INODE_KIND.SYMLINK) return entry;
+		const buffered = this.#bufferingWrites();
+		try {
+			const cached = this.#resolveFromCache(path);
+			if (cached.entry === null || buffered) return cached.entry;
+		} catch (err) {
+			// Outside a buffered scope, an incomplete cache must not replace the dialect's
+			// resolution of a stored symlink. Missing direct paths still fail locally.
+			if (buffered || entry === undefined || (err as { code?: string }).code !== "ENOENT") throw err;
+		}
 
 		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally.
 		// Read-only resolution: skip the per-sandbox advisory lock so reads
@@ -966,7 +988,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	/** Reserve all paths before awaiting, so overlapping multi-path operations cannot deadlock. */
 	async #withNamespaceMutation<T>(paths: readonly string[], run: () => Promise<T>): Promise<T> {
-		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
+		const scopeActive = this.#scriptScope;
+		const scopeGeneration = this.#scriptScopeGeneration;
 		const overlaps = (a: string, b: string): boolean =>
 			a === b || a === "/" || b === "/" || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 		const pending = [...this.#namespaceMutations].filter((mutation) =>
@@ -982,7 +1005,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#namespaceMutations.add(mutation);
 		try {
 			await Promise.all(pending.map((active) => active.done));
-			this.#assertScriptGeneration(scopeGeneration);
+			if (scopeActive !== this.#scriptScope || scopeGeneration !== this.#scriptScopeGeneration) {
+				throw this.#scriptTxLost ?? createEstale(this.#sandboxId);
+			}
+			this.#assertScriptGeneration(scopeActive ? scopeGeneration : undefined);
 			return await run();
 		} finally {
 			this.#namespaceMutations.delete(mutation);
@@ -992,6 +1018,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	/** Queued work and pending blob writes must not resume in a later or closed scope. */
 	#assertScriptGeneration(generation: number | undefined): void {
+		if (generation === undefined && this.#scriptScope) throw createEstale(this.#sandboxId);
 		if (generation !== undefined && (!this.#scriptScope || generation !== this.#scriptScopeGeneration)) {
 			throw this.#scriptTxLost ?? createEstale(this.#sandboxId);
 		}
@@ -2086,6 +2113,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (path === DEV_NULL) return new Uint8Array(0);
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
+		if (entry === null) return new Uint8Array(0);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 		// Before the cache lookup on purpose: a warm cache makes the DB round trip free
 		// but not the megabytes of string work the caller is about to do with the bytes.
@@ -2128,15 +2156,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return { ...DEV_NULL_STAT };
-		const lentry = this.#pathCache.get(path);
-		if (!lentry) throw createEnoent(path);
 
-		// stat follows symlinks at the final component. Audit M7: the previous
-		// one-hop `pathCache.get(symlinkTarget)` broke for relative targets (keys
-		// are absolute) and multi-hop chains (returned an intermediate symlink).
-		// Resolve through the dialect path resolver — the same one readFile and
-		// realpath use — so relative/chained targets and loops are handled.
-		const entry = lentry.kind === INODE_KIND.SYMLINK ? await this.#resolveReadEntry(path) : lentry;
+		// Use the same resolver as reads, including relative/chained aliases to the device.
+		const entry = await this.#resolveReadEntry(path);
+		if (entry === null) return { ...DEV_NULL_STAT };
 
 		return {
 			isFile: entry.kind === INODE_KIND.FILE,
@@ -2564,9 +2587,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async realpath(inputPath: string): Promise<string> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return path;
-		if (this.#bufferingWrites()) return this.#resolveFromCache(path).path;
+		const buffered = this.#bufferingWrites();
+		try {
+			const cached = this.#resolveFromCache(path);
+			if (cached.entry === null || buffered) return cached.path;
+		} catch (err) {
+			// The dialect remains the resolver for persisted paths outside a buffered scope.
+			if (buffered || (err as { code?: string }).code !== "ENOENT") throw err;
+		}
 		// Read-only: skip the advisory lock.
 		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
