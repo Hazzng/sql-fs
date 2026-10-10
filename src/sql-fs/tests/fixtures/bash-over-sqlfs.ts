@@ -4,7 +4,7 @@
  * filesystem with sync methods, which SqlFs does not have.
  */
 
-import { Bash } from "just-bash";
+import { Bash, type BashOptions } from "just-bash";
 import { SqlFs } from "../../sql-fs.js";
 import { type DialectProbe, makeProbeDialect } from "./buffered-dialect.js";
 
@@ -14,11 +14,11 @@ export interface BashOverSqlFs {
 	readonly probe: DialectProbe;
 }
 
-export async function bashOverSqlFs(): Promise<BashOverSqlFs> {
+export async function bashOverSqlFs(bashOptions: Omit<BashOptions, "fs"> = {}): Promise<BashOverSqlFs> {
 	const probe = makeProbeDialect();
 	const fs = new SqlFs({ dialect: probe.dialect, sandboxId: "s-redirect" });
 	await fs.ready();
-	const bash = new Bash({ fs, cwd: "/home/user" });
+	const bash = new Bash({ cwd: "/home/user", ...bashOptions, fs });
 	probe.calls.length = 0;
 	probe.windows.length = 0;
 	return { bash, fs, probe };
