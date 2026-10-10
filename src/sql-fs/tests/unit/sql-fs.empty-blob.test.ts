@@ -35,4 +35,23 @@ describe("SqlFs — empty content skips the blob commit", () => {
 		await fs.writeFile("/home/user/full.txt", "x");
 		expect(probe.calls).toContain("commitBlob");
 	});
+
+	it("omits composite cache backfill when truncating a cached file outside a buffered scope", async () => {
+		await fs.writeFile("/home/user/cached.txt", "previous bytes");
+		expect(fs._getContentCache().calculatedSize).toBeGreaterThan(0);
+		probe.calls.length = 0;
+		probe.compositeData.length = 0;
+		await fs.writeFile("/home/user/cached.txt", "");
+		expect(probe.calls).not.toContain("commitBlob");
+		expect(probe.compositeData).toEqual([undefined]);
+		expect(fs._getContentCache().calculatedSize).toBe(0);
+		expect(await fs.readFile("/home/user/cached.txt")).toBe("");
+		expect((await fs.stat("/home/user/cached.txt")).size).toBe(0);
+	});
+
+	it("still supplies empty bytes when the composite dialect cannot commit blobs separately", async () => {
+		probe.dialect.commitBlob = undefined;
+		await fs.writeFile("/home/user/empty.txt", "");
+		expect(probe.compositeData).toEqual([new Uint8Array(0)]);
+	});
 });
