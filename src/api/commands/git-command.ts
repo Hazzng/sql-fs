@@ -22,6 +22,7 @@ import { posix } from "node:path";
 import { defineCommand } from "just-bash";
 import type { Command, ExecResult, IFileSystem } from "just-bash";
 import { createGit } from "just-git";
+import { flattenTree, readCommit, revParse } from "just-git/repo";
 
 /** just-git's network option: a policy object grants outbound transport, `false` blocks it. */
 type GitNetworkOption = NonNullable<Parameters<typeof createGit>[0]>["network"];
@@ -43,6 +44,40 @@ interface CloneTarget {
 interface CloneScope {
 	readonly fs: IFileSystem;
 	readonly targets: CloneTarget[];
+	modeSelection?: ModeSelection;
+}
+
+interface ModeSelection {
+	readonly stage?: "2" | "3";
+	readonly source?: string;
+}
+
+/** Only checkout/restore explicitly select an unmerged stage or a separate source tree. */
+function modeSelectionFor(command: string, args: readonly string[]): ModeSelection | undefined {
+	if (command !== "checkout" && command !== "restore") return;
+	let ours = false;
+	let theirs = false;
+	let source: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--") break;
+		const equals = arg.indexOf("=");
+		const option = equals < 0 ? arg : arg.slice(0, equals);
+		// just-git ignores an assigned value for flags, including their --no- forms.
+		if (option === "--ours") ours = true;
+		else if (option === "--theirs") theirs = true;
+		else if (option === "--no-ours") ours = false;
+		else if (option === "--no-theirs") theirs = false;
+		else if (command === "restore") {
+			if (arg === "-s" || arg === "--source") source = args[++i];
+			else if (arg.startsWith("--source=")) source = arg.slice("--source=".length);
+			else if (/^-[qSW]*s/.test(arg)) {
+				const sourceAt = arg.indexOf("s") + 1;
+				source = arg.slice(sourceAt) || args[++i];
+			}
+		}
+	}
+	return { stage: ours ? "2" : theirs ? "3" : undefined, source: source || undefined };
 }
 
 /**
@@ -129,27 +164,67 @@ async function repoRootOf(fs: IFileSystem, start: string, memo: Map<string, stri
 
 type ListIndex = (root: string) => Promise<ExecResult>;
 
+function isRegularMode(mode: string | undefined): boolean {
+	return mode === "100755" || mode === "100644";
+}
+
+/** Git merges a regular file's mode independently of its conflicting content. */
+function mergedIndexMode(stages: ReadonlyMap<string, string>, selectedStage?: "2" | "3"): string | undefined {
+	const resolved = stages.get("0");
+	if (resolved !== undefined) return isRegularMode(resolved) ? resolved : undefined;
+	if (selectedStage !== undefined) {
+		const selected = stages.get(selectedStage);
+		return isRegularMode(selected) ? selected : undefined;
+	}
+	const ours = stages.get("2");
+	const theirs = stages.get("3");
+	// Mixed surviving file types have their own merge rules and may be renamed by git.
+	if ((ours !== undefined && !isRegularMode(ours)) || (theirs !== undefined && !isRegularMode(theirs))) return;
+	if (ours === undefined) return theirs;
+	if (theirs === undefined) return ours;
+	// An unchanged ours takes theirs; otherwise ours wins, including differing add/add modes.
+	return ours === stages.get("1") ? theirs : ours;
+}
+
 /** Absolute path to index mode for the worktree at `root`, or null when it has no readable index. */
-async function indexModes(listIndex: ListIndex, root: string): Promise<Map<string, string> | null> {
+async function indexModes(
+	listIndex: ListIndex,
+	root: string,
+	selectedStage?: "2" | "3",
+): Promise<Map<string, string> | null> {
 	const listing = await listIndex(root);
 	if (listing.exitCode !== 0) return null;
+	const byPath = new Map<string, Map<string, string>>();
 	const modes = new Map<string, string>();
 	// `ls-files -s -z`: "<mode> <hash> <stage>\t<path>\0", path relative to the worktree root.
 	for (const record of listing.stdout.split("\0")) {
 		const tab = record.indexOf("\t");
 		if (tab < 0) continue;
-		modes.set(posix.join(root, record.slice(tab + 1)), record.slice(0, record.indexOf(" ")));
+		const [mode, , stage] = record.slice(0, tab).split(" ");
+		if (mode === undefined || stage === undefined || !/^[0-3]$/.test(stage)) continue;
+		const path = posix.join(root, record.slice(tab + 1));
+		const stages = byPath.get(path) ?? new Map<string, string>();
+		stages.set(stage, mode);
+		byPath.set(path, stages);
+	}
+	for (const [path, stages] of byPath) {
+		const mode = mergedIndexMode(stages, selectedStage);
+		if (mode !== undefined) modes.set(path, mode);
 	}
 	return modes;
 }
 
 /**
- * Give each file git wrote the mode its index entry records: 755 for `100755`, 644 for `100644`.
+ * Give each regular file git wrote its index mode, merging unmerged stages as Git does.
  * Only those files change, as with real git, so a caller's own uncommitted chmod on any other file
  * stays. A branch switch where a file differs only in mode is not covered: just-git neither
  * rewrites that file nor updates its index entry, so there is no correct mode to read.
  */
-async function applyIndexModes(fs: IFileSystem, written: ReadonlySet<string>, listIndex: ListIndex): Promise<void> {
+async function applyIndexModes(
+	fs: IFileSystem,
+	written: ReadonlySet<string>,
+	readModes: (root: string) => Promise<Map<string, string> | null>,
+): Promise<void> {
 	const byRoot = new Map<string, string[]>();
 	const memo = new Map<string, string | null>();
 	for (const path of written) {
@@ -162,13 +237,15 @@ async function applyIndexModes(fs: IFileSystem, written: ReadonlySet<string>, li
 	}
 
 	for (const [root, paths] of byRoot) {
-		const modes = await indexModes(listIndex, root);
+		const modes = await readModes(root);
 		if (modes === null) continue;
 		for (const path of paths) {
 			const mode = modes.get(path);
 			if (mode !== "100755" && mode !== "100644") continue;
 			if (!(await fs.exists(path))) continue;
-			const executable = ((await fs.stat(path)).mode & 0o111) !== 0;
+			const stat = await fs.lstat(path);
+			if (!stat.isFile || stat.isSymbolicLink) continue;
+			const executable = (stat.mode & 0o111) !== 0;
 			if (executable !== (mode === "100755")) await fs.chmod(path, mode === "100755" ? 0o755 : 0o644);
 		}
 	}
@@ -296,6 +373,10 @@ export function createGitCommand(options: {
 		network: options.network,
 		identity: options.identity,
 		hooks: {
+			beforeCommand: (event) => {
+				const scope = scopes.getStore();
+				if (scope !== undefined) scope.modeSelection = modeSelectionFor(event.command, event.args);
+			},
 			preClone: async (event) => {
 				const scope = scopes.getStore();
 				if (scope === undefined) return;
@@ -334,9 +415,23 @@ export function createGitCommand(options: {
 		} finally {
 			// Cleanup runs first. Thrown checkouts and conflicted merges can still have written files.
 			try {
-				await applyIndexModes(ctx.fs, written, (root) =>
-					git.execute(["ls-files", "-s", "-z"], { ...gitCtx, cwd: root } as GitContext),
-				);
+				await applyIndexModes(ctx.fs, written, async (root) => {
+					const source = scope.modeSelection?.source;
+					if (source !== undefined) {
+						const repo = await git.findRepo({ fs: gitCtx.fs, cwd: root });
+						if (repo === null) return null;
+						const hash = await revParse(repo, `${source}^{commit}`);
+						if (hash === null) return null;
+						const commit = await readCommit(repo, hash);
+						const entries = await flattenTree(repo, commit.tree);
+						return new Map(entries.map((entry) => [posix.join(root, entry.path), entry.mode]));
+					}
+					return indexModes(
+						() => git.execute(["ls-files", "-s", "-z"], { ...gitCtx, cwd: root } as GitContext),
+						root,
+						scope.modeSelection?.stage,
+					);
+				});
 			} catch {
 				// Best-effort: a mode-repair failure must not replace git's own result or exception.
 			}
