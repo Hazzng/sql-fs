@@ -53,6 +53,31 @@ function normalizeFsPath(p: string): string {
 	return `/${stack.join("/")}`;
 }
 
+const NEW_FILE_MODE = 0o644;
+
+/**
+ * `stat().identity`: just-bash 3.6's mv/cp refuse to replace an existing target unless they can
+ * prove it is a different file. Buffered placeholder ids are negative and real ids positive, so
+ * an id is unique within a scope, which is as long as one mv/cp compares them.
+ */
+function inodeIdentity(inodeId: bigint): string {
+	return inodeId.toString();
+}
+
+// just-bash seeds /dev only through sync fs methods, which SqlFs lacks, and routes
+// `> /dev/null` through the fs (vercel-labs/just-bash#558). Serving it virtually keeps
+// discarded output out of the journal and the DB.
+const DEV_NULL = "/dev/null";
+const DEV_NULL_STAT: FsStat = {
+	isFile: true,
+	isDirectory: false,
+	isSymbolicLink: false,
+	mode: 0o666,
+	size: 0,
+	mtime: new Date(0),
+	identity: DEV_NULL,
+};
+
 /**
  * Normalize and validate a path. Rejects null bytes (security risk).
  * Throws EINVAL for invalid paths.
@@ -61,7 +86,9 @@ function validatePath(p: string): string {
 	if (p.includes("\0")) {
 		throw createEinval(p);
 	}
-	return normalizeFsPath(p);
+	const path = normalizeFsPath(p);
+	if (path.startsWith(`${DEV_NULL}/`)) throw createEnotdir(DEV_NULL);
+	return path;
 }
 
 // Extract optional-parameter types from IFileSystem to avoid importing
@@ -69,6 +96,7 @@ function validatePath(p: string): string {
 // publicly re-exported from the just-bash main entry point).
 type ReadFileOpts = Parameters<IFileSystem["readFile"]>[1];
 type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
+type CreateExclusiveOpts = Parameters<NonNullable<IFileSystem["createExclusive"]>>[1];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
 export const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
@@ -228,6 +256,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#prewarmQueued = false;
 	#scriptScope = false;
+	/** Stable across opening the DB transaction, unlike #scriptTxGeneration. */
+	#scriptScopeGeneration = 0;
 	#scriptTx: Tx | undefined;
 	#scriptTxEnd: (() => void) | undefined;
 	#scriptTxAbort: ((err: Error) => void) | undefined;
@@ -268,6 +298,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#scriptTxGeneration = 0;
 	#readOnlyDepth = 0;
+	/** In-flight namespace changes. Overlapping paths wait; independent siblings do not. */
+	readonly #namespaceMutations = new Set<{ paths: readonly string[]; done: Promise<void> }>();
 	/**
 	 * Buffered script-tx state (#166). `#mutations` is the ordered journal replayed
 	 * by `#flushMutations`; `#idRemap` binds the provisional ids the script handed
@@ -365,10 +397,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #withTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
+			this.#assertScriptGeneration(scopeGeneration);
 			const tx = this.#scriptTx as Tx;
 			return this.#db(() => fn(tx));
 		}
@@ -512,15 +546,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// scope is active would (a) auto-commit the write outside the scope — breaking
 		// atomicity — and (b) deadlock against the script-tx's advisory lock.
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			this.#assertScriptTxAlive();
 			if (this.#scriptTx === undefined) {
 				await this.#openScriptTx();
 			}
+			this.#assertScriptGeneration(scopeGeneration);
 			const scriptTx = this.#scriptTx as Tx;
 			const value = await this.#db(() => fn(scriptTx));
+			this.#assertScriptGeneration(scopeGeneration);
 			// Refresh tx-local epoch; composites advance version (mv twice).
 			if (this.#scriptEpoch !== undefined) {
-				this.#scriptEpoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+				const epoch = await this.#db(() => this.#dialect.getSandboxEpoch(scriptTx, this.#sandboxId));
+				this.#assertScriptGeneration(scopeGeneration);
+				this.#scriptEpoch = epoch;
 			}
 			return value;
 		}
@@ -547,7 +586,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	async #withWriteTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		if (this.#scriptScope) {
+			const scopeGeneration = this.#scriptScopeGeneration;
 			const value = await this.#withTx(fn);
+			this.#assertScriptGeneration(scopeGeneration);
 			this.#scriptEpochLagging = true;
 			return value;
 		}
@@ -618,6 +659,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * mutated by its own call. Capture what it needs before returning it.
 	 */
 	async #mutate(op: MutationSpec<Tx>): Promise<readonly bigint[]> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		const mints = op.mints ?? 0;
 		if (this.#bufferingWrites()) {
 			this.#assertScriptTxAlive();
@@ -627,6 +669,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			return minted;
 		}
 		const produced = op.composite ? await this.#withBareTx(op.run) : await this.#withWriteTx(op.run);
+		// An old transaction's late result must not publish rolled-back inodes to either cache.
+		if (scopeGeneration !== undefined) this.#assertScriptGeneration(scopeGeneration);
 		// The `undefined` slot exists only for the buffered replay, where a path the
 		// database produced no row for must be caught by the provisional sweep. Running
 		// eagerly the dialect contract is "return the id or throw", so the value passes
@@ -642,7 +686,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * same `undefined` into the cache rather than throwing.
 	 */
 	async #mutateOne(op: Omit<MutationSpec<Tx>, "mints">): Promise<bigint> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		const produced = await this.#mutate({ ...op, mints: 1 });
+		if (scopeGeneration !== undefined) this.#assertScriptGeneration(scopeGeneration);
 		return produced[0] as bigint;
 	}
 
@@ -853,34 +899,33 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	/**
-	 * Resolves a path to a readable inode entry, following symlinks.
-	 * Returns the final (non-symlink) PathCacheEntry.
-	 * Throws ENOENT if the path or its symlink target is missing from cache.
-	 * Throws ELOOP (via dialect.resolvePath) if a symlink loop is detected.
-	 */
-	/**
 	 * Symlink-following resolution served entirely from the pathCache (#166).
 	 *
 	 * Inside a buffered scope `dialect.resolvePath` is wrong twice over: the database
 	 * has not seen this script's journaled mutations, and pathCache ids are provisional
 	 * placeholders that can never equal a database id, so the id match below it would
 	 * miss even if the lookup succeeded. The pathCache is authoritative for the scope,
-	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard.
+	 * so walk it directly. Mirrors the dialect's 40-hop ELOOP guard. A null entry
+	 * identifies the virtual device, which has no stored inode or cache entry.
 	 */
-	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry } {
+	#resolveFromCache(path: string): { path: string; entry: PathCacheEntry | null } {
 		// Walks component by component, exactly as the dialect's `fs_resolve` does: a
 		// symlink in an INTERMEDIATE component has to be resolved and the remaining
 		// suffix continued from the target, because `/a/link/f` is never itself a
 		// pathCache key — only the resolved `/a/dir/f` is. `hops` is shared across the
 		// whole resolution so a cycle cannot escape by recursing.
 		let hops = 0;
-		const walk = (target: string): { path: string; entry: PathCacheEntry } => {
+		const walk = (target: string): { path: string; entry: PathCacheEntry | null } => {
+			if (target === DEV_NULL) return { path: target, entry: null };
+			if (target.startsWith(`${DEV_NULL}/`)) throw createEnotdir(DEV_NULL);
 			const root = this.#pathCache.get("/");
 			if (!root) throw createEnoent(path);
 			let current = "/";
 			let entry: PathCacheEntry = root;
-			for (const part of target.split("/")) {
-				if (part.length === 0) continue;
+			const parts = target.split("/").filter((part) => part.length > 0);
+			for (let i = 0; i < parts.length; i++) {
+				if (entry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(current);
+				const part = parts[i]!;
 				const candidate = current === "/" ? `/${part}` : `${current}/${part}`;
 				const next = this.#pathCache.get(candidate);
 				if (!next) throw createEnoent(path);
@@ -888,10 +933,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					if (++hops > 40) throw createEloop(path);
 					const link = next.symlinkTarget;
 					if (link === undefined || link === null) throw createEnoent(path);
-					const resolved = walk(this.resolvePath(current, link));
-					current = resolved.path;
-					entry = resolved.entry;
-					continue;
+					// Resolve the remaining suffix with the target. `/dev` need not have an
+					// inode when a directory alias leads directly to the virtual `/dev/null`.
+					const resolved = this.resolvePath(current, link);
+					const suffix = parts.slice(i + 1).join("/");
+					return walk(suffix.length > 0 ? this.resolvePath(resolved, suffix) : resolved);
 				}
 				current = candidate;
 				entry = next;
@@ -901,11 +947,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return walk(path);
 	}
 
-	async #resolveReadEntry(path: string): Promise<PathCacheEntry> {
+	/** Resolve ordinary symlinks through the dialect, but virtual targets entirely from the cache. */
+	async #resolveReadEntry(path: string): Promise<PathCacheEntry | null> {
 		const entry = this.#pathCache.get(path);
-		if (!entry) throw createEnoent(path);
-		if (entry.kind !== INODE_KIND.SYMLINK) return entry;
-		if (this.#bufferingWrites()) return this.#resolveFromCache(path).entry;
+		if (entry !== undefined && entry.kind !== INODE_KIND.SYMLINK) return entry;
+		const buffered = this.#bufferingWrites();
+		try {
+			const cached = this.#resolveFromCache(path);
+			if (cached.entry === null || buffered) return cached.entry;
+		} catch (err) {
+			// Outside a buffered scope, an incomplete cache must not replace the dialect's
+			// resolution of a stored symlink. Missing direct paths still fail locally.
+			if (buffered || entry === undefined || (err as { code?: string }).code !== "ENOENT") throw err;
+		}
 
 		// Follow symlink via dialect path resolver — ELOOP/ENOENT propagate naturally.
 		// Read-only resolution: skip the per-sandbox advisory lock so reads
@@ -930,6 +984,55 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (!parentEntry) throw createEnoent(parentPath);
 		if (parentEntry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(parentPath);
 		return { parentPath, name, parentEntry };
+	}
+
+	/** Reserve all paths before awaiting, so overlapping multi-path operations cannot deadlock. */
+	async #withNamespaceMutation<T>(paths: readonly string[], run: () => Promise<T>): Promise<T> {
+		const scopeActive = this.#scriptScope;
+		const scopeGeneration = this.#scriptScopeGeneration;
+		const overlaps = (a: string, b: string): boolean =>
+			a === b || a === "/" || b === "/" || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+		const pending = [...this.#namespaceMutations].filter((mutation) =>
+			mutation.paths.some((active) => paths.some((path) => overlaps(active, path))),
+		);
+		let release!: () => void;
+		const mutation = {
+			paths,
+			done: new Promise<void>((resolve) => {
+				release = resolve;
+			}),
+		};
+		this.#namespaceMutations.add(mutation);
+		try {
+			await Promise.all(pending.map((active) => active.done));
+			if (scopeActive !== this.#scriptScope || scopeGeneration !== this.#scriptScopeGeneration) {
+				throw this.#scriptTxLost ?? createEstale(this.#sandboxId);
+			}
+			this.#assertScriptGeneration(scopeActive ? scopeGeneration : undefined);
+			return await run();
+		} finally {
+			this.#namespaceMutations.delete(mutation);
+			release();
+		}
+	}
+
+	/** Queued work and pending blob writes must not resume in a later or closed scope. */
+	#assertScriptGeneration(generation: number | undefined): void {
+		if (generation === undefined && this.#scriptScope) throw createEstale(this.#sandboxId);
+		if (generation !== undefined && (!this.#scriptScope || generation !== this.#scriptScopeGeneration)) {
+			throw this.#scriptTxLost ?? createEstale(this.#sandboxId);
+		}
+		this.#assertScriptTxAlive();
+	}
+
+	/** A virtual device has no inode to rename, unlink, link, or change in the database. */
+	#assertStoredPath(path: string, operation: string): void {
+		if (path === DEV_NULL) throw createEperm(path, operation);
+	}
+
+	/** Reject legacy persisted device entries before replacing either cache. */
+	#assertPathCacheNamespace(entries: Map<string, PathCacheEntry>): void {
+		for (const path of entries.keys()) this.#assertStoredPath(validatePath(path), "load reserved virtual device");
 	}
 
 	/**
@@ -1082,6 +1185,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#startPrewarm();
 
 		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
+		this.#assertPathCacheNamespace(entries);
 		this.#cacheClear();
 		for (const [p, e] of entries) this.#cacheSet(p, e);
 		// Initial load established committed state; the cache is not poisoned (F1).
@@ -1141,6 +1245,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (entries.size === 0) {
 					throw createEsandboxgone(this.#sandboxId);
 				}
+				this.#assertPathCacheNamespace(entries);
 				this.#cacheClear();
 				for (const [path, entry] of entries) this.#cacheSet(path, entry);
 				this.#contentCache.clear();
@@ -1178,6 +1283,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// Any open still in flight from a previous scope belongs to an older generation and will
 		// abandon itself rather than adopt into this one.
 		this.#scriptTxGeneration += 1;
+		this.#scriptScopeGeneration += 1;
 		this.#scriptScope = true;
 	}
 
@@ -1382,6 +1488,26 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	// shadowing each other — the dialect would commit only one and drop the rest.
 	async bulkIngest(files: BulkIngestFile[]): Promise<void> {
 		if (files.length === 0) return;
+		const normalized: BulkIngestFile[] = [];
+		const seen = new Set<string>();
+		const roots: string[] = [];
+		for (const file of files) {
+			const path = validatePath(file.path);
+			this.#assertStoredPath(path, "bulkIngest");
+			if (seen.has(path)) throw createEexist(path);
+			seen.add(path);
+			normalized.push({ ...file, path });
+			// Ingest also creates missing ancestors. Reserve the first missing one.
+			let root = path;
+			while (this.#parentOf(root) !== root && !this.#pathCache.has(this.#parentOf(root))) {
+				root = this.#parentOf(root);
+			}
+			roots.push(root);
+		}
+		await this.#withNamespaceMutation(roots, () => this.#bulkIngestAt(normalized));
+	}
+
+	async #bulkIngestAt(normalized: BulkIngestFile[]): Promise<void> {
 		this.#assertWritable("/", "bulkIngest");
 		// #166: deliberately NOT buffered, and unreachable inside a scope today — both
 		// call sites (`POST /ingest/files`, MCP `ingest_files`) go straight at the
@@ -1397,15 +1523,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				{ code: "ENOTSUP" },
 			);
 		}
-		const normalized: BulkIngestFile[] = [];
-		const seen = new Set<string>();
 		const bytesByPath = new Map<string, Uint8Array>();
-		for (const file of files) {
-			const path = validatePath(file.path);
-			if (seen.has(path)) throw createEexist(path);
-			seen.add(path);
-			normalized.push({ path, content: file.content, mode: file.mode });
-			bytesByPath.set(path, file.content);
+		for (const file of normalized) {
+			bytesByPath.set(file.path, file.content);
 		}
 		const newEntries = await this.#withWriteTx((tx) =>
 			this.#dialect.bulkIngest(tx, normalized, this.#sandboxId, ...this.#expectedEpochArgs()),
@@ -1440,6 +1560,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * out of the mutation journal.
 	 */
 	#blobArgFor(bytes: Uint8Array): Uint8Array | undefined {
+		if (bytes.byteLength === 0 && this.#dialect.writeFileComposite && this.#dialect.commitBlob) return undefined;
 		return this.#bufferingWrites() && this.#dialect.commitBlob !== undefined ? undefined : bytes;
 	}
 
@@ -1449,7 +1570,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * The scope matters as much as the sharing: a closure created inside `writeFile`
 	 * would sit in a context object holding every variable any sibling closure there
 	 * captures — the file's bytes included — and a journal entry that lives for the
-	 * whole script would keep them alive. Here it captures these six values and
+	 * whole script would keep them alive. Here it captures these seven values and
 	 * nothing else. `blobBytes` is undefined exactly when the caller already
 	 * committed and backfilled the blob.
 	 */
@@ -1457,6 +1578,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		kind: "writeFile" | "appendFile",
 		parentInodeId: bigint,
 		name: string,
+		mode: number,
 		size: number,
 		sha256: Uint8Array,
 		blobBytes: Uint8Array | undefined,
@@ -1471,7 +1593,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 						this.#sandboxId,
 						this.#realId(parentInodeId),
 						name,
-						0o644,
+						mode,
 						size,
 						sha256,
 						blobBytes,
@@ -1490,7 +1612,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				if (!this.#dialect.commitBlob) await this.#dialect.upsertBlob(tx, sha256, blobBytes!);
 				const id = await this.#dialect.createInode(
 					tx,
-					{ sandboxId: this.#sandboxId, kind: INODE_KIND.FILE, mode: 0o644, size, contentSha256: sha256 },
+					{ sandboxId: this.#sandboxId, kind: INODE_KIND.FILE, mode, size, contentSha256: sha256 },
 					...this.#expectedEpochArgs(),
 				);
 				const oldInodeId = await this.#dialect.upsertDirent(tx, this.#realId(parentInodeId), name, id);
@@ -1507,6 +1629,33 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return;
+		await this.#withNamespaceMutation([path], () => this.#writeFileAt(path, content, undefined));
+	}
+
+	/**
+	 * Atomically create an entry that must not exist, as just-bash 3.6's `mktemp` requires (it
+	 * refuses with ENOSYS otherwise). Share the namespace queue with ordinary creators so the
+	 * existence check and creation cannot race. Directories get their requested mode in the
+	 * same mutation that creates the inode.
+	 */
+	async createExclusive(inputPath: string, options: CreateExclusiveOpts): Promise<void> {
+		const path = validatePath(inputPath);
+		if (path === DEV_NULL) throw createEexist(path);
+		await this.#withNamespaceMutation([path], async () => {
+			this.#assertWritable(path, "createExclusive");
+			if (this.#pathCache.has(path)) throw createEexist(path);
+			this.#requireParentDir(path);
+			if (options.directory) {
+				await this.#mkdirAt(path, undefined, options.mode);
+			} else {
+				await this.#writeFileAt(path, new Uint8Array(0), options.mode);
+			}
+		});
+	}
+
+	async #writeFileAt(path: string, content: FileContent, createMode: number | undefined): Promise<void> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "writeFile");
 		// Refuse to clobber an existing directory with a file (audit H2 #13). This
 		// also rejects writing to "/" (the root is a directory), closing #25.
@@ -1526,11 +1675,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// `#assertScriptTxAlive`, so a condemned scope would still put it on the wire — the exact
 		// hazard `#scriptTxLost` exists to prevent. Assert first, and route it through `#db` so a
 		// fault during the blob write is raced (it never settles on its own) and condemns the scope.
-		this.#assertScriptTxAlive();
-		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, bytes));
+		this.#assertScriptGeneration(scopeGeneration);
+		// An empty file needs no blob row (readers map a missing blob to empty bytes), and
+		// just-bash 3.6 truncates every `>` target with one before writing the output.
+		if (this.#dialect.commitBlob && bytes.byteLength > 0) {
+			await this.#db(() => this.#dialect.commitBlob!(sha256, bytes));
+		}
+		this.#assertScriptGeneration(scopeGeneration);
 
+		// The write replaces the inode; carry the old file's mode onto the new one, as
+		// overwriting a file in place does.
+		const prior = this.#pathCache.get(path);
+		const mode = createMode ?? (prior?.kind === INODE_KIND.FILE ? prior.mode : NEW_FILE_MODE);
 		const inodeId = await this.#mutateOne(
-			this.#putFileOp("writeFile", parentEntry.inodeId, name, bytes.length, sha256, this.#blobArgFor(bytes)),
+			this.#putFileOp("writeFile", parentEntry.inodeId, name, mode, bytes.length, sha256, this.#blobArgFor(bytes)),
 		);
 
 		// Evict the displaced inode's bytes from contentCache so the dead entry
@@ -1544,7 +1702,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
-			mode: 0o644,
+			mode,
 			size: bytes.length,
 			mtime,
 			contentSha256: sha256,
@@ -1556,6 +1714,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return;
+		await this.#withNamespaceMutation([path], () => this.#appendFileAt(path, content));
+	}
+
+	async #appendFileAt(path: string, content: FileContent): Promise<void> {
+		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "appendFile");
 		// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
@@ -1564,6 +1728,9 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const mtime = new Date();
 
 		const existing = this.#pathCache.get(path);
+		// Appending nothing changes nothing. just-bash 3.6 pre-opens every `>>` target with
+		// an empty append, which would otherwise read and rewrite the whole file.
+		if (bytes.byteLength === 0 && existing?.kind === INODE_KIND.FILE) return;
 		// The resulting size, not the appended chunk: `appendFile` materializes base+chunk in
 		// one buffer, and a file grown past the cap by repeated appends would then be unreadable
 		// from the same script. Checked off the cached size so the base blob is never fetched.
@@ -1594,11 +1761,23 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 		// F6: commit the CAS blob in its own short tx FIRST (see writeFile), under the same
 		// liveness assert and the same driver-fault race (#169 M4).
-		this.#assertScriptTxAlive();
-		if (this.#dialect.commitBlob) await this.#db(() => this.#dialect.commitBlob!(sha256, fullBytes));
+		this.#assertScriptGeneration(scopeGeneration);
+		if (this.#dialect.commitBlob && fullBytes.byteLength > 0) {
+			await this.#db(() => this.#dialect.commitBlob!(sha256, fullBytes));
+		}
+		this.#assertScriptGeneration(scopeGeneration);
 
+		const mode = existing?.kind === INODE_KIND.FILE ? existing.mode : NEW_FILE_MODE;
 		const inodeId = await this.#mutateOne(
-			this.#putFileOp("appendFile", parentEntry.inodeId, name, fullBytes.length, sha256, this.#blobArgFor(fullBytes)),
+			this.#putFileOp(
+				"appendFile",
+				parentEntry.inodeId,
+				name,
+				mode,
+				fullBytes.length,
+				sha256,
+				this.#blobArgFor(fullBytes),
+			),
 		);
 
 		if (existing) this.#contentCache.delete(existing.inodeId);
@@ -1606,7 +1785,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.FILE,
-			mode: 0o644,
+			mode,
 			size: fullBytes.length,
 			mtime,
 			contentSha256: sha256,
@@ -1617,6 +1796,21 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async mkdir(inputPath: string, options?: MkdirOptions): Promise<void> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) {
+			if (options?.recursive) throw createEnotdir(path);
+			throw createEexist(path);
+		}
+		// Recursive mkdir can create every missing ancestor, not just its final path.
+		let root = path;
+		if (options?.recursive) {
+			while (this.#parentOf(root) !== root && !this.#pathCache.has(this.#parentOf(root))) {
+				root = this.#parentOf(root);
+			}
+		}
+		await this.#withNamespaceMutation([root], () => this.#mkdirAt(path, options, 0o755));
+	}
+
+	async #mkdirAt(path: string, options: MkdirOptions | undefined, mode: number): Promise<void> {
 		this.#assertWritable(path, "mkdir");
 		const recursive = options?.recursive ?? false;
 		const mtime = new Date();
@@ -1648,7 +1842,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 								{
 									sandboxId: this.#sandboxId,
 									kind: INODE_KIND.DIRECTORY,
-									mode: 0o755,
+									mode,
 									size: 0,
 								},
 								...this.#expectedEpochArgs(),
@@ -1660,7 +1854,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					this.#cacheSet(next, {
 						inodeId,
 						kind: INODE_KIND.DIRECTORY,
-						mode: 0o755,
+						mode,
 						size: 0,
 						mtime,
 						contentSha256: null,
@@ -1689,7 +1883,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 								this.#sandboxId,
 								this.#realId(parentEntry.inodeId),
 								name,
-								0o755,
+								mode,
 								...this.#expectedEpochArgs(),
 							),
 						],
@@ -1703,7 +1897,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 								{
 									sandboxId: this.#sandboxId,
 									kind: INODE_KIND.DIRECTORY,
-									mode: 0o755,
+									mode,
 									size: 0,
 								},
 								...this.#expectedEpochArgs(),
@@ -1717,7 +1911,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#cacheSet(path, {
 			inodeId,
 			kind: INODE_KIND.DIRECTORY,
-			mode: 0o755,
+			mode,
 			size: 0,
 			mtime,
 			contentSha256: null,
@@ -1728,6 +1922,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async rm(inputPath: string, options?: RmOptions): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertStoredPath(path, "rm");
+		await this.#withNamespaceMutation([path], () => this.#rmAt(path, options));
+	}
+
+	async #rmAt(path: string, options?: RmOptions): Promise<void> {
 		this.#assertWritable(path, "rm");
 		const entry = this.#pathCache.get(path);
 
@@ -1849,6 +2048,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async chmod(inputPath: string, mode: number): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertStoredPath(path, "chmod");
+		await this.#withNamespaceMutation([path], () => this.#chmodAt(path, mode));
+	}
+
+	async #chmodAt(path: string, mode: number): Promise<void> {
 		this.#assertWritable(path, "chmod");
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
@@ -1874,6 +2078,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async utimes(inputPath: string, _atime: Date, mtime: Date): Promise<void> {
 		const path = validatePath(inputPath);
+		this.#assertStoredPath(path, "utimes");
+		await this.#withNamespaceMutation([path], () => this.#utimesAt(path, mtime));
+	}
+
+	async #utimesAt(path: string, mtime: Date): Promise<void> {
 		this.#assertWritable(path, "utimes");
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
@@ -1901,8 +2110,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async #readBytes(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return new Uint8Array(0);
 		// #resolveReadEntry follows symlinks; ENOENT/ELOOP propagate naturally
 		const entry = await this.#resolveReadEntry(path);
+		if (entry === null) return new Uint8Array(0);
 		if (entry.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 		// Before the cache lookup on purpose: a warm cache makes the DB round trip free
 		// but not the megabytes of string work the caller is about to do with the bytes.
@@ -1938,21 +2149,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async exists(inputPath: string): Promise<boolean> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
-		return this.#pathCache.has(path);
+		return path === DEV_NULL || this.#pathCache.has(path);
 	}
 
 	async stat(inputPath: string): Promise<FsStat> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
-		const lentry = this.#pathCache.get(path);
-		if (!lentry) throw createEnoent(path);
+		if (path === DEV_NULL) return { ...DEV_NULL_STAT };
 
-		// stat follows symlinks at the final component. Audit M7: the previous
-		// one-hop `pathCache.get(symlinkTarget)` broke for relative targets (keys
-		// are absolute) and multi-hop chains (returned an intermediate symlink).
-		// Resolve through the dialect path resolver — the same one readFile and
-		// realpath use — so relative/chained targets and loops are handled.
-		const entry = lentry.kind === INODE_KIND.SYMLINK ? await this.#resolveReadEntry(path) : lentry;
+		// Use the same resolver as reads, including relative/chained aliases to the device.
+		const entry = await this.#resolveReadEntry(path);
+		if (entry === null) return { ...DEV_NULL_STAT };
 
 		return {
 			isFile: entry.kind === INODE_KIND.FILE,
@@ -1961,12 +2168,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			mode: entry.mode,
 			size: entry.size,
 			mtime: entry.mtime,
+			identity: inodeIdentity(entry.inodeId),
 		};
 	}
 
 	async lstat(inputPath: string): Promise<FsStat> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return { ...DEV_NULL_STAT };
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 
@@ -1977,12 +2186,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			mode: entry.mode,
 			size: entry.size,
 			mtime: entry.mtime,
+			identity: inodeIdentity(entry.inodeId),
 		};
 	}
 
 	async readdir(inputPath: string): Promise<string[]> {
 		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) throw createEnotdir(path);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 		if (entry.kind !== INODE_KIND.DIRECTORY) throw createEnotdir(path);
@@ -1991,6 +2202,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	readdirWithFileTypes(inputPath: string): Promise<DirentEntry[]> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return Promise.reject(createEnotdir(path));
 		const entry = this.#pathCache.get(path);
 		if (!entry) return Promise.reject(createEnoent(path));
 		if (entry.kind !== INODE_KIND.DIRECTORY) return Promise.reject(createEnotdir(path));
@@ -2010,11 +2222,24 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async cp(inputSrc: string, inputDest: string, options?: CpOptions): Promise<void> {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
+		await this.#withNamespaceMutation([src, dest], () => this.#cpAt(src, dest, options));
+	}
+
+	async #cpAt(src: string, dest: string, options?: CpOptions): Promise<void> {
+		if (src === DEV_NULL) {
+			if (dest !== DEV_NULL) await this.#writeFileAt(dest, new Uint8Array(0), DEV_NULL_STAT.mode);
+			return;
+		}
+		const srcEntry = this.#pathCache.get(src);
+		if (dest === DEV_NULL) {
+			if (!srcEntry) throw createEnoent(src);
+			if (srcEntry.kind === INODE_KIND.DIRECTORY) throw createEnotdir(dest);
+			return;
+		}
 		this.#assertWritable(dest, "cp");
 		// Reject copying onto the root inode (empty basename) — would clobber "/"
 		// in pathCache and persist a corrupt root cross-replica (audit H2 #25).
 		if (this.#nameOf(dest) === "") throw createEisdir(dest);
-		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
 
 		if (srcEntry.kind === INODE_KIND.DIRECTORY) {
@@ -2039,6 +2264,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			const plan = srcPaths.map((srcPath) => {
 				const entry = this.#pathCache.get(srcPath)!;
 				const destPath = dest + srcPath.slice(src.length);
+				validatePath(destPath);
+				this.#assertStoredPath(destPath, "cp");
 				const parentPath = this.#parentOf(destPath);
 				return {
 					destPath,
@@ -2148,9 +2375,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async mv(inputSrc: string, inputDest: string): Promise<void> {
 		const src = validatePath(inputSrc);
 		const dest = validatePath(inputDest);
+		this.#assertStoredPath(src, "mv");
+		this.#assertStoredPath(dest, "mv");
+		await this.#withNamespaceMutation([src, dest], () => this.#mvAt(src, dest));
+	}
+
+	async #mvAt(src: string, dest: string): Promise<void> {
 		this.#assertWritable(dest, "mv");
 		const srcEntry = this.#pathCache.get(src);
 		if (!srcEntry) throw createEnoent(src);
+		// A subtree move can reach the reserved device even when its root is /dev.
+		for (const path of this.#allPathsUnder(src)) {
+			const destPath = validatePath(dest + path.slice(src.length));
+			this.#assertStoredPath(destPath, "mv");
+		}
 
 		const srcParentPath = this.#parentOf(src);
 		const srcName = this.#nameOf(src);
@@ -2258,6 +2496,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async symlink(target: string, inputLinkPath: string): Promise<void> {
 		const linkPath = validatePath(inputLinkPath);
+		if (linkPath === DEV_NULL) throw createEexist(linkPath);
+		await this.#withNamespaceMutation([linkPath], () => this.#symlinkAt(target, linkPath));
+	}
+
+	async #symlinkAt(target: string, linkPath: string): Promise<void> {
 		this.#assertWritable(linkPath, "symlink");
 		// Note: target is intentionally not normalized - it's stored as-is
 		if (target.includes("\0")) throw createEinval(target);
@@ -2303,6 +2546,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async link(inputExistingPath: string, inputNewPath: string): Promise<void> {
 		const existingPath = validatePath(inputExistingPath);
 		const newPath = validatePath(inputNewPath);
+		this.#assertStoredPath(existingPath, "link");
+		if (newPath === DEV_NULL) throw createEexist(newPath);
+		await this.#withNamespaceMutation([existingPath, newPath], () => this.#linkAt(existingPath, newPath));
+	}
+
+	async #linkAt(existingPath: string, newPath: string): Promise<void> {
 		this.#assertWritable(newPath, "link");
 		const srcEntry = this.#pathCache.get(existingPath);
 		if (!srcEntry) throw createEnoent(existingPath);
@@ -2330,6 +2579,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async readlink(inputPath: string): Promise<string> {
 		const path = validatePath(inputPath);
+		if (path === DEV_NULL) throw createEinval(path);
 		const entry = this.#pathCache.get(path);
 		if (!entry) throw createEnoent(path);
 		if (entry.kind !== INODE_KIND.SYMLINK) throw createEinval(path);
@@ -2337,8 +2587,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async realpath(inputPath: string): Promise<string> {
+		this.#assertScriptTxAlive();
 		const path = validatePath(inputPath);
-		if (this.#bufferingWrites()) return this.#resolveFromCache(path).path;
+		if (path === DEV_NULL) return path;
+		const buffered = this.#bufferingWrites();
+		try {
+			const cached = this.#resolveFromCache(path);
+			if (cached.entry === null || buffered) return cached.path;
+		} catch (err) {
+			// The dialect remains the resolver for persisted paths outside a buffered scope.
+			if (buffered || (err as { code?: string }).code !== "ENOENT") throw err;
+		}
 		// Read-only: skip the advisory lock.
 		const resolvedInodeId = await this.#withReadTx(async (tx) => this.#dialect.resolvePath(tx, path, true));
 		for (const [p, entry] of this.#pathCache) {
