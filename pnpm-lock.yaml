@@ -44,8 +44,8 @@ importers:
         specifier: ^3.6.0
         version: 3.6.0(patch_hash=7a67d95fa399e6f98a1b48df719664245f97561d0f0281aebb8d2e56a3a5f1dc)
       just-git:
-        specifier: ^1.9.0
-        version: 1.9.0
+        specifier: ^1.9.1
+        version: 1.9.1
       lru-cache:
         specifier: ^11.0.0
         version: 11.3.5
@@ -1972,8 +1972,8 @@ packages:
     engines: {node: '>=20.19'}
     hasBin: true
 
-  just-git@1.9.0:
-    resolution: {integrity: sha512-hwf/NEQ2DJZ+V3r7uSVSqdHfTF46TDmPaxUb/C3d+C29iauQ5ZNnczA4mNxFif15CZYugPnl5ksznifX5mk2rQ==}
+  just-git@1.9.1:
+    resolution: {integrity: sha512-UuyDJT4bbPTE5QfbA+QjQ/knKfvk0BSuIzRRAbE5DweBCEDd/NnIv+iNMILqyC0fmGj1abDoDO6Ngxqyb1vXZw==}
 
   jwa@2.0.1:
     resolution: {integrity: sha512-hRF04fqJIP8Abbkq5NKGN0Bbr3JxlQ+qhZufXVr0DvujKy93ZCbXZMHDL4EOtodSbCWxOqR8MS1tXA5hwqCXDg==}
@@ -4526,7 +4526,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  just-git@1.9.0: {}
+  just-git@1.9.1: {}
 
   jwa@2.0.1:
     dependencies:
