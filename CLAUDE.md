@@ -104,7 +104,7 @@ blobs (sha256, data, size)  — content-addressable, global dedup
 
 ### Caching Strategy
 
-- **pathCache** (Map<string, CacheEntry>): Loaded at session start and validated against the durable PostgreSQL epoch on every request. Epoch and paths come from one REPEATABLE READ transaction. Serves `stat()`, `exists()`, `readdir()`, `getAllPaths()` with zero DB calls. Updated synchronously on every write.
+- **pathCache** (Map<string, CacheEntry>): Loaded at session start and validated against the durable PostgreSQL epoch on every request. Epoch and paths come from one REPEATABLE READ transaction. Serves `stat()`, `exists()`, `readdir()`, `getAllPaths()` without per-operation DB calls after admission validation. Updated synchronously on every write.
 - **contentCache** (LRU<bigint, Uint8Array>): Fills lazily on first `readFile()`. Capped at 50MB per session. Evicted LRU when full. Invalidated on write/delete.
 - **Rule (outside a script scope):** Reads hit cache first. Writes go to DB first, then update caches. Cache is ephemeral — DB is the source of truth.
 - **Rule (inside a script scope, `SCRIPT_TX_BUFFERED=true`, the default):** the caches may LEAD the database, and only until the scope ends (#166). A mutation updates pathCache/contentCache and appends to an in-memory journal; `endScriptScope` replays the journal in one short advisory-locked transaction and commits. File *bytes* are exempt — `commitBlob` still writes them eagerly on its own connection before the metadata is buffered, and the GC grace window (`BLOB_GC_MIN_AGE_MS`) covers a blob that is committed but not yet referenced.
@@ -255,18 +255,16 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 
 **The Redis carrying the data plane (`REDIS_DATA_URL`, defaulting to `REDIS_URL`) must run `maxmemory-policy allkeys-lru`** — `allkeys-lfu` is equally fine. No other policy is.
 
-Redis defaults to `noeviction`, under which an instance that reaches `maxmemory` refuses every write and **never recovers on its own**: blob cache entries carry a 24h TTL (`REDIS_BLOB_CACHE_TTL_MS`), so waiting it out is not a strategy and a human has to flush keys or raise the limit. The load harness measured 97.6% 5xx with no recovery, against a `CLIENT PAUSE` that recovered the moment the pause lifted (#188). With `allkeys-lru` the same pressure evicts cold blobs, which costs a Postgres read.
+Redis defaults to `noeviction`, under which an instance that reaches `maxmemory` refuses every write and **never recovers on its own**: blob cache entries carry a 24h TTL (`REDIS_BLOB_CACHE_TTL_MS`), so waiting it out is not a strategy and a human has to flush keys or raise the limit. The load harness measured 97.6% 5xx with no recovery, against a `CLIENT PAUSE` that recovered the moment the pause lifted (#188). With `allkeys-lru` on a separate data instance, the same pressure evicts cached blobs, and a cache miss costs a Postgres read.
 
-Why those two and not the other evicting policies — on the default single-instance setup this policy governs the exec-lock leases as well as the cache:
+For multi-replica distributed lock isolation, use separate Redis instances for `REDIS_URL` (control) and `REDIS_DATA_URL` (data). Keep the control instance on `noeviction` with enough memory headroom for lock operations, and the data instance on `allkeys-lru` or `allkeys-lfu`. Separate connections to the same instance prevent connection-level head-of-line blocking but share its eviction policy and memory limit.
 
-- `allkeys-lru` / `allkeys-lfu` protect exactly the keys that must not go. A lease renewed every `REDIS_EXEC_LOCK_RENEW_MS` (20s) is among the most recently used keys in the instance, so a cold blob is always the better candidate.
-- `allkeys-random` samples uniformly, so a live lease is as likely to be reaped as the cold blob beside it. Not sufficient.
-- `volatile-*` evicts **only** keys carrying a TTL. That is not about recency — the problem is that once the instance fills with keys that carry no TTL (the RW-lock reader ZSETs, anything a later change adds), it has no eviction candidate left and behaves exactly like `noeviction`: writes refused, no recovery without a human. `allkeys-*` always has a candidate.
+On the default shared instance, LRU/LFU only favor recently or frequently used keys. They cannot guarantee lock retention. Evicting a reader-membership ZSET makes active readers invisible to writer drain checks. The shared instance is therefore unsuitable when distributed lock isolation must hold under cache memory pressure. `allkeys-random` also permits lock eviction. `volatile-*` only evicts keys with a TTL and can exhaust eligible keys.
 
 The check runs only when this client actually carries data-plane state (the blob cache). With `REDIS_BLOB_CACHE_ENABLED=false`, no data connection opens. A control-only Redis must NOT be switched to `allkeys-*` — that would make its leases evictable.
 
 ```bash
-redis-cli CONFIG SET maxmemory-policy allkeys-lru   # and persist it in redis.conf
+redis-cli -u "${REDIS_DATA_URL:-$REDIS_URL}" CONFIG SET maxmemory-policy allkeys-lru   # data instance; persist in redis.conf
 ```
 
 Checked at boot via `CONFIG GET maxmemory-policy` (`src/redis/eviction-policy.ts`, wired in `server.ts`):

@@ -6,6 +6,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
+import { root } from "./freshness-helpers.js";
 
 function makeDialect(): SqlDialect<unknown> {
 	const transactionMock = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({}));
@@ -58,22 +59,7 @@ describe("SqlFs.exists", () => {
 
 	async function makeFs(entries: Array<{ path: string } & PathCacheEntry>): Promise<SqlFs> {
 		const dialect = makeDialect();
-		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue(
-			entries.length
-				? entries
-				: [
-						{
-							path: "/",
-							inodeId: 1n,
-							kind: 2,
-							mode: 0o755,
-							size: 0,
-							mtime: new Date(),
-							contentSha256: null,
-							symlinkTarget: null,
-						},
-					],
-		);
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue([root, ...entries]);
 		const fs = new SqlFs({ dialect, sandboxId });
 		await fs.ready();
 		return fs;
@@ -91,8 +77,9 @@ describe("SqlFs.exists", () => {
 		expect(result).toBe(false);
 	});
 
-	it("never throws — returns false for empty cache", async () => {
+	it("finds the root and no children in a root-only sandbox", async () => {
 		const fs = await makeFs([]);
+		await expect(fs.exists("/")).resolves.toBe(true);
 		await expect(fs.exists("/anything")).resolves.toBe(false);
 	});
 });

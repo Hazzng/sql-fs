@@ -11,6 +11,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
+import { SqlFs } from "../../sql-fs.js";
 import { requireMigratedSchema } from "./helpers/schema-preconditions.js";
 
 const SKIP = !process.env.DATABASE_URL;
@@ -148,7 +149,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 			replacementCommitted.resolve();
 		}
 
-		await expect(staleTransaction).rejects.toThrow("writeFileComposite: INSERT returned no rows");
+		await expect(staleTransaction).rejects.toMatchObject({ code: "ESTALE" });
 
 		const visible = await dialect.transaction(async (tx) => {
 			await dialect.setSandboxContext(tx, sandbox.id);
@@ -194,7 +195,7 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 				await dialect.setSandboxContext(tx, sandbox.id);
 				await dialect.mkdirComposite(tx, sandbox.id, recreated.rootInodeId, "old-scope-dir", 0o755, staleEpoch);
 			}),
-		).rejects.toThrow("mkdirComposite: INSERT returned no rows");
+		).rejects.toMatchObject({ code: "ESTALE" });
 
 		const replacementRows = await dialect.transaction(async (tx) => {
 			await dialect.setSandboxContext(tx, sandbox.id);
@@ -203,6 +204,59 @@ describe.skipIf(SKIP)("Postgres fencing regressions", () => {
 			`;
 		});
 		expect(replacementRows).toEqual([{ id: sandbox.id, version: recreated.epoch.toString() }]);
+	});
+
+	it.each(["rm", "mv"])(
+		"keeps genuine missing-source %s errors and rolls back destination cleanup",
+		async (operation) => {
+			const sandbox = await createSandbox(`missing-${operation}`);
+			const fs = new SqlFs({ dialect, sandboxId: sandbox.id });
+			await fs.ready();
+			await fs.writeFile("/destination", "preserved");
+			const epoch = await dialect.transaction((tx) => dialect.getSandboxEpoch(tx, sandbox.id));
+			await expect(
+				dialect.transaction(async (tx) => {
+					if (operation === "rm") {
+						await dialect.rmComposite(tx, sandbox.id, sandbox.rootInodeId, "missing", epoch);
+					} else {
+						await dialect.mvComposite(
+							tx,
+							sandbox.id,
+							sandbox.rootInodeId,
+							"missing",
+							sandbox.rootInodeId,
+							"destination",
+							epoch,
+						);
+					}
+				}),
+			).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await dialect.transaction((tx) => dialect.getSandboxEpoch(tx, sandbox.id))).toBe(epoch);
+			await fs.reload();
+			expect(await fs.readFile("/destination")).toBe("preserved");
+			expect((await fs.stat("/destination")).mode).toBe(0o644);
+		},
+	);
+
+	it("allows all four composites to spend their own transaction's epoch advances", async () => {
+		const sandbox = await createSandbox("own-advances");
+		const fs = new SqlFs({ dialect, sandboxId: sandbox.id });
+		await fs.ready();
+		await fs.writeFile("/destination", "replaced");
+		fs.beginScriptScope();
+		try {
+			await fs.mkdir("/directory");
+			await fs.writeFile("/source", "retained");
+			await fs.mv("/source", "/destination");
+			await fs.rm("/directory");
+			await fs.endScriptScope();
+		} finally {
+			await fs.abortScriptScope();
+		}
+		await fs.reload();
+		expect(await fs.readFile("/destination")).toBe("retained");
+		expect(await fs.exists("/source")).toBe(false);
+		expect(await fs.exists("/directory")).toBe(false);
 	});
 
 	it("allows the live non-superuser RLS transaction to mutate only its own sandbox", async (ctx) => {

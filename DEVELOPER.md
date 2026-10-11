@@ -25,7 +25,7 @@ Within a single replica, two exec modes share the same `Session` and the same `S
 - **Write path (default)** — exclusive per-session lock; one exec at a time; the only path that can mutate the FS.
 - **Read path (`readOnly: true`)** — shared per-session lock; many concurrent execs; the FS is forced into a refcounted read-only scope and any mutating syscall throws `EREADONLY` pre-DB, surfaced to clients as HTTP **422 `EREADONLY_VIOLATION`**.
 
-Readers acquire shared distributed and local locks. Writers acquire exclusive locks before admission.
+Readers acquire shared local locks and writers acquire exclusive local locks before admission. With Redis configured, they also acquire the corresponding distributed locks.
 
 ---
 

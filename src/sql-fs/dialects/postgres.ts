@@ -181,7 +181,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		expectedEpoch?: bigint,
 	): Promise<bigint> {
 		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ id: string }[]>`
+		const rows = await tx<{ fenced: number; id: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
@@ -215,14 +215,19 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
 				SELECT ${sandboxId}, 2, ${mode}, 0 FROM epoch
 				RETURNING id
+			),
+			inserted AS (
+				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
+				SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
+				FROM new_inode
+				RETURNING inode_id AS id
 			)
-			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-			SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
-			FROM new_inode
-			RETURNING inode_id AS id
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM inserted) AS id
+			FROM sandboxes WHERE id = ${sandboxId}
 		`;
 		const row = rows[0];
-		if (!row) throw new Error("mkdirComposite: INSERT returned no rows");
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.id === null) throw new Error("mkdirComposite: INSERT returned no rows");
 		return BigInt(row.id);
 	}
 
@@ -234,7 +239,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		expectedEpoch?: bigint,
 	): Promise<bigint> {
 		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ removed_inode_id: string }[]>`
+		const rows = await tx<{ fenced: number; removed_inode_id: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
@@ -286,10 +291,13 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE id IN (SELECT inode_id FROM removed_dirent)
 					AND nlink > 1
 			)
-			SELECT inode_id AS removed_inode_id FROM removed_dirent
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced,
+			       (SELECT inode_id FROM removed_dirent) AS removed_inode_id
+			FROM sandboxes WHERE id = ${sandboxId}
 		`;
 		const row = rows[0];
-		if (!row) throw createEnoent(name);
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.removed_inode_id === null) throw createEnoent(name);
 		return BigInt(row.removed_inode_id);
 	}
 
@@ -308,7 +316,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// this composite runs, so there is no `blob_insert` CTE here — the
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
 		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ new_inode_id: string }[]>`
+		const rows = await tx<{ fenced: number; new_inode_id: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
@@ -369,10 +377,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				WHERE id IN (SELECT inode_id FROM old_dirent)
 					AND nlink > 1
 			)
-			SELECT id AS new_inode_id FROM new_inode
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM new_inode) AS new_inode_id
+			FROM sandboxes WHERE id = ${sandboxId}
 		`;
 		const row = rows[0];
-		if (!row) throw new Error("writeFileComposite: INSERT returned no rows");
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.new_inode_id === null) throw new Error("writeFileComposite: INSERT returned no rows");
 		// Omitted `data` means the caller already backfilled (see the interface note).
 		if (this.#blobCache !== undefined && data !== undefined) {
 			void this.#blobCache.set(sha256, data);
@@ -400,7 +410,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// Both statements fence and advance the version; the tx-local epoch
 		// refresh in SqlFs absorbs the double bump.
 		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		await tx`
+		const destinationRows = await tx<{ fenced: number }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
@@ -444,15 +454,21 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 				DELETE FROM inodes
 				WHERE id IN (SELECT inode_id FROM old_dest)
 					AND nlink <= 1
+			),
+			decremented AS (
+				UPDATE inodes
+				SET nlink = nlink - 1
+				WHERE id IN (SELECT inode_id FROM old_dest)
+					AND nlink > 1
 			)
-			UPDATE inodes
-			SET nlink = nlink - 1
-			WHERE id IN (SELECT inode_id FROM old_dest)
-				AND nlink > 1
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced
+			FROM sandboxes WHERE id = ${sandboxId}
 			`;
+		if (destinationRows[0]?.fenced === 0) throw createEstale(sandboxId);
+		if (!destinationRows[0]) throw createEnoent(oldName);
 		// Re-take for snapshot ordering; re-entrant within this tx.
 		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ inode_id: string }[]>`
+		const rows = await tx<{ fenced: number; inode_id: string | null }[]>`
 			WITH ctx AS (
 				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
 				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
@@ -481,14 +497,20 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 			),
 			epoch AS (
 				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
+			),
+			moved AS (
+				UPDATE dirents
+				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
+				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
+				  AND (SELECT 1 FROM epoch) IS NOT NULL
+				RETURNING inode_id
 			)
-			UPDATE dirents
-			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-			  AND (SELECT 1 FROM epoch) IS NOT NULL
-			RETURNING inode_id
+			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT inode_id FROM moved) AS inode_id
+			FROM sandboxes WHERE id = ${sandboxId}
 		`;
-		if (rows.length === 0) throw createEnoent(oldName);
+		const row = rows[0];
+		if (row?.fenced === 0) throw createEstale(sandboxId);
+		if (!row || row.inode_id === null) throw createEnoent(oldName);
 	}
 
 	// ── Private helpers ───────────────────────────────────────────────────────────

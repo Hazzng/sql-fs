@@ -85,11 +85,22 @@ describe("SqlFs committed views", () => {
 		expect(await fs.readFile("/value")).toBe("old");
 	});
 
+	it("refreshes Unicode content with its encoded byte size", async () => {
+		const { fs, state, blob } = fixture();
+		await fs.ready();
+		state.epoch++;
+		state.rows = [root, file("/value", "é🌱")];
+		blob.mockResolvedValue(new TextEncoder().encode("é🌱"));
+		await fs.ensureFresh();
+		expect(await fs.readFile("/value")).toBe("é🌱");
+		expect((await fs.stat("/value")).size).toBe(6);
+	});
+
 	it("refuses freshness admission inside a script scope", async () => {
 		const { fs } = fixture();
 		await fs.ready();
 		fs.beginScriptScope();
-		expect(() => fs.ensureFresh()).toThrow("Freshness admission");
+		await expect(fs.ensureFresh()).rejects.toMatchObject({ code: "EBUSY" });
 		await fs.reload();
 		expect(await fs.readFile("/value")).toBe("old");
 		await fs.abortScriptScope();

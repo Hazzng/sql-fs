@@ -19,7 +19,7 @@ export function file(path: string, value: string, inodeId = 2n): { path: string 
 		inodeId,
 		kind: 1,
 		mode: 0o644,
-		size: value.length,
+		size: Buffer.byteLength(value, "utf8"),
 		mtime: new Date(0),
 		contentSha256: createHash("sha256").update(value).digest(),
 		symlinkTarget: null,

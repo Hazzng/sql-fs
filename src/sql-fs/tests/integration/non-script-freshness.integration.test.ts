@@ -31,7 +31,7 @@ describe.skipIf(!process.env.DATABASE_URL)("non-script mutation freshness", () =
 		await requireMigratedSchema(process.env.DATABASE_URL!);
 	});
 
-	it.each(["ingest", "composite write", "chmod"])(
+	it.each(["ingest", "composite write", "composite mkdir", "composite rm", "composite mv", "chmod"])(
 		"rejects %s after an intervening commit and refreshes the next admission",
 		async (operation) => {
 			const sandboxId = `non-script-freshness-${randomUUID()}`;
@@ -63,6 +63,24 @@ describe.skipIf(!process.env.DATABASE_URL)("non-script mutation freshness", () =
 						await pause();
 						return write(...args);
 					});
+				} else if (operation === "composite mkdir") {
+					const mkdir = staleDialect.mkdirComposite.bind(staleDialect);
+					vi.spyOn(staleDialect, "mkdirComposite").mockImplementationOnce(async (...args) => {
+						await pause();
+						return mkdir(...args);
+					});
+				} else if (operation === "composite rm") {
+					const rm = staleDialect.rmComposite.bind(staleDialect);
+					vi.spyOn(staleDialect, "rmComposite").mockImplementationOnce(async (...args) => {
+						await pause();
+						return rm(...args);
+					});
+				} else if (operation === "composite mv") {
+					const mv = staleDialect.mvComposite.bind(staleDialect);
+					vi.spyOn(staleDialect, "mvComposite").mockImplementationOnce(async (...args) => {
+						await pause();
+						return mv(...args);
+					});
 				} else {
 					const context = staleDialect.setSandboxContextWithLock.bind(staleDialect);
 					vi.spyOn(staleDialect, "setSandboxContextWithLock").mockImplementationOnce(async (...args) => {
@@ -72,6 +90,9 @@ describe.skipIf(!process.env.DATABASE_URL)("non-script mutation freshness", () =
 				}
 				const mutate = () => {
 					if (operation === "composite write") return stale.writeFile("/attempt", "denied");
+					if (operation === "composite mkdir") return stale.mkdir("/attempt");
+					if (operation === "composite rm") return stale.rm("/target");
+					if (operation === "composite mv") return stale.mv("/target", "/value");
 					if (operation === "chmod") return stale.chmod("/target", 0o700);
 					return stale.bulkIngest([{ path: "/attempt", content: new TextEncoder().encode("denied"), mode: 0o644 }]);
 				};
@@ -86,11 +107,7 @@ describe.skipIf(!process.env.DATABASE_URL)("non-script mutation freshness", () =
 				const committedEpoch = await writerDialect.transaction((tx) => writerDialect.getSandboxEpoch(tx, sandboxId));
 				release.resolve();
 				const failure = await bounded(pending);
-				if (operation === "composite write") {
-					expect(failure).toEqual(new Error("writeFileComposite: INSERT returned no rows"));
-				} else {
-					expect(failure).toMatchObject({ code: "ESTALE" });
-				}
+				expect(failure).toMatchObject({ code: "ESTALE" });
 
 				expect(await writerDialect.transaction((tx) => writerDialect.getSandboxEpoch(tx, sandboxId))).toBe(
 					committedEpoch,

@@ -1,6 +1,7 @@
+import { setImmediate } from "node:timers/promises";
 import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deferred } from "../../../sql-fs/tests/unit/freshness-helpers.js";
+import { deferred, file, fixture } from "../../../sql-fs/tests/unit/freshness-helpers.js";
 import { SessionManager } from "../../session-manager.js";
 
 function setup() {
@@ -40,6 +41,33 @@ describe("SessionManager authoritative admission lifecycle", () => {
 		},
 	);
 
+	it.each(["withSession", "withSessionRead"] as const)(
+		"%s accounts for remote path growth before the callback and evicts the idle session",
+		async (method) => {
+			vi.useFakeTimers();
+			const { fs, state } = fixture();
+			await fs.ready();
+			const manager = new SessionManager({
+				createFs: async () => fs,
+				pathCacheMaxBytes: 500,
+				idleMs: 60_000,
+			});
+			manager.startReaper(1000);
+			managers.push(manager);
+			const session = await manager.getOrCreate("default", "sbx");
+			expect(session.overBudget).toBe(false);
+			state.epoch++;
+			state.rows = [...state.rows, file(`/${"x".repeat(400)}`, "new", 3n)];
+			await manager[method]("default", "sbx", async () => {
+				expect(fs.wasDirty()).toBe(false);
+				expect(session.pathCacheBytes).toBe(fs.getPathCacheBytes());
+				expect(session.overBudget).toBe(true);
+			});
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(manager.getSession("default", "sbx")).toBeUndefined();
+		},
+	);
+
 	it("a reader queued behind a local writer cannot probe or reload the open writer", async () => {
 		const { fs, manager } = setup();
 		await manager.getOrCreate("default", "sbx");
@@ -51,13 +79,17 @@ describe("SessionManager authoritative admission lifecycle", () => {
 		});
 		await entered.promise;
 		const reader = manager.withSessionRead("default", "sbx", async () => "fresh");
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(fs.ensureFresh).toHaveBeenCalledOnce();
-		release.resolve();
-		await writer;
-		expect(await reader).toBe("fresh");
-		expect(fs.ensureFresh).toHaveBeenCalledTimes(2);
+		try {
+			await setImmediate();
+			expect(fs.ensureFresh).toHaveBeenCalledOnce();
+			release.resolve();
+			await writer;
+			expect(await reader).toBe("fresh");
+			expect(fs.ensureFresh).toHaveBeenCalledTimes(2);
+		} finally {
+			release.resolve();
+			await Promise.allSettled([writer, reader]);
+		}
 	});
 
 	it("rejects authority failure without invoking the callback", async () => {

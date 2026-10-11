@@ -57,7 +57,7 @@ server (or tests) at the stack:
 ```bash
 export DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs
 export REDIS_URL=redis://localhost:6379
-redis-cli CONFIG SET maxmemory-policy allkeys-lru   # required — see below
+redis-cli CONFIG SET maxmemory-policy allkeys-lru   # local development cache; see production isolation below
 pnpm dev                      # or: pnpm test:integration
 ```
 
@@ -126,7 +126,7 @@ See [clients/typescript/README.md](clients/typescript/README.md) for the full Ty
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
-Requests take a distributed Redis lock and a local session lock before using the filesystem. SQL mutations also use `pg_advisory_xact_lock`. Redis keeps distributed locks and immutable blob bytes cached by hash.
+Requests take a local session lock before using the filesystem and a distributed Redis lock when Redis is configured. SQL mutations also use `pg_advisory_xact_lock`. Redis keeps distributed locks and immutable blob bytes cached by hash.
 
 Every filesystem request validates the durable sandbox epoch in PostgreSQL. SqlFs reads the epoch and, when it changes, the path tree in one REPEATABLE READ transaction. It installs both together after the transaction succeeds. A failed authority check returns an error instead of a successful stale read. Cold loads and recovery use the same paired loader. Buffered script mutations remain private to the exclusive session scope until commit.
 
@@ -179,7 +179,7 @@ Key design choices:
 | `MAX_INGEST_FILES` | No | `10000` | Max number of entries (files + paths) in one `ingest-files` manifest. |
 | `MAX_INGEST_PATHS_CONCURRENCY` | No | `16` | Max concurrent host-file reads for the MCP `paths` ingest mode (bounds file descriptors / memory). |
 | `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. Carries the control plane: locks and session state. |
-| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; point it at a different Redis only if you want physical separation too. This instance must run **`maxmemory-policy allkeys-lru`** (or `allkeys-lfu`) — see [Redis eviction policy](#redis-eviction-policy). |
+| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; use a separate Redis instance for data to keep cache eviction isolated from control locks. This instance must run **`maxmemory-policy allkeys-lru`** (or `allkeys-lfu`) — see [Redis eviction policy](#redis-eviction-policy). |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No | `60000` | Distributed exec lock TTL. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No | `20000` | Lock heartbeat interval. Must be strictly less than lease. |
 | `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No | `75000` | Max wait to acquire exec lock before returning 503. Must be strictly greater than `REDIS_EXEC_LOCK_LEASE_MS` and `REDIS_RWLOCK_READER_LEASE_MS` (asserted at startup), so a crashed holder's lease can be reaped before the waiter gives up. |
@@ -250,7 +250,7 @@ docker run -p 8080:8080 \
   sql-fs-api
 ```
 
-For multi-replica deployments, add `REDIS_URL`. All replicas share the same Postgres database and Redis instance; the exec lock ensures only one replica processes a given sandbox at a time.
+For multi-replica deployments, set `REDIS_URL` for a shared control instance and `REDIS_DATA_URL` for a separate blob-cache instance. All replicas share the same Postgres database and control Redis. Distributed locks coordinate writers while shared readers may run concurrently. Set the Redis policies described below.
 
 ### Redis eviction policy
 
@@ -258,7 +258,7 @@ Configure the Redis behind `REDIS_DATA_URL` (which defaults to `REDIS_URL`) with
 `allkeys-lru` (or `allkeys-lfu`):
 
 ```bash
-redis-cli CONFIG SET maxmemory-policy allkeys-lru   # and persist it in redis.conf
+redis-cli -u "${REDIS_DATA_URL:-$REDIS_URL}" CONFIG SET maxmemory-policy allkeys-lru   # data instance; persist in redis.conf
 ```
 
 Redis ships with `noeviction`, and under `noeviction` an instance that reaches
@@ -266,16 +266,12 @@ Redis ships with `noeviction`, and under `noeviction` an instance that reaches
 cache entries carry a 24h TTL (`REDIS_BLOB_CACHE_TTL_MS`), so waiting it out is not
 a strategy, and someone has to flush keys or raise the limit by hand. The load
 harness measured that as 97.6% 5xx with no recovery, against a `CLIENT PAUSE` that
-recovered the moment the pause lifted. With `allkeys-lru` the same memory pressure
-just evicts cold blobs, which costs a Postgres read.
+recovered the moment the pause lifted. With `allkeys-lru` on a separate data instance,
+the same memory pressure evicts cached blobs, and a cache miss costs a Postgres read.
 
-`allkeys-lru` and `allkeys-lfu` are the only two accepted, because on the default
-single-instance setup this policy also governs the exec-lock leases. LRU and LFU
-favor frequently renewed leases over cold blobs. `allkeys-random`
-samples uniformly, so a live lease is as likely to be reaped as that cold blob.
-`volatile-*` fails for a different reason: it evicts only keys that carry a TTL, so
-once the instance fills with keys that do not, it has no candidate left and behaves
-exactly like `noeviction`.
+For multi-replica distributed lock isolation, configure separate Redis instances for control (`REDIS_URL`) and data (`REDIS_DATA_URL`). Keep control on `noeviction` with enough memory headroom for lock operations. Keep the data instance on `allkeys-lru` or `allkeys-lfu`. Separate connections to one instance still share its eviction policy and memory limit.
+
+On the default shared instance, LRU/LFU favor recent or frequent keys but cannot guarantee lock retention. Evicting the reader-membership ZSET makes active readers invisible to writer drain checks. Use separate instances when distributed lock isolation must hold under cache memory pressure. `allkeys-random` also permits lock eviction, and `volatile-*` can run out of TTL-bearing keys to evict.
 
 The check runs only when this client actually carries the blob cache. With `REDIS_BLOB_CACHE_ENABLED=false`, no data connection opens. A control-only Redis must
 **not** be switched to `allkeys-*` — that would make its leases evictable.

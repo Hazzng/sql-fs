@@ -797,6 +797,8 @@ export class SessionManager {
 		if (coherent === undefined) return;
 		try {
 			await coherent.ensureFresh();
+			session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+			session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
 			if (session.state === "closing")
 				throw Object.assign(new Error("Session is shutting down"), { code: "ESESSIONCLOSING" });
 		} catch (error) {

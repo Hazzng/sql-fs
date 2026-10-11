@@ -68,7 +68,20 @@ describe.skipIf(!process.env.DATABASE_URL || !process.env.REDIS_URL)("authoritat
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await Promise.all([writer?.shutdown(), reader?.shutdown()]);
-		if (id) await destroyPostgresSandbox(process.env.DATABASE_URL!, id);
+		if (id) {
+			await destroyPostgresSandbox(process.env.DATABASE_URL!, id);
+			const cleanup = new PostgresDialect(process.env.DATABASE_URL!);
+			try {
+				await cleanup.connect();
+				await cleanup.transaction(async (tx) => {
+					await tx`DELETE FROM sandbox_epochs WHERE sandbox_id = ${id}`;
+					const remaining = await tx`SELECT sandbox_id FROM sandbox_epochs WHERE sandbox_id = ${id}`;
+					expect(remaining).toHaveLength(0);
+				});
+			} finally {
+				await cleanup.disconnect();
+			}
+		}
 		if (redis) {
 			const { writer: writerKey, readers } = rwLockKeys(tenant, id);
 			await redis.del(writerKey, readers, `vfs:${tenant}:ver:${id}`, `vfs:${tenant}:snap:${id}`);

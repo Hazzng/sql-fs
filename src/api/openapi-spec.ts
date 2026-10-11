@@ -75,7 +75,7 @@ const execBodySchema = {
 		retryOn5xx: {
 			type: "boolean",
 			description:
-				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs: the write may have committed before cache recovery failed, so a retry re-runs an already-applied script. Use the `retryable` field on the error body as the machine-readable form of this rule rather than enumerating codes.",
+				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs: the write may have committed before cache recovery failed, so a retry may re-run an already-applied script. Use the `retryable` field on the error body as the machine-readable form of this rule rather than enumerating codes.",
 		},
 	},
 	required: ["script"],

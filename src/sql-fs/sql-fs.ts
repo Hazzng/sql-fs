@@ -1028,7 +1028,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#freshnessRunning = false;
 	}
 
-	ensureFresh(): Promise<void> {
+	async ensureFresh(): Promise<void> {
 		if (this.#scriptScope)
 			throw Object.assign(new Error("Freshness admission during a script scope"), { code: "EBUSY" });
 		return this.#queueFreshness(false);
