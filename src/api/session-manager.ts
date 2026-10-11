@@ -22,7 +22,7 @@ import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
-import { createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
+import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
@@ -226,11 +226,18 @@ export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Recor
 		out.GIT_HTTP_USER = "x-access-token";
 		out.GIT_HTTP_PASSWORD = token;
 	}
-	for (const key of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] as const) {
-		const value = env[key];
-		if (value) out[key] = value;
-	}
 	return out;
+}
+
+/**
+ * The deployment's default commit identity. It goes to just-git as its fallback identity rather
+ * than into the sandbox env: GIT_AUTHOR_* env outranks `git -c user.*` and repo config, so as
+ * env it silently overrode both. Author values win; committer values fill in.
+ */
+export function buildGitIdentity(env: NodeJS.ProcessEnv = process.env): GitIdentity | undefined {
+	const name = env.GIT_AUTHOR_NAME || env.GIT_COMMITTER_NAME;
+	const email = env.GIT_AUTHOR_EMAIL || env.GIT_COMMITTER_EMAIL;
+	return name && email ? { name, email } : undefined;
 }
 
 const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
@@ -264,6 +271,10 @@ export function deriveExecGitCredentials(
 	if (!Object.hasOwn(env, "GIT_HTTP_PASSWORD")) out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
 	return out;
 }
+
+const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_ENV_AUDIT_NAMES = 20;
+const MAX_ENV_AUDIT_NAME_LENGTH = 128;
 
 function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
 	const out: Record<string, string> = Object.create(null);
@@ -303,6 +314,7 @@ export interface Session {
 	readonly bash: Bash;
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
+	readonly sandboxId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
 	lastUsed: number;
 	inFlight: number;
@@ -469,6 +481,8 @@ export class RuntimeBackpressureError extends Error {
 export class SessionManager {
 	/** Keyed by `${tenantId}:${sandboxId}` to isolate colliding sandbox ids across tenants. */
 	private readonly sessions: Map<string, Session> = new Map();
+	/** Weak references keep warning deduplication bounded by the warm session lifetime. */
+	private readonly unsupportedEnvWarned = new WeakSet<Session>();
 	private readonly pending: Map<string, Promise<Session>> = new Map();
 	private readonly backends: Map<string, PerTenantBackend> = new Map();
 	private readonly tenantConfig: TenantConfig | undefined;
@@ -501,6 +515,7 @@ export class SessionManager {
 	private readonly defenseInDepth: boolean;
 	private readonly defenseAuditMode: boolean;
 	private readonly sandboxBaseEnv: Record<string, string>;
+	private readonly gitIdentity: GitIdentity | undefined;
 	private shuttingDown = false;
 
 	constructor({
@@ -564,6 +579,7 @@ export class SessionManager {
 		this.defenseInDepth = defenseInDepth ?? process.env.JUST_BASH_DEFENSE_IN_DEPTH === "true";
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 		this.sandboxBaseEnv = buildSandboxBaseEnv();
+		this.gitIdentity = buildGitIdentity();
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -678,6 +694,7 @@ export class SessionManager {
 				// so a refused symlink cannot leave a poisoned index behind.
 				const gitCommand = createGitCommand({
 					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
+					identity: this.gitIdentity,
 				});
 				const customCommands = [
 					// Override just-bash's built-in nodeStubCommand with a smarter
@@ -739,6 +756,7 @@ export class SessionManager {
 					bash,
 					runtimeOptions: resolvedRuntime,
 					tenantId,
+					sandboxId,
 					scriptTx,
 					lastUsed: Date.now(),
 					inFlight: 0,
@@ -1836,6 +1854,33 @@ export class SessionManager {
 			cwd: opts?.cwd ?? session.cwd,
 			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
 		};
+		// Bash cannot export these names. Warn once per warm session with a bounded
+		// sample, without ever logging values or retaining caller-controlled names.
+		if (!this.unsupportedEnvWarned.has(session) && resolvedOpts.env !== undefined) {
+			const variableNames: string[] = [];
+			let omittedNameCount = 0;
+			let truncatedNameCount = 0;
+			for (const name in resolvedOpts.env) {
+				if (!Object.hasOwn(resolvedOpts.env, name) || SHELL_NAME.test(name)) continue;
+				if (variableNames.length >= MAX_ENV_AUDIT_NAMES) {
+					omittedNameCount++;
+					continue;
+				}
+				variableNames.push(name.slice(0, MAX_ENV_AUDIT_NAME_LENGTH));
+				if (name.length > MAX_ENV_AUDIT_NAME_LENGTH) truncatedNameCount++;
+			}
+			if (variableNames.length > 0) {
+				this.unsupportedEnvWarned.add(session);
+				logAudit("exec_env_not_exported", {
+					tenantId: session.tenantId,
+					sandboxId: session.sandboxId,
+					variableNames,
+					omittedNameCount,
+					truncatedNameCount,
+					severity: "warn",
+				});
+			}
+		}
 
 		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
 		// EREADONLY before any DB call, so the per-script transaction has

@@ -15,7 +15,9 @@ function makeSessionManager(): SessionManager {
 }
 
 describe("buildSandboxBaseEnv", () => {
-	it("exports GitHub token auth env and optional git identity only when set", () => {
+	// The git identity is just-git's fallback (buildGitIdentity), not sandbox env: as env it
+	// would outrank `git -c user.*` and repo config.
+	it("exports GitHub token auth env only, never the git identity", () => {
 		expect(buildSandboxBaseEnv({})).toEqual({});
 
 		expect(
@@ -23,14 +25,11 @@ describe("buildSandboxBaseEnv", () => {
 				GITHUB_TOKEN: "server-token",
 				GIT_AUTHOR_NAME: "Agent",
 				GIT_AUTHOR_EMAIL: "agent@example.com",
-				GIT_COMMITTER_NAME: "",
 			}),
 		).toEqual({
 			GITHUB_TOKEN: "server-token",
 			GIT_HTTP_USER: "x-access-token",
 			GIT_HTTP_PASSWORD: "server-token",
-			GIT_AUTHOR_NAME: "Agent",
-			GIT_AUTHOR_EMAIL: "agent@example.com",
 		});
 	});
 });
