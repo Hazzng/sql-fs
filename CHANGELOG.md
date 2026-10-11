@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.2
+
+### Patch Changes
+
+- [#216](https://github.com/Hazzng/sql-fs/pull/216) Thanks [@Hazzng](https://github.com/Hazzng)! - Bump just-bash to 3.6.0 and just-git to 1.9.0. Sandboxes gain `curl -d @file`, `--data-binary @file` and `-G`, `jq --arg` and string interpolation with nested quotes, and `git commit -q`. A local patch makes a redirect into a missing directory print `bash: <path>: No such file or directory` and set `$?` to 1 instead of failing the whole exec (vercel-labs/just-bash#557); drop it once a release fixes that.
+
+- [#216](https://github.com/Hazzng/sql-fs/pull/216) Thanks [@Hazzng](https://github.com/Hazzng)! - Per-request `env` with valid shell variable names now reaches `bash script.sh`, `bash -c`, and child shells started through `env`, `time`, or `timeout`. A local just-bash patch copies the active execution's variables and export attributes, and marks request variables for export without adding a shell command. This preserves the user's command budget, first-command arguments, shebangs, and line numbers, and prevents export attributes from leaking into later requests. Child-shell defaults preserve explicitly exported `SHELLOPTS` and `BASHOPTS` values.
+
+  Names outside `[A-Za-z_][A-Za-z0-9_]*`, such as `A-B`, stay available to direct commands but cannot be exported to child shells. The API logs a bounded sample once per warm session at warning severity, with tenant and sandbox IDs and without any env values. Remove the env patch when a just-bash release includes [vercel-labs/just-bash#439](https://github.com/vercel-labs/just-bash/pull/439).
+
+- [#217](https://github.com/Hazzng/sql-fs/pull/217) Thanks [@Hazzng](https://github.com/Hazzng)! - Sandbox git restores repository-recorded modes on files it rewrites and honours `git -c`, `-C` and `--no-pager`. Branch switches that change only a file's mode remain unsupported. A cloned or checked-out `100755` file used to land as 0644, so `./gradlew` failed with "Permission denied" and the next `git add -A` committed a `100755 -> 100644` change nobody made (blindmansion/just-git#10). Mode restoration also runs after partial checkout failures and is best-effort so it preserves the git command's original result or error. Files with merge conflicts retain the executable mode selected from the base and both branches, so staging a resolution does not silently record the other branch's mode. Restoring a file with `--ours`, `--theirs`, or an explicit source keeps the selected version's mode. Bump just-git to 1.9.1, which runs the command behind leading global options instead of printing help and exiting 0 (blindmansion/just-git#11). Bare `-c user.name` and `-c user.email` overrides require an explicit `=value`, so they cannot silently author a commit as `true`. `GIT_AUTHOR_*`/`GIT_COMMITTER_*` server settings are now git's fallback identity instead of sandbox env, so `git -c user.*`, repo `git config` and per-request `GIT_AUTHOR_*` env override them.
+
+- [#216](https://github.com/Hazzng/sql-fs/pull/216) Thanks [@Hazzng](https://github.com/Hazzng)! - Keep a file's mode when it is rewritten. `chmod 755 f; echo x >> f` (or `> f`, or `sed -i`) used to reset `f` to 0644. Also skip work just-bash 3.6 adds to every redirect: an empty append to an existing file is now a no-op instead of a full read and rewrite, and an empty file no longer commits a blob.
+
+- [#216](https://github.com/Hazzng/sql-fs/pull/216) Thanks [@Hazzng](https://github.com/Hazzng)! - Make `mv` and `cp` onto an existing file and `mktemp` work on just-bash 3.6. Its `mv`/`cp` refuse to replace a target unless the filesystem can prove the two paths are different files, so `jq ... > tmp && mv tmp file` failed with "cannot safely determine whether ... are the same file"; SqlFs `stat` now reports an inode identity. Its `mktemp` creates through an atomic `createExclusive`, which SqlFs now implements, so temp files are 0600 and temp directories 0700.
+
+- [#216](https://github.com/Hazzng/sql-fs/pull/216) Thanks [@Hazzng](https://github.com/Hazzng)! - Serve `/dev/null` as a virtual device in SqlFs. `cmd > /dev/null`, `>> /dev/null`, `&> /dev/null` and `< /dev/null` used to fail the whole exec with a 404 and roll back the script, because just-bash writes through to `/dev/null` and never creates `/dev` on SqlFs (vercel-labs/just-bash#558). Writes are now discarded and reads are empty, without touching the database. Reads, stat, and realpath also follow symlink aliases to the device. Copying from it creates an empty file; namespace changes and ingest cannot replace the device or create descendants beneath it.
+
+  Namespace operations queued or awaiting metadata inside an aborted script scope reject before publishing cached entries or updating a replacement scope's epoch.
+
 ## 1.0.1
 
 ### Patch Changes
