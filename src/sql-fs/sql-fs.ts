@@ -8,7 +8,6 @@
  */
 
 import { createHash } from "node:crypto";
-import type { Redis } from "ioredis";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
@@ -31,8 +30,6 @@ import {
 	createEscriptbuffer,
 	createEstale,
 } from "./errors.js";
-import type { RedisBlobCache } from "./redis-blob-cache.js";
-import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "./redis-path-snapshot.js";
 import type { BufferedMutation, ScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { type BulkIngestFile, INODE_KIND, type PathCacheEntry, type SqlDialect } from "./types.js";
 
@@ -131,27 +128,10 @@ interface MutationSpec<Tx> {
 interface SqlFsOptions<Tx> {
 	readonly dialect: SqlDialect<Tx>;
 	readonly sandboxId: string;
-	/** Tenant identifier — used to build tenant-prefixed Redis keys (Phase 3). */
-	readonly tenantId?: string;
 	/** Max total byte budget for the content cache. Default: 50 MB. */
 	readonly contentCacheMaxBytes?: number;
 	/** Allow symlink() to create symlinks. Default: false (EPERM). */
 	readonly allowSymlinks?: boolean;
-	/**
-	 * Optional Redis client used to read the per-sandbox version counter
-	 * (`vfs:{tenantId}:ver:{sandboxId}`) during cold-start / reload. Required
-	 * together with `pathSnapshot` for snapshot-backed cold starts (Phase E).
-	 */
-	readonly redis?: Redis;
-	/** Redis path snapshot — tried before `loadAllPaths` when `redis` is also set. */
-	readonly pathSnapshot?: RedisPathSnapshot;
-	/**
-	 * Tenant-scoped Redis blob cache. When set alongside `pathSnapshot`, a
-	 * synchronous `mget` pre-populates `contentCache` on snapshot hit before
-	 * `ready()` returns — eliminating the race window between session handoff
-	 * and background prewarm completion.
-	 */
-	readonly blobCache?: RedisBlobCache;
 	/**
 	 * Buffered script-tx (#166). When enabled, mutations inside a script scope are
 	 * recorded and replayed in one short transaction at `endScriptScope` instead of
@@ -174,15 +154,15 @@ interface SqlFsOptions<Tx> {
 export interface ICoherentFs extends IFileSystem {
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
+	ensureFresh(): Promise<void>;
 	/** True iff at least one mutation has run since the last clearDirty. */
 	wasDirty(): boolean;
-	/** Resets the dirty flag — called after publishing a new version. */
+	/** Resets the dirty flag after session memory accounting. */
 	clearDirty(): void;
 	/**
 	 * True iff a recovery `reload()` failed after a transaction COMMIT/abort,
 	 * leaving the in-memory caches holding mutations that never committed to the
-	 * source of truth. While poisoned the caller MUST NOT publish a new version /
-	 * snapshot — see `publishVersionIfDirty`. Cleared by a successful `reload()`.
+	 * source of truth. Admission must reload even if the epoch is unchanged.
 	 */
 	poisoned(): boolean;
 	/**
@@ -220,30 +200,32 @@ export interface IReadOnlyScopeFs extends IFileSystem {
 	readonly readOnlyScopeActive: boolean;
 }
 
+interface CommittedView {
+	epoch: bigint;
+	readonly entries: Map<string, PathCacheEntry>;
+}
+
+interface FreshnessWaiter {
+	readonly force: boolean;
+	readonly resolve: () => void;
+	readonly reject: (error: unknown) => void;
+}
+
 export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #dialect: SqlDialect<Tx>;
 	readonly #sandboxId: string;
-	readonly #tenantId: string;
-	readonly #pathCache: Map<string, PathCacheEntry>;
+	#committedView: CommittedView = { epoch: 0n, entries: new Map() };
+	#contentGeneration = 0;
+	readonly #freshnessQueue: FreshnessWaiter[] = [];
+	#freshnessRunning = false;
+
+	get #pathCache(): Map<string, PathCacheEntry> {
+		return this.#committedView.entries;
+	}
 	readonly #contentCache: LRUCache<bigint, Uint8Array>;
 	readonly #allowSymlinks: boolean;
-	readonly #redis: Redis | undefined;
-	readonly #pathSnapshot: RedisPathSnapshot | undefined;
-	readonly #blobCache: RedisBlobCache | undefined;
 	#dirty = false;
-	/**
-	 * Set when a recovery `reload()` fails after a COMMIT/abort, so the in-memory
-	 * caches still hold mutations that never landed in the source of truth.
-	 * Read by `publishVersionIfDirty` to suppress publishing a version/snapshot
-	 * of phantom state. Cleared on every successful `reload()`/`ready()`.
-	 */
 	#cachePoisoned = false;
-	/**
-	 * Single-flight guard for `reload()` — deduplicates concurrent reload calls
-	 * so a thundering herd across callers does not issue N loadAllPaths queries
-	 * against the DB simultaneously.
-	 */
-	#pendingReload: Promise<void> | undefined;
 	/**
 	 * In-flight prewarm task. Read by `readFile`/`readFileBuffer` cache-miss
 	 * paths to coalesce reads onto the batched fetch instead of racing it with
@@ -264,8 +246,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	#scriptTxPromise: Promise<void> | undefined;
 	/** Durable sandbox epoch pinned while the writer lock is held for this scope. */
 	#scriptEpoch: bigint | undefined;
-	/** Epoch observed after the last completed write outside a script scope. */
-	#lastKnownEpoch: bigint | undefined;
 	/**
 	 * Set when a scoped `#withWriteTx` ran. Those writes bump `version` via SQL
 	 * without a JS round trip, so `#scriptEpoch` lags until `endScriptScope`
@@ -308,9 +288,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * Provisional ids are negative and `inodes.id` is `BIGSERIAL`, so the two spaces
 	 * cannot collide, and `#nextProvisionalId` keeps decreasing across scopes so an
 	 * id left over from an aborted scope can never be mistaken for a fresh one.
-	 * Nothing outside this class can observe one: `FsStat` carries no `ino` field,
-	 * and the only consumer of `inodeId` outside `SqlFs` is the Redis path snapshot,
-	 * which is published after `endScriptScope` has remapped them.
 	 */
 	readonly #scriptTxBuffer: ScriptTxBufferConfig;
 	#mutations: BufferedMutation[] = [];
@@ -328,20 +305,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
-		this.#tenantId = opts.tenantId ?? "default";
 		this.#allowSymlinks = opts.allowSymlinks ?? false;
-		this.#redis = opts.redis;
-		this.#pathSnapshot = opts.pathSnapshot;
-		this.#blobCache = opts.blobCache;
 		this.#scriptTxBuffer = opts.scriptTxBuffer ?? { enabled: false, maxOps: 0, maxBytes: 0 };
-		this.#pathCache = new Map();
 		this.#contentCache = new LRUCache<bigint, Uint8Array>({
 			maxSize: opts.contentCacheMaxBytes ?? DEFAULT_CONTENT_CACHE_MAX_BYTES,
 			sizeCalculation: (value) => value.byteLength,
 		});
 	}
 
-	/** @internal exposed for the Redis path-snapshot writer (Phase E). */
 	_getPathCache(): Map<string, PathCacheEntry> {
 		return this.#pathCache;
 	}
@@ -483,7 +454,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				}
 				// Pin + compare inside the locked tx; a separate pre-read would TOCTOU.
 				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
-				if (this.#lastKnownEpoch !== undefined && epoch !== this.#lastKnownEpoch) {
+				if (epoch !== this.#committedView.epoch) {
 					throw createEstale(this.#sandboxId);
 				}
 				this.#scriptEpoch = epoch;
@@ -520,20 +491,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 	}
 
-	#expectedEpochArgs(): [bigint] | [] {
-		return this.#scriptEpoch === undefined ? [] : [this.#scriptEpoch];
-	}
-
-	/** Records the live epoch for freshly installed cache state (F2-L2). */
-	async #refreshKnownEpoch(): Promise<void> {
-		// #169 M4: `#db` rather than a bare `runTrustedDbAsync` — unraced, a driver fault leaves
-		// this await pending for the life of the session.
-		this.#lastKnownEpoch = await this.#db(() =>
-			this.#dialect.transaction(async (tx) => {
-				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-				return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
-			}),
-		);
+	#expectedEpochArgs(): [bigint] {
+		return [this.#scriptEpoch ?? this.#committedView.epoch];
 	}
 
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
@@ -574,7 +533,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				return value;
 			}),
 		);
-		if (observedEpoch !== undefined) this.#lastKnownEpoch = observedEpoch;
+		if (observedEpoch !== undefined) this.#committedView.epoch = observedEpoch;
 		return result;
 	}
 
@@ -596,13 +555,15 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const result = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				if (epoch !== this.#committedView.epoch) throw createEstale(this.#sandboxId);
 				const value = await fn(tx);
 				// Publish only after COMMIT; a failed COMMIT must not poison the pin.
 				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				return value;
 			}),
 		);
-		if (observedEpoch !== undefined) this.#lastKnownEpoch = observedEpoch;
+		if (observedEpoch !== undefined) this.#committedView.epoch = observedEpoch;
 		return result;
 	}
 
@@ -747,7 +708,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
 				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
-				if (this.#lastKnownEpoch !== undefined && epoch !== this.#lastKnownEpoch) {
+				if (epoch !== this.#committedView.epoch) {
 					throw createEstale(this.#sandboxId);
 				}
 				this.#scriptEpoch = epoch;
@@ -774,16 +735,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#applyIdRemap();
 	}
 
-	/**
-	 * Rewrites the provisional ids the script handed out to the ones the flush
-	 * created. Runs after COMMIT, before any version/snapshot publish.
-	 *
-	 * The trailing sweep is the fail-closed half: a provisional id still in the
-	 * pathCache means the replay produced no row for a path the cache claims exists —
-	 * cache/DB divergence — and letting it stand would key a contentCache entry no
-	 * inode owns and publish a negative id into the Redis path snapshot. Throwing
-	 * here lands in `endScriptScope`'s catch, which reloads the committed state.
-	 */
 	#applyIdRemap(): void {
 		if (this.#idRemap.size > 0) {
 			for (const [path, entry] of this.#pathCache) {
@@ -871,12 +822,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#pathCache.delete(key)) {
 			this.#pathCacheBytes -= key.length + 100;
 		}
-	}
-
-	/** Clears the pathCache and resets the byte counter. */
-	#cacheClear(): void {
-		this.#pathCache.clear();
-		this.#pathCacheBytes = 0;
 	}
 
 	/**
@@ -1035,106 +980,58 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		for (const path of entries.keys()) this.#assertStoredPath(validatePath(path), "load reserved virtual device");
 	}
 
-	/**
-	 * Loads the full path tree from the DB without touching in-memory caches.
-	 * Used by `ready()` (initial load) and `reload()` (cross-replica refresh).
-	 * On error the caller's caches are left untouched.
-	 *
-	 * Phase E: when `redis` and `pathSnapshot` are both configured, try a
-	 * snapshot read first. The embedded `version` must equal the current
-	 * `vfs:{tenantId}:ver:{sandboxId}` counter exactly (Edge Case §3); any mismatch,
-	 * miss, or Redis error falls through to `dialect.loadAllPaths`.
-	 */
-	async #loadFreshPathCache(): Promise<{ entries: Map<string, PathCacheEntry>; fromSnapshot: boolean }> {
-		let missReason: "disabled" | "no_key" | "version_mismatch" | "error" = "disabled";
-		if (this.#redis !== undefined && this.#pathSnapshot !== undefined) {
-			try {
-				const raw = await this.#redis.get(versionKey(this.#tenantId, this.#sandboxId));
-				// F7: a tombstone must never be coerced to 0 by `Number(raw) || 0`
-				// and then falsely match a `version: 0` snapshot. Treat it as a hard
-				// mismatch (`-1`, an impossible snapshot version) so we fall through
-				// to `loadAllPaths`, which throws ESANDBOXGONE for the (now absent)
-				// sandbox.
-				const currentVersion = raw === VERSION_TOMBSTONE ? -1 : raw === null ? 0 : Number(raw) || 0;
-				const snap = await this.#pathSnapshot.read(this.#tenantId, this.#sandboxId);
-				if (snap === null) {
-					missReason = "no_key";
-				} else if (snap.version !== currentVersion) {
-					missReason = "version_mismatch";
-				} else {
-					console.log(
-						JSON.stringify({
-							event: "path_snapshot_hit",
-							sandboxId: this.#sandboxId,
-							version: currentVersion,
-							entries: snap.entries.size,
-						}),
-					);
-					return { entries: snap.entries, fromSnapshot: true };
-				}
-			} catch (err) {
-				missReason = "error";
-				console.error(
-					JSON.stringify({
-						event: "snapshot_version_check_error",
-						sandboxId: this.#sandboxId,
-						error: (err as Error).message,
-					}),
-				);
-			}
-		}
-		console.log(JSON.stringify({ event: "path_snapshot_miss", sandboxId: this.#sandboxId, reason: missReason }));
-		// #169 M4: routed through `#db` like every other driver await — a bare `dialect.transaction`
-		// here is neither raced (a fault leaves the reload pending forever) nor inside the
-		// defense-in-depth escape hatch.
-		const rows = await this.#db(() =>
-			this.#dialect.transaction(async (tx) => {
-				await this.#dialect.setSandboxContext(tx, this.#sandboxId);
-				return await this.#dialect.loadAllPaths(tx);
-			}),
+	async #loadCommittedView(force: boolean): Promise<void> {
+		const view = await this.#db(() =>
+			this.#dialect.transaction(
+				async (tx) => {
+					await this.#dialect.setSandboxContext(tx, this.#sandboxId);
+					const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+					if (!force && !this.#cachePoisoned && this.#pathCache.size > 0 && epoch === this.#committedView.epoch)
+						return undefined;
+					const rows = await this.#dialect.loadAllPaths(tx);
+					if (rows.length === 0) throw createEsandboxgone(this.#sandboxId);
+					return { epoch, entries: new Map(rows.map(({ path, ...entry }) => [path, entry])) };
+				},
+				{ isolationLevel: "repeatable read" },
+			),
 		);
-		const fresh = new Map<string, PathCacheEntry>();
-		for (const { path, ...entry } of rows) {
-			fresh.set(path, entry);
-		}
-		return { entries: fresh, fromSnapshot: false };
+		if (view === undefined) return;
+		this.#assertPathCacheNamespace(view.entries);
+		this.#committedView = view;
+		this.#pathCacheBytes = [...view.entries.keys()].reduce((bytes, path) => bytes + path.length + 100, 0);
+		this.#contentGeneration++;
+		this.#contentCache.clear();
+		this.#dirty = false;
+		this.#cachePoisoned = false;
+		this.#startPrewarm(true);
 	}
 
-	/**
-	 * Synchronously pre-populates `#contentCache` from Redis blob cache using a
-	 * single `mget` round-trip. Called on snapshot hit before `ready()` returns,
-	 * eliminating the race window where exec reads files before background
-	 * prewarm completes. Fails open: any Redis error is logged; background
-	 * prewarm covers the rest via Postgres.
-	 */
-	async #prefetchBlobsFromSnapshot(entries: Map<string, PathCacheEntry>): Promise<void> {
-		if (this.#blobCache === undefined) return;
-		const inodeIds: bigint[] = [];
-		const sha256s: Uint8Array[] = [];
-		for (const entry of entries.values()) {
-			if (entry.kind === INODE_KIND.FILE && entry.contentSha256 !== null) {
-				inodeIds.push(entry.inodeId);
-				sha256s.push(entry.contentSha256);
+	#queueFreshness(force: boolean): Promise<void> {
+		return new Promise((resolve, reject) => {
+			this.#freshnessQueue.push({ force, resolve, reject });
+			if (this.#freshnessRunning) return;
+			this.#freshnessRunning = true;
+			queueMicrotask(() => void this.#drainFreshness());
+		});
+	}
+
+	async #drainFreshness(): Promise<void> {
+		while (this.#freshnessQueue.length > 0) {
+			const cohort = this.#freshnessQueue.splice(0);
+			try {
+				await this.#loadCommittedView(cohort.some((waiter) => waiter.force));
+				for (const waiter of cohort) waiter.resolve();
+			} catch (error) {
+				for (const waiter of cohort) waiter.reject(error);
 			}
 		}
-		if (sha256s.length === 0) return;
-		const blobs = await this.#blobCache.mget(sha256s);
-		let hits = 0;
-		for (let i = 0; i < blobs.length; i++) {
-			const data = blobs[i];
-			if (data != null && data.byteLength > 0) {
-				this.#contentCache.set(inodeIds[i]!, data);
-				hits++;
-			}
-		}
-		console.log(
-			JSON.stringify({
-				event: "snapshot_blob_prefetch_ok",
-				sandboxId: this.#sandboxId,
-				requested: sha256s.length,
-				hits,
-			}),
-		);
+		this.#freshnessRunning = false;
+	}
+
+	async ensureFresh(): Promise<void> {
+		if (this.#scriptScope)
+			throw Object.assign(new Error("Freshness admission during a script scope"), { code: "EBUSY" });
+		return this.#queueFreshness(false);
 	}
 
 	#startPrewarm(queueIfRunning = false): void {
@@ -1142,6 +1039,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			if (queueIfRunning) this.#prewarmQueued = true;
 			return;
 		}
+		const generation = this.#contentGeneration;
+		const entries = new Map([...this.#pathCache].map(([path, entry]) => [entry.inodeId, { path, entry }]));
 		const cap = this.#contentCache.maxSize;
 		const task = (async (): Promise<void> => {
 			try {
@@ -1152,6 +1051,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 					runTrustedDbAsync(() => this.#dialect.getBlobsForSandbox(this.#sandboxId, cap)),
 				);
 				for (const { inodeId, data } of blobs) {
+					const captured = entries.get(inodeId);
+					const entry = captured?.entry;
+					if (generation !== this.#contentGeneration || entry?.contentSha256 == null) continue;
+					if (!Buffer.from(entry.contentSha256).equals(createHash("sha256").update(data).digest())) continue;
+					if (captured === undefined || this.#pathCache.get(captured.path) !== entry) continue;
 					if (data.byteLength > 0) this.#contentCache.set(inodeId, data);
 				}
 				console.log(JSON.stringify({ event: "content_prewarm_ok", sandboxId: this.#sandboxId, entries: blobs.length }));
@@ -1175,92 +1079,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#prewarmInFlight = task;
 	}
 
-	/**
-	 * Initialises the in-memory pathCache by loading all paths from the DB
-	 * via a single recursive CTE query.  Must be called once before any FS op.
-	 */
 	async ready(): Promise<void> {
-		// Speculative background Postgres prewarm starts in parallel with pathCache
-		// load. Covers blobs not in Redis and the non-snapshot path.
-		this.#startPrewarm();
-
-		const { entries, fromSnapshot } = await this.#loadFreshPathCache();
-		this.#assertPathCacheNamespace(entries);
-		this.#cacheClear();
-		for (const [p, e] of entries) this.#cacheSet(p, e);
-		// Initial load established committed state; the cache is not poisoned (F1).
-		this.#cachePoisoned = false;
-		// Baseline the fence token for the state just installed; without this a
-		// later scope cannot tell a cross-replica write from its own (F2-L2).
-		await this.#refreshKnownEpoch();
-
-		// On snapshot hit: synchronous Redis mget pre-populates contentCache before
-		// this method returns, eliminating the race window for Redis-cached blobs.
-		// Only fires when both REDIS_PATH_SNAPSHOT_ENABLED and REDIS_BLOB_CACHE_ENABLED
-		// are true (i.e. pathSnapshot and blobCache are both configured).
-		if (fromSnapshot) {
-			await this.#prefetchBlobsFromSnapshot(entries);
-		}
+		await this.#queueFreshness(true);
 	}
 
-	/**
-	 * Drops the in-memory caches and repopulates `#pathCache` from the database.
-	 * Used on cross-replica cache-version mismatch (Phase D).
-	 *
-	 * Atomicity: the fresh snapshot is loaded BEFORE the existing caches are
-	 * cleared. If the DB call throws, the old caches remain intact so readers
-	 * do not see a temporary empty state (which would return ENOENT for
-	 * everything until the next successful reload).
-	 *
-	 * Concurrency: deduplicated via `#pendingReload` so simultaneous callers
-	 * share a single DB round trip.
-	 */
 	async reload(): Promise<void> {
-		// Defense-in-depth (F4): never reload while a script scope is open. A
-		// concurrent reload (e.g. a same-replica reader's `ensureFreshCache` on a
-		// Redis blip or version bump) would clear `#pathCache` / `#dirty` out from
-		// under an open writer mid-script — destroying its uncommitted in-memory
-		// view and suppressing its version publish. `endScriptScope` /
-		// `abortScriptScope` clear `#scriptScope` BEFORE their own reload(), so
-		// this guard does not block the legitimate commit/abort refresh paths.
-		if (this.#scriptScope) {
-			return;
-		}
-		if (this.#pendingReload !== undefined) {
-			return this.#pendingReload;
-		}
-		const p = (async (): Promise<void> => {
-			try {
-				const { entries } = await this.#loadFreshPathCache();
-				// F7: a cross-replica reload that comes back EMPTY means the sandbox
-				// was destroyed on another replica — the recursive CTE anchor joins
-				// `sandboxes` → root `inode`, so a live sandbox always yields at least
-				// its root dir. Refuse to install an empty pathCache (which would
-				// serve ghost ENOENTs and break cwd resolution inside bash.exec).
-				// Throw ESANDBOXGONE WITHOUT clearing the existing caches so the
-				// session manager can tear the stale warm session down and surface a
-				// clean ENOENT → 404. (This guard lives in reload(), not ready():
-				// ready() runs immediately after createSandbox, which guarantees a
-				// root row, whereas reload() refreshes a long-lived warm session.)
-				if (entries.size === 0) {
-					throw createEsandboxgone(this.#sandboxId);
-				}
-				this.#assertPathCacheNamespace(entries);
-				this.#cacheClear();
-				for (const [path, entry] of entries) this.#cacheSet(path, entry);
-				this.#contentCache.clear();
-				this.#dirty = false;
-				// A successful reload re-established committed state in the caches,
-				// so any prior poison is resolved (F1).
-				this.#cachePoisoned = false;
-				await this.#refreshKnownEpoch();
-				this.#startPrewarm(true);
-			} finally {
-				this.#pendingReload = undefined;
-			}
-		})();
-		this.#pendingReload = p;
-		return p;
+		if (this.#scriptScope) return;
+		await this.#queueFreshness(true);
 	}
 
 	// ── Script-scoped transaction (lazy) ─────────────────────────────────────────
@@ -1418,7 +1243,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			throw err;
 		} finally {
-			if (committed && this.#scriptEpoch !== undefined) this.#lastKnownEpoch = this.#scriptEpoch;
+			if (committed && this.#scriptEpoch !== undefined) this.#committedView.epoch = this.#scriptEpoch;
 			this.#scriptTx = undefined;
 			this.#scriptTxEnd = undefined;
 			this.#scriptTxAbort = undefined;
@@ -1461,10 +1286,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				await this.reload();
 				this.clearDirty();
 			} catch (reloadErr) {
-				// Reload also failed (correlated PG outage): the caches still hold
-				// uncommitted mutations. Mark poisoned so publishVersionIfDirty
-				// refuses to publish phantom state (F1). The next ensureFreshCache
-				// probe reloads the cache.
 				this.#cachePoisoned = true;
 				console.error(
 					JSON.stringify({
@@ -1477,10 +1298,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		}
 	}
 
-	// `#dirty = true` must be set AFTER `reload()` because `reload()` clears it,
-	// and `publishVersionIfDirty` at session-finalize needs to see dirty=true so
-	// other replicas pick up the new tree.
-	//
 	// Every input path is normalized via `validatePath` (rejects null bytes,
 	// resolves `.`/`..`) before reaching the dialect, matching the contract used
 	// by every other write method on this class. Two inputs that normalize to
@@ -2108,6 +1925,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	// ── IFileSystem: stubs (implemented in later stories) ────────────────────────
 
+	#contentEntryIsCurrent(path: string, entry: PathCacheEntry): boolean {
+		if (this.#pathCache.get(path) === entry) return true;
+		if (this.#pathCache.get(path)?.kind !== INODE_KIND.SYMLINK) return false;
+		return [...this.#pathCache.values()].some((current) => current === entry);
+	}
+
 	async #readBytes(inputPath: string): Promise<Uint8Array> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return new Uint8Array(0);
@@ -2119,6 +1942,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// but not the megabytes of string work the caller is about to do with the bytes.
 		this.#assertExecFileSize(path, entry.size, "read");
 
+		const generation = this.#contentGeneration;
 		const cached = this.#contentCache.get(entry.inodeId);
 		if (cached !== undefined) return cached;
 
@@ -2126,13 +1950,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#prewarmInFlight !== undefined) {
 			await this.#prewarmInFlight;
 			const afterPrewarm = this.#contentCache.get(entry.inodeId);
-			if (afterPrewarm !== undefined) return afterPrewarm;
+			if (
+				generation === this.#contentGeneration &&
+				this.#contentEntryIsCurrent(path, entry) &&
+				afterPrewarm !== undefined
+			)
+				return afterPrewarm;
 		}
 
 		// `blobs` is global (no RLS), so a transaction wrapper is unnecessary.
 		const data = await this.#db(() => this.#dialect.getBlobNoTx(entry.contentSha256!));
 		const bytes = data ?? new Uint8Array(0);
-		if (bytes.byteLength > 0) this.#contentCache.set(entry.inodeId, bytes);
+		if (generation === this.#contentGeneration && this.#contentEntryIsCurrent(path, entry) && bytes.byteLength > 0)
+			this.#contentCache.set(entry.inodeId, bytes);
 		return bytes;
 	}
 

@@ -6,7 +6,7 @@ Thank you for your interest. This guide covers everything you need to go from ze
 
 - **Node.js ≥ 22** and **pnpm**
 - **Postgres** — only required for integration tests; unit tests run without a database
-- **Redis** — optional; only needed for distributed lock / snapshot cache integration tests
+- **Redis** — optional; only needed for distributed lock and blob cache integration tests
 
 ## Setup
 
@@ -83,9 +83,7 @@ REDIS_URL=redis://localhost:6379 \
 pnpm test:integration
 ```
 
-`REDIS_URL` is not optional in practice: without it seven files — the five
-cross-replica/multi-tenant API suites plus `path-snapshot` and `redis-blob-cache` —
-skip in full, 29 tests that look like coverage and provide none. Set it.
+Set `REDIS_URL` to exercise the cross-replica, multi-tenant, authoritative freshness, and blob cache integration suites. Those tests skip when Redis is unconfigured.
 
 Every suite shares one database and one `max_connections` budget, so
 `pnpm test:integration` runs the files **serially** (`--no-file-parallelism`). Running

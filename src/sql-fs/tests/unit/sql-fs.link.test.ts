@@ -99,6 +99,7 @@ describe("SqlFs.link() — hardlink creation", () => {
 			expect.anything(), // tx
 			3n, // srcInodeId
 			sandboxId, // incrementNlink carries link's fence-and-advance
+			0n,
 		);
 		expect(incrementNlinkMock.mock.invocationCallOrder[0]!).toBeLessThan(insertDirentMock.mock.invocationCallOrder[0]!);
 	});

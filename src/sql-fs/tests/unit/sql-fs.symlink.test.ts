@@ -114,6 +114,7 @@ describe("SqlFs.symlink() — allowSymlinks=true", () => {
 		expect(createInodeMock).toHaveBeenCalledWith(
 			expect.anything(), // tx
 			expect.objectContaining({ kind: 3, symlinkTarget: "/home" }),
+			0n,
 		);
 	});
 

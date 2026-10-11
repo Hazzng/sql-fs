@@ -8,7 +8,6 @@
  *   3. A live reader on A blocks an exclusive writer on B (writer waits for drain).
  *   4. Writer-priority: a continuous reader stream on B doesn't starve a writer on A.
  *   5. A crashed reader (stale ZSET entry) cannot deadlock a writer — TTL reaper recovers.
- *   6. After a write on A commits + publishes, B's next withSessionRead sees the data.
  *   7. Parallel readers from both replicas each read the latest committed data.
  *   8. Reader on A reads fresh data after writer on B (symmetric of #6).
  *   9. Concurrent writers from different replicas serialize — no lost updates.
@@ -126,7 +125,7 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 		expect(spread).toBeLessThan(200);
 	});
 
-	it("exclusive on A blocks shared on B until A commits + publishes", async () => {
+	it("exclusive on A blocks shared on B until A commits", async () => {
 		const sandboxId = newId();
 		const smA = makeSm();
 		const smB = makeSm();
@@ -150,17 +149,9 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 		});
 
 		await timed("writer", writer);
-		// Capture the version A published — used to assert B saw the latest.
-		const versionAfterWrite = Number(await redis.get(versionKey(sandboxId)));
 		await timed("reader", reader);
 
 		expect(order).toEqual(["w-start", "w-end", "r-start"]);
-		expect(versionAfterWrite).toBeGreaterThanOrEqual(1);
-
-		// B's session must now reflect the version A published — proves the
-		// publishVersionIfDirty-before-release ordering.
-		const sessionB = smB.getSession(TENANT, sandboxId);
-		expect(sessionB?.lastSeenVersion).toBe(versionAfterWrite);
 	});
 
 	it("shared on A blocks exclusive on B until reader drains", async () => {
@@ -295,9 +286,6 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 			}),
 		);
 
-		const versionAfterA = Number(await redis.get(versionKey(sandboxId)));
-		expect(versionAfterA).toBeGreaterThanOrEqual(1);
-
 		// B's next readOnly turn must see /visible.txt (proves ordering:
 		// publishVersionIfDirty → ensureFreshCache reload → fn runs).
 		await timed(
@@ -308,9 +296,6 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 				expect(s.fs.getAllPaths()).toContain("/visible.txt");
 			}),
 		);
-
-		// B's session lastSeenVersion now matches A's published version.
-		expect(smB.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(versionAfterA);
 	});
 
 	it("parallel readers from both replicas each read the latest committed data", async () => {
@@ -361,11 +346,6 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 			}),
 		);
 
-		const versionAfterB = Number(await redis.get(versionKey(sandboxId)));
-		expect(versionAfterB).toBeGreaterThanOrEqual(1);
-
-		// A's ensureFreshCache must detect the version bump that B published
-		// and reload before running fn — so A sees B's file.
 		await timed(
 			"A-read",
 			smA.withSessionRead(TENANT, sandboxId, async (s) => {
@@ -374,8 +354,6 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 				expect(s.fs.getAllPaths()).toContain("/b-visible.txt");
 			}),
 		);
-
-		expect(smA.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(versionAfterB);
 	});
 
 	it("concurrent writers from different replicas serialize — no lost updates", async () => {

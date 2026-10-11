@@ -3,10 +3,8 @@
  * vanish, reads are empty, and nothing reaches the journal, the caches or the DB.
  */
 
-import type { Redis } from "ioredis";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readOnlyContext } from "../../../api/read-only-context.js";
-import type { RedisPathSnapshot } from "../../redis-path-snapshot.js";
 import { SqlFs } from "../../sql-fs.js";
 import { BUFFER_ON, DEFAULT_TREE, type DialectProbe, makeProbeDialect } from "../fixtures/buffered-dialect.js";
 
@@ -202,18 +200,5 @@ describe("SqlFs — virtual /dev/null", () => {
 		expect(fs.getAllPaths()).toEqual(paths);
 		expect(fs._getContentCache().calculatedSize).toBe(cacheBytes);
 		expect(await fs.readFile("/home/user/cached")).toBe("old bytes");
-	});
-
-	it("rejects a snapshot that contains the reserved device", async () => {
-		const entries = new Map(DEFAULT_TREE.map(({ path, ...entry }) => [path, entry]));
-		entries.set("/dev/null", { ...DEFAULT_TREE[3]!, inodeId: 99n });
-		const snapshotFs = new SqlFs({
-			dialect: probe.dialect,
-			sandboxId: "legacy-snapshot",
-			redis: { get: vi.fn(async () => "0") } as unknown as Redis,
-			pathSnapshot: { read: vi.fn(async () => ({ version: 0, entries })) } as unknown as RedisPathSnapshot,
-		});
-		await expect(snapshotFs.ready()).rejects.toMatchObject({ code: "EPERM" });
-		expect(snapshotFs.getAllPaths()).toEqual([]);
 	});
 });

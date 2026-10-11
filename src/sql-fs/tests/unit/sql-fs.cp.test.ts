@@ -97,7 +97,11 @@ describe("SqlFs.cp() — single file", () => {
 		expect(upsertBlobMock).not.toHaveBeenCalled();
 
 		// Verify createInode was called with the src's contentSha256
-		expect(createInodeMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ contentSha256: sha256 }));
+		expect(createInodeMock).toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ contentSha256: sha256 }),
+			0n,
+		);
 	});
 
 	it("cp file: createInode called with src mode and size", async () => {
@@ -106,6 +110,7 @@ describe("SqlFs.cp() — single file", () => {
 		expect(createInodeMock).toHaveBeenCalledWith(
 			expect.anything(),
 			expect.objectContaining({ kind: 1, mode: 0o644, size: 10 }),
+			0n,
 		);
 	});
 
@@ -261,10 +266,12 @@ describe("SqlFs.cp() — recursive directory", () => {
 		expect(createInodeMock).toHaveBeenCalledWith(
 			expect.anything(),
 			expect.objectContaining({ kind: 1, contentSha256: sha256a }),
+			0n,
 		);
 		expect(createInodeMock).toHaveBeenCalledWith(
 			expect.anything(),
 			expect.objectContaining({ kind: 1, contentSha256: sha256b }),
+			0n,
 		);
 	});
 

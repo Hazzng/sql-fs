@@ -13,7 +13,6 @@ import { Hono } from "hono";
 import { Redis } from "ioredis";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { RedisPathSnapshot } from "../../../sql-fs/redis-path-snapshot.js";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
 import { signToken } from "../../lib/jwt.js";
 import { runMigrations } from "../../migrations.js";
@@ -64,7 +63,6 @@ function makeApp(tenantConfig: TenantConfig, redis: Redis) {
 			acquireTimeoutMs: 8_000,
 			acquireRetryMs: 50,
 		},
-		pathSnapshot: new RedisPathSnapshot(redis, { ttlMs: 60_000 }),
 	});
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", createAuthMiddleware(tenantConfig));
@@ -237,10 +235,8 @@ describe.skipIf(SKIP)("Phase 5 — multi-tenant Postgres routing", () => {
 		expect(sandboxesA.map((row) => row.id)).toEqual([sandboxA]);
 		expect(sandboxesB.map((row) => row.id)).toEqual([sandboxB]);
 
-		expect(await redis.exists(versionKey(TENANT_A, sandboxA))).toBe(1);
-		expect(await redis.exists(versionKey(TENANT_B, sandboxB))).toBe(1);
-		expect(await redis.exists(RedisPathSnapshot.key(TENANT_A, sandboxA))).toBe(1);
-		expect(await redis.exists(RedisPathSnapshot.key(TENANT_B, sandboxB))).toBe(1);
+		expect(await redis.exists(versionKey(TENANT_A, sandboxA))).toBe(0);
+		expect(await redis.exists(versionKey(TENANT_B, sandboxB))).toBe(0);
 		expect(await redis.exists(legacyLockKey(sandboxA))).toBe(0);
 		expect(await redis.exists(legacyLockKey(sandboxB))).toBe(0);
 
@@ -273,7 +269,7 @@ describe.skipIf(SKIP)("Phase 5 — multi-tenant Postgres routing", () => {
 		});
 		expect(execRes.status).toBe(200);
 		expect(((await execRes.json()) as { stdout: string; exitCode: number }).stdout).toBe("legacy-ok\n");
-		expect(await redis.exists(versionKey("default", sandboxId))).toBe(1);
+		expect(await redis.exists(versionKey("default", sandboxId))).toBe(0);
 		const destroyRes = await app.request(`/v1/sandboxes/${sandboxId}`, { method: "DELETE", headers: auth });
 		expect(destroyRes.status).toBe(204);
 	});

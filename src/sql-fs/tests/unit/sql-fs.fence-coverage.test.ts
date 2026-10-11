@@ -314,7 +314,7 @@ describe("#192 — pin bookkeeping around the advancing writes", () => {
 
 		// Read AFTER the write: a pin taken before it would be one behind the row
 		// the mutation just advanced, and the scope below would open onto ESTALE.
-		expect(fake.calls).toEqual(["updateInode", "getSandboxEpoch"]);
+		expect(fake.calls).toEqual(["getSandboxEpoch", "updateInode", "getSandboxEpoch"]);
 		expect(fake.version()).toBe(5n);
 
 		fs.beginScriptScope();

@@ -16,7 +16,6 @@ import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
 import { installDriverFaultGuard, raceDriverFault } from "../sql-fs/driver-fault.js";
 import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
-import { RedisPathSnapshot } from "../sql-fs/redis-path-snapshot.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
 import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError, mapFsErrorToStatus } from "./errors.js";
@@ -46,33 +45,15 @@ export const app = new Hono<{ Variables: AuthVariables }>();
 
 const tenantConfig = loadTenantConfig();
 
-// #167: two connections. `redisClient` (control) carries the locks, the version
-// counter and session state; `redisDataClient` carries the blob cache and path
-// snapshot. Multi-MiB cache writes must not head-of-line block an INCR.
+// Separate connections keep blob backfills from delaying lock commands.
 const redisClient = getRedisClient("control");
-// Read data-plane demand from env BEFORE opening the data connection: a
-// lock-only deployment (blob cache off, snapshot off) must not pay for a
-// second socket nothing will ever use. REDIS_DATA_URL falls back to REDIS_URL
-// inside getRedisClient, so calling it unconditionally would always connect.
 const blobCacheEnvEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
-const snapshotEnvEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
-const redisDataClient = blobCacheEnvEnabled || snapshotEnvEnabled ? getRedisClient("data") : undefined;
+const redisDataClient = blobCacheEnvEnabled ? getRedisClient("data") : undefined;
 // Only parse Redis-scoped env vars when Redis is actually enabled. Parsing
 // them unconditionally would abort startup on a malformed Redis option even
 // in deployments that never touch Redis (REDIS_URL unset).
 const execLockOptions = redisClient ? loadExecLockOptions() : undefined;
 const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
-// Snapshots are version-checked against the control-side counter on every read
-// (and written only alongside its INCR), so without the control connection a
-// snapshot cache could never hit — require both clients.
-const pathSnapshotEnabled = redisClient !== undefined && redisDataClient !== undefined && snapshotEnvEnabled;
-const pathSnapshot =
-	pathSnapshotEnabled && redisDataClient
-		? new RedisPathSnapshot(redisDataClient, {
-				ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
-			})
-		: undefined;
-
 const blobCacheEnabled = redisDataClient !== undefined && blobCacheEnvEnabled;
 const blobCacheOptions = blobCacheEnabled
 	? {
@@ -164,7 +145,6 @@ const sessionManager = new SessionManager({
 	redis: redisClient,
 	execLockOptions,
 	rwlockEnabled,
-	pathSnapshot,
 	blobCacheFactory:
 		redisDataClient && blobCacheOptions
 			? (tenantId: string) => new RedisBlobCache(redisDataClient, tenantId, blobCacheOptions)
@@ -358,14 +338,8 @@ if (isMain) {
 		// because blob entries carry a 24h TTL. Warn only, and never await: a
 		// managed Redis that refuses CONFIG GET must still boot.
 		//
-		// #188 M8: only when this client actually carries data-plane state. With
-		// the blob cache off and no path snapshot, `REDIS_DATA_URL`'s fallback
-		// makes the data client the CONTROL instance, and a control-only Redis
-		// holds nothing evictable worth trading: paging its operator to switch to
-		// allkeys-* would make the exec-lock leases, version counters and destroy
-		// tombstones evictable — the remediation would be the outage.
 		startEvictionPolicyCheck(redisDataClient, {
-			carriesDataPlane: Boolean(blobCacheEnabled) || Boolean(pathSnapshotEnabled),
+			carriesDataPlane: Boolean(blobCacheEnabled),
 		});
 
 		// F8: process-wide event-loop-lag monitor. Purely observational — surfaces

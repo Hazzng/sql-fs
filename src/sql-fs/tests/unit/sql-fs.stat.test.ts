@@ -51,7 +51,22 @@ describe("SqlFs.stat and SqlFs.lstat", () => {
 
 	async function makeFs(entries: Array<{ path: string } & PathCacheEntry>): Promise<SqlFs> {
 		const dialect = makeDialect();
-		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue(entries);
+		(dialect.loadAllPaths as ReturnType<typeof vi.fn>).mockResolvedValue(
+			entries.length
+				? entries
+				: [
+						{
+							path: "/",
+							inodeId: 1n,
+							kind: 2,
+							mode: 0o755,
+							size: 0,
+							mtime: new Date(),
+							contentSha256: null,
+							symlinkTarget: null,
+						},
+					],
+		);
 		// stat() now follows symlinks via the dialect resolver (audit M7). Resolve a
 		// symlink path to its (single-hop) target inode for these tests.
 		(dialect.resolvePath as ReturnType<typeof vi.fn>).mockImplementation(async (_tx: unknown, path: string) => {

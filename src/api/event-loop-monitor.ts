@@ -6,8 +6,7 @@
  * RW-lock reader ZSET scores (shared heartbeat) — each keep themselves alive with
  * a `setTimeout`-driven heartbeat that renews well before expiry (`renewMs` <
  * `leaseMs`). They silently assume the timer fires roughly on schedule. A long
- * event-loop stall (a V8 GC pause, a pathological synchronous bash stretch, or —
- * only when `REDIS_PATH_SNAPSHOT_ENABLED=true` — the in-lock msgpack encode) fires
+ * event-loop stall (a V8 GC pause or a pathological synchronous bash stretch) fires
  * the renewal late; by then Redis has already expired the key / reaped the ZSET
  * entry, another replica can step in, and the next renew returns 0 →
  * `LockLostError`. Lock 3 (PG advisory + per-tx serialization, see DEVELOPER.md)

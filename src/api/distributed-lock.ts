@@ -127,7 +127,7 @@ export class LockLostError extends Error {
  * contract advertises `retryable: true` ("the server knows the request applied
  * nothing"). The F2-L1 pre-commit guard closes the common case by keying off
  * `lockLostSignal` before `endScope`, but `markLost()` fires from a heartbeat
- * tick and can land during the COMMIT itself or the Redis INCR that follows it.
+ * tick and can land during COMMIT.
  * Telling an auto-retrying client that a committed `echo L >> /counter.txt`
  * applied nothing double-applies it. Distinct, non-retryable code instead.
  *
