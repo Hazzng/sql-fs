@@ -1,27 +1,12 @@
-/**
- * Session Manager — US-074
- * Maintains a pool of warm Bash sessions, keyed by (tenantId, sandboxId).
- *
- * Multi-tenant: each tenant maps to its own Postgres database via
- * `TenantConfig`. Postgres backends (connection string + optional blob cache)
- * are lazily constructed per tenant; the session map is keyed by
- * `${tenantId}:${sandboxId}` so two tenants with colliding sandbox ids stay
- * isolated. Redis keys are tenant-prefixed (`vfs:${tenantId}:...`) — the
- * tenantId is propagated into snapshot operations and every Redis key generator
- * (locks, version counters, path snapshots, blob cache) so cross-tenant key
- * collisions are impossible.
- */
-
 import type { Redis } from "ioredis";
 import { Bash } from "just-bash";
 import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
 import { createEnoent } from "../sql-fs/errors.js";
 import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
-import { type RedisPathSnapshot, VERSION_TOMBSTONE, versionKey } from "../sql-fs/redis-path-snapshot.js";
 import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
-import type { PathCacheEntry, SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
+import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
@@ -38,136 +23,10 @@ import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
 import type { TenantConfig } from "./tenants.js";
 
-type SnapshotWriterFs = ICoherentFs & { _getPathCache(): Map<string, PathCacheEntry> };
-
-function asSnapshotWriter(fs: ICoherentFs): SnapshotWriterFs | undefined {
-	return typeof (fs as Partial<SnapshotWriterFs>)._getPathCache === "function" ? (fs as SnapshotWriterFs) : undefined;
-}
-
-/**
- * TTL for `vfs:{tenantId}:ver:*`, REFRESHED on every read (GETEX) and write
- * (INCR+EXPIRE). Because it is renewed on every access and far exceeds the
- * session idle-eviction window, an actively-used sandbox's counter never
- * expires; the key only ages out after a sandbox has been completely idle for
- * this long (by which point no replica holds a `lastSeenVersion` for it), which
- * is what makes the reset-to-1 safe (audit H6). It is also deleted eagerly on
- * `destroy`.
- */
-const VERSION_KEY_TTL_SECONDS = 7 * 24 * 60 * 60;
-
-/**
- * Boot-time coherence guard (audit F9b).
- *
- * The version-counter coherence proof requires the session idle-eviction
- * window to be comfortably shorter than the Redis version-key TTL: once a
- * sandbox has been idle past the TTL its `vfs:{tenant}:ver:*` key expires and
- * the counter resets to 1, which is only safe if no replica still holds a
- * `lastSeenVersion` for it — i.e. every replica has already evicted the
- * session. If an operator raises `SESSION_IDLE_MS` (or `MCP_SESSION_IDLE_MS`)
- * at or above the TTL, an idle session can outlive its counter and observe a
- * post-reset low value, silently re-opening the reset wrap.
- *
- * We enforce the MARGIN variant — `idleMs <= TTL/2` — to leave headroom for
- * the reaper tick and clock skew between replicas. The check only fires when
- * Redis is in play; memory-only deployments have no version counter and are
- * unaffected.
- *
- * NOTE: `VERSION_KEY_TTL_SECONDS` is in SECONDS and `idleMs` is in
- * MILLISECONDS — the `* 1000` conversion is load-bearing, do not drop it.
- */
-export function assertIdleBelowVersionTtl(idleMs: number, hasRedis: boolean): void {
-	if (!hasRedis) return;
-	const maxIdleMs = (VERSION_KEY_TTL_SECONDS * 1000) / 2;
-	if (idleMs > maxIdleMs) {
-		throw Object.assign(
-			new Error(
-				`Session idle window (${idleMs}ms) must not exceed half the Redis version-key TTL (${maxIdleMs}ms = ${VERSION_KEY_TTL_SECONDS}s / 2) when Redis is enabled. A session that outlives its version counter can observe a post-reset low value and break cache coherence (audit F9b). Lower SESSION_IDLE_MS / MCP_SESSION_IDLE_MS, or disable Redis.`,
-			),
-			{ code: "ERR_IDLE_TTL_INVARIANT" },
-		);
-	}
-}
-
-/**
- * #187: true when an `INCR` on the version key failed because the key itself is
- * structurally unusable rather than because Redis was unreachable.
- *
- * Redis answers `INCR` on a non-numeric string with `ERR value is not an integer
- * or out of range` and on a hash/list/set/zset with `WRONGTYPE ...`. Both are
- * permanent: every later INCR fails identically, so the #175 deferral never
- * drains and the sandbox stays write-wedged until a human edits Redis. Every
- * other failure — timeouts, ECONNRESET, `READONLY You can't write against a read
- * only replica`, breaker rejections — is transient or environmental and must keep
- * the deferral, so this matcher is deliberately narrow: two exact Redis reply
- * prefixes, nothing inferred from error class or command name.
- */
-export function isPoisonedVersionKeyError(err: unknown): boolean {
-	const message = (err as { message?: unknown } | null)?.message;
-	if (typeof message !== "string") return false;
-	return message.startsWith("WRONGTYPE") || message.startsWith("ERR value is not an integer");
-}
-
-/**
- * US-187 atomic poison repair (Codex P1 on #195: split GET-then-SET let a
- * drainer overwrite a concurrent replica's fresh version and serve stale reads
- * under a matching lastSeenVersion). Check + replace run as one Lua script
- * that only swaps a still-poisoned key, never a healed integer or tombstone.
- *
- * KEYS[1] = version key; ARGV[1] = reset; ARGV[2] = TTL seconds; ARGV[3] =
- * destroy tombstone. Returns the reset on repair, `TOMBSTONE`, or
- * `HEALTHY:<current>` when a concurrent repair already won.
- */
-const POISON_RESET_SCRIPT = `-- US-187 poison reset
-local function healthy_int(s)
-  if type(s) ~= 'string' then return false end
-  if string.match(s, '^%-?%d+$') == nil then return false end
-  local neg = false
-  if string.sub(s, 1, 1) == '-' then
-    neg = true
-    s = string.sub(s, 2)
-  end
-  s = string.gsub(s, '^0+', '')
-  if s == '' then return true end
-  if string.len(s) > 19 then return false end
-  if string.len(s) < 19 then return true end
-  if neg then
-    return s <= '9223372036854775808'
-  else
-    return s <= '9223372036854775807'
-  end
-end
-local cur = redis.pcall('GET', KEYS[1])
-if type(cur) == 'table' then
-  if cur.err ~= nil then
-    if string.find(cur.err, 'WRONGTYPE', 1, true) == 1 then
-      redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-      return ARGV[1]
-    else
-      error(cur.err)
-    end
-  else
-    error('unexpected GET reply')
-  end
-end
-if cur == false then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-  return ARGV[1]
-end
-if cur == ARGV[3] then
-  return 'TOMBSTONE'
-end
-if healthy_int(cur) then
-  return 'HEALTHY:' .. cur
-end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-return ARGV[1]
-`;
-
-type PoisonResetOutcome = { status: "repaired"; version: number } | { status: "healthy"; current: number };
-
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
 	if (
+		typeof partial.ensureFresh === "function" &&
 		typeof partial.reload === "function" &&
 		typeof partial.wasDirty === "function" &&
 		typeof partial.clearDirty === "function" &&
@@ -285,13 +144,6 @@ function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolea
 	return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/**
- * Syntactically valid sandbox id: UUIDs and dashed/underscored slugs, 1–128
- * chars. Audit M2: an unvalidated sandbox id flows straight into Redis lock /
- * version keys (`vfs:{tenant}:lock:{id}`, `…:ver:{id}`). Bounding the charset
- * and length here — before any key is built — prevents control-character /
- * unbounded-length keys and keeps a hostile id from ever reaching Redis.
- */
 const SANDBOX_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function isValidSandboxId(id: string): boolean {
@@ -331,7 +183,6 @@ export interface Session {
 	pathCacheBytes: number;
 	overBudget: boolean;
 	destroyPromise?: Promise<void>;
-	lastSeenVersion: number;
 	/**
 	 * Tracked working directory for this session.
 	 *
@@ -355,13 +206,6 @@ export interface Session {
 	 */
 	cwd: string;
 	/**
-	 * Single-flight guard for `ensureFreshCache`. While set, parallel readers
-	 * (and any concurrent writer entry) await the same probe + reload rather
-	 * than each issuing their own Redis GET / coherent.reload(). Cleared on
-	 * settle (success or failure).
-	 */
-	freshCacheInflight?: Promise<void>;
-	/**
 	 * AbortSignal that fires when the distributed exec lock is DEFINITIVELY lost
 	 * (lease expired or ownership taken by another holder) for the currently
 	 * locked region. Set by `withExecLockExclusive` / `withExecLockShared` before
@@ -371,29 +215,6 @@ export interface Session {
 	 * script-tx rolls back — BEFORE any commit on a lost lease (F2-L1).
 	 */
 	lockLostSignal?: AbortSignal;
-	/**
-	 * Set to true when a previous turn's `publishVersionIfDirty` call failed
-	 * (the write committed to Postgres but the Redis INCR errored). The write is
-	 * durable in Postgres, but the cross-replica version bump is stranded: other
-	 * replicas keep serving their pre-write tree until the counter advances.
-	 *
-	 * Two mechanisms eventually flush this bump (whichever fires first):
-	 *  - The next turn on this replica calls `publishVersionIfDirty` again, which
-	 *    publishes even with no new mutation because `publishPending` is set.
-	 *  - The background publish drainer (`drainPendingPublishes`, an unref'd
-	 *    interval tied to the reaper lifecycle) retries under the session lock,
-	 *    independent of any further client traffic — so an idle session that the
-	 *    reaper would otherwise evict (discarding this in-memory flag) is healed
-	 *    first. The reaper also makes a best-effort publish before disconnect.
-	 *
-	 * #175: a turn that publishes only because this flag is set (it mutated
-	 * nothing of its own) never surfaces the failure — the retry is the drainer's
-	 * job, not that request's, and 503-ing it would blame a read for a write it
-	 * did not make.
-	 *
-	 * Cleared after a successful publish.
-	 */
-	publishPending: boolean;
 }
 
 /** Per-tenant lazy Postgres backend state. */
@@ -420,7 +241,6 @@ export interface SessionManagerOptions {
 	readonly execLockOptions?: Partial<DistributedRWLockOptions>;
 	/** Feature flag: use the distributed RW lock keyspace. Set to false during rolling deploys. Defaults to true. */
 	readonly rwlockEnabled?: boolean;
-	readonly pathSnapshot?: RedisPathSnapshot;
 	/** Factory constructing a per-tenant RedisBlobCache. Called at most once per tenant on first access (lazy). */
 	readonly blobCacheFactory?: (tenantId: string) => RedisBlobCache | undefined;
 	/**
@@ -491,20 +311,9 @@ export class SessionManager {
 	private readonly idleMs: number;
 	private readonly pathCacheMaxBytes: number;
 	private reaperTimer: ReturnType<typeof setInterval> | undefined;
-	private drainerTimer: ReturnType<typeof setInterval> | undefined;
-	/**
-	 * F3: sessions whose committed write could not publish its Redis version bump
-	 * (the INCR failed). Keyed by `sessionKey`, valued with the coordinates the
-	 * drainer needs to retry the publish. The background drainer
-	 * (`drainPendingPublishes`) flushes these even if no further client traffic
-	 * arrives, so a stranded bump survives an idle eviction. Entries are removed
-	 * on a successful publish, on poison-suppression, or on destroy.
-	 */
-	private readonly pendingPublishes: Map<string, { tenantId: string; sandboxId: string }> = new Map();
 	private readonly redis: Redis | undefined;
 	private readonly execLockOptions: Partial<DistributedRWLockOptions> | undefined;
 	private readonly rwlockEnabled: boolean;
-	private readonly pathSnapshot: RedisPathSnapshot | undefined;
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
 	private readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
@@ -529,7 +338,6 @@ export class SessionManager {
 		redis,
 		execLockOptions,
 		rwlockEnabled,
-		pathSnapshot,
 		blobCacheFactory,
 		getSandboxMetaFn,
 		persistSandboxMetaFn,
@@ -548,12 +356,9 @@ export class SessionManager {
 			});
 		this.idleMs = idleMs ?? Number(process.env.SESSION_IDLE_MS ?? "600000");
 		this.redis = redis;
-		// Audit F9b: fail fast if the idle window could outlive the Redis version key.
-		assertIdleBelowVersionTtl(this.idleMs, this.redis !== undefined);
 		this.pathCacheMaxBytes = pathCacheMaxBytes ?? 50 * 1024 * 1024;
 		this.execLockOptions = execLockOptions;
 		this.rwlockEnabled = rwlockEnabled ?? true;
-		this.pathSnapshot = pathSnapshot;
 		this.blobCacheFactory = blobCacheFactory;
 		this.getSandboxMetaFn = getSandboxMetaFn;
 		this.persistSandboxMetaFn = persistSandboxMetaFn;
@@ -624,8 +429,6 @@ export class SessionManager {
 				connectionString: backend.connectionString,
 				tenantId,
 				blobCache: backend.blobCache,
-				redis: this.redis,
-				pathSnapshot: this.pathSnapshot,
 			},
 			sandboxId,
 			owner,
@@ -722,29 +525,6 @@ export class SessionManager {
 				const scriptTxFs = asScriptTxFs(fs);
 				const scriptTx = scriptTxFs !== undefined ? new SessionScopedFs(scriptTxFs) : undefined;
 
-				let initialVersion = 0;
-				if (this.redis !== undefined) {
-					try {
-						// GETEX so rehydrating a session refreshes the counter's TTL (audit H6).
-						const raw = await this.redis.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
-						if (raw === VERSION_TOMBSTONE) {
-							// F7: a tombstone here means the sandbox was destroyed but
-							// `buildFs` (createSandbox) just re-inserted the root — this
-							// session owns a freshly re-created sandbox. Clear the sentinel
-							// so a later `incr` does not run against the non-numeric string
-							// (which Redis rejects) and so a sibling warm session is not
-							// torn down for a sandbox that is alive again. Start at 0, the
-							// fresh-sandbox baseline.
-							await this.redis.del(versionKey(tenantId, sandboxId));
-							initialVersion = 0;
-						} else {
-							initialVersion = raw === null ? 0 : Number(raw) || 0;
-						}
-					} catch {
-						initialVersion = 0;
-					}
-				}
-
 				// Shutdown may have begun while buildFs() was running. If so, refuse
 				// to register the session — shutdown's snapshot has already been
 				// taken and would never see this fs, leaking its dialect pool.
@@ -767,17 +547,12 @@ export class SessionManager {
 					createdAt: fsCreatedAt,
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
-					lastSeenVersion: initialVersion,
-					publishPending: false,
 					cwd: bash.getCwd(),
 				};
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
 				return session;
 			} catch (err) {
-				// Disconnect any FS we built before the failure so the dialect
-				// pool doesn't leak when session construction throws
-				// post-buildFs() (e.g., new Bash(), Redis version probe, etc.).
 				if (createdFs !== undefined) {
 					try {
 						await this.disconnectFs(createdFs);
@@ -797,16 +572,6 @@ export class SessionManager {
 
 	getSession(tenantId: string, sandboxId: string): Session | undefined {
 		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
-	}
-
-	/**
-	 * Reads `session.state` *live*. The reaper mutates `state` asynchronously, so
-	 * a value the control-flow analyser narrowed to `"active"` at an earlier guard
-	 * may already be `"closing"` by the time a probe rejects. Reading through a
-	 * function call defeats that stale narrowing (F9c).
-	 */
-	private isClosing(session: Session): boolean {
-		return session.state === "closing";
 	}
 
 	private async withExecLockExclusive<T>(
@@ -859,29 +624,6 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		// F9c: a straggler that passed the `closing` check above can still run
-		// the pre-lock cache probe *after* the reaper begins disconnecting this
-		// session's pool. `ensureFreshCache` → `reload()` would then hit a pool
-		// being torn down (`PostgresDialect: not connected`, or driver
-		// `CONNECTION_DESTROYED`/`ENDED`) — an unmapped error that defaults to a
-		// 500. Re-check `state` and convert that into a clean, retryable
-		// ESESSIONCLOSING (503) so the client retries instead of seeing a 500.
-		try {
-			await this.ensureFreshCache(tenantId, sandboxId, session);
-		} catch (err) {
-			// F7: ensureFreshCache tears the session down and throws ENOENT when the
-			// sandbox is gone (tombstone or zero-row reload). That ENOENT is the
-			// definitive answer — surface it as a clean 404. Do NOT remap it to
-			// ESESSIONCLOSING below just because teardown set state="closing".
-			if ((err as Error & { code?: string }).code === "ENOENT") throw err;
-			if (this.isClosing(session)) {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
-					code: "ESESSIONCLOSING",
-				});
-			}
-			throw err;
-		}
-
 		// F2-L1: expose the distributed lock's definitive-loss signal to the exec
 		// routes (which compose it into bash.exec's abort signal) for the duration
 		// of this locked region. Cleared in finally so a stale signal never leaks
@@ -896,43 +638,34 @@ export class SessionManager {
 				}
 				session.inFlight++;
 				session.lastUsed = Date.now();
-				let primaryError: unknown;
-				let result: T | undefined;
-				let succeeded = false;
 				try {
-					result = await fn(session);
-					succeeded = true;
-				} catch (err) {
-					primaryError = err;
+					await this.ensureFreshCache(tenantId, sandboxId, session);
+				} catch (error) {
+					session.inFlight--;
+					throw error;
 				}
-				const coherent = asCoherentFs(session.fs);
-				const shouldRefreshPathBudget = coherent === undefined || coherent.wasDirty();
-				let publishError: unknown;
 				try {
-					await this.publishVersionIfDirty(tenantId, sandboxId, session);
-				} catch (err) {
-					publishError = err;
-					console.error(
-						JSON.stringify({
-							event: "publish_version_finally_error",
-							sandboxId,
-							error: (err as Error).message,
-						}),
-					);
+					const result = await fn(session);
+					if (asCoherentFs(session.fs)?.poisoned()) {
+						throw Object.assign(
+							new Error("ECOHERENCE_UNAPPLIED: recovery failed; nothing was applied, retry is safe"),
+							{ code: "ECOHERENCE_UNAPPLIED" },
+						);
+					}
+					return result;
+				} finally {
+					const coherent = asCoherentFs(session.fs);
+					if (coherent === undefined || coherent.wasDirty()) {
+						session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+						session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+						coherent?.clearDirty();
+					}
+					session.inFlight--;
 				}
-				session.inFlight--;
-				if (shouldRefreshPathBudget) {
-					session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-					session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-				}
-				// Order of precedence:
-				// 1. The handler's own error (most specific) takes priority.
-				// 2. Otherwise, surface the publish failure so the client knows the
-				//    write committed but cross-replica coherence did not (503).
-				if (primaryError !== undefined) throw primaryError;
-				if (publishError !== undefined && succeeded) throw publishError;
-				return result as T;
 			});
+		} catch (error) {
+			if ((error as { code?: string }).code === "ENOENT") await session.destroyPromise;
+			throw error;
 		} finally {
 			session.lockLostSignal = undefined;
 		}
@@ -957,24 +690,6 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		// F9c: same reaper-vs-straggler race as withSessionEntry — a reader that
-		// passed the `closing` check can still probe a pool being disconnected.
-		// Re-check `state` and surface a retryable ESESSIONCLOSING (503) instead
-		// of the unmapped error → 500.
-		try {
-			await this.ensureFreshCache(tenantId, sandboxId, session);
-		} catch (err) {
-			// F7: a gone-sandbox teardown surfaces ENOENT — the definitive 404
-			// answer. Don't remap it to ESESSIONCLOSING (see withSessionEntry).
-			if ((err as Error & { code?: string }).code === "ENOENT") throw err;
-			if (this.isClosing(session)) {
-				throw Object.assign(new Error("ESESSIONCLOSING: session is shutting down, retry"), {
-					code: "ESESSIONCLOSING",
-				});
-			}
-			throw err;
-		}
-
 		// F2-L1: expose the distributed shared lock's definitive-loss signal to the
 		// exec routes for this locked region (see withSessionEntry). Cleared in
 		// finally so it never leaks into a later turn reusing this warm session.
@@ -991,6 +706,12 @@ export class SessionManager {
 
 				session.inFlight++;
 				session.lastUsed = Date.now();
+				try {
+					await this.ensureFreshCache(tenantId, sandboxId, session);
+				} catch (error) {
+					session.inFlight--;
+					throw error;
+				}
 				let scopeOpened = false;
 				try {
 					if (roFs !== undefined) {
@@ -1061,288 +782,40 @@ export class SessionManager {
 						}
 					}
 					session.inFlight--;
-					// readOnly path never writes — no path-budget refresh, no version
-					// publish. The dirty flag is preserved so a subsequent writer's
-					// publishVersionIfDirty still fires (defense-in-depth).
 				}
 			});
+		} catch (error) {
+			if ((error as { code?: string }).code === "ENOENT") await session.destroyPromise;
+			throw error;
 		} finally {
 			session.lockLostSignal = undefined;
 		}
 	}
 
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
-		if (this.redis === undefined) return;
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
-
-		// Single-flight: parallel readers (and the rare writer that races
-		// them) share one Redis GET + reload() round trip. Without this,
-		// N concurrent readOnly execs would each issue their own probe and
-		// — on version mismatch — N concurrent loadAllPaths against
-		// Postgres.
-		const existing = session.freshCacheInflight;
-		if (existing !== undefined) return existing;
-
-		const probe = (async (): Promise<void> => {
-			let current: number;
-			try {
-				// GETEX refreshes the key's TTL on every read so an actively-used
-				// sandbox's version counter never ages out. Combined with session
-				// idle-eviction (≪ TTL), this guarantees no warm session can ever
-				// be holding a `lastSeenVersion` when the key expires and the counter
-				// resets to 1 — closing the stale-read / lost-update wrap (audit H6).
-				const raw = await this.redis!.getex(versionKey(tenantId, sandboxId), "EX", VERSION_KEY_TTL_SECONDS);
-				// F7: recognise the destroy tombstone BEFORE the numeric parse —
-				// `Number("DESTROYED") || 0` would clamp to 0 and, for a
-				// never-written session (lastSeenVersion === 0), silently match
-				// (`0 === 0`) so no reload would ever fire and the warm session
-				// would serve ghost state. Tear the session down and surface a
-				// clean ENOENT → 404 instead.
-				if (raw === VERSION_TOMBSTONE) {
-					await this.tearDownGoneSession(tenantId, sandboxId, session);
-					throw createEnoent(`/${sandboxId}`);
-				}
-				current = raw === null ? 0 : Number(raw) || 0;
-			} catch (err) {
-				if ((err as Error & { code?: string }).code === "ENOENT") throw err;
-				// Redis unavailable — can't determine whether the cache is fresh.
-				// Reload from Postgres so we don't serve stale data.
-				console.error(JSON.stringify({ event: "version_get_error", sandboxId, error: (err as Error).message }));
-				await this.reloadOrTearDownGone(tenantId, sandboxId, session, coherent);
-				return;
-			}
-
-			if (session.lastSeenVersion !== current) {
-				await this.reloadOrTearDownGone(tenantId, sandboxId, session, coherent);
-				session.lastSeenVersion = current;
-				coherent.clearDirty();
-			}
-		})().finally(() => {
-			session.freshCacheInflight = undefined;
-		});
-
-		session.freshCacheInflight = probe;
-		return probe;
-	}
-
-	/**
-	 * F7 (primary, Redis-independent): wrap `reload()` so a zero-row
-	 * `loadAllPaths` — which `SqlFs` raises as ESANDBOXGONE — tears the warm
-	 * session down and surfaces a clean ENOENT instead of installing an empty
-	 * pathCache (which would serve ghost ENOENTs / break cwd resolution inside
-	 * bash.exec). Any other reload error propagates unchanged.
-	 */
-	private async reloadOrTearDownGone(
-		tenantId: string,
-		sandboxId: string,
-		session: Session,
-		coherent: ICoherentFs,
-	): Promise<void> {
 		try {
-			await coherent.reload();
-		} catch (err) {
-			if ((err as Error & { code?: string }).code === "ESANDBOXGONE") {
-				await this.tearDownGoneSession(tenantId, sandboxId, session);
-				throw createEnoent(`/${sandboxId}`);
-			}
-			throw err;
-		}
-	}
-
-	/**
-	 * F7: tear down a warm session whose sandbox has been destroyed on another
-	 * replica. Mirrors the reaper teardown — mark `closing` so any straggler
-	 * that already captured this reference observes ESESSIONCLOSING, drop it from
-	 * the map, and disconnect the per-session Postgres pool so it cannot leak.
-	 * Idempotent: a session already `closing` (concurrent destroy/reaper) is left
-	 * for that path to finish.
-	 */
-	private async tearDownGoneSession(tenantId: string, sandboxId: string, session: Session): Promise<void> {
-		const key = this.sessionKey(tenantId, sandboxId);
-		if (session.state !== "closing") {
-			session.state = "closing";
-		}
-		this.sessions.delete(key);
-		await this.disconnectFs(session.fs);
-		console.error(JSON.stringify({ event: "session_torn_down_sandbox_gone", tenantId, sandboxId }));
-	}
-
-	/**
-	 * #187: repair a poisoned version key, or null when the caller must defer
-	 * (#175 path: tombstone, or the repair itself failed). Reset is epoch-millis
-	 * so no sibling can already hold it; a restart at 1 would invisibly match a
-	 * sibling still holding 1.
-	 */
-	private async resetPoisonedVersionKey(
-		tenantId: string,
-		sandboxId: string,
-		key: string,
-		cause: unknown,
-	): Promise<PoisonResetOutcome | null> {
-		const reset = Date.now();
-		let raw: unknown;
-		try {
-			// Single round trip: never overwrites a value healed since our INCR failed.
-			// Plain SET would also heal WRONGTYPE, but non-atomically (see header).
-			raw = await this.redis!.eval(
-				POISON_RESET_SCRIPT,
-				1,
-				key,
-				String(reset),
-				String(VERSION_KEY_TTL_SECONDS),
-				VERSION_TOMBSTONE,
-			);
-		} catch (err) {
-			console.error(
-				JSON.stringify({
-					event: "version_key_reset_error",
-					tenantId,
-					sandboxId,
-					error: (err as Error).message,
-				}),
-			);
-			return null;
-		}
-		// Tombstone is a deliberate sentinel, not corruption; overwriting it would
-		// resurrect a destroyed sandbox. Defer so ensureFreshCache raises ENOENT.
-		if (raw === "TOMBSTONE") return null;
-		if (typeof raw === "string" && raw.startsWith("HEALTHY:")) {
-			const current = Number(raw.slice("HEALTHY:".length));
-			if (Number.isSafeInteger(current)) return { status: "healthy", current };
-			console.error(
-				JSON.stringify({ event: "version_key_reset_error", tenantId, sandboxId, error: "unparseable HEALTHY" }),
-			);
-			return null;
-		}
-		if (String(raw) !== String(reset)) {
-			console.error(
-				JSON.stringify({ event: "version_key_reset_error", tenantId, sandboxId, error: "unexpected reset reply" }),
-			);
-			return null;
-		}
-		console.error(
-			JSON.stringify({
-				event: "version_key_poisoned_reset",
-				tenantId,
-				sandboxId,
-				resetTo: reset,
-				error: (cause as Error).message,
-			}),
-		);
-		return { status: "repaired", version: reset };
-	}
-
-	private async publishVersionIfDirty(tenantId: string, sandboxId: string, session: Session): Promise<void> {
-		if (this.redis === undefined) return;
-		const coherent = asCoherentFs(session.fs);
-		if (coherent === undefined) return;
-		// F1: a correlated PG failure (failed COMMIT + failed recovery reload) can
-		// leave the in-memory caches holding uncommitted "phantom" state. Refuse to
-		// publish a version/snapshot of it — that would authenticate the lie under a
-		// fresh stamp. Suppress INCR + snapshot, force the next ensureFreshCache to
-		// reload from Postgres (lastSeenVersion = -1), drop the pending publish, and
-		// surface ECOHERENCE_UNAPPLIED.
-		//
-		// #175: this is the NOT-APPLIED half of the coherence contract and must not
-		// share a code with the applied half below. Poison is only ever set after a
-		// failed COMMIT or an aborted script-tx — Postgres rolled the mutation back —
-		// so a retry cannot double-apply anything.
-		if (coherent.poisoned()) {
-			session.lastSeenVersion = -1;
-			session.publishPending = false;
-			// The reload that follows will fetch the truth from Postgres; there is
-			// nothing valid left to publish, so drop any pending retry for this key.
-			this.pendingPublishes.delete(this.sessionKey(tenantId, sandboxId));
-			throw Object.assign(
-				new Error("ECOHERENCE_UNAPPLIED: cache poisoned by failed reload; nothing was applied, retry is safe"),
-				{ code: "ECOHERENCE_UNAPPLIED" },
-			);
-		}
-		const dirty = coherent.wasDirty();
-		if (!dirty && !session.publishPending) return;
-
-		const key = versionKey(tenantId, sandboxId);
-		let newVersion: number;
-		const deferStranded = (cause: unknown): void => {
-			// Local write committed but version unpublished; remotes serve stale
-			// reads. Keep dirty, force reload next turn, surface 503, enqueue drainer.
-			console.error(JSON.stringify({ event: "version_incr_error", sandboxId, error: (cause as Error).message }));
-			session.lastSeenVersion = -1;
-			session.publishPending = true;
-			// F3: heal via background drain even with no further client traffic.
-			this.pendingPublishes.set(this.sessionKey(tenantId, sandboxId), { tenantId, sandboxId });
-			// #175: a turn that wrote nothing must not inherit the stranded turn's
-			// 503; the drainer heals the bump.
-			if (!dirty) {
-				console.error(JSON.stringify({ event: "version_incr_error_deferred", sandboxId }));
-				return;
-			}
-			// Mutation IS committed; retry would double-apply a non-idempotent script.
-			throw Object.assign(
-				new Error(
-					"ECOHERENCE: write committed but cross-replica version publish failed; " +
-						"the write IS applied — do not blindly retry",
-				),
-				{ code: "ECOHERENCE" },
-			);
-		};
-		try {
-			newVersion = Number(await this.redis.incr(key));
-		} catch (err) {
-			// #187: poisoned keys fail every INCR identically and wedge the sandbox;
-			// repair in place. Transport failures keep the #175 deferral.
-			const recovered = isPoisonedVersionKeyError(err)
-				? await this.resetPoisonedVersionKey(tenantId, sandboxId, key, err)
-				: null;
-			if (recovered === null) {
-				deferStranded(err);
-				return;
-			}
-			if (recovered.status === "healthy") {
-				// Lost the repair race; our cache lacks the winner's write. Reload,
-				// then bump so the winner is forced to reload in turn.
-				try {
-					await this.reloadOrTearDownGone(tenantId, sandboxId, session, coherent);
-				} catch (reloadErr) {
-					if ((reloadErr as Error & { code?: string }).code === "ENOENT") throw reloadErr;
-					deferStranded(reloadErr);
-					return;
+			await coherent.ensureFresh();
+			if (session.state === "closing")
+				throw Object.assign(new Error("Session is shutting down"), { code: "ESESSIONCLOSING" });
+		} catch (error) {
+			const code = (error as { code?: string }).code;
+			if (code !== "ENOENT" && code !== "ESANDBOXGONE") {
+				if (session.state === "closing") {
+					throw Object.assign(new Error("Session is shutting down"), { code: "ESESSIONCLOSING" });
 				}
-				try {
-					newVersion = Number(await this.redis.incr(key));
-				} catch (incrErr) {
-					deferStranded(incrErr);
-					return;
-				}
-				console.error(JSON.stringify({ event: "version_key_poison_race_healed", sandboxId }));
-			} else {
-				newVersion = recovered.version;
+				throw error;
 			}
-		}
-		try {
-			await this.redis.expire(key, VERSION_KEY_TTL_SECONDS);
-		} catch {
-			// swallow
-		}
-		if (this.pathSnapshot !== undefined) {
-			const writer = asSnapshotWriter(coherent);
-			if (writer !== undefined) {
-				try {
-					await this.pathSnapshot.write(tenantId, sandboxId, newVersion, writer._getPathCache());
-				} catch (err) {
-					// snapshot write is a perf optimization — losing it is fine
-					console.error(
-						JSON.stringify({ event: "path_snapshot_write_error", sandboxId, error: (err as Error).message }),
-					);
-				}
+			if (session.state !== "closing") {
+				session.state = "closing";
+				session.destroyPromise = session.lock.runExclusive(async () => {
+					await this.disconnectFs(session.fs);
+					this.sessions.delete(this.sessionKey(tenantId, sandboxId));
+				});
 			}
+			throw createEnoent(`/${sandboxId}`);
 		}
-		session.lastSeenVersion = newVersion;
-		session.publishPending = false;
-		coherent.clearDirty();
-		// F3: the bump landed — clear any pending drainer retry for this key.
-		this.pendingPublishes.delete(this.sessionKey(tenantId, sandboxId));
 	}
 
 	async withSession<T>(
@@ -1500,149 +973,32 @@ export class SessionManager {
 		return this.withExecLockExclusive(tenantId, sandboxId, async () => {
 			const key = this.sessionKey(tenantId, sandboxId);
 			const session = this.sessions.get(key);
-
 			if (session === undefined) {
 				await this.destroySandboxFn(tenantId, sandboxId);
-				await this.deleteVersionKey(tenantId, sandboxId);
-				if (this.pathSnapshot !== undefined) {
-					await this.pathSnapshot.delete(tenantId, sandboxId);
-				}
 				return false;
 			}
-
 			if (session.destroyPromise !== undefined) {
 				await session.destroyPromise;
 				return true;
 			}
-
 			session.state = "closing";
-
-			const p = session.lock.runExclusive(async () => {
+			session.destroyPromise = session.lock.runExclusive(async () => {
 				this.sessions.delete(key);
-				// F3: the sandbox (and its version key) is going away — drop any
-				// stranded publish so the drainer doesn't retry against a dead key.
-				this.pendingPublishes.delete(key);
-				// Disconnect the FS unconditionally — even if destroySandboxFn,
-				// version-key deletion, or path-snapshot cleanup throws — so the
-				// per-session Postgres pool can never leak. Errors from the
-				// individual cleanup steps are surfaced to the caller via
-				// rethrow at the end.
-				let cleanupError: unknown;
 				try {
-					let destroySucceeded = false;
-					try {
-						await this.destroySandboxFn(tenantId, sandboxId);
-						destroySucceeded = true;
-					} catch (e) {
-						cleanupError ??= e;
-						console.error(
-							JSON.stringify({
-								event: "destroy_sandbox_error",
-								sandboxId,
-								error: (e as Error).message,
-							}),
-						);
-					}
-					if (destroySucceeded) {
-						try {
-							await this.deleteVersionKey(tenantId, sandboxId);
-						} catch (e) {
-							cleanupError ??= e;
-						}
-						if (this.pathSnapshot !== undefined) {
-							try {
-								await this.pathSnapshot.delete(tenantId, sandboxId);
-							} catch (e) {
-								cleanupError ??= e;
-							}
-						}
-					}
+					await this.destroySandboxFn(tenantId, sandboxId);
 				} finally {
 					await this.disconnectFs(session.fs);
 				}
-				if (cleanupError !== undefined) throw cleanupError;
 			});
-			session.destroyPromise = p;
-
-			await p;
+			await session.destroyPromise;
 			return true;
 		});
 	}
 
-	/**
-	 * F7: tombstone the version key on destroy instead of `DEL`.
-	 *
-	 * A bare `DEL` re-introduces the "counter-absent == 0" conflation: a warm
-	 * session on another replica probes the absent key, reads `0`, and either
-	 * reloads a deleted tree (written variant) or — if it never wrote and so
-	 * holds `lastSeenVersion === 0` — sees `0 === 0` and NEVER reloads, serving
-	 * ghost state forever. Writing a distinct, non-numeric sentinel
-	 * (`VERSION_TOMBSTONE`) lets `ensureFreshCache` recognise the destroy and
-	 * tear the session down regardless of its last-seen version. The sentinel
-	 * inherits the version-key TTL so it self-cleans like any other counter.
-	 */
-	private async deleteVersionKey(tenantId: string, sandboxId: string): Promise<void> {
-		if (this.redis === undefined) return;
-		try {
-			await this.redis.set(versionKey(tenantId, sandboxId), VERSION_TOMBSTONE, "EX", VERSION_KEY_TTL_SECONDS);
-		} catch {
-			// swallow — best-effort cleanup
-		}
-	}
-
-	startReaper(intervalMs = 60_000, drainerIntervalMs = 10_000): void {
+	startReaper(intervalMs = 60_000): void {
 		if (this.reaperTimer !== undefined) return;
 		this.reaperTimer = setInterval(() => this.runReaper(), intervalMs);
-		// Reaper should never block process exit — a Node timer with `unref()`
-		// lets graceful shutdown proceed even if the reaper interval is mid-tick.
 		if (typeof this.reaperTimer.unref === "function") this.reaperTimer.unref();
-
-		// F3: background publish drainer. Heals writes whose Redis INCR failed,
-		// independent of further client traffic, so a stranded bump survives an
-		// idle eviction. No-op when Redis is disabled (nothing ever enqueues).
-		if (this.redis !== undefined && this.drainerTimer === undefined) {
-			this.drainerTimer = setInterval(() => void this.drainPendingPublishes(), drainerIntervalMs);
-			if (typeof this.drainerTimer.unref === "function") this.drainerTimer.unref();
-		}
-	}
-
-	/**
-	 * F3: retry every stranded version publish under its session lock. Re-checking
-	 * `session.publishPending` *inside* the lock is required: it serializes against
-	 * `ensureFreshCache` (which clears `#dirty` on the `-1` reload) and against a
-	 * concurrent exec turn, preventing a double INCR (V+2). A session that is
-	 * missing (evicted) or closing is dropped — the reaper already attempted a
-	 * best-effort publish before disconnecting it. A still-failing publish is left
-	 * enqueued for the next tick (fixed-interval backoff).
-	 */
-	async drainPendingPublishes(): Promise<void> {
-		if (this.redis === undefined || this.pendingPublishes.size === 0) return;
-		const snapshot = [...this.pendingPublishes.entries()];
-		for (const [key, { tenantId, sandboxId }] of snapshot) {
-			const session = this.sessions.get(key);
-			if (session === undefined || session.state === "closing") {
-				// No live session to publish from; reaper handles the in-flight case.
-				this.pendingPublishes.delete(key);
-				continue;
-			}
-			try {
-				await session.lock.runExclusive(async () => {
-					// Re-check under the lock — a racing exec or ensureFreshCache may
-					// have already flushed (or invalidated) the pending bump.
-					if (!session.publishPending) {
-						this.pendingPublishes.delete(key);
-						return;
-					}
-					await this.publishVersionIfDirty(tenantId, sandboxId, session);
-					// publishVersionIfDirty clears the map entry on success.
-				});
-			} catch (err) {
-				// Still stranded (Redis blip persists, or cache poisoned). Leave the
-				// entry for the next tick unless publishVersionIfDirty already removed
-				// it (poison-suppress path deletes the key itself).
-				console.error(JSON.stringify({ event: "publish_drain_error", sandboxId, error: (err as Error).message }));
-			}
-		}
 	}
 
 	/**
@@ -1679,6 +1035,10 @@ export class SessionManager {
 		await Promise.allSettled(
 			sessionsSnapshot.map(async ([key, session]) => {
 				const remaining = Math.max(0, deadline - Date.now());
+				if (session.destroyPromise !== undefined) {
+					await Promise.race([session.destroyPromise, new Promise<void>((resolve) => setTimeout(resolve, remaining))]);
+					return;
+				}
 				try {
 					await Promise.race([
 						session.lock.runExclusive(async () => {
@@ -1698,7 +1058,6 @@ export class SessionManager {
 			}),
 		);
 		this.sessions.clear();
-		this.pendingPublishes.clear();
 	}
 
 	/** Alias for shutdown() — matches the plan's `closeAll()` naming. */
@@ -1710,10 +1069,6 @@ export class SessionManager {
 		if (this.reaperTimer !== undefined) {
 			clearInterval(this.reaperTimer);
 			this.reaperTimer = undefined;
-		}
-		if (this.drainerTimer !== undefined) {
-			clearInterval(this.drainerTimer);
-			this.drainerTimer = undefined;
 		}
 	}
 
@@ -1729,35 +1084,7 @@ export class SessionManager {
 				// against a disconnected filesystem.
 				session.state = "closing";
 				this.sessions.delete(key);
-				// F3: if this session has a stranded version bump, make one
-				// best-effort publish under the lock *before* disconnecting — the FS
-				// is still connected here, and once it's gone the in-memory
-				// `publishPending` flag would be lost with no way to retry.
-				const pending = this.pendingPublishes.get(key);
-				void session.lock
-					.runExclusive(async () => {
-						if (pending !== undefined && session.publishPending) {
-							try {
-								await this.publishVersionIfDirty(pending.tenantId, pending.sandboxId, session);
-							} catch (err) {
-								console.error(
-									JSON.stringify({
-										event: "publish_reap_error",
-										sandboxId: pending.sandboxId,
-										error: (err as Error).message,
-									}),
-								);
-							}
-						}
-						/* drain queued waiters; they will throw ESESSIONCLOSING */
-					})
-					.catch(() => {})
-					.finally(() => {
-						// Whether the flush succeeded or not, the session is gone — drop
-						// the drainer entry so it doesn't spin against a dead session.
-						this.pendingPublishes.delete(key);
-						void this.disconnectFs(session.fs);
-					});
+				void session.lock.runExclusive(() => this.disconnectFs(session.fs));
 			}
 		}
 	}

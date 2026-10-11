@@ -152,6 +152,7 @@ describe("SqlFs.writeFile — composite path", () => {
 			new TextEncoder().encode(content).length,
 			expect.any(Uint8Array),
 			expect.any(Uint8Array),
+			0n,
 		);
 	});
 
@@ -229,7 +230,7 @@ describe("SqlFs.mkdir — composite path", () => {
 	it("passes correct arguments to mkdirComposite", async () => {
 		await fs.mkdir("/home/user/projects");
 
-		expect(m.mkdirCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "projects", 0o755);
+		expect(m.mkdirCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "projects", 0o755, 0n);
 	});
 
 	it("updates pathCache after composite mkdir", async () => {
@@ -279,7 +280,7 @@ describe("SqlFs.rm — composite path", () => {
 	it("passes correct arguments to rmComposite", async () => {
 		await fs.rm("/home/user/existing.txt");
 
-		expect(m.rmCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt");
+		expect(m.rmCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", 0n);
 	});
 
 	it("removes entry from pathCache after composite rm", async () => {
@@ -326,7 +327,7 @@ describe("SqlFs.mv — composite path", () => {
 	it("passes correct arguments to mvComposite", async () => {
 		await fs.mv("/home/user/existing.txt", "/other/moved.txt");
 
-		expect(m.mvCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", 5n, "moved.txt");
+		expect(m.mvCompositeMock).toHaveBeenCalledWith(expect.anything(), "s1", 3n, "existing.txt", 5n, "moved.txt", 0n);
 	});
 
 	it("updates pathCache after composite mv", async () => {

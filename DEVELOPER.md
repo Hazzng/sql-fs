@@ -18,14 +18,14 @@ sql-fs is a **stateless HTTP server** backed by Postgres, with warm in-process s
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
-In-process caches (pathCache, contentCache) exist purely for speed during a single exec. Redis exists for four things: serializing requests across replicas, tracking cache freshness via a version counter, caching blob bytes to avoid Postgres round-trips, and snapshotting the path tree to speed up cold starts. If you dropped Redis and all in-process caches, the system would still be correct — just slower.
+In-process caches serve filesystem calls after request admission validates their durable PostgreSQL epoch. Redis provides distributed locks and immutable blob caching. PostgreSQL remains required for every filesystem request, including warm reads.
 
 Within a single replica, two exec modes share the same `Session` and the same `SqlFs`:
 
 - **Write path (default)** — exclusive per-session lock; one exec at a time; the only path that can mutate the FS.
 - **Read path (`readOnly: true`)** — shared per-session lock; many concurrent execs; the FS is forced into a refcounted read-only scope and any mutating syscall throws `EREADONLY` pre-DB, surfaced to clients as HTTP **422 `EREADONLY_VIOLATION`**.
 
-The single-replica feature deliberately skips the distributed Redis exec lock for the read path — cross-replica coherence on reads still relies on the per-session version probe, see the "Multi-replica" sections below.
+Readers acquire shared distributed and local locks. Writers acquire exclusive locks before admission.
 
 ---
 
@@ -33,108 +33,22 @@ The single-replica feature deliberately skips the distributed Redis exec lock fo
 
 There are two exec paths, distinguished by the caller-declared `readOnly` flag on the request body. Both share the same lock layer — they just acquire it in different modes (exclusive vs. shared).
 
-### Write path (`readOnly: false` — the default)
+### Write path (`readOnly: false`)
 
-```
-POST /exec
-     │
-     ▼
-Auth middleware
-     │
-     ▼
-SessionManager.withSession(tenantId, sandboxId, fn)
-     │
-     ├─[1] Acquire Redis exec lock ─────────────── cross-replica mutex
-     │       key: vfs:{tenant}:lock:{sandboxId}
-     │       SET NX PX + heartbeat renewal
-     │
-     ├─[2] Version check ────────────────────────── cache freshness
-     │       GET vfs:{tenant}:ver:{sandboxId}
-     │       (single-flighted across concurrent entries via session.freshCacheInflight,
-     │        so N parallel entries share one Redis GET + one fs.reload() if needed)
-     │       if lastSeenVersion !== current
-     │         → fs.reload() from Postgres
-     │         → session.lastSeenVersion = current
-     │
-     ├─[3] Acquire session.lock in EXCLUSIVE mode ── in-process RWLock
-     │       (RWLock.runExclusive, per session, per replica)
-     │
-     ├─[4] bash.exec(script) ────────────────────── the actual work
-     │       each SqlFs write:
-     │         #withTx()
-     │           SET LOCAL app.sandbox_id = X        ← RLS scoping
-     │           pg_advisory_xact_lock(hash(X))      ← DB-layer lock
-     │           write to inodes / dirents / blobs
-     │           COMMIT
-     │         update #pathCache + #contentCache (in-process)
-     │         blobCache.set(sha256, data) → Redis    ← fire-and-forget
-     │         set #dirty = true
-     │
-     ├─[5] publishVersionIfDirty (still under exclusive lock)
-     │       if #dirty:
-     │         INCR vfs:{tenant}:ver:{sandboxId}
-     │         session.lastSeenVersion = newVersion
-     │         pathSnapshot.write(ver, pathCache) → Redis   ← cold-start cache (optional)
-     │         clearDirty()
-     │
-     ├─[6] Release session.lock (exclusive)
-     │       → RWLock dispatch wakes the next waiter:
-     │           • next exclusive writer (one), OR
-     │           • every consecutive shared (readOnly) waiter in one batch
-     │
-     └─[7] Release Redis exec lock (Lua check-and-del)
-```
+1. Acquire the distributed Redis writer lock.
+2. Acquire the local session lock in exclusive mode.
+3. Call `SqlFs.ensureFresh()` to validate PostgreSQL authority before invoking the handler.
+4. Run the handler or script scope. SQL mutation transactions hold the advisory lock and advance the durable epoch. A buffered script records metadata changes locally and flushes them in one transaction at scope completion.
+5. Refresh the session memory estimate and release both locks.
 
 ### Read path (`readOnly: true`)
 
-Parallel readers on the same sandbox no longer queue behind each other. Multiple readOnly requests acquire the same `Session.lock` in **shared** mode and run concurrently.
+1. Acquire a shared distributed Redis lock and the local session lock in shared mode.
+2. Call `SqlFs.ensureFresh()`. A sealed cohort may share one SQL sample; requests arriving after that sample starts wait for another sample.
+3. Enter the refcounted read-only filesystem scope and run the callback inside its `readOnlyContext`. Every mutating syscall rejects with `EREADONLY`; the request maps a violation to `EREADONLY_VIOLATION` and HTTP 422.
+4. End the read-only scope and release both locks. Concurrent readers keep separate violation contexts.
 
-```
-POST /exec   { readOnly: true }
-     │
-     ▼
-Auth middleware
-     │
-     ▼
-SessionManager.withSessionRead(tenantId, sandboxId, fn)
-     │       ── NO distributed Redis exec lock (single-replica only feature; see "Multi-replica
-     │           consistency" caveat below)
-     │
-     ├─[1] Version check (single-flighted across the reader cohort)
-     │       same ensureFreshCache as write path
-     │
-     ├─[2] Acquire session.lock in SHARED mode ──── in-process RWLock
-     │       (RWLock.runShared — multiple readers run concurrently)
-     │       Writer-priority: if a writer is queued, new readers wait behind it.
-     │
-     ├─[3] fs.beginReadOnlyScope() ──────────────── refcounted, per-FS
-     │       every mutating SqlFs method now throws EREADONLY pre-DB
-     │       (writeFile, appendFile, mkdir, rm, chmod, utimes, cp, mv,
-     │        symlink, link, bulkIngest)
-     │
-     ├─[4] readOnlyContext.run(ctx, () => bash.exec(script))
-     │       AsyncLocalStorage propagates ctx down into SqlFs.#assertWritable,
-     │       which marks THIS call's ctx.violated rather than a shared FS flag.
-     │       → a lying script in one reader never falsely flags innocent siblings.
-     │       → scriptTx is SKIPPED — no writes can occur, and the shared
-     │         SessionScopedFs would race across concurrent readers.
-     │
-     ├─[5] After fn returns:
-     │       • if a raw EREADONLY escaped bash.exec (shell redirections like
-     │         `echo x > f` do this) → remap to EREADONLY_VIOLATION
-     │       • if ctx.violated (script completed but tagged a violation) →
-     │         throw EREADONLY_VIOLATION
-     │       → route layer maps EREADONLY_VIOLATION to HTTP 422
-     │
-     ├─[6] fs.endReadOnlyScope() ──────────────── decrements refcount;
-     │       last reader to leave clears the FS-level scope
-     │
-     └─[7] Release session.lock (shared)
-
-NOTE: the read path does NOT call publishVersionIfDirty. No writes ⇒ #dirty
-      stays false anyway, but the flag is preserved across read entries so a
-      subsequent writer's publish still fires correctly.
-```
+Writers queue behind active readers, and newly arriving readers queue behind a local waiting writer. Read-only callbacks do not open a script transaction. Failed admission never invokes the callback.
 
 ---
 
@@ -165,29 +79,17 @@ Three locks work together. Each is the fallback for the one above it.
 
 Bypassing the lock to write directly to `SqlFs` from elsewhere in the codebase will break the read-only safety net. All exec entry must go through `SessionManager.withSession` / `withSessionRead` / `withSessionOrRehydrate`.
 
-### Lock 2 — Redis exec lock (distributed)
+### Lock 2 — Redis readers-writer lock (distributed)
 
-- **Type:** `SET NX PX` with a unique token + heartbeat renewal + Lua check-and-release
-- **Key:** `vfs:{tenant}:lock:{sandboxId}`
+- **Type:** Lua acquisition and release with token ownership and heartbeat renewal. Writers hold an exclusive lease; readers hold shared leases in a sorted set.
+- **Keys:** `vfs:${tenantId}:rwlock:{${sandboxId}}:writer` and `vfs:${tenantId}:rwlock:{${sandboxId}}:readers`. The sandbox braces are Redis Cluster hash tags.
+- **Legacy fallback:** `REDIS_RWLOCK_ENABLED=false` uses `SET NX PX` at `vfs:${tenantId}:lock:${sandboxId}`. Both readers and writers acquire this exclusive lock.
 - **Scope:** entire fleet
 - **Held for:** entire `withSession` callback (wraps bash.exec + pre/post logic)
-- **Purpose:** only one replica runs exec for a given sandbox at a time
-- **Failure mode:** if a GC pause exceeds the lease interval, the lock expires and another replica can acquire. Lock 3 catches the resulting DB-level race. This is an accepted trade-off — data integrity is preserved but script atomicity for that one request is not.
-- **`LockLostError` is post-hoc, not preventive:** the heartbeat sets `lost = true` when the renew Lua script returns 0 (key no longer holds our token), but `lost` is only checked *after* `fn()` completes (`distributed-lock.ts:137`). By the time `LockLostError` is thrown, the bash script has already finished executing — including any DB writes — and Replica B has already been running concurrently. The error tells the caller the result is unreliable; it does not interrupt execution mid-script. Interrupting `fn()` mid-execution would leave `SqlFs` in a half-written state, which is worse than letting it finish and surfacing the error after.
-
-  ```
-  t=0s    Replica A acquires lock (leaseMs=60s)
-  t=20s   heartbeat fires → RENEW_SCRIPT returns 1 ✓
-  t=40s   heartbeat fires → RENEW_SCRIPT returns 1 ✓
-          ← Node.js GC pause starts (or Redis outage)
-  t=60s   lease expires — Replica B acquires the lock
-  t=60s   heartbeat fires → RENEW_SCRIPT returns 0 (key now holds B's token)
-          → lost = true
-          ← GC pause ends, Replica A resumes
-  t=61s   fn() finishes
-  t=61s   if (lost) throw new LockLostError  ← thrown here, but overlap already happened
-  ```
-- **Redis down:** fail closed → 503. Mutating endpoints never proceed without this lock.
+- **Purpose:** serialize writers against other writers and readers across replicas, while allowing concurrent readers
+- **Failure mode:** a pause longer than the lease can allow another replica to enter. The SQL advisory lock and epoch fence reject stale mutations. Request-entry freshness does not promise a fixed view for a whole script after lease loss.
+- **Lease loss:** a definitive heartbeat failure aborts the signal passed to active exec work. A guarded callback that has already completed returns `ELOCKLOST_APPLIED`, so clients must not retry a non-idempotent write blindly.
+- **Redis down:** with Redis configured, lock acquisition fails closed with 503.
 
 ### Lock 3 — `pg_advisory_xact_lock` (database)
 
@@ -204,8 +106,8 @@ Bypassing the lock to write directly to `SqlFs` from elsewhere in the codebase w
 |---|---|---|---|
 | Two concurrent writes, same replica, same sandbox | blocks (exclusive) | redundant | redundant |
 | Two concurrent writes, different replicas, same sandbox | — | blocks | backstop |
-| N concurrent readOnly reads, same replica, same sandbox | **lets them run in parallel (shared)** | (read path skips Lock 2) | not engaged (no writes) |
-| Mixed reader + writer, same replica | reader waits for writer / writer waits for readers; writer-priority | only the writer takes it | only the writer's DB tx |
+| N concurrent readOnly reads, same replica, same sandbox | **lets them run in parallel (shared)** | shared reader leases | not engaged (no writes) |
+| Mixed reader + writer, same replica | reader waits for writer / writer waits for readers; writer-priority | shared readers exclude the writer lease | only the writer's DB tx |
 | GC pause > lease; second replica interleaves DB writes | — | fails | serializes at DB layer |
 | `DELETE /sandboxes/:id` races an active exec | drains via exclusive acquire | blocks (routed through lock) | backstop |
 | Admin/test route bypasses `withSession` | — | — | still catches |
@@ -262,7 +164,7 @@ Lives inside each `SqlFs` instance. Thrown away when the session is evicted.
 | `#pathCache` | `Map<string, PathCacheEntry>` | absolute path | configurable (default 50 MB) | `loadAllPaths` at session start, then updated on every write |
 | `#contentCache` | `LRUCache<bigint, Uint8Array>` | inode ID | 50 MB, LRU-evicted | lazy on first `readFile`, evicted on write/delete |
 
-Reads during an exec hit these at zero latency. They may be arbitrarily stale *between* execs — that is fine because nothing reads them between execs. The version counter (below) ensures they're refreshed before the next exec begins.
+Reads during an exec hit these at zero latency. They may be arbitrarily stale *between* execs — that is fine because nothing reads them between execs. The authoritative epoch check refreshes them before the next request callback begins.
 
 ### L2 — Redis blob cache
 
@@ -273,23 +175,6 @@ Reads during an exec hit these at zero latency. They may be arbitrarily stale *b
 - **Size cap per entry:** `REDIS_BLOB_MAX_BYTES` (default 8 MB); larger blobs bypass Redis entirely to prevent a single large file from flushing the working set
 - **Eviction:** Redis `allkeys-lru` + per-key TTL (default 24 h)
 
-### L2b — Redis path snapshot
-
-- **Key:** `vfs:{tenant}:snap:{sandboxId}` → msgpack-encoded full `pathCache` with embedded version number
-- **Purpose:** cold-start optimization — lets a replica bootstrap its `pathCache` from Redis instead of running a full `loadAllPaths` Postgres CTE scan
-- **Write path:** `publishVersionIfDirty` (session-manager) → after `INCR ver`, writes the current `pathCache` to Redis via `pathSnapshot.write(tenantId, sandboxId, newVersion, pathCache)`. Only fires if `pathSnapshot` is configured.
-- **Read path:** `SqlFs.#loadFreshPathCache()` (called by `ready()` on session creation and `reload()` on cache refresh) → reads snapshot, checks embedded version matches `vfs:ver:{sandboxId}` exactly; any mismatch, miss, or Redis error falls through to `loadAllPaths` from Postgres
-- **Correctness:** the embedded version acts as a consistency guard — a snapshot is only used if it was written by the exact same exec that last bumped the version counter. Stale or partially-written snapshots are always rejected
-- **Failure mode:** all Redis errors fail open — `read` returns `null`, `write` logs and returns. The system falls back to Postgres silently
-- **TTL:** 1 hour (default); sandbox delete also calls `pathSnapshot.delete()` eagerly
-- **Enabled by:** set `REDIS_PATH_SNAPSHOT_ENABLED=true` (requires Redis to also be configured). `server.ts` constructs the `RedisPathSnapshot` instance and passes it to `SessionManager` when both conditions are met.
-
-```
-Cold start without snapshot:  session created → loadAllPaths (Postgres CTE, proportional to file count)
-Cold start with snapshot hit: session created → GET snap key → msgpack decode → pathCache ready
-Cold start with snapshot miss: snapshot absent or version mismatch → falls through to Postgres
-```
-
 ### L3 — Postgres
 
 Always the source of truth. Every mutation writes here first before any cache is updated. A cache miss at any layer falls through to Postgres.
@@ -298,41 +183,15 @@ Always the source of truth. Every mutation writes here first before any cache is
 
 ## Cross-Replica Cache Coherence
 
-No pub/sub. Coherence is solved with a single version counter in Redis, feasible because exec serialization (Lock 2) collapses the requirement from continuous to exec-boundary only.
+`SqlFs` owns a committed view containing a bigint epoch and the path map. Every session entry holds distributed and local lifecycle locks while `ensureFresh()` opens a REPEATABLE READ transaction. The transaction reads the durable epoch. A changed epoch, a cold load, or poisoned state also loads paths from that same SQL snapshot. Only a successful transaction can replace the paired view.
 
-### Version counter
+An unchanged epoch avoids the recursive path scan. Each validation cohort executes BEGIN, sets the sandbox context, reads the epoch, and executes COMMIT. A mismatch adds the path query in that transaction. Concurrent readers can share a cohort only when they arrive before its SQL sample begins. Later arrivals join the next cohort, even while the earlier query is still in flight. Authority failures propagate and no callback runs with an unvalidated view.
 
-- **Key:** `vfs:{tenant}:ver:{sandboxId}` — a monotonic integer, absent = 0
-- **Bumped:** `INCR` after every exec that set `#dirty = true`, performed *after* the bash.exec completes but *before* releasing the Redis lock
-- **Checked:** at the start of every exec, after acquiring the Redis lock
+Cold loads and recovery use the same loader. Each installed view clears content and advances its generation. Delayed blob fills must still belong to the current generation and entry. Prewarm also verifies the blob hash against the committed entry.
 
-### Protocol
+A writer needs no Redis notification after commit. Other replicas detect the durable epoch on their next request, including after writer process loss. A missing sandbox returns ENOENT and queues session disconnect after all local readers release. Recovery never reruns the original command. ESTALE still fences writes that lost their epoch, and applied or uncertain errors remain nonretryable.
 
-**On exec entry (after Lock 2 acquired):**
-```
-current = GET vfs:ver:{sandboxId}
-if session.lastSeenVersion !== current:
-    fs.reload()                  ← clears #pathCache and #contentCache, re-runs loadAllPaths from Postgres
-    session.lastSeenVersion = current
-```
-
-**On exec exit (before Lock 2 released):**
-```
-if fs.wasDirty():
-    newVersion = INCR vfs:ver:{sandboxId}
-    session.lastSeenVersion = newVersion
-    fs.clearDirty()
-```
-
-### Why this is sufficient
-
-1. Lock 2 ensures only one replica holds an exec for a given sandbox at a time
-2. Nothing reads sandbox state outside of an exec
-3. When a replica picks up a sandbox after another replica left it:
-   - It acquires Lock 2 (previous holder has released it)
-   - Reads the version counter → mismatch → `reload()` from Postgres
-   - Proceeds with a fully fresh cache
-4. Between execs, caches can be stale — harmless because they are never read between execs
+Freshness is measured at request admission. It does not promise a continuous snapshot after a distributed lock lease is lost.
 
 ---
 
@@ -345,21 +204,15 @@ The behaviour depends on whether each request is `readOnly`:
 | Request A | Request B | Outcome on the same replica |
 |---|---|---|
 | write | write | B queues behind A at the Redis lock and at `session.lock` (exclusive). Fully serialized. |
-| write | readOnly | B skips the Redis lock but queues behind A at `session.lock` (shared waits for exclusive). |
-| readOnly | write | B grabs the Redis lock immediately, then queues at `session.lock` (exclusive waits for active readers). New readers arriving after B queue behind B (writer-priority). |
+| write | readOnly | B waits for the shared Redis lock, then acquires `session.lock` in shared mode. |
+| readOnly | write | B waits for the exclusive Redis lock, then queues at `session.lock` (exclusive waits for active readers). New readers arriving after B queue behind B (writer-priority). |
 | readOnly | readOnly | **Both run in parallel.** Both take `session.lock` in shared mode; the FS is in a refcounted read-only scope; any mutating syscall throws `EREADONLY` pre-DB and is remapped to HTTP 422 `EREADONLY_VIOLATION`. |
 
 Mixed read/write inside a *single script* is always handled on the write path — `readOnly` is a caller declaration, not auto-detected. An agent that issues a script with any chance of writing must leave `readOnly` unset (defaults to false).
 
 ### Same sandbox, different replicas
 
-Request B on Replica 2 tries to acquire `vfs:lock:{sandboxId}` while Request A on Replica 1 holds it. Request B blocks at the Redis lock until Request A completes, version is incremented, and the lock is released. When Request B acquires, it reads the updated version, sees a mismatch, reloads from Postgres, and proceeds with a fresh cache.
-
-```
-Replica 1:  [acquire lock] → [exec] → [INCR ver] → [release lock]
-Replica 2:                    [waiting on Redis lock]
-                                                              [acquire lock] → [version mismatch → reload] → [exec]
-```
+If either request writes, Request B waits for Request A to release its distributed lock. Readers can hold shared locks concurrently. After acquiring its own distributed and local locks, B samples PostgreSQL and reloads the tree if A advanced the epoch.
 
 ### Different sandboxes
 
@@ -375,7 +228,7 @@ Locks and caches are entirely per-sandbox. Requests on different sandboxes are a
 
 ### Creation
 
-`getOrCreate` builds a session lazily on first access for a `(tenantId, sandboxId)` pair. It constructs the `SqlFs` instance (which runs `loadAllPaths` or loads from path snapshot), creates a `Bash` instance with the filesystem wired in, reads the current version counter from Redis, and stores the session in the in-process map. Concurrent creation requests for the same sandbox coalesce onto a single `Promise` via the `pending` map — only one `SqlFs` + `Bash` is ever constructed.
+`getOrCreate` builds a session lazily on first access for a `(tenantId, sandboxId)` pair. It constructs the `SqlFs` instance (which loads epoch and paths in one PostgreSQL transaction), creates a `Bash` instance with the filesystem wired in, and stores the session in the in-process map. Concurrent creation requests for the same sandbox coalesce onto a single `Promise` via the `pending` map — only one `SqlFs` + `Bash` is ever constructed.
 
 ### Rehydration from cold storage
 
@@ -385,13 +238,13 @@ Locks and caches are entirely per-sandbox. Requests on different sandboxes are a
 Request hits Replica B, session not in memory
   → getSandboxMetaFn(tenantId, sandboxId) → Postgres → { owner, python, javascript }
   → getOrCreate → new SqlFs + new Bash   ← full construction, not reuse
-      → ready() → loadAllPaths from Postgres (or Redis snapshot if enabled)
+      → ready() → paired epoch and path load from Postgres
   → withSessionEntry → exec proceeds normally
 ```
 
 What rehydration saves is knowing *which* owner and runtime flags to reconstruct with — the client does not need to re-specify them. It does not avoid the `SqlFs` initialization cost.
 
-**The actual cold-start speedup** comes from the path snapshot (`REDIS_PATH_SNAPSHOT_ENABLED=true`), not rehydration. Without the snapshot, `ready()` runs a full `loadAllPaths` Postgres CTE scan proportional to the number of files. With the snapshot, it becomes a single Redis GET + msgpack decode. Rehydration and path snapshot are complementary: rehydration restores metadata, the snapshot restores the path tree.
+
 
 ### Eviction (reaper)
 
@@ -496,7 +349,7 @@ echo $new > balance.txt
 
 **Script atomicity under pathological GC pauses.** If the Node.js GC pauses longer than the Redis lock lease (`REDIS_EXEC_LOCK_LEASE_MS`, default 60s), the lock expires, another replica can acquire, and two scripts may interleave in time. Postgres data integrity is preserved by Lock 3 — no corruption, but bash-level semantics are not guaranteed for the affected request.
 
-**Continuous cache freshness between execs.** The in-process caches are stale between execs by design. This is fine — they are only authoritative *during* an exec, after the version check has confirmed or refreshed them.
+**Continuous cache freshness between execs.** The in-process caches are stale between execs by design. This is fine — they are only authoritative *during* an exec, after the durable epoch check has confirmed or refreshed them.
 
 ---
 
@@ -506,10 +359,10 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 
 | Key pattern | Type | Purpose | Written by | Read by |
 |---|---|---|---|---|
-| `vfs:{tenant}:lock:{sandboxId}` | string (token) | Distributed exec mutex — one replica holds exec at a time | `withDistributedLock` (SET NX PX) | `withDistributedLock` (Lua renew + release) |
-| `vfs:{tenant}:ver:{sandboxId}` | integer | Monotonic version counter — cache freshness signal | `publishVersionIfDirty` (INCR) | `ensureFreshCache` (GET), `#loadFreshPathCache` (GET) |
+| `vfs:${tenantId}:rwlock:{${sandboxId}}:writer` | string (token) | Default distributed writer lease | `withDistributedRWLock` | `withDistributedRWLock` (Lua acquire, renew, and release) |
+| `vfs:${tenantId}:rwlock:{${sandboxId}}:readers` | sorted set (tokens and lease deadlines) | Default distributed shared reader leases | `withDistributedRWLock` | `withDistributedRWLock` (Lua acquire, renew, and release) |
+| `vfs:${tenantId}:lock:${sandboxId}` | string (token) | Exclusive reader and writer fallback when `REDIS_RWLOCK_ENABLED=false` | `withDistributedLock` (SET NX PX) | `withDistributedLock` (Lua renew + release) |
 | `vfs:{tenant}:blob:{sha256hex}` | bytes | Blob content cache — avoids Postgres round-trips for file reads | `PostgresDialect.upsertBlob` (fire-and-forget SET) | `PostgresDialect.getBlob` (GET before Postgres) |
-| `vfs:{tenant}:snap:{sandboxId}` | bytes (msgpack) | Path snapshot — cold-start pathCache bootstrap | `publishVersionIfDirty` → `pathSnapshot.write` | `SqlFs.#loadFreshPathCache` → `pathSnapshot.read` |
 
 ---
 
@@ -517,7 +370,7 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 
 | File | What it does |
 |---|---|
-| `src/api/session-manager.ts` | Owns the session pool, all three lock acquisitions, write + read entries (`withSession`, `withSessionRead`, `withSessionOrRehydrate`), version check, dirty publish, `EREADONLY` → `EREADONLY_VIOLATION` remap |
+| `src/api/session-manager.ts` | Owns the session pool, all three lock acquisitions, write + read entries (`withSession`, `withSessionRead`, `withSessionOrRehydrate`), authoritative admission, lifecycle protection, `EREADONLY` → `EREADONLY_VIOLATION` remap |
 | `src/api/rw-lock.ts` | `RWLock` — hand-rolled async readers-writer lock used by `Session.lock`. Writer-priority, batch-wake for queued readers, `AbortSignal` support |
 | `src/api/read-only-context.ts` | `readOnlyContext` AsyncLocalStorage — per-call violation attribution for the parallel-readOnly path |
 | `src/api/ownership.ts` | `withOwnedSessionOrRehydrate` / `withOwnedSessionRead` — adds owner check inside the lock before delegating to `SessionManager` |
@@ -525,7 +378,6 @@ All Redis keys are tenant-prefixed to prevent cross-tenant collisions.
 | `src/fs/sql-fs/dialects/postgres.ts` | Postgres dialect — `setSandboxContext` (RLS + advisory lock), blob cache read/write, all SQL |
 | `src/fs/sql-fs/session-scoped-fs.ts` | `ICoherentFs` interface — `reload`, `wasDirty`, `clearDirty` |
 | `src/fs/sql-fs/redis-blob-cache.ts` | Redis blob cache — `get`/`set` with TTL and size cap |
-| `src/fs/sql-fs/redis-path-snapshot.ts` | Version key helpers; path snapshot — cold-start pathCache bootstrap from Redis (off by default) |
 | `src/api/routes/exec.ts` | HTTP exec routes — branches on `readOnly` to funnel through `withOwnedSessionOrRehydrate` (write) or `withOwnedSessionRead` (read); maps `EREADONLY_VIOLATION` → 422 |
 | `src/api/mcp/tools.ts` | MCP `bash_exec` / `bash_exec_batch` — same `readOnly` branching as HTTP routes |
 | `thoughts/shared/research/2026-05-10_13-03-37_parallel-readonly-bash-exec.md` | Design doc for the parallel-readOnly feature |
@@ -543,12 +395,12 @@ Each concern that consensus typically solves is handled more simply here:
 | Concern | Consensus approach | sql-fs approach |
 |---|---|---|
 | Leader election | Raft leader vote, quorum | Redis `SET NX` — whoever wins the atomic SET owns the exec |
-| Distributed state agreement | Log replication across nodes | Version counter (`INCR ver`) + reload from Postgres on mismatch |
+| Distributed state agreement | Log replication across nodes | Durable PostgreSQL epoch validation and paired path reload |
 | Conflict resolution | Consensus on write order | Not needed — exec serialization prevents concurrent writes to the same sandbox |
 | Partition tolerance | Quorum reads/writes | Fail closed → 503 when Redis is unreachable (CP, not AP) |
 
 **Why this works here but wouldn't in the general case:**
 
-The key constraint is that all writes to a sandbox are serialized through a single exec at a time (Lock 2). This collapses the consistency requirement from *continuous* (nodes must agree at all times) to *exec-boundary only* (a replica only needs a fresh view at the start of each exec). A single monotonic integer answers that in one Redis GET — no voting, no quorum, no log replication.
+The key constraint is that all writes to a sandbox are serialized through a single exec at a time (Lock 2). This collapses the consistency requirement from *continuous* (nodes must agree at all times) to *exec-boundary only* (a replica only needs a fresh view at the start of each exec). A durable epoch sampled in PostgreSQL establishes freshness at request admission. If the epoch changed, the same transaction loads the corresponding paths.
 
 If the workload ever required two replicas to concurrently write the same sandbox, this model would break and a stronger coordination mechanism would be needed. The architecture avoids that requirement by design.

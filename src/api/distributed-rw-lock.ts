@@ -515,9 +515,6 @@ async function runExclusive<T>(
 	// Start heartbeat immediately after acquiring flag so it doesn't expire
 	// while we wait for readers to drain.
 	let lost = false;
-	// F2-L1: abort in-flight work the instant ownership is DEFINITIVELY lost so it
-	// rolls back BEFORE committing, instead of running to completion and then
-	// surfacing LockLostError for a write that already committed + INCR'd.
 	const lostController = new AbortController();
 	const stopHeartbeat = startExclusiveHeartbeat(redis, keys, token, opts, () => {
 		lost = true;
@@ -539,9 +536,6 @@ async function runExclusive<T>(
 			if (lost) throw new LockLostError(keys.writer);
 			throw err;
 		}
-		// #175 M1: `fn` RETURNED, so the script transaction COMMITted and the
-		// version INCR already ran. Retryable ELOCKLOST here re-applies a durable
-		// non-idempotent write on any auto-retrying client.
 		if (lost) {
 			logLockLostAfterCommit(keys.writer, false);
 			throw new LockLostAfterCommitError(keys.writer);

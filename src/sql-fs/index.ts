@@ -12,7 +12,6 @@
  * remain for benchmarks and integration tests that rely on a single `DATABASE_URL`.
  */
 
-import type { Redis } from "ioredis";
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
 import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
@@ -20,7 +19,6 @@ import { getRedisClient } from "../redis/client.js";
 import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
-import { RedisPathSnapshot } from "./redis-path-snapshot.js";
 import { loadScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
@@ -34,8 +32,6 @@ export interface PostgresBackendOptions {
 	readonly connectionString: string;
 	readonly tenantId?: string;
 	readonly blobCache?: RedisBlobCache;
-	readonly pathSnapshot?: RedisPathSnapshot;
-	readonly redis?: Redis;
 }
 
 /**
@@ -45,8 +41,6 @@ export interface PostgresBackendOptions {
  *
  * @param opts.connectionString - Postgres connection URL for this tenant's database.
  * @param opts.blobCache - Optional tenant-scoped RedisBlobCache (Phase 3 makes keys tenant-prefixed).
- * @param opts.pathSnapshot - Optional RedisPathSnapshot (shared instance in Phase 2).
- * @param opts.redis - Optional Redis client forwarded to SqlFs for coherence counters.
  * @param sandboxId - Sandbox identifier scoped within this tenant's database.
  */
 export async function createPostgresSandboxFs(
@@ -77,10 +71,6 @@ export async function createPostgresSandboxFs(
 		const fs = new SqlFs({
 			dialect,
 			sandboxId,
-			tenantId: opts.tenantId,
-			redis: opts.redis,
-			pathSnapshot: opts.pathSnapshot,
-			blobCache: opts.blobCache,
 			// #166: the deployment default lives here rather than in SqlFs, so a bare
 			// `new SqlFs(...)` in a test keeps the legacy script-long-transaction shape.
 			scriptTxBuffer: loadScriptTxBufferConfig(),
@@ -134,17 +124,8 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			if (!databaseUrl) {
 				throw new Error("DATABASE_URL environment variable is required for the postgres backend");
 			}
-			// #167: cache traffic rides the data connection; the control client
-			// stays free for the version counter and locks.
-			const redis = getRedisClient("control");
-			// Read data-plane demand from env BEFORE opening the data connection:
-			// a lock-only deployment (blob cache off, snapshot off) must not pay
-			// for a second socket nothing will ever use. REDIS_DATA_URL falls
-			// back to REDIS_URL inside getRedisClient, so calling it
-			// unconditionally would always connect.
 			const blobCacheEnabled = process.env.REDIS_BLOB_CACHE_ENABLED !== "false";
-			const snapshotEnabled = process.env.REDIS_PATH_SNAPSHOT_ENABLED === "true";
-			const redisData = blobCacheEnabled || snapshotEnabled ? getRedisClient("data") : undefined;
+			const redisData = blobCacheEnabled ? getRedisClient("data") : undefined;
 			const blobCache =
 				redisData && blobCacheEnabled
 					? new RedisBlobCache(redisData, "default", {
@@ -155,17 +136,7 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 							breaker: getRedisCircuitBreaker("data"),
 						})
 					: undefined;
-			const pathSnapshotEnabled = redisData && snapshotEnabled;
-			const pathSnapshot =
-				pathSnapshotEnabled && redisData
-					? new RedisPathSnapshot(redisData, {
-							ttlMs: parseNonNegativeInt("REDIS_PATH_SNAPSHOT_TTL_MS", 60 * 60 * 1000),
-						})
-					: undefined;
-			const { fs } = await createPostgresSandboxFs(
-				{ connectionString: databaseUrl, blobCache, pathSnapshot, redis: redis ?? undefined },
-				sandboxId,
-			);
+			const { fs } = await createPostgresSandboxFs({ connectionString: databaseUrl, blobCache }, sandboxId);
 			return fs;
 		}
 		case "memory":

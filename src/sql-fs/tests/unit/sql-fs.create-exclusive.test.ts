@@ -25,7 +25,7 @@ describe("SqlFs — createExclusive", () => {
 		await env.fs.createExclusive("/home/user/td", { mode: 0o700, directory: true });
 		const st = await env.fs.stat("/home/user/td");
 		expect({ isDirectory: st.isDirectory, mode: st.mode }).toEqual({ isDirectory: true, mode: 0o700 });
-		expect(env.probe.dialect.mkdirComposite).toHaveBeenCalledWith(expect.anything(), "s-redirect", 3n, "td", 0o700);
+		expect(env.probe.dialect.mkdirComposite).toHaveBeenCalledWith(expect.anything(), "s-redirect", 3n, "td", 0o700, 0n);
 		expect(env.probe.calls.filter((call) => call === "mkdirComposite")).toHaveLength(1);
 		expect(env.probe.calls).not.toContain("updateInode");
 	});

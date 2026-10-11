@@ -126,11 +126,9 @@ See [clients/typescript/README.md](clients/typescript/README.md) for the full Ty
 
 > **Postgres is always the source of truth. Everything else is a cache or a lock.**
 
-Each `exec` call flows through three stacked locks — in-process mutex → Redis distributed lock → `pg_advisory_xact_lock` — ensuring only one writer touches a sandbox at a time across any number of replicas. Writes always go to Postgres first; in-process caches (`pathCache` Map, `contentCache` LRU) and Redis (blob cache, path snapshot) are updated after and exist purely for speed.
+Requests take a distributed Redis lock and a local session lock before using the filesystem. SQL mutations also use `pg_advisory_xact_lock`. Redis keeps distributed locks and immutable blob bytes cached by hash.
 
-Cross-replica coherence uses a single monotonic version counter in Redis — no pub/sub needed. When a replica acquires the exec lock and finds the counter advanced, it reloads `pathCache` from Postgres before proceeding.
-
-> **Note:** The `/files/*` HTTP endpoints bypass the exec lock. Use `exec` for all agent and production file access; the file API is for admin and test use only.
+Every filesystem request validates the durable sandbox epoch in PostgreSQL. SqlFs reads the epoch and, when it changes, the path tree in one REPEATABLE READ transaction. It installs both together after the transaction succeeds. A failed authority check returns an error instead of a successful stale read. Cold loads and recovery use the same paired loader. Buffered script mutations remain private to the exclusive session scope until commit.
 
 ## Schema
 
@@ -180,8 +178,8 @@ Key design choices:
 | `MAX_INGEST_BYTES` | No | `536870912` | Max total decoded bytes across one `ingest-files` manifest (512 MB). The request-body cap above normally trips first. |
 | `MAX_INGEST_FILES` | No | `10000` | Max number of entries (files + paths) in one `ingest-files` manifest. |
 | `MAX_INGEST_PATHS_CONCURRENCY` | No | `16` | Max concurrent host-file reads for the MCP `paths` ingest mode (bounds file descriptors / memory). |
-| `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. Carries the control plane: locks, version counter, session state. |
-| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache, path snapshot). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; point it at a different Redis only if you want physical separation too. This instance must run **`maxmemory-policy allkeys-lru`** (or `allkeys-lfu`) — see [Redis eviction policy](#redis-eviction-policy). |
+| `REDIS_URL` | No | — | Redis connection string. Required for multi-replica deployments. Without it, only the in-process mutex protects execution. Carries the control plane: locks and session state. |
+| `REDIS_DATA_URL` | No | `REDIS_URL` | Connection string for the data plane (blob cache). A **separate connection** is opened either way, so multi-MiB cache writes cannot head-of-line block a lock command; point it at a different Redis only if you want physical separation too. This instance must run **`maxmemory-policy allkeys-lru`** (or `allkeys-lfu`) — see [Redis eviction policy](#redis-eviction-policy). |
 | `REDIS_EXEC_LOCK_LEASE_MS` | No | `60000` | Distributed exec lock TTL. Must be > `REDIS_EXEC_LOCK_RENEW_MS`. |
 | `REDIS_EXEC_LOCK_RENEW_MS` | No | `20000` | Lock heartbeat interval. Must be strictly less than lease. |
 | `REDIS_EXEC_LOCK_ACQUIRE_TIMEOUT_MS` | No | `75000` | Max wait to acquire exec lock before returning 503. Must be strictly greater than `REDIS_EXEC_LOCK_LEASE_MS` and `REDIS_RWLOCK_READER_LEASE_MS` (asserted at startup), so a crashed holder's lease can be reaped before the waiter gives up. |
@@ -190,8 +188,6 @@ Key design choices:
 | `REDIS_BLOB_MAX_BYTES` | No | `8388608` | Blobs larger than this bypass Redis entirely (8 MB). |
 | `REDIS_BLOB_SET_MAX_IN_FLIGHT` | No | `32` | Max concurrent blob-cache backfill writes, per data connection and shared across all tenants on it. Writes over the cap are dropped (the cache is fail-open), not queued. |
 | `REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES` | No | `33554432` | Max total bytes of concurrent blob-cache backfill writes (32 MB), likewise per data connection and shared across tenants. Same drop-not-queue rule. |
-| `REDIS_PATH_SNAPSHOT_ENABLED` | No | `false` | Cache full path tree in Redis for faster cold starts. |
-| `REDIS_PATH_SNAPSHOT_TTL_MS` | No | `3600000` | Path snapshot TTL (1h). |
 | `PG_DRIVER_FAULT_GUARD` | No | `true` | Keeps the replica alive when `postgres.js` throws out of its own socket-write path (#169) — a backend reaped mid-transaction makes the driver flush a buffered write to a nulled socket from a bare `setImmediate`, which is a fatal uncaught exception that drops every other in-flight request on the replica. The guard recognises that one stack frame (`nextWrite` in `postgres/src/connection.js`), logs `driver_socket_fault`, and fails the stuck DB awaits with `EDRIVERFAULT` → 503. **Everything else still crashes the process.** Set `false` to restore crash-and-restart: right if your orchestrator restarts fast, you would rather lose the replica than serve from one whose pool just lost a connection, and you alert on restarts but not on log events. |
 | `PG_DRIVER_FAULT_GRACE_MS` | No | `5000` | How long a DB await may stay pending after a driver fault before it is failed with `EDRIVERFAULT`. The fault handler cannot tell which connection the dropped write belonged to, so the window spares healthy concurrent queries (which settle in ms) while still bounding the ones that will never settle. Raise it if a loaded replica legitimately holds statements open longer than this. |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | No | `false` | Monkey-patches host globals during exec for extra isolation. |
@@ -274,18 +270,14 @@ recovered the moment the pause lifted. With `allkeys-lru` the same memory pressu
 just evicts cold blobs, which costs a Postgres read.
 
 `allkeys-lru` and `allkeys-lfu` are the only two accepted, because on the default
-single-instance setup this policy also governs the exec-lock leases, version
-counters and destroy tombstones. Under LRU or LFU those are effectively immune — a
-lease renewed every 20s and a counter touched on every write are the hottest keys
-in the instance, so a cold blob is always the better candidate. `allkeys-random`
+single-instance setup this policy also governs the exec-lock leases. LRU and LFU
+favor frequently renewed leases over cold blobs. `allkeys-random`
 samples uniformly, so a live lease is as likely to be reaped as that cold blob.
 `volatile-*` fails for a different reason: it evicts only keys that carry a TTL, so
 once the instance fills with keys that do not, it has no candidate left and behaves
 exactly like `noeviction`.
 
-The check runs only when this client actually carries the blob cache or the path
-snapshot. With `REDIS_BLOB_CACHE_ENABLED=false` and no path snapshot the "data"
-client is the control instance via the fallback, and a control-only Redis must
+The check runs only when this client actually carries the blob cache. With `REDIS_BLOB_CACHE_ENABLED=false`, no data connection opens. A control-only Redis must
 **not** be switched to `allkeys-*` — that would make its leases evictable.
 
 The server checks this at boot with `CONFIG GET maxmemory-policy` and logs

@@ -11,7 +11,6 @@
  *    GET, one reload).
  */
 
-import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
@@ -64,39 +63,6 @@ function adaptReadOnlyFs(host: TestReadOnlyFs): IFileSystem {
 		},
 	});
 	return merged as unknown as IFileSystem;
-}
-
-/** Minimal ICoherentFs around InMemoryFs so ensureFreshCache will probe Redis. */
-class CoherentInMemoryFs {
-	readonly inner: InMemoryFs;
-	#dirty = false;
-	reloadCount = 0;
-	constructor() {
-		this.inner = new InMemoryFs();
-	}
-	wasDirty(): boolean {
-		return this.#dirty;
-	}
-	clearDirty(): void {
-		this.#dirty = false;
-	}
-	poisoned(): boolean {
-		return false;
-	}
-	async reload(): Promise<void> {
-		this.reloadCount++;
-	}
-}
-
-function adaptCoherentFs(host: CoherentInMemoryFs): IFileSystem {
-	const fs = host.inner as unknown as Record<string, unknown>;
-	return new Proxy(host as unknown as Record<string, unknown>, {
-		get(target, prop, receiver) {
-			if (prop in target) return Reflect.get(target, prop, receiver);
-			const v = fs[prop as string];
-			return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(host.inner) : v;
-		},
-	}) as unknown as IFileSystem;
 }
 
 describe("SessionManager.withSessionRead", () => {
@@ -334,63 +300,5 @@ describe("SessionManager.withSessionRead", () => {
 
 		expect(session.inFlight).toBe(0);
 		expect(host.depth).toBe(0);
-	});
-
-	it("single-flights ensureFreshCache across parallel readers", async () => {
-		// Fake Redis that records every GET. The probe done by getOrCreate
-		// for the initial version returns immediately; the probes done by
-		// ensureFreshCache for the parallel readers block on `block` so we
-		// can observe how many concurrent GETs are in-flight.
-		const getCalls: string[] = [];
-		let blockReads = false;
-		let onceResolve!: () => void;
-		const block = new Promise<void>((r) => {
-			onceResolve = r;
-		});
-		const recordingRead = async (key: string): Promise<string> => {
-			getCalls.push(key);
-			if (blockReads) await block;
-			return "0";
-		};
-		const fakeRedis: Partial<Redis> = {
-			get: vi.fn(recordingRead),
-			// ensureFreshCache + getOrCreate now read via GETEX (TTL refresh, audit H6).
-			getex: vi.fn(recordingRead) as unknown as Redis["getex"],
-			incr: vi.fn(async () => 1),
-			expire: vi.fn(async () => 1),
-			// eval is needed by withExecLockShared (distributed RW shared lock).
-			// Return 1 so all shared acquire/renew/release ops succeed.
-			eval: vi.fn(async () => 1),
-		};
-
-		const host = new CoherentInMemoryFs();
-		const sm = new SessionManager({
-			createFs: async () => adaptCoherentFs(host),
-			redis: fakeRedis as Redis,
-		});
-		await sm.getOrCreate(T, "sb-single-flight");
-		const initialGets = getCalls.length;
-		blockReads = true;
-
-		// Five readers in flight before the first GET resolves.
-		const readers = Array.from({ length: 5 }, () => sm.withSessionRead(T, "sb-single-flight", async () => "ok"));
-
-		// Let the readers progress through lock acquisition and reach ensureFreshCache.
-		await new Promise<void>((r) => {
-			const poll = (): void => {
-				if (getCalls.length > initialGets) r();
-				else setImmediate(poll);
-			};
-			setImmediate(poll);
-		});
-		// All five share one in-flight GET (single-flight ensureFreshCache).
-		expect(getCalls.length - initialGets).toBe(1);
-
-		onceResolve();
-		await Promise.all(readers);
-		// And no extra GET was issued for the rest of the cohort.
-		expect(getCalls.length - initialGets).toBe(1);
-
-		await sm.shutdown();
 	});
 });

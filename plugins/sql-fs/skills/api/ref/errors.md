@@ -51,10 +51,7 @@ echo "Stderr: $(echo $result | jq -r .stderr)"
 
 ### ENOENT on a path that should exist
 
-The path cache is populated at session start. If the sandbox was written to by another
-replica between session creation and the read, the local replica's cache may be stale.
-The server auto-refreshes via Redis version counters, but if Redis is unavailable it
-falls back to a full Postgres reload. In practice this is transparent — just retry.
+Every filesystem request validates the sandbox's durable PostgreSQL epoch. A changed epoch reloads the path tree before the request runs. If authority is unavailable, the request fails instead of serving cached success. ENOENT can mean that another request deleted the file or sandbox.
 
 ### 504 / "stream timeout" on ingest
 

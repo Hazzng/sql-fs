@@ -85,13 +85,6 @@ const UNAVAILABLE_ERROR_CODE = "EUNAVAILABLE";
  * script transaction was definitively rolled back. These are the only errors we
  * advertise as `retryable: true`.
  *
- * `ECOHERENCE` is deliberately absent: the write committed to Postgres and only
- * the cross-replica version publish failed, so a blind retry re-applies a
- * non-idempotent script. So is `ELOCKLOST_APPLIED` — the lease lapsed only
- * *after* the guarded work returned, so its transaction is already durable
- * (#175 M1). So is the `08xxx` connection-exception class — a connection lost
- * mid-COMMIT leaves the outcome in doubt, which is not the same as
- * known-not-applied.
  *
  * `ELOCKLOST` is listed, and that is a claim about the FAILING OPERATION only:
  * the F2-L1 guard rolls the script transaction back before COMMIT, and the
@@ -176,10 +169,10 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  *                       ELOCKLOST means "not committed" — safe to retry.
  * ELOCKLOST_     → 503  Service Unavailable, NOT retryable. The lease was lost only
  *   APPLIED             after the guarded work RETURNED — the heartbeat tick can land
- *                       during the COMMIT itself or the INCR after it — so the write
+ *                       during COMMIT — so the write
  *                       is durable and a retry re-applies it (#175 M1).
- * ECOHERENCE     → 503  Service Unavailable, NOT retryable. The write COMMITTED;
- *                       only the cross-replica version publish failed (#175).
+ * ECOHERENCE     → 503  Service Unavailable, NOT retryable. Cache recovery failed
+ *                       after a potentially durable operation.
  * EDRIVERFAULT   → 503  Service Unavailable, NOT retryable. The Postgres driver threw
  *                       out of its own socket-write path and never settled the query
  *                       (#169); the commit status of the lost statement is unknowable.

@@ -461,21 +461,23 @@ describe("SqlFs script-tx — poisoned cache after correlated PG failure (F1)", 
 		expect(fs.poisoned()).toBe(true);
 	});
 
-	it("a successful reload clears the poison", async () => {
-		const { dialect, state } = makePoisoningDialect();
-		const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
-		await fs.ready();
+	it.each(["reload", "ensureFresh"] as const)(
+		"a successful %s clears poison even when the durable epoch is unchanged",
+		async (method) => {
+			const { dialect, state } = makePoisoningDialect();
+			const fs = new SqlFs({ dialect, sandboxId: "s-tx" });
+			await fs.ready();
 
-		fs.beginScriptScope();
-		await fs.writeFile("/home/user/phantom.txt", "ghost");
-		state.failPg = true;
-		await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
-		expect(fs.poisoned()).toBe(true);
+			fs.beginScriptScope();
+			await fs.writeFile("/home/user/phantom.txt", "ghost");
+			state.failPg = true;
+			await expect(fs.endScriptScope()).rejects.toThrow(/COMMIT failed/);
+			expect(fs.poisoned()).toBe(true);
 
-		// PG recovers; the next reload succeeds and clears the poison + phantom.
-		state.failPg = false;
-		await fs.reload();
-		expect(fs.poisoned()).toBe(false);
-		expect(fs.getAllPaths()).not.toContain("/home/user/phantom.txt");
-	});
+			state.failPg = false;
+			await fs[method]();
+			expect(fs.poisoned()).toBe(false);
+			expect(fs.getAllPaths()).not.toContain("/home/user/phantom.txt");
+		},
+	);
 });

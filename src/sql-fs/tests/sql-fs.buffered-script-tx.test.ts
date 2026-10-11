@@ -145,7 +145,7 @@ describe("buffered script-tx — no transaction spans the script", () => {
 		await fs.abortScriptScope();
 
 		// Only the recovery reload's read transaction — no write ever reached the DB.
-		expect(probe.calls).toEqual(["setSandboxContext", "setSandboxContext"]);
+		expect(probe.calls).toEqual(["setSandboxContext"]);
 		expect(probe.dialect.writeFileComposite).not.toHaveBeenCalled();
 		expect(probe.dialect.mkdirComposite).not.toHaveBeenCalled();
 	});

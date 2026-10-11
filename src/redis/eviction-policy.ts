@@ -83,13 +83,6 @@ export async function readEvictionPolicy(client: ConfigReader): Promise<Eviction
  * The only two policies that both always have something to evict and evict the
  * right thing.
  *
- * By default the data role shares an instance with the control role
- * (`REDIS_DATA_URL` falls back to `REDIS_URL`), so whatever policy is set
- * governs the exec-lock leases, the version counters and the destroy
- * tombstones as well as the blob cache. Under LRU or LFU those are effectively
- * immune: a lease renewed every `REDIS_EXEC_LOCK_RENEW_MS` (20 s) and a version
- * counter touched on every write are the most recently and most frequently used
- * keys in the instance, so a cold blob is always the better candidate.
  *
  * `allkeys-random` is NOT accepted: it samples uniformly, so a live lease is
  * exactly as likely to be reaped as the cold blob next to it. `volatile-*` is
@@ -105,7 +98,7 @@ const SAFE_POLICIES: ReadonlySet<string> = new Set(["allkeys-lru", "allkeys-lfu"
 /** Why this specific policy is refused — an operator log line has to be actionable. */
 function unsafeReason(policy: string | undefined): string {
 	if (policy === "allkeys-random") {
-		return "allkeys-random evicts uniformly at random, so a live exec-lock lease or version counter is as likely to be reaped as a cold blob; LRU/LFU never pick a key renewed every 20s.";
+		return "allkeys-random evicts uniformly at random, so a live exec-lock lease is as likely to be reaped as a cold blob; LRU/LFU favor frequently renewed keys.";
 	}
 	if (policy?.startsWith("volatile-") === true) {
 		return "volatile-* evicts only keys that carry a TTL, so once the instance fills with keys that do not, it has no candidate left and behaves exactly like noeviction: writes refused, no recovery without a human.";
@@ -166,15 +159,8 @@ export async function checkEvictionPolicy(
 
 export interface EvictionPolicyCheckOptions {
 	/**
-	 * Whether this client actually carries data-plane state (blob cache or path
-	 * snapshot). Defaults to `true`; pass `false` to skip the check entirely.
+	 * Whether this client actually carries data-plane state (blob cache). Defaults to `true`; pass `false` to skip the check entirely.
 	 *
-	 * #188 M8: `REDIS_DATA_URL` falls back to `REDIS_URL`, so with the blob cache
-	 * disabled and no path snapshot the "data" client IS the control instance. A
-	 * control-only Redis holds leases, version counters and destroy tombstones and
-	 * no cache at all — nothing there is worth evicting, and the remediation this
-	 * check pages for (switch to `allkeys-*`) would make all of it evictable. So a
-	 * correctly-configured control-only deployment must not be paged at all.
 	 */
 	readonly carriesDataPlane?: boolean;
 }

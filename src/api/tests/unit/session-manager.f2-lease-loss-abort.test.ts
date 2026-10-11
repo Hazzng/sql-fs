@@ -13,7 +13,6 @@ import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
 import { describe, expect, it } from "vitest";
-import { versionKey } from "../../../sql-fs/redis-path-snapshot.js";
 import { SessionManager } from "../../session-manager.js";
 
 // ── FakeRedis (ZSET-aware, with forced exclusive renew loss + version INCR) ─────
@@ -263,7 +262,6 @@ describe("F2-L1: abort exec on definitive lease loss before commit", () => {
 		expect(record.ends).toBe(0);
 
 		// No version bump was published (the write did not commit).
-		expect(redis.counters.get(versionKey(T, "sbx-loss")) ?? 0).toBe(0);
 
 		await sm.shutdown();
 	});

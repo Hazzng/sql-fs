@@ -91,6 +91,7 @@ describe("cp single symlink preserves the link (M8 regression)", () => {
 				symlinkTarget: targetPath,
 				contentSha256: null,
 			}),
+			0n,
 		);
 
 		// lstat reports a symlink (not a file) with the target's string length —

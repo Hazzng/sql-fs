@@ -64,7 +64,18 @@ vi.mock("../../dialects/postgres.js", () => ({
 		getBlob: vi.fn(),
 		gcOrphanBlobs: vi.fn(),
 		getBlobsForSandbox: vi.fn(async () => []),
-		loadAllPaths: vi.fn().mockResolvedValue([]),
+		loadAllPaths: vi.fn().mockResolvedValue([
+			{
+				path: "/",
+				inodeId: 1n,
+				kind: 2,
+				mode: 0o755,
+				size: 0,
+				mtime: new Date(),
+				contentSha256: null,
+				symlinkTarget: null,
+			},
+		]),
 		loadSubtreeInodes: vi.fn(),
 		bulkIngest: vi.fn(),
 		resolvePath: vi.fn(),
@@ -93,7 +104,7 @@ describe("createSandboxFs", () => {
 			expect(fs).toBeInstanceOf(SqlFs);
 		});
 
-		it("opens no data connection when lock-only (blob cache off, snapshot off)", async () => {
+		it("opens no Redis connection when blob caching is disabled", async () => {
 			// #167: REDIS_DATA_URL falls back to REDIS_URL inside getRedisClient,
 			// so requesting the data client would always connect — the factory
 			// must not request it when no data-plane feature is enabled.
@@ -102,7 +113,6 @@ describe("createSandboxFs", () => {
 			vi.stubEnv("REDIS_URL", "redis://localhost:6379");
 			vi.stubEnv("REDIS_DATA_URL", undefined);
 			vi.stubEnv("REDIS_BLOB_CACHE_ENABLED", "false");
-			vi.stubEnv("REDIS_PATH_SNAPSHOT_ENABLED", "false");
 			vi.stubEnv("DATABASE_URL", "postgres://localhost/test");
 			const { createSandboxFs: freshCreateSandboxFs } = await import("../../index.js");
 			// Fresh class identity: resetModules re-evaluates sql-fs.js, so the
@@ -110,7 +120,7 @@ describe("createSandboxFs", () => {
 			const { SqlFs: FreshSqlFs } = await import("../../sql-fs.js");
 			const fs = await freshCreateSandboxFs("postgres", "lock-only-sandbox");
 			expect(fs).toBeInstanceOf(FreshSqlFs);
-			expect(constructed).toEqual(["sql-fs-control"]);
+			expect(constructed).toEqual([]);
 		});
 
 		it("throws if DATABASE_URL is not set", async () => {

@@ -1,19 +1,4 @@
-/**
- * Role-split Redis clients.
- *
- * #167: one ioredis connection carried everything — blob cache, path snapshot,
- * locks, version counter and session state. ioredis pipelines commands over a
- * single socket, so a queue of multi-MiB blob `SET`s head-of-line blocks the
- * latency-critical `INCR`/`EVAL` behind them; at 260 in-flight 2 MiB writes an
- * `INCR` on the shared connection timed out at 2043 ms while the same command
- * on a separate connection answered in 44 ms. Each timeout then drove the lock
- * acquire breaker, which fast-failed every request on the replica.
- *
- * So the data plane (blob cache, path snapshot) gets its own connection and the
- * control plane (locks, version counter, session state) keeps the original one.
- * `REDIS_DATA_URL` defaults to `REDIS_URL`: the split is by connection, not by
- * server, so existing single-Redis deployments get the isolation for free.
- */
+/** Separate Redis connections keep blob backfills from delaying lock commands. */
 
 import { Redis, type RedisOptions } from "ioredis";
 

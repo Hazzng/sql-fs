@@ -1,21 +1,7 @@
-/**
- * Phase D — cross-replica cache-coherence integration tests.
- *
- * Two SessionManager instances against one real Postgres + one real Redis
- * simulate two API replicas. Verifies:
- *   1. Write on A → version bumps → next exec on B reloads and sees the write.
- *   2. Back-to-back execs on B with no intervening A write → no spurious reload.
- *   3. destroy() tombstones the version key so a warm peer replica tears its
- *      session down instead of serving ghost state (F7).
- *   4. Two alternating writes converge both replicas on the latest version.
- *
- * Skipped unless both DATABASE_URL and REDIS_URL are set.
- */
-
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { destroySandbox } from "../../../sql-fs/index.js";
-import { VERSION_TOMBSTONE } from "../../../sql-fs/redis-path-snapshot.js";
+import type { SqlFs } from "../../../sql-fs/sql-fs.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
@@ -38,7 +24,7 @@ function versionKey(sandboxId: string): string {
 	return `vfs:${TENANT}:ver:${sandboxId}`;
 }
 
-describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
+describe.skipIf(SKIP)("cross-replica committed cache coherence", () => {
 	let redis: Redis;
 	const cleanup: string[] = [];
 
@@ -100,16 +86,12 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 		const bSessionBefore = smB.getSession(TENANT, sandboxId)!;
 		expect(bSessionBefore.fs.getAllPaths()).not.toContain("/from-a.txt");
 
-		// A writes via bash — mutation goes through SqlFs.writeFile → marks dirty → INCRs version.
 		await timed(
 			"A-write",
 			smA.withSession(TENANT, sandboxId, async (s) => {
 				await s.bash.exec("echo hello > /from-a.txt");
 			}),
 		);
-
-		const versionAfterA = await redis.get(versionKey(sandboxId));
-		expect(Number(versionAfterA)).toBeGreaterThanOrEqual(1);
 
 		// B's next exec must reload and see /from-a.txt.
 		await timed(
@@ -121,10 +103,6 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 				expect(s.fs.getAllPaths()).toContain("/from-a.txt");
 			}),
 		);
-
-		// After B's reload, B's lastSeenVersion should match Redis.
-		const bSessionAfter = smB.getSession(TENANT, sandboxId)!;
-		expect(String(bSessionAfter.lastSeenVersion)).toBe(versionAfterA);
 	});
 
 	it("no reload when no other replica wrote in between", async () => {
@@ -135,24 +113,18 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 			/* warm */
 		});
 
-		// Spy on fs.reload — we can't easily spy since fs is owned internally,
-		// but we can observe via the Redis version key NOT changing and the
-		// session's lastSeenVersion staying put.
-		const before = await redis.get(versionKey(sandboxId));
-		const sessionBefore = sm.getSession(TENANT, sandboxId)!;
-		const lsvBefore = sessionBefore.lastSeenVersion;
+		const fs = sm.getSession(TENANT, sandboxId)!.fs as SqlFs;
+		const before = fs._getPathCache();
 
 		// Pure-read turn (no mutation)
 		await sm.withSession(TENANT, sandboxId, async (s) => {
 			await s.bash.exec("ls /");
 		});
 
-		const after = await redis.get(versionKey(sandboxId));
-		expect(after).toBe(before); // version key untouched
-		expect(sm.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(lsvBefore);
+		expect(fs._getPathCache()).toBe(before);
 	});
 
-	it("destroy tombstones the version key and tears down a peer replica's warm session", async () => {
+	it("destroy tears down a peer replica's warm session without Redis metadata", async () => {
 		const sandboxId = newId();
 		const smA = makeSm();
 		const smB = makeSm();
@@ -165,19 +137,10 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 			expect(String(await s.fs.readFile("/x.txt")).trim()).toBe("bye");
 		});
 
-		expect(await redis.get(versionKey(sandboxId))).not.toBeNull();
+		expect(await redis.get(versionKey(sandboxId))).toBeNull();
 
 		await smA.destroy(TENANT, sandboxId);
 
-		// F7: a bare DEL would conflate "absent" with version 0, so a warm peer
-		// holding lastSeenVersion 0 would never reload and would serve ghost state
-		// forever. The sentinel is distinct and non-numeric, and inherits the
-		// version-key TTL so it self-cleans.
-		expect(await redis.get(versionKey(sandboxId))).toBe(VERSION_TOMBSTONE);
-		expect(await redis.ttl(versionKey(sandboxId))).toBeGreaterThan(0);
-
-		// The sentinel is what B's freshness probe keys off: its warm session is
-		// torn down and the request surfaces a clean ENOENT instead of ghost state.
 		await expect(
 			smB.withSession(TENANT, sandboxId, async (s) => {
 				await s.fs.readFile("/x.txt");
@@ -202,10 +165,5 @@ describe.skipIf(SKIP)("Phase D — cross-replica cache coherence", () => {
 			const pong = String(await s.fs.readFile("/pong.txt")).trim();
 			expect(pong).toBe("b1");
 		});
-
-		// The counter should have ticked at least twice (A-write, B-write).
-		expect(Number(await redis.get(versionKey(sandboxId)))).toBeGreaterThanOrEqual(2);
-		// Both replicas now see the same lastSeenVersion.
-		expect(smA.getSession(TENANT, sandboxId)?.lastSeenVersion).toBe(smB.getSession(TENANT, sandboxId)?.lastSeenVersion);
 	});
 });
