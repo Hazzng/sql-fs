@@ -1,0 +1,2664 @@
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts
+new file mode 100644
+index 0000000..3a26128
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts
+@@ -0,0 +1,268 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { Bash } from "../../Bash.js";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  allocations: [] as number[],
++  workers: [] as Array<{ finish(): void }>,
++  holdTermination: false,
++  holdBridge: false,
++  terminationReleases: [] as Array<() => void>,
++  bridgeReleases: [] as Array<() => void>,
++}));
++
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? []) {
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++          }
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (state.holdTermination)
++        await new Promise<void>((resolve) =>
++          state.terminationReleases.push(resolve),
++        );
++      return 0;
++    }
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    async run() {
++      if (state.holdBridge)
++        await new Promise<void>((resolve) =>
++          state.bridgeReleases.push(resolve),
++        );
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++function context(
++  fs = new InMemoryFs(),
++  messageBytes = 64 * 1024 * 1024,
++): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: messageBytes }),
++  };
++}
++
++async function tick(): Promise<void> {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain(): Promise<void> {
++  state.holdTermination = false;
++  state.holdBridge = false;
++  for (let index = 0; index < 10; index++) {
++    for (const release of state.terminationReleases.splice(0)) release();
++    for (const release of state.bridgeReleases.splice(0)) release();
++    for (const worker of state.workers) worker.finish();
++    await tick();
++  }
++}
++
++describe("Python bridge allocation admission", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.allocations = [];
++    state.workers = [];
++    state.holdTermination = false;
++    state.holdBridge = false;
++    state.terminationReleases = [];
++    state.bridgeReleases = [];
++  });
++
++  it("preserves the historical default 8 MiB payload allocation", async () => {
++    const operation = python3Command.execute(["-c", "print(1)"], context());
++    await tick();
++    const measured = [...state.allocations];
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(measured).toEqual([8 * 1024 * 1024 + 4128]);
++  });
++
++  it("allocates no bridge for a queued or cancelled same-filesystem command", async () => {
++    const fs = new InMemoryFs();
++    const abort = new AbortController();
++    const first = python3Command.execute(["-c", "print(1)"], context(fs));
++    const second = python3Command.execute(["-c", "print(2)"], {
++      ...context(fs),
++      signal: abort.signal,
++    });
++    await tick();
++    const measured = [...state.allocations];
++    abort.abort();
++    await drain();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    expect(await second).toMatchObject({ exitCode: 124 });
++    expect(measured).toHaveLength(1);
++    expect(state.allocations).toHaveLength(1);
++  });
++
++  it("bounds active buffers across independent filesystems before allocating the sixth", async () => {
++    const operations = Array.from({ length: 6 }, () =>
++      python3Command.execute(
++        ["-c", "print(1)"],
++        context(new InMemoryFs(), 8192),
++      ),
++    );
++    await tick();
++    const beforeRelease = [...state.allocations];
++    const workersBeforeRelease = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(beforeRelease).toHaveLength(5);
++    expect(workersBeforeRelease).toBe(5);
++    expect(state.allocations).toHaveLength(6);
++  });
++
++  it.each([
++    "termination",
++    "bridge",
++  ])("holds filesystem ownership until %s settles", async (held) => {
++    const fs = new InMemoryFs();
++    state.holdTermination = held === "termination";
++    state.holdBridge = held === "bridge";
++    const first = python3Command.execute(["-c", "print(1)"], context(fs, 8192));
++    const second = python3Command.execute(
++      ["-c", "print(2)"],
++      context(fs, 8192),
++    );
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const workersBeforeSettlement = state.workers.length;
++    const buffersBeforeSettlement = state.allocations.length;
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(workersBeforeSettlement).toBe(1);
++    expect(buffersBeforeSettlement).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it("allows another filesystem to dispatch past a blocked queue head", async () => {
++    const fs = new InMemoryFs();
++    const operations = [
++      python3Command.execute(["-c", "print(1)"], context(fs, 8192)),
++      python3Command.execute(["-c", "print(2)"], context(fs, 8192)),
++      python3Command.execute(
++        ["-c", "print(3)"],
++        context(new InMemoryFs(), 8192),
++      ),
++    ];
++    await tick();
++    const beforeRelease = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0, 0]);
++    expect(beforeRelease).toBe(2);
++    expect(state.allocations).toHaveLength(3);
++  });
++
++  it("expires a waiting request without allocating or dispatching it later", async () => {
++    const fs = new InMemoryFs();
++    const first = python3Command.execute(["-c", "print(1)"], context(fs, 8192));
++    const second = python3Command.execute(["-c", "print(2)"], {
++      ...context(fs, 8192),
++      limits: resolveLimits({
++        maxPythonTimeoutMs: 5,
++        maxWorkerMessageBytes: 8192,
++      }),
++    });
++    const secondResult = await second;
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    expect(secondResult).toMatchObject({
++      exitCode: 124,
++      stdout: "",
++      stderr: "python3: Execution timeout: exceeded 5ms limit\n",
++    });
++    expect(beforeRelease).toBe(1);
++    expect(state.allocations).toHaveLength(1);
++  });
++
++  it.each([
++    24,
++    1024,
++    8 * 1024 * 1024,
++    64 * 1024 * 1024 - 4128,
++  ])("uses an explicit %i byte bridge payload independently of the string ceiling", async (capacity) => {
++    const ctx = context();
++    ctx.limits = { ...resolveLimits(), maxPythonBridgeBytes: capacity };
++    const operation = python3Command.execute(["-c", "print(1)"], ctx);
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(state.allocations).toEqual([capacity + 4128]);
++  });
++
++  it("admits dynamically named pipeline stages before allocating their bridges", async () => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: 8192 },
++    });
++    const operation = bash.exec(
++      `command=py; command=\${command}thon3; $command -c 'print(1)' | $command -c 'print(2)' | $command -c 'print(3)'`,
++    );
++    await tick();
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(beforeRelease).toBe(1);
++    expect(state.allocations).toHaveLength(3);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts
+new file mode 100644
+index 0000000..3b1c31f
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts
+@@ -0,0 +1,284 @@
++import { createHash } from "node:crypto";
++import { describe, expect, it } from "vitest";
++import { Bash } from "../../Bash.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++
++const MIB = 1024 * 1024;
++const BRIDGE_OVERHEAD = 4128;
++
++describe("installed just-bash Python bridge", () => {
++  it("completes a dynamically named producer-consumer Python pipeline on one filesystem", async () => {
++    const bash = new Bash({ python: true });
++    expect(
++      await bash.exec(
++        `command=py; command=\${command}thon3; $command -c 'print("pipeline")' | $command -c 'import sys; print(sys.stdin.read().upper(),end="")'`,
++      ),
++    ).toMatchObject({ exitCode: 0, stderr: "", stdout: "PIPELINE\n" });
++  });
++  it.each([
++    0,
++    BRIDGE_OVERHEAD,
++    BRIDGE_OVERHEAD + 1,
++    BRIDGE_OVERHEAD + 23,
++  ])("rejects an impossible %i byte bridge budget with its minimum configuration", async (messageBytes) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: messageBytes },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires maxWorkerMessageBytes >= 4152 and maxStringLength >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++
++  it.each([
++    24, 25,
++  ])("supports tiny Python at the %i byte bridge payload boundary", async (capacity) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: capacity + BRIDGE_OVERHEAD },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "37\n",
++      stderr: "",
++    });
++    expect(await bash.exec("python3 -c 'print(38)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "38\n",
++      stderr: "",
++    });
++  });
++
++  it.each([24, 25])(
++    "returns filesystem errors and preserves Unicode output at the %i byte payload minimum",
++    { timeout: 20000 },
++    async (capacity) => {
++      const fs = new InMemoryFs({ "/oversized": Buffer.alloc(capacity + 1) });
++      const stat = fs.stat.bind(fs);
++      fs.stat = async (path) => {
++        if (path === "/missing")
++          throw new Error(`${"🐙".repeat(40)} no such file`);
++        return stat(path);
++      };
++      const readFileBuffer = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return readFileBuffer(path);
++      };
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxWorkerMessageBytes: capacity + BRIDGE_OVERHEAD,
++          maxPythonTimeoutMs: 3000,
++        },
++      });
++      const missing = await bash.exec("python3 -c 'open(\"/missing\").read()'");
++      expect(missing.exitCode).toBe(1);
++      expect(missing.stderr).toContain("[Errno 44] No such file or directory");
++      expect(missing.stderr).not.toMatch(/timeout/i);
++      expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++      const oversized = await bash.exec(
++        'python3 -c \'open("/oversized","rb").read()\'',
++      );
++      expect(oversized.exitCode).toBe(1);
++      expect(oversized.stderr).toContain("[Errno 22] File too large");
++      expect(oversized.stderr).not.toMatch(/timeout/i);
++      expect(reads).not.toContain("/oversized");
++      expect(
++        await bash.exec(
++          'python3 -c \'import sys; print("é🐙"*40); print("λ🪵"*40,file=sys.stderr)\'',
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${"é🐙".repeat(40)}\n`,
++        stderr: `${"λ🪵".repeat(40)}\n`,
++      });
++      expect(await bash.exec("python3 -c 'print(38)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "38\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it("rejects a file limit below the bridge metadata capacity with its minimum configuration", async () => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxStringLength: 23, maxWorkerMessageBytes: 32768 },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires maxWorkerMessageBytes >= 4152 and maxStringLength >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++
++  it(
++    "releases descriptors after repeated oversized opens",
++    { timeout: 60000 },
++    async () => {
++      const fs = new InMemoryFs({
++        "/oversized.bin": Buffer.alloc(8194),
++        "/fits.bin": "safe",
++      });
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: { maxWorkerMessageBytes: 8193 + BRIDGE_OVERHEAD },
++      });
++      const code = `import errno
++for i in range(4100):
++    try:
++        open("/oversized.bin", "rb")
++    except OSError as error:
++        if error.errno != errno.EFBIG:
++            raise
++print(open("/fits.bin").read())`;
++      expect(await bash.exec(`python3 -c '${code}'`)).toMatchObject({
++        exitCode: 0,
++        stdout: "safe\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it(
++    "reads and hashes 49 MiB within configured budgets",
++    { timeout: 60000 },
++    async () => {
++      const content = Buffer.alloc(49 * MIB, 0x5a);
++      const expectedHash = createHash("sha256").update(content).digest("hex");
++      const fs = new InMemoryFs({ "/large.bin": content });
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxStringLength: 64 * MIB,
++          maxWorkerMessageBytes: 64 * MIB,
++          maxPythonBridgeBytes: 64 * MIB - BRIDGE_OVERHEAD,
++        },
++      });
++      const result = await bash.exec(
++        `python3 -c 'import hashlib; data=open("/large.bin", "rb").read(); print(len(data)); print(hashlib.sha256(data).hexdigest())'`,
++      );
++      expect(result).toMatchObject({
++        exitCode: 0,
++        stderr: "",
++        stdout: `${content.length}\n${expectedHash}\n`,
++      });
++      expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it.each([
++    [8193, 8193 + BRIDGE_OVERHEAD, 32768],
++    [4096, 32768, 4096],
++  ])(
++    "enforces a %i byte payload ceiling before reading oversized files",
++    { timeout: 60000 },
++    async (capacity, messageBytes, fileBytes) => {
++      const fs = new InMemoryFs({
++        "/fits.bin": Buffer.alloc(capacity, 0x61),
++        "/oversized.bin": Buffer.alloc(capacity + 1, 0x62),
++      });
++      const readFileBuffer = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return readFileBuffer(path);
++      };
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxStringLength: fileBytes,
++          maxWorkerMessageBytes: messageBytes,
++        },
++      });
++      expect(
++        await bash.exec(
++          `python3 -c 'print(len(open("/fits.bin", "rb").read()))'`,
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${capacity}\n`,
++        stderr: "",
++      });
++      const result = await bash.exec(
++        `python3 -c 'open("/oversized.bin", "rb").read()'`,
++      );
++      expect(result.exitCode).toBe(1);
++      expect(result.stderr).toContain("[Errno 22] File too large");
++      expect(reads).not.toContain("/oversized.bin");
++      expect(
++        await bash.exec(
++          `python3 -c 'print(len(open("/fits.bin", "rb").read()))'`,
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${capacity}\n`,
++        stderr: "",
++      });
++    },
++  );
++  it.each([
++    0,
++    23,
++    Number.POSITIVE_INFINITY,
++  ])("rejects invalid dedicated bridge payload %s before dispatch", async (capacity) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxPythonBridgeBytes: capacity },
++    });
++    expect(await bash.exec("python3 -c 'print(1)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires an integer maxPythonBridgeBytes >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++  it.each([
++    -1,
++    24.5,
++    Number.NaN,
++  ])("rejects invalid dedicated bridge configuration %s", (capacity) => {
++    expect(
++      () =>
++        new Bash({
++          python: true,
++          executionLimits: { maxPythonBridgeBytes: capacity },
++        }),
++    ).toThrow(
++      "maxPythonBridgeBytes must be a non-negative safe integer or positive Infinity",
++    );
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts
+new file mode 100644
+index 0000000..d35d113
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts
+@@ -0,0 +1,170 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { IFileSystem } from "../../fs/interface.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  bridgeContexts: [] as Array<string | undefined>,
++  workerContexts: [] as Array<string | undefined>,
++  getTag: () => undefined as string | undefined,
++  constructorThrows: false,
++}));
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workerContexts.push(state.getTag());
++      if (state.constructorThrows) throw new Error("owned constructor failure");
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      return 0;
++    }
++  },
++}));
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(
++      _buffer: SharedArrayBuffer,
++      private fs: IFileSystem,
++    ) {}
++    async run() {
++      await this.fs.exists("/owned-context-probe");
++      state.bridgeContexts.push(state.getTag());
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++const tags = new AsyncLocalStorage<string>();
++function context(fs = new InMemoryFs()): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: 8192 }),
++  };
++}
++function execute(tag: string, fs = new InMemoryFs()) {
++  return tags.run(tag, () =>
++    python3Command.execute(["-c", "print(1)"], context(fs)),
++  );
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  for (let index = 0; index < 10; index++) {
++    tags.run("release-host", () => {
++      for (const worker of state.workers) worker.finish();
++    });
++    await tick();
++  }
++}
++describe("queued Python async ownership", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.bridgeContexts = [];
++    state.workerContexts = [];
++    state.getTag = () => tags.getStore();
++    state.constructorThrows = false;
++  });
++  it("preserves the waiting same-filesystem request context across another owner's release", async () => {
++    const fs = new InMemoryFs();
++    const first = execute("owner-A", fs);
++    const second = execute("owner-B", fs);
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(state.workerContexts).toEqual(["owner-A", "owner-B"]);
++    expect(state.bridgeContexts).toEqual(["owner-A", "owner-B"]);
++  });
++  it("preserves a waiting independent filesystem's context when global capacity becomes available", async () => {
++    const operations = Array.from({ length: 5 }, (_, index) =>
++      execute(`owner-${index}`),
++    );
++    operations.push(execute("waiting-owner"));
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(state.workerContexts).toEqual([
++      "owner-0",
++      "owner-1",
++      "owner-2",
++      "owner-3",
++      "owner-4",
++      "waiting-owner",
++    ]);
++    expect(state.bridgeContexts).toEqual(state.workerContexts);
++  });
++  it("releases ownership after a constructor failure", async () => {
++    const fs = new InMemoryFs();
++    state.constructorThrows = true;
++    const failed = await execute("failed-owner", fs);
++    expect(failed).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: owned constructor failure\n",
++    });
++    state.constructorThrows = false;
++    const healthy = execute("healthy-owner", fs);
++    await drain();
++    expect(await healthy).toMatchObject({ exitCode: 0 });
++    expect(state.workerContexts).toEqual(["failed-owner", "healthy-owner"]);
++  });
++
++  it("releases ownership after rejecting an impossible allocation before constructing its buffer", async () => {
++    const fs = new InMemoryFs();
++    const failed = await python3Command.execute(["-c", "print(1)"], {
++      ...context(fs),
++      limits: resolveLimits({
++        maxPythonBridgeBytes: 2 ** 31,
++        maxStringLength: 2 ** 31,
++        maxWorkerMessageBytes: 2 ** 31 + 4128,
++      }),
++    });
++    expect(failed).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Invalid shared bridge payload capacity\n",
++    });
++    expect(state.workerContexts).toHaveLength(0);
++    const healthy = execute("healthy-owner", fs);
++    await drain();
++    expect(await healthy).toMatchObject({ exitCode: 0 });
++    expect(state.workerContexts).toEqual(["healthy-owner"]);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts
+new file mode 100644
+index 0000000..c128240
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts
+@@ -0,0 +1,230 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { IFileSystem } from "../../fs/interface.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  bridgeContexts: [] as Array<string | undefined>,
++  workerContexts: [] as Array<string | undefined>,
++  getTag: () => undefined as string | undefined,
++  constructorThrows: false,
++  allocations: [] as number[],
++  rejectedTerminationOwner: "",
++}));
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    private readonly owner = state.getTag();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workerContexts.push(state.getTag());
++      if (state.constructorThrows) throw new Error("owned constructor failure");
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (this.owner === state.rejectedTerminationOwner)
++        throw new Error("owned termination failure");
++      return 0;
++    }
++  },
++}));
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(
++      _buffer: SharedArrayBuffer,
++      private fs: IFileSystem,
++    ) {}
++    async run() {
++      await this.fs.exists("/owned-context-probe");
++      state.bridgeContexts.push(state.getTag());
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++const tags = new AsyncLocalStorage<string>();
++function context(fs = new InMemoryFs()): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: 8192 }),
++  };
++}
++function execute(tag: string, fs = new InMemoryFs()) {
++  return tags.run(tag, () =>
++    python3Command.execute(["-c", "print(1)"], context(fs)),
++  );
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  for (let index = 0; index < 10; index++) {
++    tags.run("release-host", () => {
++      for (const worker of state.workers) worker.finish();
++    });
++    await tick();
++  }
++}
++describe("Python queue capacity boundary", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.bridgeContexts = [];
++    state.workerContexts = [];
++    state.allocations = [];
++    state.getTag = () => tags.getStore();
++    state.constructorThrows = false;
++    state.rejectedTerminationOwner = "";
++  });
++  it("rejects the 101st waiter but dispatches an eligible filesystem past the full blocked queue", async () => {
++    const fs = new InMemoryFs();
++    const first = execute("active", fs);
++    const aborts = Array.from({ length: 100 }, () => new AbortController());
++    const waiting = aborts.map((abort) =>
++      python3Command.execute(["-c", "print(1)"], {
++        ...context(fs),
++        signal: abort.signal,
++      }),
++    );
++    const refused = await execute("refused", fs);
++    const independent = execute("independent");
++    await tick();
++    const beforeRelease = [...state.allocations];
++    for (const abort of aborts) abort.abort();
++    await drain();
++    expect(refused).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr: "python3: Python execution queue is full\n",
++    });
++    expect(
++      (await Promise.all(waiting)).every((result) => result.exitCode === 124),
++    ).toBe(true);
++    expect(
++      (await Promise.all([first, independent])).map(
++        (result) => result.exitCode,
++      ),
++    ).toEqual([0, 0]);
++    expect(beforeRelease).toEqual([8192, 8192]);
++    expect(state.allocations).toEqual([8192, 8192]);
++    expect(state.workers).toHaveLength(2);
++  });
++  it("never allocates or starts a worker for a pre-aborted request", async () => {
++    const abort = new AbortController();
++    abort.abort();
++    expect(
++      await python3Command.execute(["-c", "print(1)"], {
++        ...context(),
++        signal: abort.signal,
++      }),
++    ).toMatchObject({
++      exitCode: 124,
++      stdout: "",
++      stderr: "python3: Execution aborted\n",
++    });
++    expect(state.allocations).toHaveLength(0);
++    expect(state.workers).toHaveLength(0);
++  });
++
++  it("retains a global reservation after worker termination is unacknowledged", async () => {
++    state.rejectedTerminationOwner = "lost-owner";
++    const lost = execute("lost-owner");
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    expect(await lost).toMatchObject({ exitCode: 0 });
++    const operations = Array.from({ length: 5 }, (_, index) =>
++      execute(`replacement-${index}`),
++    );
++    await tick();
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(beforeRelease).toBe(5);
++    expect(state.workerContexts.slice(1, 5)).toEqual([
++      "replacement-0",
++      "replacement-1",
++      "replacement-2",
++      "replacement-3",
++    ]);
++    expect(state.allocations).toHaveLength(6);
++  });
++
++  it("poisons pending and future requests before a failed worker's bridge finishes", async () => {
++    state.rejectedTerminationOwner = "lost-owner";
++    let release = () => {};
++    const pendingOperation = new Promise<boolean>((resolve) => {
++      release = () => resolve(false);
++    });
++    const fs = new InMemoryFs();
++    fs.exists = () => pendingOperation;
++    const lost = execute("lost-owner", fs);
++    const waiting = execute("waiting-owner", fs);
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const queued = await waiting;
++    const future = await execute("future-owner", fs);
++    release();
++    await drain();
++    expect(await lost).toMatchObject({ exitCode: 0 });
++    expect(queued).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(future).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(state.allocations).toEqual([8192]);
++    expect(state.workers).toHaveLength(1);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts b/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts
+new file mode 100644
+index 0000000..7742f9a
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts
+@@ -0,0 +1,261 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { Bash } from "../../Bash.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { ExecResult } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  allocations: [] as number[],
++  filesystems: [] as object[],
++  holdTermination: false,
++  holdBridge: false,
++  rejectFirstTermination: false,
++  terminationReleases: [] as Array<() => void>,
++  bridgeReleases: [] as Array<() => void>,
++}));
++
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    private id = state.workers.length;
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(event, [
++        ...(this.listeners.get(event) ?? []),
++        listener,
++      ]);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (state.rejectFirstTermination && this.id === 0)
++        throw new Error("owned termination refusal");
++      if (state.holdTermination)
++        await new Promise<void>((resolve) =>
++          state.terminationReleases.push(resolve),
++        );
++      return 0;
++    }
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(_buffer: SharedArrayBuffer, fs: object) {
++      state.filesystems.push(fs);
++    }
++    async run() {
++      if (state.holdBridge)
++        await new Promise<void>((resolve) =>
++          state.bridgeReleases.push(resolve),
++        );
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue } from "./python3.js";
++
++const command = "python3 -c 'print(1)'";
++const operations: Promise<ExecResult>[] = [];
++function execute(bash: Bash, script = command) {
++  const operation = bash.exec(script);
++  operations.push(operation);
++  return operation;
++}
++function shell(fs = new InMemoryFs(), defenseInDepth = false) {
++  return new Bash({
++    fs,
++    python: true,
++    defenseInDepth,
++    executionLimits: { maxWorkerMessageBytes: 8192 },
++  });
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  state.holdTermination = false;
++  state.holdBridge = false;
++  state.rejectFirstTermination = false;
++  for (let index = 0; index < 8; index++) {
++    for (const release of state.terminationReleases.splice(0)) release();
++    for (const release of state.bridgeReleases.splice(0)) release();
++    for (const worker of state.workers) worker.finish();
++    await tick();
++  }
++}
++
++describe("Python stable filesystem admission through Bash", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.allocations = [];
++    state.filesystems = [];
++    state.holdTermination = false;
++    state.holdBridge = false;
++    state.rejectFirstTermination = false;
++    state.terminationReleases = [];
++    state.bridgeReleases = [];
++  });
++  afterEach(async () => {
++    try {
++      await drain();
++    } finally {
++      await Promise.allSettled(operations.splice(0));
++    }
++  });
++
++  it.each([
++    false,
++    true,
++  ])("serializes two fresh command wrappers for the same filesystem (defense %s)", async (defense) => {
++    const fs = new InMemoryFs();
++    const operations = [
++      execute(shell(fs, defense)),
++      execute(shell(fs, defense)),
++    ];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toEqual({ workers: 1, buffers: 1, bytes: 8192 });
++    expect(state.workers).toHaveLength(2);
++    expect(Object.is(state.filesystems[0], state.filesystems[1])).toBe(false);
++  });
++
++  it("keeps two independent filesystem commands concurrent", async () => {
++    const requests = [execute(shell()), execute(shell())];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(requests)).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++  });
++
++  it("admits another filesystem past the blocked same-filesystem invocation", async () => {
++    const fs = new InMemoryFs();
++    const operations = [
++      execute(shell(fs)),
++      execute(shell(fs)),
++      execute(shell()),
++    ];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0, 0]);
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++    expect(state.workers).toHaveLength(3);
++  });
++
++  it("holds ownership across sequential commands until termination acknowledges", async () => {
++    state.holdTermination = true;
++    const operation = execute(shell(), `${command}; ${command}`);
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const before = state.workers.length;
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(before).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it("holds ownership while a prior bridge is still settling", async () => {
++    state.holdBridge = true;
++    const fs = new InMemoryFs();
++    const first = execute(shell(fs));
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const second = execute(shell(fs));
++    await tick();
++    const before = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it.each([
++    false,
++    true,
++  ])("retains poison across fresh wrappers without blocking another filesystem (defense %s)", async (defense) => {
++    const fs = new InMemoryFs();
++    state.rejectFirstTermination = true;
++    const first = execute(shell(fs, defense));
++    await tick();
++    state.workers[0]?.finish();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    await tick();
++    const later = execute(shell(fs, defense));
++    const other = execute(shell(new InMemoryFs(), defense));
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(await later).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(await other).toMatchObject({ exitCode: 0 });
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++    expect(state.workers).toHaveLength(2);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts b/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
+index 21376a7..d51cf3a 100644
+--- a/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
+@@ -113,6 +113,8 @@ vi.mock("../worker-bridge/bridge-handler.js", () => {
+ 
+ vi.mock("../worker-bridge/protocol.js", () => {
+   return {
++    SHARED_BUFFER_OVERHEAD: 4128,
++    getMinimumSharedBufferPayloadBytes: () => 24,
+     createSharedBuffer: () => new _SAB(4096),
+   };
+ });
+diff --git a/packages/just-bash/src/commands/python3/python3.security.test.ts b/packages/just-bash/src/commands/python3/python3.security.test.ts
+index 85952f6..6f16059 100644
+--- a/packages/just-bash/src/commands/python3/python3.security.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.security.test.ts
+@@ -119,7 +119,7 @@ describe("python3 security", () => {
+       );
+ 
+       expect(result.stdout).toBe("");
+-      expect(result.stderr).toContain("[Errno 27]");
++      expect(result.stderr).toContain("[Errno 22]");
+       expect(result.exitCode).toBe(1);
+       const bytes = await env.fs.readFileBuffer("/tmp/truncated.bin");
+       expect(bytes.byteLength).toBeLessThanOrEqual(128);
+diff --git a/packages/just-bash/src/commands/python3/python3.ts b/packages/just-bash/src/commands/python3/python3.ts
+index bce387e..66e4811 100644
+--- a/packages/just-bash/src/commands/python3/python3.ts
++++ b/packages/just-bash/src/commands/python3/python3.ts
+@@ -10,10 +10,10 @@
+  * This command is Node.js only (uses worker_threads).
+  */
+ 
++import { AsyncLocalStorage } from "node:async_hooks";
+ import { fileURLToPath } from "node:url";
+ import { Worker } from "node:worker_threads";
+ import { decodeBytesToUtf8, latin1FromBytes } from "../../encoding.js";
+-import type { IFileSystem } from "../../fs/interface.js";
+ import {
+   sanitizeErrorMessage,
+   sanitizeHostErrorMessage,
+@@ -29,8 +29,15 @@ import type {
+   RuntimeCommandContext,
+ } from "../../types.js";
+ import { hasHelpFlag, showHelp } from "../help.js";
+-import { BridgeHandler } from "../worker-bridge/bridge-handler.js";
+-import { createSharedBuffer } from "../worker-bridge/protocol.js";
++import {
++  BridgeHandler,
++  type BridgeOutput,
++} from "../worker-bridge/bridge-handler.js";
++import {
++  createSharedBuffer,
++  getMinimumSharedBufferPayloadBytes,
++  SHARED_BUFFER_OVERHEAD,
++} from "../worker-bridge/protocol.js";
+ import { WorkerRequestController } from "../worker-request-controller.js";
+ import type { WorkerInput, WorkerOutput } from "./worker.js";
+ 
+@@ -156,11 +163,12 @@ function parseArgs(args: string[]): ParsedArgs | ExecResult {
+   return result;
+ }
+ 
+-// Queue for serializing Python executions (one at a time)
+ type QueuedExecution = {
+-  /** Unforgeable ownership marker for this queue slot. */
+   executionId: symbol;
+-  input: WorkerInput;
++  start: () => void;
++  queueState: QueueState;
++  initializeInput: () => WorkerInput;
++  bridgeSettled: () => Promise<BridgeOutput>;
+   settle: (result: WorkerOutput) => void;
+   requireDefenseContext?: boolean;
+   state: "queued" | "running" | "terminating" | "settled";
+@@ -170,28 +178,39 @@ type QueuedExecution = {
+   cancel: (result: WorkerOutput) => void;
+ };
+ type QueueState = {
+-  executionQueue: QueuedExecution[];
+   activeExecution: QueuedExecution | null;
+   poisonedError: string | null;
+ };
+-let executionQueues = new WeakMap<IFileSystem, QueueState>();
++type ExecutionDispatcher = {
++  queues: WeakMap<object, QueueState>;
++  pending: QueuedExecution[];
++  activeCount: number;
++  dispatching: boolean;
++};
++function createDispatcher(): ExecutionDispatcher {
++  return {
++    queues: new WeakMap(),
++    pending: [],
++    activeCount: 0,
++    dispatching: false,
++  };
++}
++let executionDispatcher = createDispatcher();
+ 
+-function getQueueState(fs: IFileSystem): QueueState {
+-  let state = executionQueues.get(fs);
++function getQueueState(
++  dispatcher: ExecutionDispatcher,
++  fsIdentity: object,
++): QueueState {
++  let state = dispatcher.queues.get(fsIdentity);
+   if (!state) {
+-    state = {
+-      executionQueue: [],
+-      activeExecution: null,
+-      poisonedError: null,
+-    };
+-    executionQueues.set(fs, state);
++    state = { activeExecution: null, poisonedError: null };
++    dispatcher.queues.set(fsIdentity, state);
+   }
+   return state;
+ }
+ 
+-/** @internal Reset queue state — for tests only */
+ export function _resetExecutionQueue(): void {
+-  executionQueues = new WeakMap();
++  executionDispatcher = createDispatcher();
+ }
+ 
+ const workerPath = fileURLToPath(new URL("./worker.js", import.meta.url));
+@@ -254,62 +273,63 @@ function normalizeWorkerMessage(
+   };
+ }
+ 
+-function processNextExecution(queueState: QueueState): void {
+-  if (queueState.poisonedError !== null) {
+-    for (const queued of queueState.executionQueue.splice(0)) {
+-      if (queued.state !== "queued") continue;
+-      queued.state = "settled";
+-      queued.stopBridge();
+-      queued.settle({ success: false, error: queueState.poisonedError });
++function processNextExecution(dispatcher: ExecutionDispatcher): void {
++  if (dispatcher.dispatching) return;
++  dispatcher.dispatching = true;
++  try {
++    for (let index = dispatcher.pending.length - 1; index >= 0; index--) {
++      const entry = dispatcher.pending[index];
++      if (entry.queueState.poisonedError === null) continue;
++      dispatcher.pending.splice(index, 1);
++      entry.state = "settled";
++      entry.settle({ success: false, error: entry.queueState.poisonedError });
+     }
+-    return;
+-  }
+-  if (
+-    queueState.activeExecution !== null ||
+-    queueState.executionQueue.length === 0
+-  ) {
+-    return;
+-  }
+-
+-  // Settled entries timed out while queued and must never be dispatched.
+-  while (
+-    queueState.executionQueue.length > 0 &&
+-    queueState.executionQueue[0]?.state !== "queued"
+-  ) {
+-    queueState.executionQueue.shift();
+-  }
+-  if (queueState.executionQueue.length === 0) {
+-    return;
++    while (dispatcher.activeCount < 5) {
++      const index = dispatcher.pending.findIndex(
++        (entry) => entry.queueState.activeExecution === null,
++      );
++      if (index === -1) break;
++      const [next] = dispatcher.pending.splice(index, 1);
++      next.start();
++    }
++  } finally {
++    dispatcher.dispatching = false;
+   }
++}
+ 
+-  const next = queueState.executionQueue.shift();
+-  if (!next) {
++function startExecution(
++  dispatcher: ExecutionDispatcher,
++  next: QueuedExecution,
++): void {
++  const queueState = next.queueState;
++  if (next.controller.remainingTimeMs() <= 0) {
++    next.cancel({ success: false, error: next.controller.timeoutMessage() });
+     return;
+   }
++  dispatcher.activeCount++;
+   next.state = "running";
+   queueState.activeExecution = next;
+ 
+-  // Create a fresh worker for each execution.
+   // CPython Emscripten uses EXIT_RUNTIME, so the module can only run once.
+-  // The worker caches the stdlib zip at module scope (read from disk once
+-  // per worker lifetime, not per execution).
+   let worker: Worker;
+   try {
++    const input = next.initializeInput();
+     worker = DefenseInDepthBox.runTrusted(
+       // @banned-pattern-ignore: constructor is immediately owned by next.controller lifecycle
+-      () => new Worker(workerPath, { workerData: next.input }),
++      () => new Worker(workerPath, { workerData: input }),
+     );
+   } catch (err) {
+     const message = err instanceof Error ? err.message : String(err);
+-    next.state = "settled";
+-    next.settle({
+-      success: false,
+-      error: sanitizeHostErrorMessage(message),
+-    });
+-    if (queueState.activeExecution === next) {
+-      queueState.activeExecution = null;
+-      processNextExecution(queueState);
+-    }
++    next.stopBridge();
++    void (async () => {
++      await next.bridgeSettled();
++      next.state = "settled";
++      next.settle({ success: false, error: sanitizeHostErrorMessage(message) });
++      dispatcher.activeCount--;
++      if (queueState.activeExecution === next)
++        queueState.activeExecution = null;
++      processNextExecution(dispatcher);
++    })();
+     return;
+   }
+ 
+@@ -328,8 +348,6 @@ function processNextExecution(queueState: QueueState): void {
+     result: WorkerOutput,
+     terminateWorker: boolean,
+   ): Promise<void> => {
+-    // Every callback closes over its own entry. Checking both identity and state
+-    // prevents a stale event from releasing a newer queue owner.
+     if (
+       queueState.activeExecution?.executionId !== next.executionId ||
+       next.state !== "running"
+@@ -339,28 +357,32 @@ function processNextExecution(queueState: QueueState): void {
+ 
+     next.state = "terminating";
+     cleanupListeners();
++    next.stopBridge();
+     next.settle(result);
+ 
+     if (terminateWorker) {
+       const acknowledged = await next.controller.terminate(worker);
+       if (!acknowledged) {
+         const error = "Worker termination was not acknowledged";
+-        next.worker = null;
+-        next.state = "settled";
+         queueState.poisonedError = error;
++        processNextExecution(dispatcher);
++        await next.bridgeSettled();
++        next.state = "settled";
+         if (queueState.activeExecution?.executionId === next.executionId) {
+           queueState.activeExecution = null;
+         }
+-        processNextExecution(queueState);
++        processNextExecution(dispatcher);
+         return;
+       }
+     }
+ 
++    await next.bridgeSettled();
+     next.worker = null;
+     next.state = "settled";
++    dispatcher.activeCount--;
+     if (queueState.activeExecution?.executionId === next.executionId) {
+       queueState.activeExecution = null;
+-      processNextExecution(queueState);
++      processNextExecution(dispatcher);
+     }
+   };
+ 
+@@ -386,7 +408,7 @@ function processNextExecution(queueState: QueueState): void {
+         return;
+       }
+       void settleActiveExecution(
+-        normalizeWorkerMessage(msg, next.input.protocolToken),
++        normalizeWorkerMessage(msg, next.controller.protocolToken),
+         true,
+       );
+     },
+@@ -478,18 +500,36 @@ async function executePython(
+   scriptPath?: string,
+   scriptArgs: string[] = [],
+ ): Promise<ExecResult> {
+-  const sharedBuffer = createSharedBuffer();
+-  const bridgeHandler = new BridgeHandler(
+-    sharedBuffer,
+-    ctx.fs,
+-    ctx.cwd,
+-    "python3",
+-    ctx.fetch,
+-    ctx.limits.maxOutputSize,
++  const minimumPayloadBytes = getMinimumSharedBufferPayloadBytes();
++  const minimumMessageBytes = SHARED_BUFFER_OVERHEAD + minimumPayloadBytes;
++  if (
++    ctx.limits.maxWorkerMessageBytes < minimumMessageBytes ||
++    ctx.limits.maxStringLength < minimumPayloadBytes
++  ) {
++    return {
++      stdout: "",
++      stderr: `python3: worker bridge requires maxWorkerMessageBytes >= ${minimumMessageBytes} and maxStringLength >= ${minimumPayloadBytes}\n`,
++      exitCode: 1,
++    };
++  }
++  if (
++    !Number.isSafeInteger(ctx.limits.maxPythonBridgeBytes) ||
++    ctx.limits.maxPythonBridgeBytes < minimumPayloadBytes
++  ) {
++    return {
++      stdout: "",
++      stderr: `python3: worker bridge requires an integer maxPythonBridgeBytes >= ${minimumPayloadBytes}\n`,
++      exitCode: 1,
++    };
++  }
++  const maxFileSize = Math.min(
++    ctx.limits.maxPythonBridgeBytes,
++    ctx.limits.maxStringLength,
++    ctx.limits.maxWorkerMessageBytes - SHARED_BUFFER_OVERHEAD,
+   );
+-
+   const timeoutMs = ctx.limits.maxPythonTimeoutMs;
+-  const queueState = getQueueState(ctx.fs);
++  const dispatcher = executionDispatcher;
++  const queueState = getQueueState(dispatcher, ctx.fsIdentity ?? ctx.fs);
+   if (queueState.poisonedError !== null) {
+     return {
+       stdout: "",
+@@ -505,9 +545,8 @@ async function executePython(
+     maxMessageBytes: ctx.limits.maxWorkerMessageBytes,
+   });
+ 
+-  const workerInput: WorkerInput = {
++  const workerRequest: Omit<WorkerInput, "sharedBuffer"> = {
+     protocolToken: controller.protocolToken,
+-    sharedBuffer,
+     pythonCode,
+     stdin,
+     cwd: ctx.cwd,
+@@ -517,22 +556,61 @@ async function executePython(
+     args: scriptArgs,
+     scriptPath,
+     timeoutMs,
+-    maxFileSize: ctx.limits.maxStringLength,
++    maxFileSize,
+   };
+ 
+-  controller.assertMessageSize(
+-    { ...workerInput, sharedBuffer: undefined },
+-    "request",
+-  );
++  controller.assertMessageSize(workerRequest, "request");
++
++  let bridgeHandler: BridgeHandler | undefined;
++  let bridgeStarted = false;
++  let resolveBridge: (output: BridgeOutput) => void = () => {};
++  const bridgePromise = new Promise<BridgeOutput>((resolve) => {
++    resolveBridge = resolve;
++  });
+ 
+   const workerPromise = new Promise<WorkerOutput>((resolve) => {
+     let settled = false;
++    const runInContext = AsyncLocalStorage.snapshot();
+     const queueEntry: QueuedExecution = {
+       executionId: Symbol("python3 execution"),
+-      input: workerInput,
++      start: () => runInContext(startExecution, dispatcher, queueEntry),
++      queueState,
++      initializeInput: () => {
++        const sharedBuffer = createSharedBuffer(maxFileSize);
++        bridgeHandler = new BridgeHandler(
++          sharedBuffer,
++          ctx.fs,
++          ctx.cwd,
++          "python3",
++          ctx.fetch,
++          ctx.limits.maxOutputSize,
++        );
++        bridgeStarted = true;
++        void (async () => {
++          try {
++            resolveBridge(
++              await bridgeHandler.run(controller.remainingTimeMs()),
++            );
++          } catch (error) {
++            resolveBridge({
++              stdout: "",
++              stderr: `python3: bridge error: ${sanitizeHostErrorMessage(getErrorMessage(error))}\n`,
++              exitCode: 1,
++            });
++          }
++        })();
++        return { ...workerRequest, sharedBuffer };
++      },
++      bridgeSettled: async () => {
++        if (!bridgeStarted)
++          resolveBridge({ stdout: "", stderr: "", exitCode: 0 });
++        return await bridgePromise;
++      },
+       settle: (result) => {
+         if (settled) return;
+         settled = true;
++        if (!bridgeStarted)
++          resolveBridge({ stdout: "", stderr: "", exitCode: 0 });
+         controller.close();
+         resolve(result);
+       },
+@@ -540,19 +618,19 @@ async function executePython(
+       state: "queued",
+       worker: null,
+       controller,
+-      stopBridge: () => bridgeHandler.stop?.(),
+-      cancel: () => {}, // Replaced if and when this entry owns a worker.
++      stopBridge: () => bridgeHandler?.stop?.(),
++      cancel: () => {},
+     };
+ 
+     queueEntry.cancel = (result) => {
+       if (queueEntry.state !== "queued") return;
+       queueEntry.state = "settled";
+-      const queuedIndex = queueState.executionQueue.indexOf(queueEntry);
++      const queuedIndex = dispatcher.pending.indexOf(queueEntry);
+       if (queuedIndex !== -1) {
+-        queueState.executionQueue.splice(queuedIndex, 1);
++        dispatcher.pending.splice(queuedIndex, 1);
+       }
+       queueEntry.settle(result);
+-      processNextExecution(queueState);
++      processNextExecution(dispatcher);
+     };
+ 
+     const onCancel = bindDefenseContextCallback(
+@@ -560,7 +638,7 @@ async function executePython(
+       "python3",
+       "worker cancellation callback",
+       (reason: "abort" | "timeout") => {
+-        bridgeHandler.stop?.();
++        bridgeHandler?.stop?.();
+         queueEntry.cancel({
+           success: false,
+           error:
+@@ -583,25 +661,27 @@ async function executePython(
+       }
+     };
+ 
+-    // Arm the parent signal and deadline before making this request visible.
+     controller.arm(dispatchCancel);
+ 
+     if (!controller.isCanceled) {
+-      // Queue the execution (serialized — one at a time per filesystem).
+-      queueState.executionQueue.push(queueEntry);
+-      processNextExecution(queueState);
++      if (
++        dispatcher.pending.length >= 100 &&
++        (queueState.activeExecution !== null || dispatcher.activeCount >= 5)
++      ) {
++        queueEntry.state = "settled";
++        queueEntry.settle({
++          success: false,
++          error: "Python execution queue is full",
++        });
++      } else {
++        dispatcher.pending.push(queueEntry);
++        processNextExecution(dispatcher);
++      }
+     }
+   });
+ 
+   const [bridgeOutput, workerResult] = await Promise.all([
+-    bridgeHandler.run(timeoutMs).catch((e) => {
+-      const bridgeError = sanitizeHostErrorMessage(getErrorMessage(e));
+-      return {
+-        stdout: "",
+-        stderr: `python3: bridge error: ${bridgeError}\n`,
+-        exitCode: 1,
+-      };
+-    }),
++    bridgePromise,
+     workerPromise.catch((e) => {
+       const workerError = sanitizeHostErrorMessage(getErrorMessage(e));
+       return {
+diff --git a/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts b/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
+index 961892c..264ec94 100644
+--- a/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
+@@ -92,6 +92,8 @@ vi.mock("../worker-bridge/bridge-handler.js", () => {
+ 
+ vi.mock("../worker-bridge/protocol.js", () => {
+   return {
++    SHARED_BUFFER_OVERHEAD: 4128,
++    getMinimumSharedBufferPayloadBytes: () => 24,
+     createSharedBuffer: () => new _SAB(4096),
+   };
+ });
+diff --git a/packages/just-bash/src/commands/python3/worker.ts b/packages/just-bash/src/commands/python3/worker.ts
+index 18b1ecb..6f84a92 100644
+--- a/packages/just-bash/src/commands/python3/worker.ts
++++ b/packages/just-bash/src/commands/python3/worker.ts
+@@ -193,6 +193,7 @@ interface EmscriptenNode {
+ }
+ 
+ interface EmscriptenStream {
++  fd: number;
+   node: EmscriptenNode;
+   flags: number;
+   position: number;
+@@ -268,6 +269,7 @@ interface EmscriptenStat {
+ }
+ 
+ interface EmscriptenFS {
++  closeStream: (fd: number) => void;
+   isDir: (mode: number) => boolean;
+   isFile: (mode: number) => boolean;
+   isLink: (mode: number) => boolean;
+@@ -329,7 +331,7 @@ function createHOSTFS(
+       ENOTDIR: 54,
+       EISDIR: 31,
+       EINVAL: 28,
+-      EFBIG: 27,
++      EFBIG: 22,
+       EMFILE: 33,
+       ENOSPC: 51,
+       ESPIPE: 70,
+@@ -457,6 +459,11 @@ function createHOSTFS(
+             attr.size < 0 ||
+             attr.size > maxFileSize
+           ) {
++            if (Number.isSafeInteger(attr.size) && attr.size >= 0) {
++              tryFSOperation(() =>
++                backend.assertFileAccess(path, attr.size as number, "write"),
++              );
++            }
+             throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+           }
+           tryFSOperation(() => {
+@@ -550,17 +557,31 @@ function createHOSTFS(
+           if (isTruncate && isWrite) {
+             content = new Uint8Array(0);
+           } else {
++            const stat = backend.stat(path);
++            if (stat.size > maxFileSize) {
++              backend.assertFileAccess(path, stat.size, "read");
++              throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
++            }
+             content = backend.readFile(path);
+           }
+-        } catch (_e) {
++        } catch (error) {
++          if (error instanceof FS.ErrnoError) {
++            FS.closeStream(stream.fd);
++            throw error;
++          }
+           if (isCreate && isWrite) {
+             content = new Uint8Array(0);
+           } else {
++            FS.closeStream(stream.fd);
+             throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+           }
+         }
+ 
+         if (content.length > maxFileSize) {
++          FS.closeStream(stream.fd);
++          tryFSOperation(() =>
++            backend.assertFileAccess(path, content.length, "read"),
++          );
+           throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+         }
+ 
+@@ -616,11 +637,20 @@ function createHOSTFS(
+           position < 0 ||
+           length < 0 ||
+           offset < 0 ||
+-          length > buffer.length - offset ||
+-          position > maxFileSize - length
++          length > buffer.length - offset
+         ) {
+           throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+         }
++        if (position > maxFileSize - length) {
++          tryFSOperation(() =>
++            backend.assertFileAccess(
++              stream.hostPath ?? realPath(stream.node),
++              position + length,
++              "write",
++            ),
++          );
++          throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
++        }
+         let content = stream.hostContent || new Uint8Array(0);
+         const newSize = Math.max(content.length, position + length);
+ 
+diff --git a/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts b/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
+index 5d8b731..6e9ee40 100644
+--- a/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
++++ b/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
+@@ -152,6 +152,9 @@ export class BridgeHandler {
+         case OpCode.READ_FILE:
+           await this.handleReadFile();
+           break;
++        case OpCode.FILE_ACCESS:
++          await this.handleFileAccess();
++          break;
+         case OpCode.WRITE_FILE:
+           await this.handleWriteFile();
+           break;
+@@ -228,6 +231,13 @@ export class BridgeHandler {
+   private async handleReadFile(): Promise<void> {
+     const path = this.resolvePath(this.protocol.getPath());
+     try {
++      const stat = await this.fs.stat(path);
++      if (stat.size > this.protocol.dataBufferSize) {
++        await this.fs.assertFileAccess?.(path, stat.size, "read");
++        throw new Error(
++          `File too large: ${stat.size} > ${this.protocol.dataBufferSize}`,
++        );
++      }
+       const content = await this.fs.readFileBuffer(path);
+       this.protocol.setResult(content);
+       this.protocol.setStatus(Status.SUCCESS);
+@@ -236,6 +246,32 @@ export class BridgeHandler {
+     }
+   }
+ 
++  private async handleFileAccess(): Promise<void> {
++    const flags = this.protocol.getFlags();
++    const data = this.protocol.getData();
++    if (
++      data.byteLength !== 8 ||
++      (flags !== Flags.FILE_ACCESS_READ && flags !== Flags.FILE_ACCESS_WRITE)
++    ) {
++      throw new Error("Invalid file access request");
++    }
++    const bytes = new DataView(
++      data.buffer,
++      data.byteOffset,
++      data.byteLength,
++    ).getFloat64(0, true);
++    if (!Number.isSafeInteger(bytes) || bytes < 0)
++      throw new Error("Invalid file access size");
++    const path = this.resolvePath(this.protocol.getPath());
++    await this.fs.assertFileAccess?.(
++      path,
++      bytes,
++      flags === Flags.FILE_ACCESS_READ ? "read" : "write",
++    );
++    this.protocol.setResult(new Uint8Array(0));
++    this.protocol.setStatus(Status.SUCCESS);
++  }
++
+   private async handleWriteFile(): Promise<void> {
+     const path = this.resolvePath(this.protocol.getPath());
+     const data = this.protocol.getData();
+@@ -401,7 +437,7 @@ export class BridgeHandler {
+       this.output.exitCode = 1;
+       this.appendOutputLimitError();
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString("Output size limit exceeded");
++      this.protocol.setErrorResultFromString("Output size limit exceeded");
+       this.protocol.setStatus(Status.ERROR);
+       return;
+     }
+@@ -415,7 +451,7 @@ export class BridgeHandler {
+       this.output.exitCode = 1;
+       this.appendOutputLimitError();
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString("Output size limit exceeded");
++      this.protocol.setErrorResultFromString("Output size limit exceeded");
+       this.protocol.setStatus(Status.ERROR);
+       return;
+     }
+@@ -502,7 +538,7 @@ export class BridgeHandler {
+     const fetchFn = this.secureFetch;
+     if (!fetchFn) {
+       this.protocol.setErrorCode(ErrorCode.NETWORK_NOT_CONFIGURED);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Network access not configured. Enable network in Bash options.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -543,7 +579,7 @@ export class BridgeHandler {
+         e instanceof Error ? e.message : String(e),
+       );
+       this.protocol.setErrorCode(ErrorCode.NETWORK_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -552,7 +588,7 @@ export class BridgeHandler {
+     const execFn = this.exec;
+     if (!execFn) {
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Command execution not available in this context.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -596,7 +632,7 @@ export class BridgeHandler {
+       controller.abort();
+       const message = e instanceof Error ? e.message : String(e);
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -605,7 +641,7 @@ export class BridgeHandler {
+     const invokeToolFn = this.invokeTool;
+     if (!invokeToolFn) {
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Tool invocation not available in this context.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -626,7 +662,7 @@ export class BridgeHandler {
+         e instanceof Error ? e.message : String(e),
+       );
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -667,7 +703,7 @@ export class BridgeHandler {
+     }
+ 
+     this.protocol.setErrorCode(errorCode);
+-    this.protocol.setResultFromString(message);
++    this.protocol.setErrorResultFromString(message);
+     this.protocol.setStatus(Status.ERROR);
+   }
+ }
+diff --git a/packages/just-bash/src/commands/worker-bridge/file-access.test.ts b/packages/just-bash/src/commands/worker-bridge/file-access.test.ts
+new file mode 100644
+index 0000000..cd21424
+--- /dev/null
++++ b/packages/just-bash/src/commands/worker-bridge/file-access.test.ts
+@@ -0,0 +1,256 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { describe, expect, it } from "vitest";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import { BridgeHandler } from "./bridge-handler.js";
++import {
++  createSharedBuffer,
++  Flags,
++  OpCode,
++  type OpCodeType,
++  ProtocolBuffer,
++  Status,
++} from "./protocol.js";
++import { SyncBackend } from "./sync-backend.js";
++
++function sizeData(bytes: number): Uint8Array {
++  const data = new Uint8Array(8);
++  new DataView(data.buffer).setFloat64(0, bytes, true);
++  return data;
++}
++
++async function request(
++  fs: InMemoryFs,
++  op: OpCodeType,
++  data: Uint8Array = new Uint8Array(0),
++  flags = 0,
++  path = "/input",
++) {
++  const shared = createSharedBuffer(24);
++  const protocol = new ProtocolBuffer(shared);
++  const handler = new BridgeHandler(shared, fs, "/", "unit");
++  const running = handler.run(1000);
++  try {
++    protocol.setOpCode(op);
++    protocol.setPath(path);
++    protocol.setData(data);
++    protocol.setFlags(flags);
++    protocol.setStatus(Status.READY);
++    protocol.notify();
++    await expect.poll(() => protocol.getStatus()).not.toBe(Status.READY);
++    return {
++      status: protocol.getStatus(),
++      result: protocol.getResultAsString(),
++      sharedBytes: shared.byteLength,
++    };
++  } finally {
++    handler.stop();
++    await running;
++  }
++}
++
++class ValidatedFs extends InMemoryFs {
++  calls: { path: string; bytes: number; op: "read" | "write" }[] = [];
++  reads = 0;
++  limit = 24;
++  async assertFileAccess(path: string, bytes: number, op: "read" | "write") {
++    this.calls.push({ path, bytes, op });
++    if (path.includes("\0")) throw new Error("Invalid path");
++    if (bytes > this.limit) throw new Error("Domain file too large");
++  }
++  override async readFileBuffer(path: string) {
++    this.reads++;
++    return await super.readFileBuffer(path);
++  }
++}
++
++describe("file access intent protocol", () => {
++  it.each([
++    Flags.FILE_ACCESS_READ,
++    Flags.FILE_ACCESS_WRITE,
++  ])("validates an eight-byte extent in a minimum payload (mode %i)", async (flags) => {
++    const fs = new ValidatedFs();
++    expect(
++      await request(fs, OpCode.FILE_ACCESS, sizeData(25), flags),
++    ).toMatchObject({
++      status: Status.ERROR,
++      result: "Domain file too large",
++      sharedBytes: 4152,
++    });
++    expect(fs.calls).toEqual([
++      {
++        path: "/input",
++        bytes: 25,
++        op: flags === Flags.FILE_ACCESS_READ ? "read" : "write",
++      },
++    ]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it.each([
++    0,
++    24,
++    Number.MAX_SAFE_INTEGER,
++  ])("preserves the exact safe extent %s", async (bytes) => {
++    const fs = new ValidatedFs();
++    fs.limit = Number.MAX_SAFE_INTEGER;
++    expect(
++      await request(
++        fs,
++        OpCode.FILE_ACCESS,
++        sizeData(bytes),
++        Flags.FILE_ACCESS_WRITE,
++      ),
++    ).toMatchObject({ status: Status.SUCCESS });
++    expect(fs.calls).toEqual([{ path: "/input", bytes, op: "write" }]);
++  });
++
++  it.each([
++    -1,
++    0.5,
++    Number.NaN,
++    Number.POSITIVE_INFINITY,
++    Number.MAX_SAFE_INTEGER + 1,
++  ])("rejects invalid extent %s before invoking the filesystem", async (bytes) => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(bytes),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it.each([0, 3, -1])("rejects an invalid operation flag %i", async (flags) => {
++    const fs = new ValidatedFs();
++    expect(
++      (await request(fs, OpCode.FILE_ACCESS, sizeData(25), flags)).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it.each([0, 7, 9])("rejects a malformed %i-byte frame", async (length) => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          new Uint8Array(length),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it("resolves paths and preserves filesystem path validation", async () => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(1),
++          Flags.FILE_ACCESS_READ,
++          "nested/../input",
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect(fs.calls[0].path).toBe("/input");
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(1),
++          Flags.FILE_ACCESS_READ,
++          "/bad\0path",
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++  });
++
++  it("runs asynchronous validation in the originating context", async () => {
++    const context = new AsyncLocalStorage<string>();
++    const fs = new ValidatedFs();
++    const tags: (string | undefined)[] = [];
++    fs.assertFileAccess = async () => {
++      tags.push(context.getStore());
++      await Promise.resolve();
++      tags.push(context.getStore());
++    };
++    expect(
++      (
++        await context.run("request-B", () =>
++          request(fs, OpCode.FILE_ACCESS, sizeData(25), Flags.FILE_ACCESS_READ),
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect(tags).toEqual(["request-B", "request-B"]);
++  });
++
++  it("checks read intent before rejecting the host transport without fetching content", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(25) });
++    expect((await request(fs, OpCode.READ_FILE)).result).toBe(
++      "Domain file too large",
++    );
++    expect(fs.calls).toEqual([{ path: "/input", bytes: 25, op: "read" }]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it("keeps independent transport rejection when the domain allows the extent", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(25) });
++    fs.limit = 50;
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([{ path: "/input", bytes: 25, op: "read" }]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it("supports filesystems without the optional hook", async () => {
++    const fs = new InMemoryFs({ "/input": "a".repeat(25) });
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(25),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.ERROR);
++  });
++
++  it("keeps metadata stat and successful reads free of preflight overhead", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(24) });
++    expect((await request(fs, OpCode.STAT)).status).toBe(Status.SUCCESS);
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.SUCCESS);
++    expect(fs.calls).toEqual([]);
++    expect(fs.reads).toBe(1);
++  });
++
++  it.each([
++    -1,
++    0.5,
++    Number.NaN,
++    Number.POSITIVE_INFINITY,
++    Number.MAX_SAFE_INTEGER + 1,
++  ])("rejects invalid sender size %s before dispatch", (bytes) => {
++    const backend = new SyncBackend(createSharedBuffer(24), 10);
++    expect(() => backend.assertFileAccess("/input", bytes, "read")).toThrow(
++      "Invalid file access size",
++    );
++  });
++
++  it("rejects an invalid sender operation before dispatch", () => {
++    const backend = new SyncBackend(createSharedBuffer(24), 10);
++    expect(() =>
++      backend.assertFileAccess("/input", 25, "invalid" as "read"),
++    ).toThrow("Invalid file access operation");
++  });
++});
+diff --git a/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts b/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts
+new file mode 100644
+index 0000000..77521e2
+--- /dev/null
++++ b/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts
+@@ -0,0 +1,78 @@
++import { describe, expect, it } from "vitest";
++import {
++  createSharedBuffer,
++  ErrorCode,
++  ProtocolBuffer,
++  SHARED_BUFFER_OVERHEAD,
++} from "./protocol.js";
++
++describe("shared bridge capacity", () => {
++  it.each([
++    24, 25,
++  ])("preserves an error header and valid UTF-8 within %i bytes", (capacity) => {
++    const shared = createSharedBuffer(capacity);
++    const sender = new ProtocolBuffer(shared);
++    const receiver = new ProtocolBuffer(shared);
++    sender.setErrorCode(ErrorCode.NOT_FOUND);
++    sender.setErrorResultFromString(`${"🐙".repeat(40)} no such file`);
++    expect(receiver.getErrorCode()).toBe(ErrorCode.NOT_FOUND);
++    expect(receiver.getResultAsString()).toContain("No such file");
++    expect(receiver.getResultAsString()).not.toContain("\ufffd");
++    expect(receiver.getResult().length).toBeLessThanOrEqual(capacity);
++    sender.setErrorResultFromString("ordinary error");
++    expect(receiver.getResultAsString()).toBe("ordinary error");
++    expect(() => sender.setResultFromString("🐙".repeat(40))).toThrow(
++      "Result too large",
++    );
++  });
++
++  it("preserves an unaligned configured byte capacity in both directions", () => {
++    const shared = createSharedBuffer(8193);
++    const sender = new ProtocolBuffer(shared);
++    const receiver = new ProtocolBuffer(shared);
++    const data = new Uint8Array(8193).fill(0x5a);
++    expect(shared.byteLength).toBe(SHARED_BUFFER_OVERHEAD + data.length);
++    sender.setData(data);
++    expect(receiver.getData()).toEqual(data);
++    receiver.setResult(data);
++    expect(sender.getResult()).toEqual(data);
++    expect(() => sender.setData(new Uint8Array(8194))).toThrow(
++      "Data too large",
++    );
++    expect(() => receiver.setResult(new Uint8Array(8194))).toThrow(
++      "Result too large",
++    );
++  });
++
++  it.each([
++    [2, -1],
++    [2, 4097],
++    [3, -1],
++    [3, 8194],
++    [4, -1],
++    [4, 8194],
++  ])("rejects an invalid length at control word %i with value %i", (index, length) => {
++    const shared = createSharedBuffer(8193);
++    const protocol = new ProtocolBuffer(shared);
++    Atomics.store(new Int32Array(shared, 0, 8), index, length);
++    const read =
++      index === 2
++        ? () => protocol.getPath()
++        : index === 3
++          ? () => protocol.getData()
++          : () => protocol.getResult();
++    expect(read).toThrow("Invalid bridge length");
++  });
++
++  it.each([
++    0,
++    23,
++    -1,
++    1.5,
++    Number.POSITIVE_INFINITY,
++    0x80000000,
++  ])("rejects an invalid allocation capacity %s", (capacity) =>
++    expect(() => createSharedBuffer(capacity)).toThrow(
++      "Invalid shared bridge payload capacity",
++    ));
++});
+diff --git a/packages/just-bash/src/commands/worker-bridge/protocol.ts b/packages/just-bash/src/commands/worker-bridge/protocol.ts
+index 31a536f..8bb4bd4 100644
+--- a/packages/just-bash/src/commands/worker-bridge/protocol.ts
++++ b/packages/just-bash/src/commands/worker-bridge/protocol.ts
+@@ -37,6 +37,7 @@ export const OpCode = {
+   REALPATH: 13,
+   RENAME: 14,
+   COPY_FILE: 15,
++  FILE_ACCESS: 16,
+   // Special operations for I/O
+   WRITE_STDOUT: 100,
+   WRITE_STDERR: 101,
+@@ -78,6 +79,15 @@ export const ErrorCode = {
+ 
+ export type ErrorCodeType = (typeof ErrorCode)[keyof typeof ErrorCode];
+ 
++const ERROR_DESCRIPTIONS: Partial<Record<ErrorCodeType, string>> = {
++  [ErrorCode.NOT_FOUND]: "No such file",
++  [ErrorCode.IS_DIRECTORY]: "Is a directory",
++  [ErrorCode.NOT_DIRECTORY]: "Not a directory",
++  [ErrorCode.EXISTS]: "Already exists",
++  [ErrorCode.PERMISSION_DENIED]: "Permission denied",
++  [ErrorCode.INVALID_PATH]: "Invalid path",
++};
++
+ /** Buffer layout offsets */
+ const Offset = {
+   OP_CODE: 0,
+@@ -96,11 +106,7 @@ const Offset = {
+ const Size = {
+   CONTROL_REGION: 32,
+   PATH_BUFFER: 4096,
+-  // 8MB limit for FS read/write, HTTP responses, and tool invocation results.
+-  // Sized to handle typical OpenAPI/GraphQL responses (paginated lists, batch queries).
+-  // Still well under the 64MB QuickJS memory limit per execution.
+   DATA_BUFFER: 8388608,
+-  TOTAL: 8392736, // 32 + 4096 + 8MB
+ } as const;
+ 
+ /** Flags for operations */
+@@ -109,6 +115,8 @@ export const Flags = {
+   RECURSIVE: 1,
+   FORCE: 2,
+   MKDIR_RECURSIVE: 1,
++  FILE_ACCESS_READ: 1,
++  FILE_ACCESS_WRITE: 2,
+ } as const;
+ 
+ /** Stat result structure layout */
+@@ -127,8 +135,23 @@ import {
+   _Atomics,
+   _SharedArrayBuffer,
+ } from "../../security/trusted-globals.js";
+-export function createSharedBuffer(): SharedArrayBuffer {
+-  return new _SharedArrayBuffer(Size.TOTAL);
++export const SHARED_BUFFER_OVERHEAD: number = Offset.DATA_BUFFER;
++
++export function getMinimumSharedBufferPayloadBytes(): number {
++  return StatLayout.TOTAL;
++}
++
++export function createSharedBuffer(
++  dataBufferBytes: number = Size.DATA_BUFFER,
++): SharedArrayBuffer {
++  if (
++    !Number.isSafeInteger(dataBufferBytes) ||
++    dataBufferBytes < StatLayout.TOTAL ||
++    dataBufferBytes > 0x7fffffff
++  ) {
++    throw new RangeError("Invalid shared bridge payload capacity");
++  }
++  return new _SharedArrayBuffer(SHARED_BUFFER_OVERHEAD + dataBufferBytes);
+ }
+ 
+ /**
+@@ -138,13 +161,25 @@ export class ProtocolBuffer {
+   private int32View: Int32Array;
+   private uint8View: Uint8Array;
+   private dataView: DataView;
++  readonly dataBufferSize: number;
+ 
+   constructor(buffer: SharedArrayBuffer) {
+-    this.int32View = new Int32Array(buffer);
++    this.dataBufferSize = buffer.byteLength - SHARED_BUFFER_OVERHEAD;
++    if (this.dataBufferSize < StatLayout.TOTAL) {
++      throw new RangeError("Shared bridge buffer is too small");
++    }
++    this.int32View = new Int32Array(buffer, 0, Size.CONTROL_REGION / 4);
+     this.uint8View = new Uint8Array(buffer);
+     this.dataView = new DataView(buffer);
+   }
+ 
++  private checkLength(length: number, capacity: number): number {
++    if (length < 0 || length > capacity) {
++      throw new RangeError(`Invalid bridge length: ${length} > ${capacity}`);
++    }
++    return length;
++  }
++
+   getOpCode(): OpCodeType {
+     return _Atomics.load(this.int32View, Offset.OP_CODE / 4) as OpCodeType;
+   }
+@@ -213,7 +248,7 @@ export class ProtocolBuffer {
+   }
+ 
+   getPath(): string {
+-    const length = this.getPathLength();
++    const length = this.checkLength(this.getPathLength(), Size.PATH_BUFFER);
+     const bytes = this.uint8View.slice(
+       Offset.PATH_BUFFER,
+       Offset.PATH_BUFFER + length,
+@@ -231,7 +266,7 @@ export class ProtocolBuffer {
+   }
+ 
+   getData(): Uint8Array {
+-    const length = this.getDataLength();
++    const length = this.checkLength(this.getDataLength(), this.dataBufferSize);
+     return this.uint8View.slice(
+       Offset.DATA_BUFFER,
+       Offset.DATA_BUFFER + length,
+@@ -239,8 +274,10 @@ export class ProtocolBuffer {
+   }
+ 
+   setData(data: Uint8Array): void {
+-    if (data.length > Size.DATA_BUFFER) {
+-      throw new Error(`Data too large: ${data.length} > ${Size.DATA_BUFFER}`);
++    if (data.length > this.dataBufferSize) {
++      throw new Error(
++        `Data too large: ${data.length} > ${this.dataBufferSize}`,
++      );
+     }
+     this.uint8View.set(data, Offset.DATA_BUFFER);
+     this.setDataLength(data.length);
+@@ -257,7 +294,10 @@ export class ProtocolBuffer {
+   }
+ 
+   getResult(): Uint8Array {
+-    const length = this.getResultLength();
++    const length = this.checkLength(
++      this.getResultLength(),
++      this.dataBufferSize,
++    );
+     return this.uint8View.slice(
+       Offset.DATA_BUFFER,
+       Offset.DATA_BUFFER + length,
+@@ -265,8 +305,10 @@ export class ProtocolBuffer {
+   }
+ 
+   setResult(data: Uint8Array): void {
+-    if (data.length > Size.DATA_BUFFER) {
+-      throw new Error(`Result too large: ${data.length} > ${Size.DATA_BUFFER}`);
++    if (data.length > this.dataBufferSize) {
++      throw new Error(
++        `Result too large: ${data.length} > ${this.dataBufferSize}`,
++      );
+     }
+     this.uint8View.set(data, Offset.DATA_BUFFER);
+     this.setResultLength(data.length);
+@@ -282,6 +324,20 @@ export class ProtocolBuffer {
+     this.setResult(encoded);
+   }
+ 
++  setErrorResultFromString(str: string): void {
++    const destination = this.uint8View.subarray(
++      Offset.DATA_BUFFER,
++      Offset.DATA_BUFFER + this.dataBufferSize,
++    );
++    const encoder = new TextEncoder();
++    let { read, written } = encoder.encodeInto(str, destination);
++    const description = ERROR_DESCRIPTIONS[this.getErrorCode()];
++    if (read < str.length && description) {
++      ({ written } = encoder.encodeInto(`${description}: ${str}`, destination));
++    }
++    this.setResultLength(written);
++  }
++
+   encodeStat(stat: {
+     isFile: boolean;
+     isDirectory: boolean;
+diff --git a/packages/just-bash/src/commands/worker-bridge/sync-backend.ts b/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
+index 6f734de..e935fee 100644
+--- a/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
++++ b/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
+@@ -79,6 +79,24 @@ export class SyncBackend {
+     return result.result ?? new Uint8Array(0);
+   }
+ 
++  assertFileAccess(path: string, bytes: number, op: "read" | "write"): void {
++    if (!Number.isSafeInteger(bytes) || bytes < 0) {
++      throw new Error("Invalid file access size");
++    }
++    if (op !== "read" && op !== "write")
++      throw new Error("Invalid file access operation");
++    const data = new Uint8Array(8);
++    new DataView(data.buffer).setFloat64(0, bytes, true);
++    const result = this.execSync(
++      OpCode.FILE_ACCESS,
++      path,
++      data,
++      op === "read" ? Flags.FILE_ACCESS_READ : Flags.FILE_ACCESS_WRITE,
++    );
++    if (!result.success)
++      throw new Error(result.error || "File access validation failed");
++  }
++
+   writeFile(path: string, data: Uint8Array): void {
+     const result = this.execSync(OpCode.WRITE_FILE, path, data);
+     if (!result.success) {
+@@ -205,19 +223,29 @@ export class SyncBackend {
+   }
+ 
+   writeStdout(data: string): void {
+-    const encoded = new TextEncoder().encode(data);
+-    const result = this.execSync(OpCode.WRITE_STDOUT, "", encoded);
+-    if (!result.success) {
+-      throw new Error(result.error || "Failed to write stdout");
+-    }
++    this.writeOutput(OpCode.WRITE_STDOUT, "stdout", data);
+   }
+ 
+   writeStderr(data: string): void {
++    this.writeOutput(OpCode.WRITE_STDERR, "stderr", data);
++  }
++
++  private writeOutput(
++    opCode: OpCodeType,
++    stream: "stdout" | "stderr",
++    data: string,
++  ): void {
+     const encoded = new TextEncoder().encode(data);
+-    const result = this.execSync(OpCode.WRITE_STDERR, "", encoded);
+-    if (!result.success) {
+-      throw new Error(result.error || "Failed to write stderr");
+-    }
++    let offset = 0;
++    do {
++      let end = Math.min(offset + this.protocol.dataBufferSize, encoded.length);
++      while (end < encoded.length && (encoded[end] & 0xc0) === 0x80) end -= 1;
++      const result = this.execSync(opCode, "", encoded.subarray(offset, end));
++      if (!result.success) {
++        throw new Error(result.error || `Failed to write ${stream}`);
++      }
++      offset = end;
++    } while (offset < encoded.length);
+   }
+ 
+   exit(code: number): void {
+diff --git a/packages/just-bash/src/fs/interface.ts b/packages/just-bash/src/fs/interface.ts
+index 5ad0acc..20cc975 100644
+--- a/packages/just-bash/src/fs/interface.ts
++++ b/packages/just-bash/src/fs/interface.ts
+@@ -173,6 +173,13 @@ export interface IFileSystem {
+    */
+   readFileBuffer(path: string): Promise<Uint8Array>;
+ 
++  /** Optional metadata-only validation before an interpreter rejects a file operation by size. */
++  assertFileAccess?(
++    path: string,
++    bytes: number,
++    op: "read" | "write",
++  ): void | Promise<void>;
++
+   /**
+    * Write content to a file, creating it if it doesn't exist
+    */
+diff --git a/packages/just-bash/src/interpreter/defense-aware-command-context.ts b/packages/just-bash/src/interpreter/defense-aware-command-context.ts
+index ecbe0cf..e4e2f07 100644
+--- a/packages/just-bash/src/interpreter/defense-aware-command-context.ts
++++ b/packages/just-bash/src/interpreter/defense-aware-command-context.ts
+@@ -198,6 +198,15 @@ function wrapFileSystem(
+     );
+   }
+ 
++  if (fs.assertFileAccess) {
++    wrappedFs.assertFileAccess = wrapFunction(
++      fs.assertFileAccess.bind(fs),
++      requireDefenseContext,
++      component,
++      "fs.assertFileAccess",
++    );
++  }
++
+   return wrappedFs;
+ }
+ 
+diff --git a/packages/just-bash/src/limits.ts b/packages/just-bash/src/limits.ts
+index 8fcb820..77fd0ce 100644
+--- a/packages/just-bash/src/limits.ts
++++ b/packages/just-bash/src/limits.ts
+@@ -100,6 +100,9 @@ export interface ExecutionLimits {
+   /** Maximum worker request or response payload bytes (default: 64 MiB) */
+   maxWorkerMessageBytes?: number;
+ 
++  /** Maximum Python filesystem bridge payload bytes (default: 8 MiB; minimum: 24 bytes) */
++  maxPythonBridgeBytes?: number;
++
+   /** Maximum top-level execution wall time in milliseconds (default: 1 hour) */
+   maxExecutionTimeMs?: number;
+ 
+@@ -196,6 +199,7 @@ const DEFAULT_LIMITS: Required<ExecutionLimits> = {
+   maxArchiveEntryBytes: 512 * 1024 * 1024,
+   maxArchiveEntries: 1000000,
+   maxWorkerMessageBytes: 64 * 1024 * 1024,
++  maxPythonBridgeBytes: 8 * 1024 * 1024,
+   // Prior releases had no top-level deadline. Keep normal compatibility-safe
+   // for long real workloads while retaining a finite defense-in-depth bound.
+   maxExecutionTimeMs: 60 * 60 * 1000,
+@@ -257,6 +261,7 @@ const HARDENED_LIMITS: Required<ExecutionLimits> = {
+   maxArchiveEntryBytes: 64 * 1024 * 1024,
+   maxArchiveEntries: 100_000,
+   maxWorkerMessageBytes: 16 * 1024 * 1024,
++  maxPythonBridgeBytes: 8 * 1024 * 1024,
+   maxExecutionTimeMs: 30_000,
+ };
+ 
+@@ -320,6 +325,8 @@ export function resolveLimits(
+       userLimits.maxArchiveEntries ?? defaults.maxArchiveEntries,
+     maxWorkerMessageBytes:
+       userLimits.maxWorkerMessageBytes ?? defaults.maxWorkerMessageBytes,
++    maxPythonBridgeBytes:
++      userLimits.maxPythonBridgeBytes ?? defaults.maxPythonBridgeBytes,
+     maxExecutionTimeMs:
+       userLimits.maxExecutionTimeMs ?? defaults.maxExecutionTimeMs,
+     maxExtensionCleanupTimeMs:
+diff --git a/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts b/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
+index 871ae3e..3b27546 100644
+--- a/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
++++ b/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
+@@ -51,6 +51,7 @@ describeDefense("Defense context invariant", () => {
+     // here, and the assertion below then proves the wrapper forwards it.
+     const IFILESYSTEM_METHODS: Record<keyof IFileSystem, true> = {
+       appendFile: true,
++      assertFileAccess: true,
+       chmod: true,
+       cp: true,
+       createExclusive: true,

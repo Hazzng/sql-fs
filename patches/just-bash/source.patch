@@ -1,0 +1,4480 @@
+diff --git a/packages/just-bash/src/Bash.ts b/packages/just-bash/src/Bash.ts
+index 288a5a3..7165cc7 100644
+--- a/packages/just-bash/src/Bash.ts
++++ b/packages/just-bash/src/Bash.ts
+@@ -88,6 +88,15 @@ import type {
+ 
+ export type { ExecutionLimitProfile, ExecutionLimits } from "./limits.js";
+ 
++const DEFAULT_PATH = "/usr/bin:/bin";
++
++const HOST_VARS: ReadonlyArray<readonly [string, string]> = [
++  ["OSTYPE", "linux-gnu"],
++  ["MACHTYPE", "x86_64-pc-linux-gnu"],
++  ["HOSTTYPE", "x86_64"],
++  ["HOSTNAME", "localhost"], // Match hostname command in sandboxed environment
++];
++
+ /**
+  * Logger interface for Bash execution logging.
+  * Implement this interface to receive execution logs.
+@@ -368,12 +377,9 @@ export class Bash {
+     // Use Map for env to prevent prototype pollution attacks
+     const env = new Map<string, string>([
+       ["HOME", this.useDefaultLayout ? "/home/user" : "/"],
+-      ["PATH", "/usr/bin:/bin"],
++      ["PATH", DEFAULT_PATH],
+       ["IFS", " \t\n"],
+-      ["OSTYPE", "linux-gnu"],
+-      ["MACHTYPE", "x86_64-pc-linux-gnu"],
+-      ["HOSTTYPE", "x86_64"],
+-      ["HOSTNAME", "localhost"], // Match hostname command in sandboxed environment
++      ...HOST_VARS,
+       ["PWD", cwd],
+       ["OLDPWD", cwd],
+       ["OPTIND", "1"], // getopts option index
+@@ -644,7 +650,8 @@ export class Bash {
+       throw error;
+     }
+ 
+-    let finalResult = result;
++    const executionAborted = executionScope.executionAborted;
++    let finalResult = { ...result };
+     try {
+       await executionScope.close();
+     } catch {
+@@ -656,17 +663,20 @@ export class Bash {
+         exitCode: 126,
+       };
+     }
++    delete finalResult.executionAborted;
++    if (executionAborted) finalResult.executionAborted = true;
+     return commandLine.trim() ? this.logResult(finalResult) : finalResult;
+   }
+ 
+   private async execInScope(
+     commandLine: string,
+-    options: ExecOptions | undefined,
++    options: (ExecOptions & { newShell?: boolean }) | undefined,
+     executionScope: ExecutionScope,
+     execDepth: number,
+     parentSignal: AbortSignal | undefined,
+     stdinAlreadyAccounted = false,
+     shouldLogResult = true,
++    callerState?: InterpreterState,
+   ): Promise<BashExecResult> {
+     const finishResult = (result: BashExecResult): BashExecResult =>
+       shouldLogResult ? this.logResult(result) : result;
+@@ -726,10 +736,11 @@ export class Bash {
+         }
+       }
+ 
+-      // Create environment for this execution
+-      const execEnv = effectiveOptions.replaceEnv
++      const replaceEnv =
++        effectiveOptions.replaceEnv || effectiveOptions.newShell;
++      const execEnv = replaceEnv
+         ? new Map<string, string>()
+-        : new Map(this.state.env);
++        : new Map((callerState ?? this.state).env);
+       // Merge in options.env
+       if (effectiveOptions.env) {
+         for (const [key, value] of Object.entries(effectiveOptions.env)) {
+@@ -741,14 +752,57 @@ export class Bash {
+         execEnv.set("PWD", newPwd);
+       }
+ 
++      const exportsEnv = !callerState || effectiveOptions.newShell;
++      const exportedVars =
++        replaceEnv && exportsEnv
++          ? new Set<string>()
++          : callerState
++            ? new Set([
++                ...(callerState.exportedVars ?? []),
++                ...(callerState.tempExportedVars ?? []),
++              ])
++            : new Set(this.state.exportedVars);
++      if (exportsEnv) {
++        for (const key of Object.keys(effectiveOptions.env ?? {})) {
++          if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) {
++            exportedVars.add(key);
++          }
++        }
++        if (newPwd !== undefined) {
++          exportedVars.add("PWD");
++        }
++      }
++
++      if (effectiveOptions.newShell) {
++        // Startup defaults do not add export attributes. Resetting inherited
++        // values retains their existing export attributes.
++        if (!execEnv.has("PATH")) {
++          execEnv.set("PATH", DEFAULT_PATH);
++        }
++        for (const [name, value] of HOST_VARS) {
++          if (!execEnv.has(name)) {
++            execEnv.set(name, value);
++          }
++        }
++        execEnv.set("IFS", " \t\n");
++        execEnv.set("OPTIND", "1");
++        if (!execEnv.has("SHELLOPTS")) {
++          execEnv.set("SHELLOPTS", this.state.env.get("SHELLOPTS") ?? "");
++        }
++        if (!execEnv.has("BASHOPTS")) {
++          execEnv.set("BASHOPTS", this.state.env.get("BASHOPTS") ?? "");
++        }
++      }
++
+       const execState: InterpreterState = {
+         ...this.state,
+         env: execEnv,
+-        arrays: effectiveOptions.replaceEnv
+-          ? new Map()
+-          : cloneArrays(this.state.arrays),
++        exportedVars,
++        arrays: replaceEnv ? new Map() : cloneArrays(this.state.arrays),
+         cwd: newCwd,
+-        previousDir: effectiveOptions.env?.OLDPWD ?? this.state.previousDir,
++        previousDir:
++          effectiveOptions.env?.OLDPWD ??
++          (replaceEnv ? "" : this.state.previousDir),
+         // Deep copy mutable objects to prevent interference
+         functions: new Map(this.state.functions),
+         localScopes: [...this.state.localScopes],
+@@ -827,6 +881,8 @@ export class Bash {
+                 execDepth + 1,
+                 effectiveOptions.signal,
+                 childStdinAlreadyAccounted,
++                true,
++                execState,
+               ),
+             fetch: this.secureFetch,
+             sleep: this.sleepFn,
+@@ -882,6 +938,7 @@ export class Bash {
+         }
+         // ExecutionAbortedError is thrown when an AbortSignal fires (timeout cancellation)
+         if (error instanceof ExecutionAbortedError) {
++          executionScope.markExecutionAborted();
+           return finishResult({
+             stdout: error.stdout,
+             stderr: error.stderr,
+@@ -942,6 +999,7 @@ export class Bash {
+       }
+     } catch (error) {
+       if (error instanceof ExecutionAbortedError) {
++        executionScope.markExecutionAborted();
+         return finishResult({
+           stdout: error.stdout,
+           stderr: error.stderr,
+diff --git a/packages/just-bash/src/commands/bash/bash.ts b/packages/just-bash/src/commands/bash/bash.ts
+index 2ecda5a..14bdce4 100644
+--- a/packages/just-bash/src/commands/bash/bash.ts
++++ b/packages/just-bash/src/commands/bash/bash.ts
+@@ -140,16 +140,20 @@ async function executeScript(
+     };
+   }
+ 
+-  // Build environment for the exec call
+-  // Include exported environment from parent (for prefix assignments like "FOO=bar exec sh -c '...'")
+-  // plus positional parameters
++  // The nested shell is a new process: its environment is the parent's
++  // exported variables (including prefix assignments like
++  // "FOO=bar sh -c '...'"), plus the positional parameters. The exec entry
++  // initializes the shell's own variables (IFS, OPTIND, ...) on top.
+   // Use null-prototype object to prevent prototype pollution
+-  const positionalEnv = mergeToNullPrototype(ctx.exportedEnv || {}, {
+-    "0": scriptName,
+-    "#": String(scriptArgs.length),
+-    "@": scriptArgs.join(" "),
+-    "*": scriptArgs.join(" "),
+-  }) as Record<string, string>;
++  const positionalEnv = mergeToNullPrototype(
++    ctx.exportedEnv ?? Object.create(null),
++    {
++      "0": scriptName,
++      "#": String(scriptArgs.length),
++      "@": scriptArgs.join(" "),
++      "*": scriptArgs.join(" "),
++    },
++  ) as Record<string, string>;
+   scriptArgs.forEach((arg, i) => {
+     positionalEnv[String(i + 1)] = arg;
+   });
+@@ -173,11 +177,13 @@ async function executeScript(
+   const result = nestedExec
+     ? await nestedExec(scriptToRun, {
+         env: positionalEnv,
++        newShell: true,
+         cwd: ctx.cwd,
+         signal: ctx.signal,
+       })
+     : await ctx.exec(scriptToRun, {
+         env: positionalEnv,
++        newShell: true,
+         cwd: ctx.cwd,
+         stdin: latin1FromBytes(ctx.stdin),
+         stdinKind: "bytes",
+diff --git a/packages/just-bash/src/commands/js-exec/js-exec.bridge-capacity.test.ts b/packages/just-bash/src/commands/js-exec/js-exec.bridge-capacity.test.ts
+new file mode 100644
+index 0000000..dac0e86
+--- /dev/null
++++ b/packages/just-bash/src/commands/js-exec/js-exec.bridge-capacity.test.ts
+@@ -0,0 +1,191 @@
++import { describe, expect, it } from "vitest";
++import { Bash } from "../../Bash.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++
++const MIB = 1024 * 1024;
++
++describe("JavaScript bridge capacity", () => {
++  it(
++    "reads 16 MiB of binary data across chunk boundaries within the unchanged guest heap",
++    { timeout: 60000 },
++    async () => {
++      const size = 16 * MIB;
++      const data = Buffer.alloc(size, 0x5a);
++      const positions = [0, size - 1];
++      for (let boundary = MIB; boundary < size; boundary += MIB)
++        positions.push(boundary - 1, boundary);
++      const expected = positions.map((position, index) => {
++        data[position] = index;
++        return index;
++      });
++      const fs = new InMemoryFs({ "/large.bin": data });
++      const originalRead = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return originalRead(path);
++      };
++      const bash = new Bash({
++        fs,
++        javascript: true,
++        executionLimits: {
++          maxStringLength: 64 * MIB,
++          maxWorkerMessageBytes: 64 * MIB,
++        },
++      });
++      const script = `js-exec -c 'const data=require("fs").readFileSync("/large.bin"); console.log(data.length, JSON.stringify(${JSON.stringify(positions)}.map(i=>data.readUInt8(i))))'`;
++      expect(await bash.exec(script)).toMatchObject({
++        exitCode: 0,
++        stderr: "",
++        stdout: `${size} ${JSON.stringify(expected)}\n`,
++      });
++      expect(reads.filter((path) => path === "/large.bin")).toHaveLength(1);
++      expect(await bash.exec("js-exec -c 'console.log(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it(
++    "rejects 49 MiB before reading host content and remains reusable",
++    { timeout: 60000 },
++    async () => {
++      const fs = new InMemoryFs({ "/large.bin": Buffer.alloc(49 * MIB) });
++      const originalRead = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return originalRead(path);
++      };
++      const bash = new Bash({
++        fs,
++        javascript: true,
++        executionLimits: {
++          maxStringLength: 64 * MIB,
++          maxWorkerMessageBytes: 64 * MIB,
++        },
++      });
++      const result = await bash.exec(
++        `js-exec -c 'require("fs").readFileSync("/large.bin")'`,
++      );
++      expect(result.exitCode).toBe(1);
++      expect(result.stderr).toContain("File exceeds");
++      expect(reads).not.toContain("/large.bin");
++      expect(await bash.exec("js-exec -c 'console.log(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it("preserves UTF-8 spanning a chunk boundary, empty files, and promise reads", async () => {
++    const text = `${"a".repeat(MIB - 2)}🙂€`;
++    const fs = new InMemoryFs({ "/text": text, "/empty": "" });
++    const bash = new Bash({
++      fs,
++      javascript: true,
++      executionLimits: {
++        maxStringLength: 64 * MIB,
++        maxWorkerMessageBytes: 64 * MIB,
++      },
++    });
++    const result = await bash.exec(
++      `js-exec -c 'const fs=require("fs"); const text=await fs.promises.readFile("/text", "utf8"); console.log(text.length, text.slice(-3), fs.readFileSync("/empty").length, fs.readFileBuffer("/text").byteLength)'`,
++    );
++    expect(result).toMatchObject({
++      exitCode: 0,
++      stderr: "",
++      stdout: `${text.length} 🙂€ 0 ${Buffer.byteLength(text)}\n`,
++    });
++  });
++
++  it("bounds partial reads by bridge requests and clears them before reuse", async () => {
++    const fs = new InMemoryFs({ "/large.bin": Buffer.alloc(2 * MIB) });
++    const bash = new Bash({
++      fs,
++      javascript: true,
++      executionLimits: {
++        maxWorkerMessageBytes: 64 * MIB,
++        maxJsBridgeRequests: 1,
++      },
++    });
++    const result = await bash.exec(
++      `js-exec -c 'require("fs").readFileSync("/large.bin")'`,
++    );
++    expect(result.exitCode).toBe(1);
++    expect(result.stderr).toContain("bridge request limit");
++    expect(await bash.exec("js-exec -c 'console.log(37)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "37\n",
++      stderr: "",
++    });
++  });
++
++  it("cancels a pending host read and safely handles its late completion", async () => {
++    let startRead!: () => void;
++    let releaseRead!: () => void;
++    const started = new Promise<void>((resolve) => {
++      startRead = resolve;
++    });
++    const pending = new Promise<void>((resolve) => {
++      releaseRead = resolve;
++    });
++    const fs = new InMemoryFs({ "/large.bin": Buffer.alloc(2 * MIB) });
++    const originalRead = fs.readFileBuffer.bind(fs);
++    fs.readFileBuffer = async (path) => {
++      if (path === "/large.bin") {
++        startRead();
++        await pending;
++      }
++      return originalRead(path);
++    };
++    const bash = new Bash({ fs, javascript: true });
++    const controller = new AbortController();
++    const execution = bash.exec(
++      `js-exec -c 'require("fs").readFileSync("/large.bin")'`,
++      { signal: controller.signal },
++    );
++    await started;
++    controller.abort();
++    try {
++      expect((await execution).exitCode).toBe(124);
++    } finally {
++      releaseRead();
++    }
++    expect(await bash.exec("js-exec -c 'console.log(37)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "37\n",
++      stderr: "",
++    });
++  });
++
++  it("keeps tolerant base64 decoding byte-compatible with Node", async () => {
++    const values = [
++      "",
++      "A",
++      "AA",
++      "AAA",
++      "AAAA",
++      "aG☃VsbG8=ignored",
++      "__--",
++      "aGVs\0 bG8====tail",
++      "=aGVsbG8",
++      "aGVsbG8=====",
++    ];
++    const expected = values.map((value) =>
++      Buffer.from(value, "base64").toString("hex"),
++    );
++    const bash = new Bash({ javascript: true });
++    const result = await bash.exec(
++      `js-exec -c 'console.log(JSON.stringify(${JSON.stringify(values)}.map(value=>Buffer.from(value,"base64").toString("hex"))))'`,
++    );
++    expect(result).toMatchObject({
++      exitCode: 0,
++      stderr: "",
++      stdout: `${JSON.stringify(expected)}\n`,
++    });
++  });
++});
+diff --git a/packages/just-bash/src/commands/js-exec/module-shims.ts b/packages/just-bash/src/commands/js-exec/module-shims.ts
+index f729ac9..37db361 100644
+--- a/packages/just-bash/src/commands/js-exec/module-shims.ts
++++ b/packages/just-bash/src/commands/js-exec/module-shims.ts
+@@ -263,10 +263,15 @@ function _utf8Encode(str) {
+       bytes.push(c);
+     } else if (c < 0x800) {
+       bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+-    } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+-      var lo = str.charCodeAt(++i);
+-      var cp = ((c - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000;
+-      bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
++    } else if (c >= 0xD800 && c <= 0xDFFF) {
++      var lo = str.charCodeAt(i + 1);
++      if (c <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF) {
++        i++;
++        var cp = ((c - 0xD800) * 0x400) + (lo - 0xDC00) + 0x10000;
++        bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
++      } else {
++        bytes.push(0xEF, 0xBF, 0xBD);
++      }
+     } else {
+       bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+     }
+@@ -278,11 +283,25 @@ function _utf8Decode(bytes) {
+   var i = 0;
+   while (i < bytes.length) {
+     var b = bytes[i];
+-    if (b < 0x80) { str += String.fromCharCode(b); i++; }
+-    else if ((b & 0xE0) === 0xC0) { str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i+1] & 0x3F)); i += 2; }
+-    else if ((b & 0xF0) === 0xE0) { str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i+1] & 0x3F) << 6) | (bytes[i+2] & 0x3F)); i += 3; }
+-    else if ((b & 0xF8) === 0xF0) { var cp = ((b & 0x07) << 18) | ((bytes[i+1] & 0x3F) << 12) | ((bytes[i+2] & 0x3F) << 6) | (bytes[i+3] & 0x3F); cp -= 0x10000; str += String.fromCharCode((cp >> 10) + 0xD800, (cp & 0x3FF) + 0xDC00); i += 4; }
+-    else { i++; }
++    i++;
++    if (b < 0x80) { str += String.fromCharCode(b); continue; }
++    var count = b >= 0xC2 && b <= 0xDF ? 1 : b >= 0xE0 && b <= 0xEF ? 2 : b >= 0xF0 && b <= 0xF4 ? 3 : 0;
++    if (!count) { str += String.fromCharCode(0xFFFD); continue; }
++    var cp = b & (count === 1 ? 0x1F : count === 2 ? 0x0F : 0x07);
++    var consumed = 0;
++    while (consumed < count && i < bytes.length) {
++      var next = bytes[i];
++      var min = consumed === 0 && b === 0xE0 ? 0xA0 : consumed === 0 && b === 0xF0 ? 0x90 : 0x80;
++      var max = consumed === 0 && b === 0xED ? 0x9F : consumed === 0 && b === 0xF4 ? 0x8F : 0xBF;
++      if (next < min || next > max) break;
++      cp = (cp << 6) | (next & 0x3F);
++      i++;
++      consumed++;
++    }
++    // Replace a valid prefix once, leaving any invalid continuation to decode next.
++    if (consumed !== count) { str += String.fromCharCode(0xFFFD); continue; }
++    if (cp < 0x10000) str += String.fromCharCode(cp);
++    else { cp -= 0x10000; str += String.fromCharCode((cp >> 10) + 0xD800, (cp & 0x3FF) + 0xDC00); }
+   }
+   return str;
+ }
+@@ -290,8 +309,8 @@ function _utf8Decode(bytes) {
+ // IMPORTANT: round-trip tests (encode then decode) mask broken encodings
+ // because both sides become no-ops. Encoding tests MUST assert the encoded
+ // constant directly.
+-function _normEnc(enc) {
+-  if (enc === undefined || enc === null) return 'utf8';
++function _normEnc(enc, strict) {
++  if (enc === undefined || (!strict && (enc === null || enc === ''))) return 'utf8';
+   var e = String(enc).toLowerCase();
+   if (e === 'utf8' || e === 'utf-8') return 'utf8';
+   if (e === 'utf16le' || e === 'utf-16le' || e === 'ucs2' || e === 'ucs-2') return 'utf16le';
+@@ -399,30 +418,38 @@ function _b64UrlEncode(bytes) {
+   return s.replace(/=+$/, '').replace(/\\+/g, '-').replace(/\\//g, '_');
+ }
+ function _b64Decode(str) {
++  var padding = str.indexOf('=');
++  if (padding >= 0) str = str.slice(0, padding);
++  str = str.replace(/[^A-Za-z0-9+/_-]/g, '');
+   var t = _b64DecTable();
+-  var out = [];
+-  var buf = 0, bits = 0;
+-  for (var i = 0; i < str.length; i++) {
+-    var c = str.charCodeAt(i);
+-    if (c === 61) break;
+-    var v = c < 256 ? t[c] : -1;
+-    if (v < 0) continue;
+-    buf = (buf << 6) | v;
+-    bits += 6;
+-    if (bits >= 8) {
+-      bits -= 8;
+-      out.push((buf >> bits) & 0xff);
++  var out = new Uint8Array(Math.floor(str.length * 3 / 4));
++  var i = 0, index = 0;
++  while (i + 3 < str.length) {
++    var bits = (t[str.charCodeAt(i)] << 18) | (t[str.charCodeAt(i + 1)] << 12)
++      | (t[str.charCodeAt(i + 2)] << 6) | t[str.charCodeAt(i + 3)];
++    out[index++] = bits >> 16;
++    out[index++] = bits >> 8;
++    out[index++] = bits;
++    i += 4;
++  }
++  if (i + 1 < str.length) {
++    out[index++] = (t[str.charCodeAt(i)] << 2) | (t[str.charCodeAt(i + 1)] >> 4);
++    if (i + 2 < str.length) {
++      out[index] = (t[str.charCodeAt(i + 1)] << 4) | (t[str.charCodeAt(i + 2)] >> 2);
+     }
+   }
+   return out;
+ }
+ 
++function _isArrayBuffer(value) {
++  return value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer);
++}
+ function Buffer(arg) {
+   if (typeof arg === 'number') {
+     this._data = new Uint8Array(arg);
+-  } else if (arg instanceof ArrayBuffer) {
++  } else if (_isArrayBuffer(arg)) {
+     this._data = new Uint8Array(arg);
+-  } else if (arg instanceof Uint8Array) {
++  } else if (ArrayBuffer.isView(arg)) {
+     this._data = new Uint8Array(arg);
+   } else if (Array.isArray(arg)) {
+     this._data = new Uint8Array(arg);
+@@ -440,9 +467,9 @@ Buffer.from = function(data, encoding) {
+     if (enc === 'latin1')    return new Buffer(_rawEncode(data));
+     if (enc === 'ascii')     return new Buffer(_rawEncode(data));
+     if (enc === 'hex')       return new Buffer(_hexDecode(data));
+-    if (enc === 'base64' || enc === 'base64url') return new Buffer(_b64Decode(data));
++    if (enc === 'base64' || enc === 'base64url') return new Buffer(_b64Decode(data).buffer);
+   }
+-  if (data instanceof ArrayBuffer) {
++  if (_isArrayBuffer(data)) {
+     var off = typeof encoding === 'number' ? encoding : 0;
+     var len = arguments.length > 2 ? arguments[2] : undefined;
+     var view = len === undefined ? new Uint8Array(data, off) : new Uint8Array(data, off, len);
+@@ -451,7 +478,7 @@ Buffer.from = function(data, encoding) {
+     buf.length = view.length;
+     return buf;
+   }
+-  if (data instanceof Uint8Array)  return new Buffer(data);
++  if (ArrayBuffer.isView(data))    return new Buffer(data);
+   if (Array.isArray(data))         return new Buffer(data);
+   if (data && data._data)          return new Buffer(data._data.slice());
+   return new Buffer(0);
+@@ -482,13 +509,12 @@ Buffer.concat = function(list, totalLength) {
+ Buffer.byteLength = function(value, encoding) {
+   if (typeof value !== 'string') {
+     if (value && value._data) return value._data.length;
+-    if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
++    if (ArrayBuffer.isView(value) || _isArrayBuffer(value)) {
+       return value.byteLength;
+     }
+     throw new TypeError('The "string" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type ' + typeof value + ' (' + value + ')');
+   }
+-  var enc = _normEnc(encoding);
+-  if (enc === undefined) _badEnc(encoding);
++  var enc = _normEnc(encoding) || 'utf8';
+   if (enc === 'utf8')      return _utf8Encode(value).length;
+   if (enc === 'utf16le')   return value.length * 2;
+   if (enc === 'latin1' || enc === 'ascii') return value.length;
+@@ -506,7 +532,8 @@ Buffer.prototype.toString = function(encoding, start, end) {
+     var e = end === undefined ? len : (end < 0 ? 0 : (end > len ? len : end | 0));
+     bytes = e <= s ? bytes.subarray(0, 0) : bytes.subarray(s, e);
+   }
+-  var enc = _normEnc(encoding);
++  if (bytes.length === 0) return '';
++  var enc = _normEnc(encoding, true);
+   if (enc === undefined) _badEnc(encoding);
+   if (enc === 'utf8')      return _utf8Decode(bytes);
+   if (enc === 'utf16le')   return _utf16leDecode(bytes);
+@@ -533,7 +560,13 @@ Buffer.prototype.copy = function(target, targetStart, sourceStart, sourceEnd) {
+ Buffer.prototype.write = function(str, offset, length, encoding) {
+   if (typeof offset === 'string') { encoding = offset; offset = 0; length = undefined; }
+   else if (typeof length === 'string') { encoding = length; length = undefined; }
+-  offset = offset | 0;
++  if (offset === undefined) offset = 0;
++  if (typeof offset !== 'number') {
++    throw new TypeError('The "offset" argument must be of type number. Received type ' + typeof offset);
++  }
++  if (!Number.isInteger(offset)) {
++    throw new RangeError('The value of "offset" is out of range. It must be an integer. Received ' + offset);
++  }
+   if (offset < 0 || offset > this._data.length) {
+     throw new RangeError('The value of "offset" is out of range. It must be >= 0 && <= ' + this._data.length + '. Received ' + offset);
+   }
+@@ -548,12 +581,23 @@ Buffer.prototype.write = function(str, offset, length, encoding) {
+   else                        bytes = _b64Decode(str);
+   var max = this._data.length - offset;
+   if (length !== undefined) {
+-    length = length | 0;
++    if (typeof length !== 'number') {
++      throw new TypeError('The "length" argument must be of type number. Received type ' + typeof length);
++    }
++    if (!Number.isInteger(length)) {
++      throw new RangeError('The value of "length" is out of range. It must be an integer. Received ' + length);
++    }
+     if (length < 0 || length > this._data.length) {
+       throw new RangeError('The value of "length" is out of range. It must be >= 0 && <= ' + this._data.length + '. Received ' + length);
+     }
+   }
+   var write = Math.min(length === undefined ? max : length, bytes.length, max);
++  if (enc === 'utf8') {
++    // A continuation byte at the boundary means the preceding character is incomplete.
++    while (write > 0 && write < bytes.length && (bytes[write] & 0xC0) === 0x80) write--;
++  } else if (enc === 'utf16le') {
++    write -= write % 2;
++  }
+   for (var i = 0; i < write; i++) this._data[offset + i] = bytes[i];
+   return write;
+ };
+diff --git a/packages/just-bash/src/commands/js-exec/run-runtime.ts b/packages/just-bash/src/commands/js-exec/run-runtime.ts
+index 1bb6ad1..940fdbc 100644
+--- a/packages/just-bash/src/commands/js-exec/run-runtime.ts
++++ b/packages/just-bash/src/commands/js-exec/run-runtime.ts
+@@ -72,7 +72,6 @@ interface QueuedExecution {
+ const executionQueue: QueuedExecution[] = [];
+ let executionActive = false;
+ const RUN_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
+-const RUN_SYNC_BRIDGE_PAYLOAD_BYTES = 8 * 1024 * 1024;
+ const RUN_MAX_LIMIT_VALUE = 2_147_483_647;
+ const RUN_BRIDGE_VALUE_OVERHEAD_BYTES = 4096;
+ const GUEST_STACK_SCAN_CHARS = 64 * 1024;
+@@ -478,13 +477,24 @@ const guestSetupSource = (
+   };
+ 
+   ${RUN_BUFFER_MODULE_SOURCE}
++  function readFileBytes(path) {
++    var chunk = unwrap(host.fsRead(path, 0));
++    var data = new Uint8Array(chunk.size);
++    var offset = 0;
++    while (true) {
++      var bytes = Buffer.from(chunk.data, 'base64')._data;
++      data.set(bytes, offset);
++      offset += bytes.length;
++      if (offset === data.length) return data;
++      chunk = unwrap(host.fsRead(path, offset));
++    }
++  }
+   var fs = {
+     readFileBuffer: function(path) {
+-      var data = Buffer.from(unwrap(host.fsRead(path)), 'base64')._data;
+-      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
++      return readFileBytes(path).buffer;
+     },
+     readFileSync: function(path, opts) {
+-      var buffer = Buffer.from(unwrap(host.fsRead(path)), 'base64');
++      var buffer = Buffer.from(readFileBytes(path).buffer);
+       var encoding = typeof opts === 'string' ? opts : opts && opts.encoding;
+       return encoding ? buffer.toString(encoding) : buffer;
+     },
+@@ -691,12 +701,9 @@ async function executeWithRunInner(
+   deadline: number,
+   deadlineSignal: AbortSignal,
+ ): Promise<ExecResult> {
+-  // run accounts for the SharedArrayBuffer inside the invocation budget and
+-  // adds framing space to host-function arguments. Leave bounded headroom
+-  // while preserving the existing 64 MiB QuickJS heap limit.
+   const maxBridgePayloadBytes = Math.min(
+     ctx.limits.maxWorkerMessageBytes,
+-    RUN_SYNC_BRIDGE_PAYLOAD_BYTES,
++    RUN_MEMORY_LIMIT_BYTES - RUN_BRIDGE_VALUE_OVERHEAD_BYTES,
+   );
+   const maxFileReadBytes = Math.max(
+     0,
+@@ -712,6 +719,13 @@ async function executeWithRunInner(
+       RUN_MAX_LIMIT_VALUE,
+     ),
+   );
++  const fileReadChunkBytes = Math.max(
++    1,
++    Math.min(1024 * 1024, maxFileReadBytes),
++  );
++  let activeFileRead:
++    | { path: string; data: Uint8Array; nextOffset: number }
++    | undefined;
+   const hostNamespace = createHostNamespace();
+   const bootstrapModuleSpecifier = `just-bash:bootstrap:${createOpaqueSuffix()}`;
+   const output: OutputState = {
+@@ -877,22 +891,47 @@ async function executeWithRunInner(
+             output.exitCode = requestedExitCode;
+             throw new Error("Guest requested process exit.");
+           },
+-          fsRead: (path: string) =>
++          fsRead: (path: string, offset: number) =>
+             attempt(async () => {
++              if (!Number.isSafeInteger(offset) || offset < 0) {
++                throw new Error("Invalid file read offset");
++              }
+               const resolved = resolve(path);
+-              const stat = await ctx.fs.stat(resolved);
+-              if (stat.size > maxFileReadBytes) {
+-                throw new Error(
+-                  `File exceeds JavaScript bridge read limit (${maxFileReadBytes} bytes)`,
+-                );
++              if (offset === 0) {
++                activeFileRead = undefined;
++                const stat = await ctx.fs.stat(resolved);
++                if (stat.size > maxFileReadBytes) {
++                  throw new Error(
++                    `File exceeds JavaScript bridge read limit (${maxFileReadBytes} bytes)`,
++                  );
++                }
++                const data = await ctx.fs.readFileBuffer(resolved);
++                if (data.byteLength > maxFileReadBytes) {
++                  throw new Error(
++                    `File exceeds JavaScript bridge read limit (${maxFileReadBytes} bytes)`,
++                  );
++                }
++                abortSignal?.throwIfAborted();
++                activeFileRead = { path: resolved, data, nextOffset: 0 };
+               }
+-              const data = await ctx.fs.readFileBuffer(resolved);
+-              if (data.byteLength > maxFileReadBytes) {
+-                throw new Error(
+-                  `File exceeds JavaScript bridge read limit (${maxFileReadBytes} bytes)`,
+-                );
++              const read = activeFileRead;
++              if (
++                !read ||
++                read.path !== resolved ||
++                read.nextOffset !== offset
++              ) {
++                throw new Error("Invalid file read continuation");
+               }
+-              return Buffer.from(data).toString("base64");
++              const end = Math.min(
++                offset + fileReadChunkBytes,
++                read.data.byteLength,
++              );
++              const data = Buffer.from(
++                read.data.subarray(offset, end),
++              ).toString("base64");
++              read.nextOffset = end;
++              if (end === read.data.byteLength) activeFileRead = undefined;
++              return { size: read.data.byteLength, data };
+             }),
+           fsWrite: (path: string, data: unknown) =>
+             attempt(
+@@ -1150,7 +1189,7 @@ ${bootstrap}
+       Math.max(trustedEntryBytes, trustedBootstrapModuleBytes),
+   );
+   const maxRunHostFunctionOutputBytes = Math.min(
+-    RUN_SYNC_BRIDGE_PAYLOAD_BYTES,
++    RUN_MEMORY_LIMIT_BYTES - RUN_BRIDGE_VALUE_OVERHEAD_BYTES,
+     Math.max(
+       maxBridgePayloadBytes,
+       options.isModule
+@@ -1251,6 +1290,7 @@ ${bootstrap}
+       );
+     }
+   }
++  activeFileRead = undefined;
+   if (bridgeLimitExceeded) reportBridgeLimit();
+   if (output.limitExceeded) {
+     output.exitCode = 1;
+diff --git a/packages/just-bash/src/commands/ls/ls.mode.test.ts b/packages/just-bash/src/commands/ls/ls.mode.test.ts
+new file mode 100644
+index 0000000..e7e0523
+--- /dev/null
++++ b/packages/just-bash/src/commands/ls/ls.mode.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from "vitest";
++import { Bash } from "../../Bash.js";
++
++describe("ls long listing modes", () => {
++  it.each([
++    ["echo x > a; chmod 755 a; ls -l a", "-rwxr-xr-x"],
++    ["mkdir d; echo x > d/f; chmod 600 d/f; ls -l d | tail -n 1", "-rw-------"],
++    ["mkdir d; chmod 750 d; ls -ld d", "drwxr-x---"],
++    ["mkdir d; chmod 700 d; ls -la d | grep ' \\.$'", "drwx------"],
++    ["mkdir -p p/d; chmod 711 p; ls -la p/d | grep ' \\.\\.$'", "drwx--x--x"],
++  ])("reports stored permissions for %s", async (script, mode) => {
++    const env = new Bash();
++    const result = await env.exec(`${script} | cut -d' ' -f1`);
++    expect({
++      stdout: result.stdout,
++      stderr: result.stderr,
++      exitCode: result.exitCode,
++    }).toEqual({
++      stdout: `${mode}\n`,
++      stderr: "",
++      exitCode: 0,
++    });
++  });
++});
+diff --git a/packages/just-bash/src/commands/ls/ls.ts b/packages/just-bash/src/commands/ls/ls.ts
+index 6e4319e..ec08999 100644
+--- a/packages/just-bash/src/commands/ls/ls.ts
++++ b/packages/just-bash/src/commands/ls/ls.ts
+@@ -13,6 +13,7 @@ import type {
+ } from "../../types.js";
+ import { parseArgs } from "../../utils/args.js";
+ import { DEFAULT_BATCH_SIZE } from "../../utils/constants.js";
++import { formatMode } from "../format-mode.js";
+ import { hasHelpFlag, showHelp } from "../help.js";
+ 
+ function appendLsOutput(
+@@ -237,7 +238,7 @@ export const lsCommand: RuntimeCommand = {
+         try {
+           const stat = await ctx.fs.stat(fullPath);
+           if (longFormat) {
+-            const mode = stat.isDirectory ? "drwxr-xr-x" : "-rw-r--r--";
++            const mode = formatMode(stat.mode, stat.isDirectory);
+             const suffix = classifyFiles
+               ? classifySuffix(await ctx.fs.lstat(fullPath))
+               : "";
+@@ -497,7 +498,7 @@ async function listPath(
+         const mtime = stat.mtime ?? new Date(0);
+         const dateStr = formatDate(mtime);
+         return {
+-          stdout: `-rw-r--r-- 1 user user ${sizeStr} ${dateStr} ${path}${fileSuffix}\n`,
++          stdout: `${formatMode(stat.mode, stat.isDirectory)} 1 user user ${sizeStr} ${dateStr} ${path}${fileSuffix}\n`,
+           stderr: "",
+           exitCode: 0,
+         };
+@@ -574,11 +575,23 @@ async function listPath(
+ 
+       // Add special entries first
+       for (const entry of specialEntries) {
+-        stdout = appendLsOutput(
+-          ctx,
+-          stdout,
+-          `drwxr-xr-x 1 user user     0 Jan  1 00:00 ${entry}\n`,
+-        );
++        const entryPath =
++          entry === "." || fullPath === "/"
++            ? fullPath
++            : fullPath.slice(0, fullPath.lastIndexOf("/")) || "/";
++        let line: string;
++        try {
++          const entryStat = await ctx.fs.stat(entryPath);
++          const size = entryStat.size ?? 0;
++          const sizeStr = humanReadable
++            ? formatHumanSize(size).padStart(5)
++            : String(size).padStart(5);
++          const dateStr = formatDate(entryStat.mtime ?? new Date(0));
++          line = `${formatMode(entryStat.mode, entryStat.isDirectory)} 1 user user ${sizeStr} ${dateStr} ${entry}\n`;
++        } catch {
++          line = `drwxr-xr-x 1 user user     0 Jan  1 00:00 ${entry}\n`;
++        }
++        stdout = appendLsOutput(ctx, stdout, line);
+       }
+ 
+       // Parallelize stat calls for regular entries
+@@ -595,7 +608,7 @@ async function listPath(
+               fullPath === "/" ? `/${entry}` : `${fullPath}/${entry}`;
+             try {
+               const entryStat = await ctx.fs.stat(entryPath);
+-              const mode = entryStat.isDirectory ? "drwxr-xr-x" : "-rw-r--r--";
++              const mode = formatMode(entryStat.mode, entryStat.isDirectory);
+               const suffix = classifyFiles
+                 ? classifySuffix(await ctx.fs.lstat(entryPath))
+                 : "";
+diff --git a/packages/just-bash/src/commands/mv/mv.test.ts b/packages/just-bash/src/commands/mv/mv.test.ts
+index 576edcc..fa277a8 100644
+--- a/packages/just-bash/src/commands/mv/mv.test.ts
++++ b/packages/just-bash/src/commands/mv/mv.test.ts
+@@ -2,6 +2,27 @@ import { describe, expect, it } from "vitest";
+ import { Bash } from "../../Bash.js";
+ 
+ describe("mv", () => {
++  it.each([
++    "./file",
++    "./",
++  ])("rejects moving a file onto itself through %s", async (target) => {
++    const env = new Bash({
++      cwd: "/home/user",
++      files: { "/home/user/file": "content" },
++    });
++    const result = await env.exec(`mv file ${target}`);
++    expect({
++      stdout: result.stdout,
++      stderr: result.stderr,
++      exitCode: result.exitCode,
++    }).toEqual({
++      stdout: "",
++      stderr: "mv: 'file' and './file' are the same file\n",
++      exitCode: 1,
++    });
++    expect(await env.readFile("/home/user/file")).toBe("content");
++  });
++
+   it("should move file", async () => {
+     const env = new Bash({
+       files: { "/old.txt": "content" },
+diff --git a/packages/just-bash/src/commands/mv/mv.ts b/packages/just-bash/src/commands/mv/mv.ts
+index 9c7deb1..3f67c99 100644
+--- a/packages/just-bash/src/commands/mv/mv.ts
++++ b/packages/just-bash/src/commands/mv/mv.ts
+@@ -147,7 +147,11 @@ export const mvCommand: RuntimeCommand = {
+         }
+         const identity = await compareFileIdentity(ctx.fs, srcPath, targetPath);
+         if (identity === "same") {
+-          // POSIX rename of a file onto itself succeeds without changing it.
++          const displayTarget = destIsDir
++            ? `${dest.replace(/\/+$/, "")}/${src.split("/").pop() || src}`
++            : dest;
++          stderr += `mv: '${src}' and '${displayTarget}' are the same file\n`;
++          exitCode = 1;
+           continue;
+         }
+         if (identity === "unknown") {
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts
+new file mode 100644
+index 0000000..3a26128
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-admission.test.ts
+@@ -0,0 +1,268 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { Bash } from "../../Bash.js";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  allocations: [] as number[],
++  workers: [] as Array<{ finish(): void }>,
++  holdTermination: false,
++  holdBridge: false,
++  terminationReleases: [] as Array<() => void>,
++  bridgeReleases: [] as Array<() => void>,
++}));
++
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? []) {
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++          }
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (state.holdTermination)
++        await new Promise<void>((resolve) =>
++          state.terminationReleases.push(resolve),
++        );
++      return 0;
++    }
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    async run() {
++      if (state.holdBridge)
++        await new Promise<void>((resolve) =>
++          state.bridgeReleases.push(resolve),
++        );
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++function context(
++  fs = new InMemoryFs(),
++  messageBytes = 64 * 1024 * 1024,
++): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: messageBytes }),
++  };
++}
++
++async function tick(): Promise<void> {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain(): Promise<void> {
++  state.holdTermination = false;
++  state.holdBridge = false;
++  for (let index = 0; index < 10; index++) {
++    for (const release of state.terminationReleases.splice(0)) release();
++    for (const release of state.bridgeReleases.splice(0)) release();
++    for (const worker of state.workers) worker.finish();
++    await tick();
++  }
++}
++
++describe("Python bridge allocation admission", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.allocations = [];
++    state.workers = [];
++    state.holdTermination = false;
++    state.holdBridge = false;
++    state.terminationReleases = [];
++    state.bridgeReleases = [];
++  });
++
++  it("preserves the historical default 8 MiB payload allocation", async () => {
++    const operation = python3Command.execute(["-c", "print(1)"], context());
++    await tick();
++    const measured = [...state.allocations];
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(measured).toEqual([8 * 1024 * 1024 + 4128]);
++  });
++
++  it("allocates no bridge for a queued or cancelled same-filesystem command", async () => {
++    const fs = new InMemoryFs();
++    const abort = new AbortController();
++    const first = python3Command.execute(["-c", "print(1)"], context(fs));
++    const second = python3Command.execute(["-c", "print(2)"], {
++      ...context(fs),
++      signal: abort.signal,
++    });
++    await tick();
++    const measured = [...state.allocations];
++    abort.abort();
++    await drain();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    expect(await second).toMatchObject({ exitCode: 124 });
++    expect(measured).toHaveLength(1);
++    expect(state.allocations).toHaveLength(1);
++  });
++
++  it("bounds active buffers across independent filesystems before allocating the sixth", async () => {
++    const operations = Array.from({ length: 6 }, () =>
++      python3Command.execute(
++        ["-c", "print(1)"],
++        context(new InMemoryFs(), 8192),
++      ),
++    );
++    await tick();
++    const beforeRelease = [...state.allocations];
++    const workersBeforeRelease = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(beforeRelease).toHaveLength(5);
++    expect(workersBeforeRelease).toBe(5);
++    expect(state.allocations).toHaveLength(6);
++  });
++
++  it.each([
++    "termination",
++    "bridge",
++  ])("holds filesystem ownership until %s settles", async (held) => {
++    const fs = new InMemoryFs();
++    state.holdTermination = held === "termination";
++    state.holdBridge = held === "bridge";
++    const first = python3Command.execute(["-c", "print(1)"], context(fs, 8192));
++    const second = python3Command.execute(
++      ["-c", "print(2)"],
++      context(fs, 8192),
++    );
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const workersBeforeSettlement = state.workers.length;
++    const buffersBeforeSettlement = state.allocations.length;
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(workersBeforeSettlement).toBe(1);
++    expect(buffersBeforeSettlement).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it("allows another filesystem to dispatch past a blocked queue head", async () => {
++    const fs = new InMemoryFs();
++    const operations = [
++      python3Command.execute(["-c", "print(1)"], context(fs, 8192)),
++      python3Command.execute(["-c", "print(2)"], context(fs, 8192)),
++      python3Command.execute(
++        ["-c", "print(3)"],
++        context(new InMemoryFs(), 8192),
++      ),
++    ];
++    await tick();
++    const beforeRelease = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0, 0]);
++    expect(beforeRelease).toBe(2);
++    expect(state.allocations).toHaveLength(3);
++  });
++
++  it("expires a waiting request without allocating or dispatching it later", async () => {
++    const fs = new InMemoryFs();
++    const first = python3Command.execute(["-c", "print(1)"], context(fs, 8192));
++    const second = python3Command.execute(["-c", "print(2)"], {
++      ...context(fs, 8192),
++      limits: resolveLimits({
++        maxPythonTimeoutMs: 5,
++        maxWorkerMessageBytes: 8192,
++      }),
++    });
++    const secondResult = await second;
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    expect(secondResult).toMatchObject({
++      exitCode: 124,
++      stdout: "",
++      stderr: "python3: Execution timeout: exceeded 5ms limit\n",
++    });
++    expect(beforeRelease).toBe(1);
++    expect(state.allocations).toHaveLength(1);
++  });
++
++  it.each([
++    24,
++    1024,
++    8 * 1024 * 1024,
++    64 * 1024 * 1024 - 4128,
++  ])("uses an explicit %i byte bridge payload independently of the string ceiling", async (capacity) => {
++    const ctx = context();
++    ctx.limits = { ...resolveLimits(), maxPythonBridgeBytes: capacity };
++    const operation = python3Command.execute(["-c", "print(1)"], ctx);
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(state.allocations).toEqual([capacity + 4128]);
++  });
++
++  it("admits dynamically named pipeline stages before allocating their bridges", async () => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: 8192 },
++    });
++    const operation = bash.exec(
++      `command=py; command=\${command}thon3; $command -c 'print(1)' | $command -c 'print(2)' | $command -c 'print(3)'`,
++    );
++    await tick();
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(beforeRelease).toBe(1);
++    expect(state.allocations).toHaveLength(3);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts
+new file mode 100644
+index 0000000..3b1c31f
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-capacity.test.ts
+@@ -0,0 +1,284 @@
++import { createHash } from "node:crypto";
++import { describe, expect, it } from "vitest";
++import { Bash } from "../../Bash.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++
++const MIB = 1024 * 1024;
++const BRIDGE_OVERHEAD = 4128;
++
++describe("installed just-bash Python bridge", () => {
++  it("completes a dynamically named producer-consumer Python pipeline on one filesystem", async () => {
++    const bash = new Bash({ python: true });
++    expect(
++      await bash.exec(
++        `command=py; command=\${command}thon3; $command -c 'print("pipeline")' | $command -c 'import sys; print(sys.stdin.read().upper(),end="")'`,
++      ),
++    ).toMatchObject({ exitCode: 0, stderr: "", stdout: "PIPELINE\n" });
++  });
++  it.each([
++    0,
++    BRIDGE_OVERHEAD,
++    BRIDGE_OVERHEAD + 1,
++    BRIDGE_OVERHEAD + 23,
++  ])("rejects an impossible %i byte bridge budget with its minimum configuration", async (messageBytes) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: messageBytes },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires maxWorkerMessageBytes >= 4152 and maxStringLength >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++
++  it.each([
++    24, 25,
++  ])("supports tiny Python at the %i byte bridge payload boundary", async (capacity) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxWorkerMessageBytes: capacity + BRIDGE_OVERHEAD },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "37\n",
++      stderr: "",
++    });
++    expect(await bash.exec("python3 -c 'print(38)'")).toMatchObject({
++      exitCode: 0,
++      stdout: "38\n",
++      stderr: "",
++    });
++  });
++
++  it.each([24, 25])(
++    "returns filesystem errors and preserves Unicode output at the %i byte payload minimum",
++    { timeout: 20000 },
++    async (capacity) => {
++      const fs = new InMemoryFs({ "/oversized": Buffer.alloc(capacity + 1) });
++      const stat = fs.stat.bind(fs);
++      fs.stat = async (path) => {
++        if (path === "/missing")
++          throw new Error(`${"🐙".repeat(40)} no such file`);
++        return stat(path);
++      };
++      const readFileBuffer = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return readFileBuffer(path);
++      };
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxWorkerMessageBytes: capacity + BRIDGE_OVERHEAD,
++          maxPythonTimeoutMs: 3000,
++        },
++      });
++      const missing = await bash.exec("python3 -c 'open(\"/missing\").read()'");
++      expect(missing.exitCode).toBe(1);
++      expect(missing.stderr).toContain("[Errno 44] No such file or directory");
++      expect(missing.stderr).not.toMatch(/timeout/i);
++      expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++      const oversized = await bash.exec(
++        'python3 -c \'open("/oversized","rb").read()\'',
++      );
++      expect(oversized.exitCode).toBe(1);
++      expect(oversized.stderr).toContain("[Errno 22] File too large");
++      expect(oversized.stderr).not.toMatch(/timeout/i);
++      expect(reads).not.toContain("/oversized");
++      expect(
++        await bash.exec(
++          'python3 -c \'import sys; print("é🐙"*40); print("λ🪵"*40,file=sys.stderr)\'',
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${"é🐙".repeat(40)}\n`,
++        stderr: `${"λ🪵".repeat(40)}\n`,
++      });
++      expect(await bash.exec("python3 -c 'print(38)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "38\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it("rejects a file limit below the bridge metadata capacity with its minimum configuration", async () => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxStringLength: 23, maxWorkerMessageBytes: 32768 },
++    });
++    expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires maxWorkerMessageBytes >= 4152 and maxStringLength >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++
++  it(
++    "releases descriptors after repeated oversized opens",
++    { timeout: 60000 },
++    async () => {
++      const fs = new InMemoryFs({
++        "/oversized.bin": Buffer.alloc(8194),
++        "/fits.bin": "safe",
++      });
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: { maxWorkerMessageBytes: 8193 + BRIDGE_OVERHEAD },
++      });
++      const code = `import errno
++for i in range(4100):
++    try:
++        open("/oversized.bin", "rb")
++    except OSError as error:
++        if error.errno != errno.EFBIG:
++            raise
++print(open("/fits.bin").read())`;
++      expect(await bash.exec(`python3 -c '${code}'`)).toMatchObject({
++        exitCode: 0,
++        stdout: "safe\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it(
++    "reads and hashes 49 MiB within configured budgets",
++    { timeout: 60000 },
++    async () => {
++      const content = Buffer.alloc(49 * MIB, 0x5a);
++      const expectedHash = createHash("sha256").update(content).digest("hex");
++      const fs = new InMemoryFs({ "/large.bin": content });
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxStringLength: 64 * MIB,
++          maxWorkerMessageBytes: 64 * MIB,
++          maxPythonBridgeBytes: 64 * MIB - BRIDGE_OVERHEAD,
++        },
++      });
++      const result = await bash.exec(
++        `python3 -c 'import hashlib; data=open("/large.bin", "rb").read(); print(len(data)); print(hashlib.sha256(data).hexdigest())'`,
++      );
++      expect(result).toMatchObject({
++        exitCode: 0,
++        stderr: "",
++        stdout: `${content.length}\n${expectedHash}\n`,
++      });
++      expect(await bash.exec("python3 -c 'print(37)'")).toMatchObject({
++        exitCode: 0,
++        stdout: "37\n",
++        stderr: "",
++      });
++    },
++  );
++
++  it.each([
++    [8193, 8193 + BRIDGE_OVERHEAD, 32768],
++    [4096, 32768, 4096],
++  ])(
++    "enforces a %i byte payload ceiling before reading oversized files",
++    { timeout: 60000 },
++    async (capacity, messageBytes, fileBytes) => {
++      const fs = new InMemoryFs({
++        "/fits.bin": Buffer.alloc(capacity, 0x61),
++        "/oversized.bin": Buffer.alloc(capacity + 1, 0x62),
++      });
++      const readFileBuffer = fs.readFileBuffer.bind(fs);
++      const reads: string[] = [];
++      fs.readFileBuffer = async (path) => {
++        reads.push(path);
++        return readFileBuffer(path);
++      };
++      const bash = new Bash({
++        fs,
++        python: true,
++        executionLimits: {
++          maxStringLength: fileBytes,
++          maxWorkerMessageBytes: messageBytes,
++        },
++      });
++      expect(
++        await bash.exec(
++          `python3 -c 'print(len(open("/fits.bin", "rb").read()))'`,
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${capacity}\n`,
++        stderr: "",
++      });
++      const result = await bash.exec(
++        `python3 -c 'open("/oversized.bin", "rb").read()'`,
++      );
++      expect(result.exitCode).toBe(1);
++      expect(result.stderr).toContain("[Errno 22] File too large");
++      expect(reads).not.toContain("/oversized.bin");
++      expect(
++        await bash.exec(
++          `python3 -c 'print(len(open("/fits.bin", "rb").read()))'`,
++        ),
++      ).toMatchObject({
++        exitCode: 0,
++        stdout: `${capacity}\n`,
++        stderr: "",
++      });
++    },
++  );
++  it.each([
++    0,
++    23,
++    Number.POSITIVE_INFINITY,
++  ])("rejects invalid dedicated bridge payload %s before dispatch", async (capacity) => {
++    const bash = new Bash({
++      python: true,
++      executionLimits: { maxPythonBridgeBytes: capacity },
++    });
++    expect(await bash.exec("python3 -c 'print(1)'")).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr:
++        "python3: worker bridge requires an integer maxPythonBridgeBytes >= 24\n",
++    });
++    expect(await bash.exec("printf healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy",
++      stderr: "",
++    });
++  });
++  it.each([
++    -1,
++    24.5,
++    Number.NaN,
++  ])("rejects invalid dedicated bridge configuration %s", (capacity) => {
++    expect(
++      () =>
++        new Bash({
++          python: true,
++          executionLimits: { maxPythonBridgeBytes: capacity },
++        }),
++    ).toThrow(
++      "maxPythonBridgeBytes must be a non-negative safe integer or positive Infinity",
++    );
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts
+new file mode 100644
+index 0000000..d35d113
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-context.test.ts
+@@ -0,0 +1,170 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { IFileSystem } from "../../fs/interface.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  bridgeContexts: [] as Array<string | undefined>,
++  workerContexts: [] as Array<string | undefined>,
++  getTag: () => undefined as string | undefined,
++  constructorThrows: false,
++}));
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workerContexts.push(state.getTag());
++      if (state.constructorThrows) throw new Error("owned constructor failure");
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      return 0;
++    }
++  },
++}));
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(
++      _buffer: SharedArrayBuffer,
++      private fs: IFileSystem,
++    ) {}
++    async run() {
++      await this.fs.exists("/owned-context-probe");
++      state.bridgeContexts.push(state.getTag());
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++const tags = new AsyncLocalStorage<string>();
++function context(fs = new InMemoryFs()): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: 8192 }),
++  };
++}
++function execute(tag: string, fs = new InMemoryFs()) {
++  return tags.run(tag, () =>
++    python3Command.execute(["-c", "print(1)"], context(fs)),
++  );
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  for (let index = 0; index < 10; index++) {
++    tags.run("release-host", () => {
++      for (const worker of state.workers) worker.finish();
++    });
++    await tick();
++  }
++}
++describe("queued Python async ownership", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.bridgeContexts = [];
++    state.workerContexts = [];
++    state.getTag = () => tags.getStore();
++    state.constructorThrows = false;
++  });
++  it("preserves the waiting same-filesystem request context across another owner's release", async () => {
++    const fs = new InMemoryFs();
++    const first = execute("owner-A", fs);
++    const second = execute("owner-B", fs);
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(state.workerContexts).toEqual(["owner-A", "owner-B"]);
++    expect(state.bridgeContexts).toEqual(["owner-A", "owner-B"]);
++  });
++  it("preserves a waiting independent filesystem's context when global capacity becomes available", async () => {
++    const operations = Array.from({ length: 5 }, (_, index) =>
++      execute(`owner-${index}`),
++    );
++    operations.push(execute("waiting-owner"));
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(state.workerContexts).toEqual([
++      "owner-0",
++      "owner-1",
++      "owner-2",
++      "owner-3",
++      "owner-4",
++      "waiting-owner",
++    ]);
++    expect(state.bridgeContexts).toEqual(state.workerContexts);
++  });
++  it("releases ownership after a constructor failure", async () => {
++    const fs = new InMemoryFs();
++    state.constructorThrows = true;
++    const failed = await execute("failed-owner", fs);
++    expect(failed).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: owned constructor failure\n",
++    });
++    state.constructorThrows = false;
++    const healthy = execute("healthy-owner", fs);
++    await drain();
++    expect(await healthy).toMatchObject({ exitCode: 0 });
++    expect(state.workerContexts).toEqual(["failed-owner", "healthy-owner"]);
++  });
++
++  it("releases ownership after rejecting an impossible allocation before constructing its buffer", async () => {
++    const fs = new InMemoryFs();
++    const failed = await python3Command.execute(["-c", "print(1)"], {
++      ...context(fs),
++      limits: resolveLimits({
++        maxPythonBridgeBytes: 2 ** 31,
++        maxStringLength: 2 ** 31,
++        maxWorkerMessageBytes: 2 ** 31 + 4128,
++      }),
++    });
++    expect(failed).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Invalid shared bridge payload capacity\n",
++    });
++    expect(state.workerContexts).toHaveLength(0);
++    const healthy = execute("healthy-owner", fs);
++    await drain();
++    expect(await healthy).toMatchObject({ exitCode: 0 });
++    expect(state.workerContexts).toEqual(["healthy-owner"]);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts b/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts
+new file mode 100644
+index 0000000..c128240
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.bridge-queue-boundary.test.ts
+@@ -0,0 +1,230 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { EMPTY_BYTES } from "../../encoding.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { IFileSystem } from "../../fs/interface.js";
++import { resolveLimits } from "../../limits.js";
++import type { RuntimeCommandContext } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  bridgeContexts: [] as Array<string | undefined>,
++  workerContexts: [] as Array<string | undefined>,
++  getTag: () => undefined as string | undefined,
++  constructorThrows: false,
++  allocations: [] as number[],
++  rejectedTerminationOwner: "",
++}));
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    private readonly owner = state.getTag();
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workerContexts.push(state.getTag());
++      if (state.constructorThrows) throw new Error("owned constructor failure");
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      const listeners = this.listeners.get(event) ?? [];
++      listeners.push(listener);
++      this.listeners.set(event, listeners);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (this.owner === state.rejectedTerminationOwner)
++        throw new Error("owned termination failure");
++      return 0;
++    }
++  },
++}));
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(
++      _buffer: SharedArrayBuffer,
++      private fs: IFileSystem,
++    ) {}
++    async run() {
++      await this.fs.exists("/owned-context-probe");
++      state.bridgeContexts.push(state.getTag());
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++import { _resetExecutionQueue, python3Command } from "./python3.js";
++
++const tags = new AsyncLocalStorage<string>();
++function context(fs = new InMemoryFs()): RuntimeCommandContext {
++  return {
++    fs,
++    cwd: "/home/user",
++    env: new Map(),
++    stdin: EMPTY_BYTES,
++    limits: resolveLimits({ maxWorkerMessageBytes: 8192 }),
++  };
++}
++function execute(tag: string, fs = new InMemoryFs()) {
++  return tags.run(tag, () =>
++    python3Command.execute(["-c", "print(1)"], context(fs)),
++  );
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  for (let index = 0; index < 10; index++) {
++    tags.run("release-host", () => {
++      for (const worker of state.workers) worker.finish();
++    });
++    await tick();
++  }
++}
++describe("Python queue capacity boundary", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.bridgeContexts = [];
++    state.workerContexts = [];
++    state.allocations = [];
++    state.getTag = () => tags.getStore();
++    state.constructorThrows = false;
++    state.rejectedTerminationOwner = "";
++  });
++  it("rejects the 101st waiter but dispatches an eligible filesystem past the full blocked queue", async () => {
++    const fs = new InMemoryFs();
++    const first = execute("active", fs);
++    const aborts = Array.from({ length: 100 }, () => new AbortController());
++    const waiting = aborts.map((abort) =>
++      python3Command.execute(["-c", "print(1)"], {
++        ...context(fs),
++        signal: abort.signal,
++      }),
++    );
++    const refused = await execute("refused", fs);
++    const independent = execute("independent");
++    await tick();
++    const beforeRelease = [...state.allocations];
++    for (const abort of aborts) abort.abort();
++    await drain();
++    expect(refused).toMatchObject({
++      exitCode: 1,
++      stdout: "",
++      stderr: "python3: Python execution queue is full\n",
++    });
++    expect(
++      (await Promise.all(waiting)).every((result) => result.exitCode === 124),
++    ).toBe(true);
++    expect(
++      (await Promise.all([first, independent])).map(
++        (result) => result.exitCode,
++      ),
++    ).toEqual([0, 0]);
++    expect(beforeRelease).toEqual([8192, 8192]);
++    expect(state.allocations).toEqual([8192, 8192]);
++    expect(state.workers).toHaveLength(2);
++  });
++  it("never allocates or starts a worker for a pre-aborted request", async () => {
++    const abort = new AbortController();
++    abort.abort();
++    expect(
++      await python3Command.execute(["-c", "print(1)"], {
++        ...context(),
++        signal: abort.signal,
++      }),
++    ).toMatchObject({
++      exitCode: 124,
++      stdout: "",
++      stderr: "python3: Execution aborted\n",
++    });
++    expect(state.allocations).toHaveLength(0);
++    expect(state.workers).toHaveLength(0);
++  });
++
++  it("retains a global reservation after worker termination is unacknowledged", async () => {
++    state.rejectedTerminationOwner = "lost-owner";
++    const lost = execute("lost-owner");
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    expect(await lost).toMatchObject({ exitCode: 0 });
++    const operations = Array.from({ length: 5 }, (_, index) =>
++      execute(`replacement-${index}`),
++    );
++    await tick();
++    const beforeRelease = state.allocations.length;
++    await drain();
++    expect(
++      (await Promise.all(operations)).every((result) => result.exitCode === 0),
++    ).toBe(true);
++    expect(beforeRelease).toBe(5);
++    expect(state.workerContexts.slice(1, 5)).toEqual([
++      "replacement-0",
++      "replacement-1",
++      "replacement-2",
++      "replacement-3",
++    ]);
++    expect(state.allocations).toHaveLength(6);
++  });
++
++  it("poisons pending and future requests before a failed worker's bridge finishes", async () => {
++    state.rejectedTerminationOwner = "lost-owner";
++    let release = () => {};
++    const pendingOperation = new Promise<boolean>((resolve) => {
++      release = () => resolve(false);
++    });
++    const fs = new InMemoryFs();
++    fs.exists = () => pendingOperation;
++    const lost = execute("lost-owner", fs);
++    const waiting = execute("waiting-owner", fs);
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const queued = await waiting;
++    const future = await execute("future-owner", fs);
++    release();
++    await drain();
++    expect(await lost).toMatchObject({ exitCode: 0 });
++    expect(queued).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(future).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(state.allocations).toEqual([8192]);
++    expect(state.workers).toHaveLength(1);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts b/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts
+new file mode 100644
+index 0000000..7742f9a
+--- /dev/null
++++ b/packages/just-bash/src/commands/python3/python3.filesystem-identity.test.ts
+@@ -0,0 +1,261 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { Bash } from "../../Bash.js";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import type { ExecResult } from "../../types.js";
++
++const state = vi.hoisted(() => ({
++  workers: [] as Array<{ finish(): void }>,
++  allocations: [] as number[],
++  filesystems: [] as object[],
++  holdTermination: false,
++  holdBridge: false,
++  rejectFirstTermination: false,
++  terminationReleases: [] as Array<() => void>,
++  bridgeReleases: [] as Array<() => void>,
++}));
++
++vi.mock("node:worker_threads", () => ({
++  Worker: class {
++    private listeners = new Map<string, Array<(value: unknown) => void>>();
++    private id = state.workers.length;
++    constructor(
++      _path: string,
++      options: { workerData: { protocolToken: string } },
++    ) {
++      state.workers.push({
++        finish: () => {
++          for (const listener of this.listeners.get("message") ?? [])
++            listener({
++              protocolToken: options.workerData.protocolToken,
++              success: true,
++            });
++        },
++      });
++    }
++    on(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(event, [
++        ...(this.listeners.get(event) ?? []),
++        listener,
++      ]);
++      return this;
++    }
++    removeListener(event: string, listener: (value: unknown) => void): this {
++      this.listeners.set(
++        event,
++        (this.listeners.get(event) ?? []).filter((value) => value !== listener),
++      );
++      return this;
++    }
++    async terminate(): Promise<number> {
++      if (state.rejectFirstTermination && this.id === 0)
++        throw new Error("owned termination refusal");
++      if (state.holdTermination)
++        await new Promise<void>((resolve) =>
++          state.terminationReleases.push(resolve),
++        );
++      return 0;
++    }
++  },
++}));
++
++vi.mock("../worker-bridge/protocol.js", async (original) => {
++  const protocol =
++    await original<typeof import("../worker-bridge/protocol.js")>();
++  return {
++    ...protocol,
++    createSharedBuffer: (bytes: number) => {
++      const buffer = protocol.createSharedBuffer(bytes);
++      state.allocations.push(buffer.byteLength);
++      return buffer;
++    },
++  };
++});
++
++vi.mock("../worker-bridge/bridge-handler.js", () => ({
++  BridgeHandler: class {
++    constructor(_buffer: SharedArrayBuffer, fs: object) {
++      state.filesystems.push(fs);
++    }
++    async run() {
++      if (state.holdBridge)
++        await new Promise<void>((resolve) =>
++          state.bridgeReleases.push(resolve),
++        );
++      return { stdout: "", stderr: "", exitCode: 0 };
++    }
++    stop() {}
++  },
++}));
++
++import { _resetExecutionQueue } from "./python3.js";
++
++const command = "python3 -c 'print(1)'";
++const operations: Promise<ExecResult>[] = [];
++function execute(bash: Bash, script = command) {
++  const operation = bash.exec(script);
++  operations.push(operation);
++  return operation;
++}
++function shell(fs = new InMemoryFs(), defenseInDepth = false) {
++  return new Bash({
++    fs,
++    python: true,
++    defenseInDepth,
++    executionLimits: { maxWorkerMessageBytes: 8192 },
++  });
++}
++async function tick() {
++  await new Promise((resolve) => setTimeout(resolve, 0));
++}
++async function drain() {
++  state.holdTermination = false;
++  state.holdBridge = false;
++  state.rejectFirstTermination = false;
++  for (let index = 0; index < 8; index++) {
++    for (const release of state.terminationReleases.splice(0)) release();
++    for (const release of state.bridgeReleases.splice(0)) release();
++    for (const worker of state.workers) worker.finish();
++    await tick();
++  }
++}
++
++describe("Python stable filesystem admission through Bash", () => {
++  beforeEach(() => {
++    _resetExecutionQueue();
++    state.workers = [];
++    state.allocations = [];
++    state.filesystems = [];
++    state.holdTermination = false;
++    state.holdBridge = false;
++    state.rejectFirstTermination = false;
++    state.terminationReleases = [];
++    state.bridgeReleases = [];
++  });
++  afterEach(async () => {
++    try {
++      await drain();
++    } finally {
++      await Promise.allSettled(operations.splice(0));
++    }
++  });
++
++  it.each([
++    false,
++    true,
++  ])("serializes two fresh command wrappers for the same filesystem (defense %s)", async (defense) => {
++    const fs = new InMemoryFs();
++    const operations = [
++      execute(shell(fs, defense)),
++      execute(shell(fs, defense)),
++    ];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toEqual({ workers: 1, buffers: 1, bytes: 8192 });
++    expect(state.workers).toHaveLength(2);
++    expect(Object.is(state.filesystems[0], state.filesystems[1])).toBe(false);
++  });
++
++  it("keeps two independent filesystem commands concurrent", async () => {
++    const requests = [execute(shell()), execute(shell())];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(requests)).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++  });
++
++  it("admits another filesystem past the blocked same-filesystem invocation", async () => {
++    const fs = new InMemoryFs();
++    const operations = [
++      execute(shell(fs)),
++      execute(shell(fs)),
++      execute(shell()),
++    ];
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(
++      (await Promise.all(operations)).map((result) => result.exitCode),
++    ).toEqual([0, 0, 0]);
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++    expect(state.workers).toHaveLength(3);
++  });
++
++  it("holds ownership across sequential commands until termination acknowledges", async () => {
++    state.holdTermination = true;
++    const operation = execute(shell(), `${command}; ${command}`);
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const before = state.workers.length;
++    await drain();
++    expect(await operation).toMatchObject({ exitCode: 0 });
++    expect(before).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it("holds ownership while a prior bridge is still settling", async () => {
++    state.holdBridge = true;
++    const fs = new InMemoryFs();
++    const first = execute(shell(fs));
++    await tick();
++    state.workers[0]?.finish();
++    await tick();
++    const second = execute(shell(fs));
++    await tick();
++    const before = state.workers.length;
++    await drain();
++    expect(
++      (await Promise.all([first, second])).map((result) => result.exitCode),
++    ).toEqual([0, 0]);
++    expect(before).toBe(1);
++    expect(state.workers).toHaveLength(2);
++  });
++
++  it.each([
++    false,
++    true,
++  ])("retains poison across fresh wrappers without blocking another filesystem (defense %s)", async (defense) => {
++    const fs = new InMemoryFs();
++    state.rejectFirstTermination = true;
++    const first = execute(shell(fs, defense));
++    await tick();
++    state.workers[0]?.finish();
++    expect(await first).toMatchObject({ exitCode: 0 });
++    await tick();
++    const later = execute(shell(fs, defense));
++    const other = execute(shell(new InMemoryFs(), defense));
++    await tick();
++    const before = {
++      workers: state.workers.length,
++      buffers: state.allocations.length,
++      bytes: state.allocations.reduce((sum, bytes) => sum + bytes, 0),
++    };
++    await drain();
++    expect(await later).toMatchObject({
++      exitCode: 1,
++      stderr: "python3: Worker termination was not acknowledged\n",
++    });
++    expect(await other).toMatchObject({ exitCode: 0 });
++    expect(before).toEqual({ workers: 2, buffers: 2, bytes: 16384 });
++    expect(state.workers).toHaveLength(2);
++  });
++});
+diff --git a/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts b/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
+index 21376a7..d51cf3a 100644
+--- a/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.queue-timeout-exploit.test.ts
+@@ -113,6 +113,8 @@ vi.mock("../worker-bridge/bridge-handler.js", () => {
+ 
+ vi.mock("../worker-bridge/protocol.js", () => {
+   return {
++    SHARED_BUFFER_OVERHEAD: 4128,
++    getMinimumSharedBufferPayloadBytes: () => 24,
+     createSharedBuffer: () => new _SAB(4096),
+   };
+ });
+diff --git a/packages/just-bash/src/commands/python3/python3.security.test.ts b/packages/just-bash/src/commands/python3/python3.security.test.ts
+index 85952f6..6f16059 100644
+--- a/packages/just-bash/src/commands/python3/python3.security.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.security.test.ts
+@@ -119,7 +119,7 @@ describe("python3 security", () => {
+       );
+ 
+       expect(result.stdout).toBe("");
+-      expect(result.stderr).toContain("[Errno 27]");
++      expect(result.stderr).toContain("[Errno 22]");
+       expect(result.exitCode).toBe(1);
+       const bytes = await env.fs.readFileBuffer("/tmp/truncated.bin");
+       expect(bytes.byteLength).toBeLessThanOrEqual(128);
+diff --git a/packages/just-bash/src/commands/python3/python3.ts b/packages/just-bash/src/commands/python3/python3.ts
+index bce387e..66e4811 100644
+--- a/packages/just-bash/src/commands/python3/python3.ts
++++ b/packages/just-bash/src/commands/python3/python3.ts
+@@ -10,10 +10,10 @@
+  * This command is Node.js only (uses worker_threads).
+  */
+ 
++import { AsyncLocalStorage } from "node:async_hooks";
+ import { fileURLToPath } from "node:url";
+ import { Worker } from "node:worker_threads";
+ import { decodeBytesToUtf8, latin1FromBytes } from "../../encoding.js";
+-import type { IFileSystem } from "../../fs/interface.js";
+ import {
+   sanitizeErrorMessage,
+   sanitizeHostErrorMessage,
+@@ -29,8 +29,15 @@ import type {
+   RuntimeCommandContext,
+ } from "../../types.js";
+ import { hasHelpFlag, showHelp } from "../help.js";
+-import { BridgeHandler } from "../worker-bridge/bridge-handler.js";
+-import { createSharedBuffer } from "../worker-bridge/protocol.js";
++import {
++  BridgeHandler,
++  type BridgeOutput,
++} from "../worker-bridge/bridge-handler.js";
++import {
++  createSharedBuffer,
++  getMinimumSharedBufferPayloadBytes,
++  SHARED_BUFFER_OVERHEAD,
++} from "../worker-bridge/protocol.js";
+ import { WorkerRequestController } from "../worker-request-controller.js";
+ import type { WorkerInput, WorkerOutput } from "./worker.js";
+ 
+@@ -156,11 +163,12 @@ function parseArgs(args: string[]): ParsedArgs | ExecResult {
+   return result;
+ }
+ 
+-// Queue for serializing Python executions (one at a time)
+ type QueuedExecution = {
+-  /** Unforgeable ownership marker for this queue slot. */
+   executionId: symbol;
+-  input: WorkerInput;
++  start: () => void;
++  queueState: QueueState;
++  initializeInput: () => WorkerInput;
++  bridgeSettled: () => Promise<BridgeOutput>;
+   settle: (result: WorkerOutput) => void;
+   requireDefenseContext?: boolean;
+   state: "queued" | "running" | "terminating" | "settled";
+@@ -170,28 +178,39 @@ type QueuedExecution = {
+   cancel: (result: WorkerOutput) => void;
+ };
+ type QueueState = {
+-  executionQueue: QueuedExecution[];
+   activeExecution: QueuedExecution | null;
+   poisonedError: string | null;
+ };
+-let executionQueues = new WeakMap<IFileSystem, QueueState>();
++type ExecutionDispatcher = {
++  queues: WeakMap<object, QueueState>;
++  pending: QueuedExecution[];
++  activeCount: number;
++  dispatching: boolean;
++};
++function createDispatcher(): ExecutionDispatcher {
++  return {
++    queues: new WeakMap(),
++    pending: [],
++    activeCount: 0,
++    dispatching: false,
++  };
++}
++let executionDispatcher = createDispatcher();
+ 
+-function getQueueState(fs: IFileSystem): QueueState {
+-  let state = executionQueues.get(fs);
++function getQueueState(
++  dispatcher: ExecutionDispatcher,
++  fsIdentity: object,
++): QueueState {
++  let state = dispatcher.queues.get(fsIdentity);
+   if (!state) {
+-    state = {
+-      executionQueue: [],
+-      activeExecution: null,
+-      poisonedError: null,
+-    };
+-    executionQueues.set(fs, state);
++    state = { activeExecution: null, poisonedError: null };
++    dispatcher.queues.set(fsIdentity, state);
+   }
+   return state;
+ }
+ 
+-/** @internal Reset queue state — for tests only */
+ export function _resetExecutionQueue(): void {
+-  executionQueues = new WeakMap();
++  executionDispatcher = createDispatcher();
+ }
+ 
+ const workerPath = fileURLToPath(new URL("./worker.js", import.meta.url));
+@@ -254,62 +273,63 @@ function normalizeWorkerMessage(
+   };
+ }
+ 
+-function processNextExecution(queueState: QueueState): void {
+-  if (queueState.poisonedError !== null) {
+-    for (const queued of queueState.executionQueue.splice(0)) {
+-      if (queued.state !== "queued") continue;
+-      queued.state = "settled";
+-      queued.stopBridge();
+-      queued.settle({ success: false, error: queueState.poisonedError });
++function processNextExecution(dispatcher: ExecutionDispatcher): void {
++  if (dispatcher.dispatching) return;
++  dispatcher.dispatching = true;
++  try {
++    for (let index = dispatcher.pending.length - 1; index >= 0; index--) {
++      const entry = dispatcher.pending[index];
++      if (entry.queueState.poisonedError === null) continue;
++      dispatcher.pending.splice(index, 1);
++      entry.state = "settled";
++      entry.settle({ success: false, error: entry.queueState.poisonedError });
+     }
+-    return;
+-  }
+-  if (
+-    queueState.activeExecution !== null ||
+-    queueState.executionQueue.length === 0
+-  ) {
+-    return;
+-  }
+-
+-  // Settled entries timed out while queued and must never be dispatched.
+-  while (
+-    queueState.executionQueue.length > 0 &&
+-    queueState.executionQueue[0]?.state !== "queued"
+-  ) {
+-    queueState.executionQueue.shift();
+-  }
+-  if (queueState.executionQueue.length === 0) {
+-    return;
++    while (dispatcher.activeCount < 5) {
++      const index = dispatcher.pending.findIndex(
++        (entry) => entry.queueState.activeExecution === null,
++      );
++      if (index === -1) break;
++      const [next] = dispatcher.pending.splice(index, 1);
++      next.start();
++    }
++  } finally {
++    dispatcher.dispatching = false;
+   }
++}
+ 
+-  const next = queueState.executionQueue.shift();
+-  if (!next) {
++function startExecution(
++  dispatcher: ExecutionDispatcher,
++  next: QueuedExecution,
++): void {
++  const queueState = next.queueState;
++  if (next.controller.remainingTimeMs() <= 0) {
++    next.cancel({ success: false, error: next.controller.timeoutMessage() });
+     return;
+   }
++  dispatcher.activeCount++;
+   next.state = "running";
+   queueState.activeExecution = next;
+ 
+-  // Create a fresh worker for each execution.
+   // CPython Emscripten uses EXIT_RUNTIME, so the module can only run once.
+-  // The worker caches the stdlib zip at module scope (read from disk once
+-  // per worker lifetime, not per execution).
+   let worker: Worker;
+   try {
++    const input = next.initializeInput();
+     worker = DefenseInDepthBox.runTrusted(
+       // @banned-pattern-ignore: constructor is immediately owned by next.controller lifecycle
+-      () => new Worker(workerPath, { workerData: next.input }),
++      () => new Worker(workerPath, { workerData: input }),
+     );
+   } catch (err) {
+     const message = err instanceof Error ? err.message : String(err);
+-    next.state = "settled";
+-    next.settle({
+-      success: false,
+-      error: sanitizeHostErrorMessage(message),
+-    });
+-    if (queueState.activeExecution === next) {
+-      queueState.activeExecution = null;
+-      processNextExecution(queueState);
+-    }
++    next.stopBridge();
++    void (async () => {
++      await next.bridgeSettled();
++      next.state = "settled";
++      next.settle({ success: false, error: sanitizeHostErrorMessage(message) });
++      dispatcher.activeCount--;
++      if (queueState.activeExecution === next)
++        queueState.activeExecution = null;
++      processNextExecution(dispatcher);
++    })();
+     return;
+   }
+ 
+@@ -328,8 +348,6 @@ function processNextExecution(queueState: QueueState): void {
+     result: WorkerOutput,
+     terminateWorker: boolean,
+   ): Promise<void> => {
+-    // Every callback closes over its own entry. Checking both identity and state
+-    // prevents a stale event from releasing a newer queue owner.
+     if (
+       queueState.activeExecution?.executionId !== next.executionId ||
+       next.state !== "running"
+@@ -339,28 +357,32 @@ function processNextExecution(queueState: QueueState): void {
+ 
+     next.state = "terminating";
+     cleanupListeners();
++    next.stopBridge();
+     next.settle(result);
+ 
+     if (terminateWorker) {
+       const acknowledged = await next.controller.terminate(worker);
+       if (!acknowledged) {
+         const error = "Worker termination was not acknowledged";
+-        next.worker = null;
+-        next.state = "settled";
+         queueState.poisonedError = error;
++        processNextExecution(dispatcher);
++        await next.bridgeSettled();
++        next.state = "settled";
+         if (queueState.activeExecution?.executionId === next.executionId) {
+           queueState.activeExecution = null;
+         }
+-        processNextExecution(queueState);
++        processNextExecution(dispatcher);
+         return;
+       }
+     }
+ 
++    await next.bridgeSettled();
+     next.worker = null;
+     next.state = "settled";
++    dispatcher.activeCount--;
+     if (queueState.activeExecution?.executionId === next.executionId) {
+       queueState.activeExecution = null;
+-      processNextExecution(queueState);
++      processNextExecution(dispatcher);
+     }
+   };
+ 
+@@ -386,7 +408,7 @@ function processNextExecution(queueState: QueueState): void {
+         return;
+       }
+       void settleActiveExecution(
+-        normalizeWorkerMessage(msg, next.input.protocolToken),
++        normalizeWorkerMessage(msg, next.controller.protocolToken),
+         true,
+       );
+     },
+@@ -478,18 +500,36 @@ async function executePython(
+   scriptPath?: string,
+   scriptArgs: string[] = [],
+ ): Promise<ExecResult> {
+-  const sharedBuffer = createSharedBuffer();
+-  const bridgeHandler = new BridgeHandler(
+-    sharedBuffer,
+-    ctx.fs,
+-    ctx.cwd,
+-    "python3",
+-    ctx.fetch,
+-    ctx.limits.maxOutputSize,
++  const minimumPayloadBytes = getMinimumSharedBufferPayloadBytes();
++  const minimumMessageBytes = SHARED_BUFFER_OVERHEAD + minimumPayloadBytes;
++  if (
++    ctx.limits.maxWorkerMessageBytes < minimumMessageBytes ||
++    ctx.limits.maxStringLength < minimumPayloadBytes
++  ) {
++    return {
++      stdout: "",
++      stderr: `python3: worker bridge requires maxWorkerMessageBytes >= ${minimumMessageBytes} and maxStringLength >= ${minimumPayloadBytes}\n`,
++      exitCode: 1,
++    };
++  }
++  if (
++    !Number.isSafeInteger(ctx.limits.maxPythonBridgeBytes) ||
++    ctx.limits.maxPythonBridgeBytes < minimumPayloadBytes
++  ) {
++    return {
++      stdout: "",
++      stderr: `python3: worker bridge requires an integer maxPythonBridgeBytes >= ${minimumPayloadBytes}\n`,
++      exitCode: 1,
++    };
++  }
++  const maxFileSize = Math.min(
++    ctx.limits.maxPythonBridgeBytes,
++    ctx.limits.maxStringLength,
++    ctx.limits.maxWorkerMessageBytes - SHARED_BUFFER_OVERHEAD,
+   );
+-
+   const timeoutMs = ctx.limits.maxPythonTimeoutMs;
+-  const queueState = getQueueState(ctx.fs);
++  const dispatcher = executionDispatcher;
++  const queueState = getQueueState(dispatcher, ctx.fsIdentity ?? ctx.fs);
+   if (queueState.poisonedError !== null) {
+     return {
+       stdout: "",
+@@ -505,9 +545,8 @@ async function executePython(
+     maxMessageBytes: ctx.limits.maxWorkerMessageBytes,
+   });
+ 
+-  const workerInput: WorkerInput = {
++  const workerRequest: Omit<WorkerInput, "sharedBuffer"> = {
+     protocolToken: controller.protocolToken,
+-    sharedBuffer,
+     pythonCode,
+     stdin,
+     cwd: ctx.cwd,
+@@ -517,22 +556,61 @@ async function executePython(
+     args: scriptArgs,
+     scriptPath,
+     timeoutMs,
+-    maxFileSize: ctx.limits.maxStringLength,
++    maxFileSize,
+   };
+ 
+-  controller.assertMessageSize(
+-    { ...workerInput, sharedBuffer: undefined },
+-    "request",
+-  );
++  controller.assertMessageSize(workerRequest, "request");
++
++  let bridgeHandler: BridgeHandler | undefined;
++  let bridgeStarted = false;
++  let resolveBridge: (output: BridgeOutput) => void = () => {};
++  const bridgePromise = new Promise<BridgeOutput>((resolve) => {
++    resolveBridge = resolve;
++  });
+ 
+   const workerPromise = new Promise<WorkerOutput>((resolve) => {
+     let settled = false;
++    const runInContext = AsyncLocalStorage.snapshot();
+     const queueEntry: QueuedExecution = {
+       executionId: Symbol("python3 execution"),
+-      input: workerInput,
++      start: () => runInContext(startExecution, dispatcher, queueEntry),
++      queueState,
++      initializeInput: () => {
++        const sharedBuffer = createSharedBuffer(maxFileSize);
++        bridgeHandler = new BridgeHandler(
++          sharedBuffer,
++          ctx.fs,
++          ctx.cwd,
++          "python3",
++          ctx.fetch,
++          ctx.limits.maxOutputSize,
++        );
++        bridgeStarted = true;
++        void (async () => {
++          try {
++            resolveBridge(
++              await bridgeHandler.run(controller.remainingTimeMs()),
++            );
++          } catch (error) {
++            resolveBridge({
++              stdout: "",
++              stderr: `python3: bridge error: ${sanitizeHostErrorMessage(getErrorMessage(error))}\n`,
++              exitCode: 1,
++            });
++          }
++        })();
++        return { ...workerRequest, sharedBuffer };
++      },
++      bridgeSettled: async () => {
++        if (!bridgeStarted)
++          resolveBridge({ stdout: "", stderr: "", exitCode: 0 });
++        return await bridgePromise;
++      },
+       settle: (result) => {
+         if (settled) return;
+         settled = true;
++        if (!bridgeStarted)
++          resolveBridge({ stdout: "", stderr: "", exitCode: 0 });
+         controller.close();
+         resolve(result);
+       },
+@@ -540,19 +618,19 @@ async function executePython(
+       state: "queued",
+       worker: null,
+       controller,
+-      stopBridge: () => bridgeHandler.stop?.(),
+-      cancel: () => {}, // Replaced if and when this entry owns a worker.
++      stopBridge: () => bridgeHandler?.stop?.(),
++      cancel: () => {},
+     };
+ 
+     queueEntry.cancel = (result) => {
+       if (queueEntry.state !== "queued") return;
+       queueEntry.state = "settled";
+-      const queuedIndex = queueState.executionQueue.indexOf(queueEntry);
++      const queuedIndex = dispatcher.pending.indexOf(queueEntry);
+       if (queuedIndex !== -1) {
+-        queueState.executionQueue.splice(queuedIndex, 1);
++        dispatcher.pending.splice(queuedIndex, 1);
+       }
+       queueEntry.settle(result);
+-      processNextExecution(queueState);
++      processNextExecution(dispatcher);
+     };
+ 
+     const onCancel = bindDefenseContextCallback(
+@@ -560,7 +638,7 @@ async function executePython(
+       "python3",
+       "worker cancellation callback",
+       (reason: "abort" | "timeout") => {
+-        bridgeHandler.stop?.();
++        bridgeHandler?.stop?.();
+         queueEntry.cancel({
+           success: false,
+           error:
+@@ -583,25 +661,27 @@ async function executePython(
+       }
+     };
+ 
+-    // Arm the parent signal and deadline before making this request visible.
+     controller.arm(dispatchCancel);
+ 
+     if (!controller.isCanceled) {
+-      // Queue the execution (serialized — one at a time per filesystem).
+-      queueState.executionQueue.push(queueEntry);
+-      processNextExecution(queueState);
++      if (
++        dispatcher.pending.length >= 100 &&
++        (queueState.activeExecution !== null || dispatcher.activeCount >= 5)
++      ) {
++        queueEntry.state = "settled";
++        queueEntry.settle({
++          success: false,
++          error: "Python execution queue is full",
++        });
++      } else {
++        dispatcher.pending.push(queueEntry);
++        processNextExecution(dispatcher);
++      }
+     }
+   });
+ 
+   const [bridgeOutput, workerResult] = await Promise.all([
+-    bridgeHandler.run(timeoutMs).catch((e) => {
+-      const bridgeError = sanitizeHostErrorMessage(getErrorMessage(e));
+-      return {
+-        stdout: "",
+-        stderr: `python3: bridge error: ${bridgeError}\n`,
+-        exitCode: 1,
+-      };
+-    }),
++    bridgePromise,
+     workerPromise.catch((e) => {
+       const workerError = sanitizeHostErrorMessage(getErrorMessage(e));
+       return {
+diff --git a/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts b/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
+index 961892c..264ec94 100644
+--- a/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
++++ b/packages/just-bash/src/commands/python3/python3.worker-protocol-abuse.test.ts
+@@ -92,6 +92,8 @@ vi.mock("../worker-bridge/bridge-handler.js", () => {
+ 
+ vi.mock("../worker-bridge/protocol.js", () => {
+   return {
++    SHARED_BUFFER_OVERHEAD: 4128,
++    getMinimumSharedBufferPayloadBytes: () => 24,
+     createSharedBuffer: () => new _SAB(4096),
+   };
+ });
+diff --git a/packages/just-bash/src/commands/python3/worker.ts b/packages/just-bash/src/commands/python3/worker.ts
+index 18b1ecb..6f84a92 100644
+--- a/packages/just-bash/src/commands/python3/worker.ts
++++ b/packages/just-bash/src/commands/python3/worker.ts
+@@ -193,6 +193,7 @@ interface EmscriptenNode {
+ }
+ 
+ interface EmscriptenStream {
++  fd: number;
+   node: EmscriptenNode;
+   flags: number;
+   position: number;
+@@ -268,6 +269,7 @@ interface EmscriptenStat {
+ }
+ 
+ interface EmscriptenFS {
++  closeStream: (fd: number) => void;
+   isDir: (mode: number) => boolean;
+   isFile: (mode: number) => boolean;
+   isLink: (mode: number) => boolean;
+@@ -329,7 +331,7 @@ function createHOSTFS(
+       ENOTDIR: 54,
+       EISDIR: 31,
+       EINVAL: 28,
+-      EFBIG: 27,
++      EFBIG: 22,
+       EMFILE: 33,
+       ENOSPC: 51,
+       ESPIPE: 70,
+@@ -457,6 +459,11 @@ function createHOSTFS(
+             attr.size < 0 ||
+             attr.size > maxFileSize
+           ) {
++            if (Number.isSafeInteger(attr.size) && attr.size >= 0) {
++              tryFSOperation(() =>
++                backend.assertFileAccess(path, attr.size as number, "write"),
++              );
++            }
+             throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+           }
+           tryFSOperation(() => {
+@@ -550,17 +557,31 @@ function createHOSTFS(
+           if (isTruncate && isWrite) {
+             content = new Uint8Array(0);
+           } else {
++            const stat = backend.stat(path);
++            if (stat.size > maxFileSize) {
++              backend.assertFileAccess(path, stat.size, "read");
++              throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
++            }
+             content = backend.readFile(path);
+           }
+-        } catch (_e) {
++        } catch (error) {
++          if (error instanceof FS.ErrnoError) {
++            FS.closeStream(stream.fd);
++            throw error;
++          }
+           if (isCreate && isWrite) {
+             content = new Uint8Array(0);
+           } else {
++            FS.closeStream(stream.fd);
+             throw new FS.ErrnoError(ERRNO_CODES.ENOENT);
+           }
+         }
+ 
+         if (content.length > maxFileSize) {
++          FS.closeStream(stream.fd);
++          tryFSOperation(() =>
++            backend.assertFileAccess(path, content.length, "read"),
++          );
+           throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+         }
+ 
+@@ -616,11 +637,20 @@ function createHOSTFS(
+           position < 0 ||
+           length < 0 ||
+           offset < 0 ||
+-          length > buffer.length - offset ||
+-          position > maxFileSize - length
++          length > buffer.length - offset
+         ) {
+           throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
+         }
++        if (position > maxFileSize - length) {
++          tryFSOperation(() =>
++            backend.assertFileAccess(
++              stream.hostPath ?? realPath(stream.node),
++              position + length,
++              "write",
++            ),
++          );
++          throw new FS.ErrnoError(ERRNO_CODES.EFBIG);
++        }
+         let content = stream.hostContent || new Uint8Array(0);
+         const newSize = Math.max(content.length, position + length);
+ 
+diff --git a/packages/just-bash/src/commands/registry.ts b/packages/just-bash/src/commands/registry.ts
+index b0b8677..a84d888 100644
+--- a/packages/just-bash/src/commands/registry.ts
++++ b/packages/just-bash/src/commands/registry.ts
+@@ -596,7 +596,7 @@ function createLazyCommand(def: LazyCommandDef): RuntimeCommand {
+         emitFlagCoverage(ctx.coverage, def.name, args);
+       }
+ 
+-      return cmd.execute(args, ctx);
++      return await cmd.execute(args, ctx);
+     },
+   };
+ }
+diff --git a/packages/just-bash/src/commands/sed/executor.ts b/packages/just-bash/src/commands/sed/executor.ts
+index 29d9331..5783f73 100644
+--- a/packages/just-bash/src/commands/sed/executor.ts
++++ b/packages/just-bash/src/commands/sed/executor.ts
+@@ -2,6 +2,7 @@
+ 
+ import { ExecutionLimitError } from "../../interpreter/errors.js";
+ import { createUserRegex } from "../../regex/index.js";
++import { createStringBuilder } from "../../utils/string-builder.js";
+ import { breToEre, escapeForList, normalizeForJs } from "./sed-regex.js";
+ import type {
+   AddressRange,
+@@ -339,7 +340,7 @@ function globalReplace(
+   _replacement: string,
+   replaceFn: (match: string, groups: string[]) => string,
+ ): string {
+-  let result = "";
++  const result = createStringBuilder();
+   let pos = 0;
+   let skipZeroLengthAtNextPos = false;
+ 
+@@ -352,17 +353,16 @@ function globalReplace(
+     // No match found at or after current position
+     if (!match) {
+       // Output remaining characters
+-      result += input.slice(pos);
++      result.append(input.slice(pos));
+       break;
+     }
+ 
+     // Match found, but not at current position
+     if (match.index !== pos) {
+       // Output characters up to the match
+-      result += input.slice(pos, match.index);
++      result.append(input.slice(pos, match.index));
+       pos = match.index;
+       skipZeroLengthAtNextPos = false;
+-      continue;
+     }
+ 
+     // Match found at current position
+@@ -373,7 +373,7 @@ function globalReplace(
+     if (skipZeroLengthAtNextPos && matchedText.length === 0) {
+       // Skip this zero-length match, output the character, advance
+       if (pos < input.length) {
+-        result += input[pos];
++        result.append(input[pos]);
+         pos++;
+       } else {
+         break;
+@@ -383,13 +383,13 @@ function globalReplace(
+     }
+ 
+     // Apply replacement
+-    result += replaceFn(matchedText, groups);
++    result.append(replaceFn(matchedText, groups));
+     skipZeroLengthAtNextPos = false;
+ 
+     if (matchedText.length === 0) {
+       // Zero-length match: advance by 1 char, output that char
+       if (pos < input.length) {
+-        result += input[pos];
++        result.append(input[pos]);
+         pos++;
+       } else {
+         break; // At end of string
+@@ -402,7 +402,7 @@ function globalReplace(
+     }
+   }
+ 
+-  return result;
++  return result.finish();
+ }
+ 
+ function processReplacement(
+@@ -573,13 +573,9 @@ function executeCommand(
+             );
+           } else if (subCmd.global) {
+             // Use custom global replace for POSIX-compliant zero-length match handling
+-            const globalRegex = createUserRegex(
+-              pattern,
+-              `g${subCmd.ignoreCase ? "i" : ""}`,
+-            );
+             state.patternSpace = globalReplace(
+               state.patternSpace,
+-              globalRegex,
++              regex,
+               subCmd.replacement,
+               (match, groups) =>
+                 processReplacement(subCmd.replacement, match, groups),
+diff --git a/packages/just-bash/src/commands/sed/sed.limits.test.ts b/packages/just-bash/src/commands/sed/sed.limits.test.ts
+index 61beb5a..3c6e385 100644
+--- a/packages/just-bash/src/commands/sed/sed.limits.test.ts
++++ b/packages/just-bash/src/commands/sed/sed.limits.test.ts
+@@ -51,9 +51,9 @@ describe("SED Execution Limits", () => {
+ 
+       const result = await env.exec(`sed 's/a/b/g' /input.txt`);
+ 
+-      // Should complete without hanging
+       expect(result.exitCode).toBe(0);
+-      expect(result.stdout.length).toBeGreaterThan(0);
++      expect(result.stdout).toBe("b".repeat(longLine.length));
++      expect(result.stderr).toBe("");
+     });
+ 
+     it("should handle backreference expansion limits", async () => {
+diff --git a/packages/just-bash/src/commands/tr/tr.ts b/packages/just-bash/src/commands/tr/tr.ts
+index 7ee659a..36764e7 100644
+--- a/packages/just-bash/src/commands/tr/tr.ts
++++ b/packages/just-bash/src/commands/tr/tr.ts
+@@ -1,8 +1,4 @@
+-import {
+-  decodeBytesToUtf8,
+-  latin1FromBytes,
+-  utf8ByteLength,
+-} from "../../encoding.js";
++import { decodeBytesToUtf8, latin1FromBytes } from "../../encoding.js";
+ import { rethrowFatalExecutionError } from "../../fatal-execution-error.js";
+ import { sanitizeErrorMessage } from "../../fs/sanitize-error.js";
+ import { ExecutionLimitError } from "../../interpreter/errors.js";
+@@ -12,6 +8,7 @@ import type {
+   RuntimeCommandContext,
+ } from "../../types.js";
+ import { parseArgs } from "../../utils/args.js";
++import { createStringBuilder } from "../../utils/string-builder.js";
+ import { hasHelpFlag, showHelp } from "../help.js";
+ 
+ const trHelp = {
+@@ -262,23 +259,32 @@ export const trCommand: RuntimeCommand = {
+       return complementMode ? !inSet : inSet;
+     };
+ 
+-    let output = "";
++    const output = createStringBuilder(content.length <= 32768 ? 32768 : 32);
+     let outputBytes = 0;
+     const appendOutput = (value: string): void => {
+-      const bytes = utf8ByteLength(value);
++      // Lone surrogate code units encode as three UTF-8 bytes.
++      let bytes = 0;
++      if (value.length === 2) bytes = 4;
++      else if (value.length === 1) {
++        const code = value.charCodeAt(0);
++        bytes = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3;
++      }
+       if (bytes > maxOutputSize - outputBytes) {
+         throw new ExecutionLimitError(
+           `tr: output size limit exceeded (${maxOutputSize} bytes)`,
+           "output_size",
+         );
+       }
+-      output += value;
++      output.append(value);
+       outputBytes += bytes;
+     };
+ 
+     if (deleteMode) {
+       // Delete characters in set1 (or complement of set1)
+-      for (const char of content) {
++      for (let i = 0; i < content.length; ) {
++        const code = content.codePointAt(i) as number;
++        const char = code > 0xffff ? content.slice(i, i + 2) : content[i];
++        i += char.length;
+         if (!isInSet1(char)) {
+           appendOutput(char);
+         }
+@@ -286,7 +292,10 @@ export const trCommand: RuntimeCommand = {
+     } else if (squeezeMode && sets.length === 1) {
+       // Squeeze consecutive characters in set1
+       let prev = "";
+-      for (const char of content) {
++      for (let i = 0; i < content.length; ) {
++        const code = content.codePointAt(i) as number;
++        const char = code > 0xffff ? content.slice(i, i + 2) : content[i];
++        i += char.length;
+         if (isInSet1(char) && char === prev) {
+           continue; // Skip repeated character
+         }
+@@ -307,7 +316,10 @@ export const trCommand: RuntimeCommand = {
+         // In complement mode, all characters NOT in set1 are translated
+         // They're all mapped to a single character (last char of set2)
+         const targetChar = set2.length > 0 ? set2[set2.length - 1] : "";
+-        for (const char of content) {
++        for (let i = 0; i < content.length; ) {
++          const code = content.codePointAt(i) as number;
++          const char = code > 0xffff ? content.slice(i, i + 2) : content[i];
++          i += char.length;
+           if (!set1.has(char)) {
+             appendTranslated(targetChar);
+           } else {
+@@ -323,7 +335,10 @@ export const trCommand: RuntimeCommand = {
+           translationMap.set(set1Raw[i], targetChar);
+         }
+ 
+-        for (const char of content) {
++        for (let i = 0; i < content.length; ) {
++          const code = content.codePointAt(i) as number;
++          const char = code > 0xffff ? content.slice(i, i + 2) : content[i];
++          i += char.length;
+           appendTranslated(translationMap.get(char) ?? char);
+         }
+       }
+@@ -331,7 +346,7 @@ export const trCommand: RuntimeCommand = {
+ 
+     // tr emits text; the pipeline handles encoding.
+     return {
+-      stdout: output,
++      stdout: output.finish(),
+       stderr: "",
+       exitCode: 0,
+     };
+diff --git a/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts b/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
+index 5d8b731..6e9ee40 100644
+--- a/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
++++ b/packages/just-bash/src/commands/worker-bridge/bridge-handler.ts
+@@ -152,6 +152,9 @@ export class BridgeHandler {
+         case OpCode.READ_FILE:
+           await this.handleReadFile();
+           break;
++        case OpCode.FILE_ACCESS:
++          await this.handleFileAccess();
++          break;
+         case OpCode.WRITE_FILE:
+           await this.handleWriteFile();
+           break;
+@@ -228,6 +231,13 @@ export class BridgeHandler {
+   private async handleReadFile(): Promise<void> {
+     const path = this.resolvePath(this.protocol.getPath());
+     try {
++      const stat = await this.fs.stat(path);
++      if (stat.size > this.protocol.dataBufferSize) {
++        await this.fs.assertFileAccess?.(path, stat.size, "read");
++        throw new Error(
++          `File too large: ${stat.size} > ${this.protocol.dataBufferSize}`,
++        );
++      }
+       const content = await this.fs.readFileBuffer(path);
+       this.protocol.setResult(content);
+       this.protocol.setStatus(Status.SUCCESS);
+@@ -236,6 +246,32 @@ export class BridgeHandler {
+     }
+   }
+ 
++  private async handleFileAccess(): Promise<void> {
++    const flags = this.protocol.getFlags();
++    const data = this.protocol.getData();
++    if (
++      data.byteLength !== 8 ||
++      (flags !== Flags.FILE_ACCESS_READ && flags !== Flags.FILE_ACCESS_WRITE)
++    ) {
++      throw new Error("Invalid file access request");
++    }
++    const bytes = new DataView(
++      data.buffer,
++      data.byteOffset,
++      data.byteLength,
++    ).getFloat64(0, true);
++    if (!Number.isSafeInteger(bytes) || bytes < 0)
++      throw new Error("Invalid file access size");
++    const path = this.resolvePath(this.protocol.getPath());
++    await this.fs.assertFileAccess?.(
++      path,
++      bytes,
++      flags === Flags.FILE_ACCESS_READ ? "read" : "write",
++    );
++    this.protocol.setResult(new Uint8Array(0));
++    this.protocol.setStatus(Status.SUCCESS);
++  }
++
+   private async handleWriteFile(): Promise<void> {
+     const path = this.resolvePath(this.protocol.getPath());
+     const data = this.protocol.getData();
+@@ -401,7 +437,7 @@ export class BridgeHandler {
+       this.output.exitCode = 1;
+       this.appendOutputLimitError();
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString("Output size limit exceeded");
++      this.protocol.setErrorResultFromString("Output size limit exceeded");
+       this.protocol.setStatus(Status.ERROR);
+       return;
+     }
+@@ -415,7 +451,7 @@ export class BridgeHandler {
+       this.output.exitCode = 1;
+       this.appendOutputLimitError();
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString("Output size limit exceeded");
++      this.protocol.setErrorResultFromString("Output size limit exceeded");
+       this.protocol.setStatus(Status.ERROR);
+       return;
+     }
+@@ -502,7 +538,7 @@ export class BridgeHandler {
+     const fetchFn = this.secureFetch;
+     if (!fetchFn) {
+       this.protocol.setErrorCode(ErrorCode.NETWORK_NOT_CONFIGURED);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Network access not configured. Enable network in Bash options.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -543,7 +579,7 @@ export class BridgeHandler {
+         e instanceof Error ? e.message : String(e),
+       );
+       this.protocol.setErrorCode(ErrorCode.NETWORK_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -552,7 +588,7 @@ export class BridgeHandler {
+     const execFn = this.exec;
+     if (!execFn) {
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Command execution not available in this context.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -596,7 +632,7 @@ export class BridgeHandler {
+       controller.abort();
+       const message = e instanceof Error ? e.message : String(e);
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -605,7 +641,7 @@ export class BridgeHandler {
+     const invokeToolFn = this.invokeTool;
+     if (!invokeToolFn) {
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(
++      this.protocol.setErrorResultFromString(
+         "Tool invocation not available in this context.",
+       );
+       this.protocol.setStatus(Status.ERROR);
+@@ -626,7 +662,7 @@ export class BridgeHandler {
+         e instanceof Error ? e.message : String(e),
+       );
+       this.protocol.setErrorCode(ErrorCode.IO_ERROR);
+-      this.protocol.setResultFromString(message);
++      this.protocol.setErrorResultFromString(message);
+       this.protocol.setStatus(Status.ERROR);
+     }
+   }
+@@ -667,7 +703,7 @@ export class BridgeHandler {
+     }
+ 
+     this.protocol.setErrorCode(errorCode);
+-    this.protocol.setResultFromString(message);
++    this.protocol.setErrorResultFromString(message);
+     this.protocol.setStatus(Status.ERROR);
+   }
+ }
+diff --git a/packages/just-bash/src/commands/worker-bridge/file-access.test.ts b/packages/just-bash/src/commands/worker-bridge/file-access.test.ts
+new file mode 100644
+index 0000000..cd21424
+--- /dev/null
++++ b/packages/just-bash/src/commands/worker-bridge/file-access.test.ts
+@@ -0,0 +1,256 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { describe, expect, it } from "vitest";
++import { InMemoryFs } from "../../fs/in-memory-fs/in-memory-fs.js";
++import { BridgeHandler } from "./bridge-handler.js";
++import {
++  createSharedBuffer,
++  Flags,
++  OpCode,
++  type OpCodeType,
++  ProtocolBuffer,
++  Status,
++} from "./protocol.js";
++import { SyncBackend } from "./sync-backend.js";
++
++function sizeData(bytes: number): Uint8Array {
++  const data = new Uint8Array(8);
++  new DataView(data.buffer).setFloat64(0, bytes, true);
++  return data;
++}
++
++async function request(
++  fs: InMemoryFs,
++  op: OpCodeType,
++  data: Uint8Array = new Uint8Array(0),
++  flags = 0,
++  path = "/input",
++) {
++  const shared = createSharedBuffer(24);
++  const protocol = new ProtocolBuffer(shared);
++  const handler = new BridgeHandler(shared, fs, "/", "unit");
++  const running = handler.run(1000);
++  try {
++    protocol.setOpCode(op);
++    protocol.setPath(path);
++    protocol.setData(data);
++    protocol.setFlags(flags);
++    protocol.setStatus(Status.READY);
++    protocol.notify();
++    await expect.poll(() => protocol.getStatus()).not.toBe(Status.READY);
++    return {
++      status: protocol.getStatus(),
++      result: protocol.getResultAsString(),
++      sharedBytes: shared.byteLength,
++    };
++  } finally {
++    handler.stop();
++    await running;
++  }
++}
++
++class ValidatedFs extends InMemoryFs {
++  calls: { path: string; bytes: number; op: "read" | "write" }[] = [];
++  reads = 0;
++  limit = 24;
++  async assertFileAccess(path: string, bytes: number, op: "read" | "write") {
++    this.calls.push({ path, bytes, op });
++    if (path.includes("\0")) throw new Error("Invalid path");
++    if (bytes > this.limit) throw new Error("Domain file too large");
++  }
++  override async readFileBuffer(path: string) {
++    this.reads++;
++    return await super.readFileBuffer(path);
++  }
++}
++
++describe("file access intent protocol", () => {
++  it.each([
++    Flags.FILE_ACCESS_READ,
++    Flags.FILE_ACCESS_WRITE,
++  ])("validates an eight-byte extent in a minimum payload (mode %i)", async (flags) => {
++    const fs = new ValidatedFs();
++    expect(
++      await request(fs, OpCode.FILE_ACCESS, sizeData(25), flags),
++    ).toMatchObject({
++      status: Status.ERROR,
++      result: "Domain file too large",
++      sharedBytes: 4152,
++    });
++    expect(fs.calls).toEqual([
++      {
++        path: "/input",
++        bytes: 25,
++        op: flags === Flags.FILE_ACCESS_READ ? "read" : "write",
++      },
++    ]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it.each([
++    0,
++    24,
++    Number.MAX_SAFE_INTEGER,
++  ])("preserves the exact safe extent %s", async (bytes) => {
++    const fs = new ValidatedFs();
++    fs.limit = Number.MAX_SAFE_INTEGER;
++    expect(
++      await request(
++        fs,
++        OpCode.FILE_ACCESS,
++        sizeData(bytes),
++        Flags.FILE_ACCESS_WRITE,
++      ),
++    ).toMatchObject({ status: Status.SUCCESS });
++    expect(fs.calls).toEqual([{ path: "/input", bytes, op: "write" }]);
++  });
++
++  it.each([
++    -1,
++    0.5,
++    Number.NaN,
++    Number.POSITIVE_INFINITY,
++    Number.MAX_SAFE_INTEGER + 1,
++  ])("rejects invalid extent %s before invoking the filesystem", async (bytes) => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(bytes),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it.each([0, 3, -1])("rejects an invalid operation flag %i", async (flags) => {
++    const fs = new ValidatedFs();
++    expect(
++      (await request(fs, OpCode.FILE_ACCESS, sizeData(25), flags)).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it.each([0, 7, 9])("rejects a malformed %i-byte frame", async (length) => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          new Uint8Array(length),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([]);
++  });
++
++  it("resolves paths and preserves filesystem path validation", async () => {
++    const fs = new ValidatedFs();
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(1),
++          Flags.FILE_ACCESS_READ,
++          "nested/../input",
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect(fs.calls[0].path).toBe("/input");
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(1),
++          Flags.FILE_ACCESS_READ,
++          "/bad\0path",
++        )
++      ).status,
++    ).toBe(Status.ERROR);
++  });
++
++  it("runs asynchronous validation in the originating context", async () => {
++    const context = new AsyncLocalStorage<string>();
++    const fs = new ValidatedFs();
++    const tags: (string | undefined)[] = [];
++    fs.assertFileAccess = async () => {
++      tags.push(context.getStore());
++      await Promise.resolve();
++      tags.push(context.getStore());
++    };
++    expect(
++      (
++        await context.run("request-B", () =>
++          request(fs, OpCode.FILE_ACCESS, sizeData(25), Flags.FILE_ACCESS_READ),
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect(tags).toEqual(["request-B", "request-B"]);
++  });
++
++  it("checks read intent before rejecting the host transport without fetching content", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(25) });
++    expect((await request(fs, OpCode.READ_FILE)).result).toBe(
++      "Domain file too large",
++    );
++    expect(fs.calls).toEqual([{ path: "/input", bytes: 25, op: "read" }]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it("keeps independent transport rejection when the domain allows the extent", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(25) });
++    fs.limit = 50;
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.ERROR);
++    expect(fs.calls).toEqual([{ path: "/input", bytes: 25, op: "read" }]);
++    expect(fs.reads).toBe(0);
++  });
++
++  it("supports filesystems without the optional hook", async () => {
++    const fs = new InMemoryFs({ "/input": "a".repeat(25) });
++    expect(
++      (
++        await request(
++          fs,
++          OpCode.FILE_ACCESS,
++          sizeData(25),
++          Flags.FILE_ACCESS_READ,
++        )
++      ).status,
++    ).toBe(Status.SUCCESS);
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.ERROR);
++  });
++
++  it("keeps metadata stat and successful reads free of preflight overhead", async () => {
++    const fs = new ValidatedFs({ "/input": "a".repeat(24) });
++    expect((await request(fs, OpCode.STAT)).status).toBe(Status.SUCCESS);
++    expect((await request(fs, OpCode.READ_FILE)).status).toBe(Status.SUCCESS);
++    expect(fs.calls).toEqual([]);
++    expect(fs.reads).toBe(1);
++  });
++
++  it.each([
++    -1,
++    0.5,
++    Number.NaN,
++    Number.POSITIVE_INFINITY,
++    Number.MAX_SAFE_INTEGER + 1,
++  ])("rejects invalid sender size %s before dispatch", (bytes) => {
++    const backend = new SyncBackend(createSharedBuffer(24), 10);
++    expect(() => backend.assertFileAccess("/input", bytes, "read")).toThrow(
++      "Invalid file access size",
++    );
++  });
++
++  it("rejects an invalid sender operation before dispatch", () => {
++    const backend = new SyncBackend(createSharedBuffer(24), 10);
++    expect(() =>
++      backend.assertFileAccess("/input", 25, "invalid" as "read"),
++    ).toThrow("Invalid file access operation");
++  });
++});
+diff --git a/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts b/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts
+new file mode 100644
+index 0000000..77521e2
+--- /dev/null
++++ b/packages/just-bash/src/commands/worker-bridge/protocol.capacity.test.ts
+@@ -0,0 +1,78 @@
++import { describe, expect, it } from "vitest";
++import {
++  createSharedBuffer,
++  ErrorCode,
++  ProtocolBuffer,
++  SHARED_BUFFER_OVERHEAD,
++} from "./protocol.js";
++
++describe("shared bridge capacity", () => {
++  it.each([
++    24, 25,
++  ])("preserves an error header and valid UTF-8 within %i bytes", (capacity) => {
++    const shared = createSharedBuffer(capacity);
++    const sender = new ProtocolBuffer(shared);
++    const receiver = new ProtocolBuffer(shared);
++    sender.setErrorCode(ErrorCode.NOT_FOUND);
++    sender.setErrorResultFromString(`${"🐙".repeat(40)} no such file`);
++    expect(receiver.getErrorCode()).toBe(ErrorCode.NOT_FOUND);
++    expect(receiver.getResultAsString()).toContain("No such file");
++    expect(receiver.getResultAsString()).not.toContain("\ufffd");
++    expect(receiver.getResult().length).toBeLessThanOrEqual(capacity);
++    sender.setErrorResultFromString("ordinary error");
++    expect(receiver.getResultAsString()).toBe("ordinary error");
++    expect(() => sender.setResultFromString("🐙".repeat(40))).toThrow(
++      "Result too large",
++    );
++  });
++
++  it("preserves an unaligned configured byte capacity in both directions", () => {
++    const shared = createSharedBuffer(8193);
++    const sender = new ProtocolBuffer(shared);
++    const receiver = new ProtocolBuffer(shared);
++    const data = new Uint8Array(8193).fill(0x5a);
++    expect(shared.byteLength).toBe(SHARED_BUFFER_OVERHEAD + data.length);
++    sender.setData(data);
++    expect(receiver.getData()).toEqual(data);
++    receiver.setResult(data);
++    expect(sender.getResult()).toEqual(data);
++    expect(() => sender.setData(new Uint8Array(8194))).toThrow(
++      "Data too large",
++    );
++    expect(() => receiver.setResult(new Uint8Array(8194))).toThrow(
++      "Result too large",
++    );
++  });
++
++  it.each([
++    [2, -1],
++    [2, 4097],
++    [3, -1],
++    [3, 8194],
++    [4, -1],
++    [4, 8194],
++  ])("rejects an invalid length at control word %i with value %i", (index, length) => {
++    const shared = createSharedBuffer(8193);
++    const protocol = new ProtocolBuffer(shared);
++    Atomics.store(new Int32Array(shared, 0, 8), index, length);
++    const read =
++      index === 2
++        ? () => protocol.getPath()
++        : index === 3
++          ? () => protocol.getData()
++          : () => protocol.getResult();
++    expect(read).toThrow("Invalid bridge length");
++  });
++
++  it.each([
++    0,
++    23,
++    -1,
++    1.5,
++    Number.POSITIVE_INFINITY,
++    0x80000000,
++  ])("rejects an invalid allocation capacity %s", (capacity) =>
++    expect(() => createSharedBuffer(capacity)).toThrow(
++      "Invalid shared bridge payload capacity",
++    ));
++});
+diff --git a/packages/just-bash/src/commands/worker-bridge/protocol.ts b/packages/just-bash/src/commands/worker-bridge/protocol.ts
+index 31a536f..8bb4bd4 100644
+--- a/packages/just-bash/src/commands/worker-bridge/protocol.ts
++++ b/packages/just-bash/src/commands/worker-bridge/protocol.ts
+@@ -37,6 +37,7 @@ export const OpCode = {
+   REALPATH: 13,
+   RENAME: 14,
+   COPY_FILE: 15,
++  FILE_ACCESS: 16,
+   // Special operations for I/O
+   WRITE_STDOUT: 100,
+   WRITE_STDERR: 101,
+@@ -78,6 +79,15 @@ export const ErrorCode = {
+ 
+ export type ErrorCodeType = (typeof ErrorCode)[keyof typeof ErrorCode];
+ 
++const ERROR_DESCRIPTIONS: Partial<Record<ErrorCodeType, string>> = {
++  [ErrorCode.NOT_FOUND]: "No such file",
++  [ErrorCode.IS_DIRECTORY]: "Is a directory",
++  [ErrorCode.NOT_DIRECTORY]: "Not a directory",
++  [ErrorCode.EXISTS]: "Already exists",
++  [ErrorCode.PERMISSION_DENIED]: "Permission denied",
++  [ErrorCode.INVALID_PATH]: "Invalid path",
++};
++
+ /** Buffer layout offsets */
+ const Offset = {
+   OP_CODE: 0,
+@@ -96,11 +106,7 @@ const Offset = {
+ const Size = {
+   CONTROL_REGION: 32,
+   PATH_BUFFER: 4096,
+-  // 8MB limit for FS read/write, HTTP responses, and tool invocation results.
+-  // Sized to handle typical OpenAPI/GraphQL responses (paginated lists, batch queries).
+-  // Still well under the 64MB QuickJS memory limit per execution.
+   DATA_BUFFER: 8388608,
+-  TOTAL: 8392736, // 32 + 4096 + 8MB
+ } as const;
+ 
+ /** Flags for operations */
+@@ -109,6 +115,8 @@ export const Flags = {
+   RECURSIVE: 1,
+   FORCE: 2,
+   MKDIR_RECURSIVE: 1,
++  FILE_ACCESS_READ: 1,
++  FILE_ACCESS_WRITE: 2,
+ } as const;
+ 
+ /** Stat result structure layout */
+@@ -127,8 +135,23 @@ import {
+   _Atomics,
+   _SharedArrayBuffer,
+ } from "../../security/trusted-globals.js";
+-export function createSharedBuffer(): SharedArrayBuffer {
+-  return new _SharedArrayBuffer(Size.TOTAL);
++export const SHARED_BUFFER_OVERHEAD: number = Offset.DATA_BUFFER;
++
++export function getMinimumSharedBufferPayloadBytes(): number {
++  return StatLayout.TOTAL;
++}
++
++export function createSharedBuffer(
++  dataBufferBytes: number = Size.DATA_BUFFER,
++): SharedArrayBuffer {
++  if (
++    !Number.isSafeInteger(dataBufferBytes) ||
++    dataBufferBytes < StatLayout.TOTAL ||
++    dataBufferBytes > 0x7fffffff
++  ) {
++    throw new RangeError("Invalid shared bridge payload capacity");
++  }
++  return new _SharedArrayBuffer(SHARED_BUFFER_OVERHEAD + dataBufferBytes);
+ }
+ 
+ /**
+@@ -138,13 +161,25 @@ export class ProtocolBuffer {
+   private int32View: Int32Array;
+   private uint8View: Uint8Array;
+   private dataView: DataView;
++  readonly dataBufferSize: number;
+ 
+   constructor(buffer: SharedArrayBuffer) {
+-    this.int32View = new Int32Array(buffer);
++    this.dataBufferSize = buffer.byteLength - SHARED_BUFFER_OVERHEAD;
++    if (this.dataBufferSize < StatLayout.TOTAL) {
++      throw new RangeError("Shared bridge buffer is too small");
++    }
++    this.int32View = new Int32Array(buffer, 0, Size.CONTROL_REGION / 4);
+     this.uint8View = new Uint8Array(buffer);
+     this.dataView = new DataView(buffer);
+   }
+ 
++  private checkLength(length: number, capacity: number): number {
++    if (length < 0 || length > capacity) {
++      throw new RangeError(`Invalid bridge length: ${length} > ${capacity}`);
++    }
++    return length;
++  }
++
+   getOpCode(): OpCodeType {
+     return _Atomics.load(this.int32View, Offset.OP_CODE / 4) as OpCodeType;
+   }
+@@ -213,7 +248,7 @@ export class ProtocolBuffer {
+   }
+ 
+   getPath(): string {
+-    const length = this.getPathLength();
++    const length = this.checkLength(this.getPathLength(), Size.PATH_BUFFER);
+     const bytes = this.uint8View.slice(
+       Offset.PATH_BUFFER,
+       Offset.PATH_BUFFER + length,
+@@ -231,7 +266,7 @@ export class ProtocolBuffer {
+   }
+ 
+   getData(): Uint8Array {
+-    const length = this.getDataLength();
++    const length = this.checkLength(this.getDataLength(), this.dataBufferSize);
+     return this.uint8View.slice(
+       Offset.DATA_BUFFER,
+       Offset.DATA_BUFFER + length,
+@@ -239,8 +274,10 @@ export class ProtocolBuffer {
+   }
+ 
+   setData(data: Uint8Array): void {
+-    if (data.length > Size.DATA_BUFFER) {
+-      throw new Error(`Data too large: ${data.length} > ${Size.DATA_BUFFER}`);
++    if (data.length > this.dataBufferSize) {
++      throw new Error(
++        `Data too large: ${data.length} > ${this.dataBufferSize}`,
++      );
+     }
+     this.uint8View.set(data, Offset.DATA_BUFFER);
+     this.setDataLength(data.length);
+@@ -257,7 +294,10 @@ export class ProtocolBuffer {
+   }
+ 
+   getResult(): Uint8Array {
+-    const length = this.getResultLength();
++    const length = this.checkLength(
++      this.getResultLength(),
++      this.dataBufferSize,
++    );
+     return this.uint8View.slice(
+       Offset.DATA_BUFFER,
+       Offset.DATA_BUFFER + length,
+@@ -265,8 +305,10 @@ export class ProtocolBuffer {
+   }
+ 
+   setResult(data: Uint8Array): void {
+-    if (data.length > Size.DATA_BUFFER) {
+-      throw new Error(`Result too large: ${data.length} > ${Size.DATA_BUFFER}`);
++    if (data.length > this.dataBufferSize) {
++      throw new Error(
++        `Result too large: ${data.length} > ${this.dataBufferSize}`,
++      );
+     }
+     this.uint8View.set(data, Offset.DATA_BUFFER);
+     this.setResultLength(data.length);
+@@ -282,6 +324,20 @@ export class ProtocolBuffer {
+     this.setResult(encoded);
+   }
+ 
++  setErrorResultFromString(str: string): void {
++    const destination = this.uint8View.subarray(
++      Offset.DATA_BUFFER,
++      Offset.DATA_BUFFER + this.dataBufferSize,
++    );
++    const encoder = new TextEncoder();
++    let { read, written } = encoder.encodeInto(str, destination);
++    const description = ERROR_DESCRIPTIONS[this.getErrorCode()];
++    if (read < str.length && description) {
++      ({ written } = encoder.encodeInto(`${description}: ${str}`, destination));
++    }
++    this.setResultLength(written);
++  }
++
+   encodeStat(stat: {
+     isFile: boolean;
+     isDirectory: boolean;
+diff --git a/packages/just-bash/src/commands/worker-bridge/sync-backend.ts b/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
+index 6f734de..e935fee 100644
+--- a/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
++++ b/packages/just-bash/src/commands/worker-bridge/sync-backend.ts
+@@ -79,6 +79,24 @@ export class SyncBackend {
+     return result.result ?? new Uint8Array(0);
+   }
+ 
++  assertFileAccess(path: string, bytes: number, op: "read" | "write"): void {
++    if (!Number.isSafeInteger(bytes) || bytes < 0) {
++      throw new Error("Invalid file access size");
++    }
++    if (op !== "read" && op !== "write")
++      throw new Error("Invalid file access operation");
++    const data = new Uint8Array(8);
++    new DataView(data.buffer).setFloat64(0, bytes, true);
++    const result = this.execSync(
++      OpCode.FILE_ACCESS,
++      path,
++      data,
++      op === "read" ? Flags.FILE_ACCESS_READ : Flags.FILE_ACCESS_WRITE,
++    );
++    if (!result.success)
++      throw new Error(result.error || "File access validation failed");
++  }
++
+   writeFile(path: string, data: Uint8Array): void {
+     const result = this.execSync(OpCode.WRITE_FILE, path, data);
+     if (!result.success) {
+@@ -205,19 +223,29 @@ export class SyncBackend {
+   }
+ 
+   writeStdout(data: string): void {
+-    const encoded = new TextEncoder().encode(data);
+-    const result = this.execSync(OpCode.WRITE_STDOUT, "", encoded);
+-    if (!result.success) {
+-      throw new Error(result.error || "Failed to write stdout");
+-    }
++    this.writeOutput(OpCode.WRITE_STDOUT, "stdout", data);
+   }
+ 
+   writeStderr(data: string): void {
++    this.writeOutput(OpCode.WRITE_STDERR, "stderr", data);
++  }
++
++  private writeOutput(
++    opCode: OpCodeType,
++    stream: "stdout" | "stderr",
++    data: string,
++  ): void {
+     const encoded = new TextEncoder().encode(data);
+-    const result = this.execSync(OpCode.WRITE_STDERR, "", encoded);
+-    if (!result.success) {
+-      throw new Error(result.error || "Failed to write stderr");
+-    }
++    let offset = 0;
++    do {
++      let end = Math.min(offset + this.protocol.dataBufferSize, encoded.length);
++      while (end < encoded.length && (encoded[end] & 0xc0) === 0x80) end -= 1;
++      const result = this.execSync(opCode, "", encoded.subarray(offset, end));
++      if (!result.success) {
++        throw new Error(result.error || `Failed to write ${stream}`);
++      }
++      offset = end;
++    } while (offset < encoded.length);
+   }
+ 
+   exit(code: number): void {
+diff --git a/packages/just-bash/src/custom-command-deadline.test.ts b/packages/just-bash/src/custom-command-deadline.test.ts
+index 56d84fd..8e90666 100644
+--- a/packages/just-bash/src/custom-command-deadline.test.ts
++++ b/packages/just-bash/src/custom-command-deadline.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from "vitest";
+ import { Bash } from "./Bash.js";
+ import { type CustomCommand, defineCommand } from "./custom-commands.js";
++import { InMemoryFs } from "./fs/in-memory-fs/index.js";
+ 
+ function never(): Promise<never> {
+   return new Promise(() => {});
+@@ -89,6 +90,7 @@ describe("custom command deadline boundary", () => {
+             "accountResult",
+             "appendOutput",
+             "chargeCommand",
++            "markExecutionAborted",
+           ].filter((name) => typeof budget[name] === "function");
+           return { stdout: "", stderr: "", exitCode: 0 };
+         }),
+@@ -350,3 +352,183 @@ describe("custom command deadline boundary", () => {
+     expect(cleanupRuns).toBe(1);
+   });
+ });
++
++function executionGate() {
++  let resolve!: () => void;
++  return {
++    promise: new Promise<void>((ready) => {
++      resolve = ready;
++    }),
++    resolve: () => resolve(),
++  };
++}
++
++describe("request cancellation provenance", () => {
++  it("preserves a committed explicit exit 124 without an abort marker", async () => {
++    const fs = new InMemoryFs();
++    const controller = new AbortController();
++    const result = await new Bash({ fs, defenseInDepth: false }).exec(
++      "echo committed > /proof; echo 'bash: execution aborted' >&2; exit 124",
++      { signal: controller.signal },
++    );
++
++    expect(result.exitCode).toBe(124);
++    expect(result.stderr).toBe("bash: execution aborted\n");
++    expect(Object.hasOwn(result, "executionAborted")).toBe(false);
++    expect(await fs.readFile("/proof")).toBe("committed\n");
++  });
++
++  it("does not trust a command-provided abort marker", async () => {
++    const bash = new Bash({
++      defenseInDepth: false,
++      customCommands: [
++        defineCommand("spoof", async () => ({
++          stdout: "completed\n",
++          stderr: "",
++          exitCode: 124,
++          executionAborted: true,
++        })),
++      ],
++    });
++    const result = await bash.exec("spoof");
++
++    expect(result.exitCode).toBe(124);
++    expect(result.stdout).toBe("completed\n");
++    expect(Object.hasOwn(result, "executionAborted")).toBe(false);
++  });
++
++  it.each([
++    ["echo committed > /proof; exit 124", 124, ""],
++    ["timeout 0.001 sleep 1; echo recovered; exit 0", 0, "recovered\n"],
++  ])("does not mark a completed execution when cleanup observes a late abort: %s", async (script, exitCode, stdout) => {
++    const cleanupStarted = executionGate();
++    const releaseCleanup = executionGate();
++    const controller = new AbortController();
++    const fs = new InMemoryFs();
++    const bash = new Bash({
++      fs,
++      defenseInDepth: false,
++      executionLimits: { maxExtensionCleanupTimeMs: 1_000 },
++      customCommands: [
++        defineCommand("hold-cleanup", async (_args, ctx) => {
++          ctx.executionScope?.registerCleanup(async () => {
++            cleanupStarted.resolve();
++            await releaseCleanup.promise;
++          });
++          return { stdout: "", stderr: "", exitCode: 0 };
++        }),
++      ],
++    });
++    const execution = bash.exec(`hold-cleanup; ${script}`, {
++      signal: controller.signal,
++    });
++
++    await cleanupStarted.promise;
++    controller.abort();
++    releaseCleanup.resolve();
++    const result = await execution;
++
++    expect(result).toMatchObject({ exitCode, stdout, stderr: "" });
++    expect(Object.hasOwn(result, "executionAborted")).toBe(false);
++    if (exitCode === 124) {
++      expect(await fs.readFile("/proof")).toBe("committed\n");
++    }
++    expect(await bash.exec("echo healthy")).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy\n",
++    });
++  });
++
++  it("does not mark a command-local timeout as request cancellation", async () => {
++    const controller = new AbortController();
++    const result = await new Bash({ defenseInDepth: false }).exec(
++      "timeout 0.001 sleep 1",
++      { signal: controller.signal },
++    );
++
++    expect(result.exitCode).toBe(124);
++    expect(controller.signal.aborted).toBe(false);
++    expect(Object.hasOwn(result, "executionAborted")).toBe(false);
++  });
++
++  it.each([
++    "sleep 60",
++    "bash -c 'sleep 60'",
++    "eval 'sleep 60'",
++    "source /run.sh",
++    'printf %s "$(sleep 60)"',
++    "while true; do sleep 60; done",
++  ])("marks request cancellation observed in %s", async (script) => {
++    const entered = executionGate();
++    const controller = new AbortController();
++    const bash = new Bash({
++      fs: new InMemoryFs({ "/run.sh": "sleep 60" }),
++      defenseInDepth: false,
++      sleep: () => {
++        entered.resolve();
++        return new Promise<void>(() => {});
++      },
++      executionLimits: {
++        maxExecutionTimeMs: 1_000,
++        maxExtensionCleanupTimeMs: 5,
++      },
++    });
++    const execution = bash.exec(script, { signal: controller.signal });
++    await entered.promise;
++    controller.abort();
++    const result = await execution;
++
++    expect(result.exitCode).toBe(124);
++    expect(result).toHaveProperty("executionAborted", true);
++    expect(
++      Object.getOwnPropertyDescriptor(result, "executionAborted"),
++    ).toMatchObject({
++      enumerable: true,
++    });
++    expect(JSON.parse(JSON.stringify(result))).toHaveProperty(
++      "executionAborted",
++      true,
++    );
++    const next = await bash.exec("echo healthy");
++    expect(next).toMatchObject({
++      exitCode: 0,
++      stdout: "healthy\n",
++      stderr: "",
++    });
++    expect(Object.hasOwn(next, "executionAborted")).toBe(false);
++  });
++
++  it("marks request cancellation before interpreter execution starts", async () => {
++    const controller = new AbortController();
++    controller.abort();
++    const result = await new Bash({ defenseInDepth: false }).exec(
++      "echo unreachable",
++      {
++        signal: controller.signal,
++      },
++    );
++
++    expect(result).toMatchObject({
++      exitCode: 124,
++      stdout: "",
++      executionAborted: true,
++    });
++  });
++
++  it("marks cancellation observed while executing a loop", async () => {
++    const controller = new AbortController();
++    const bash = new Bash({
++      defenseInDepth: false,
++      customCommands: [
++        defineCommand("abort-loop", async () => {
++          controller.abort();
++          return { stdout: "", stderr: "", exitCode: 0 };
++        }),
++      ],
++    });
++    const result = await bash.exec("while true; do abort-loop; done", {
++      signal: controller.signal,
++    });
++    expect(result).toMatchObject({ exitCode: 124, executionAborted: true });
++  });
++});
+diff --git a/packages/just-bash/src/custom-commands.ts b/packages/just-bash/src/custom-commands.ts
+index cf0a943..7ef4616 100644
+--- a/packages/just-bash/src/custom-commands.ts
++++ b/packages/just-bash/src/custom-commands.ts
+@@ -196,7 +196,7 @@ export function createLazyCustomCommand(lazy: LazyCommand): Command {
+       }
+       const command = cached;
+       if (!command) throw new Error(`Failed to load command: ${lazy.name}`);
+-      return command.execute(args, ctx);
++      return await command.execute(args, ctx);
+     },
+   };
+ }
+diff --git a/packages/just-bash/src/encoding.fs-fallback.test.ts b/packages/just-bash/src/encoding.fs-fallback.test.ts
+index 71ac583..3d7cd0e 100644
+--- a/packages/just-bash/src/encoding.fs-fallback.test.ts
++++ b/packages/just-bash/src/encoding.fs-fallback.test.ts
+@@ -8,7 +8,6 @@
+  */
+ import { describe, expect, it } from "vitest";
+ import { Bash } from "./Bash.js";
+-import { type ByteString, bytesFromUint8Array } from "./encoding.js";
+ import { InMemoryFs } from "./fs/in-memory-fs/in-memory-fs.js";
+ import type { IFileSystem } from "./fs/interface.js";
+ 
+@@ -50,13 +49,4 @@ describe("readFileBytes back-compat fallback", () => {
+       exitCode: r.exitCode,
+     }).toEqual({ stdout: "한글", stderr: "", exitCode: 0 });
+   });
+-
+-  it("bytesFromUint8Array round-trips bytes verbatim", () => {
+-    const buf = new Uint8Array([0x00, 0x7f, 0x80, 0xc3, 0xa9, 0xff]);
+-    const s: ByteString = bytesFromUint8Array(buf);
+-    const back = Uint8Array.from(s as unknown as string, (c) =>
+-      c.charCodeAt(0),
+-    );
+-    expect(Array.from(back)).toEqual(Array.from(buf));
+-  });
+ });
+diff --git a/packages/just-bash/src/encoding.ts b/packages/just-bash/src/encoding.ts
+index 1739360..cd884b8 100644
+--- a/packages/just-bash/src/encoding.ts
++++ b/packages/just-bash/src/encoding.ts
+@@ -45,6 +45,7 @@ function assertConversionSize(
+ 
+ /** Return UTF-8 byte length without allocating an encoded copy. */
+ export function utf8ByteLength(value: string): number {
++  if (typeof Buffer !== "undefined") return Buffer.byteLength(value, "utf8");
+   let bytes = 0;
+   for (let index = 0; index < value.length; index++) {
+     const code = value.charCodeAt(index);
+@@ -130,16 +131,37 @@ export function encodeUtf8ToBytes(
+   maxBytes: number = DEFAULT_MAX_CONVERSION_BYTES,
+ ): ByteString {
+   if (!s) return s as unknown as ByteString;
+-  assertConversionSize(utf8ByteLength(s), maxBytes, "UTF-8 encode");
+-  const bytes = utf8Encoder.encode(s);
+-  let out = "";
+-  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+-  return out as unknown as ByteString;
++  const byteLength = utf8ByteLength(s);
++  assertConversionSize(byteLength, maxBytes, "UTF-8 encode");
++  if (byteLength === s.length) return s as unknown as ByteString;
++  return stringFromBytes(utf8Encoder.encode(s)) as unknown as ByteString;
+ }
+ 
+ /** The empty `ByteString`. */
+ export const EMPTY_BYTES: ByteString = "" as unknown as ByteString;
+ 
++const BYTE_STRING_CHUNK_SIZE = 8192;
++
++function stringFromBytes(bytes: Uint8Array): string {
++  if (typeof Buffer !== "undefined") {
++    // Share only the supplied view; Buffer.from(bytes) would copy the input.
++    return Buffer.from(
++      bytes.buffer,
++      bytes.byteOffset,
++      bytes.byteLength,
++    ).toString("latin1");
++  }
++  const chunks: string[] = [];
++  const codes: number[] = [];
++  for (let i = 0; i < bytes.length; i += BYTE_STRING_CHUNK_SIZE) {
++    const length = Math.min(BYTE_STRING_CHUNK_SIZE, bytes.length - i);
++    codes.length = length;
++    for (let j = 0; j < length; j++) codes[j] = bytes[i + j];
++    chunks.push(String.fromCharCode.apply(null, codes));
++  }
++  return chunks.join("");
++}
++
+ /**
+  * Convert a `Uint8Array` to a `ByteString`. Each byte becomes one char.
+  * The reverse is `Uint8Array.from(latin1FromBytes(b), (c) => c.charCodeAt(0))`.
+@@ -149,9 +171,7 @@ export function bytesFromUint8Array(
+   maxBytes: number = DEFAULT_MAX_CONVERSION_BYTES,
+ ): ByteString {
+   assertConversionSize(buf.byteLength, maxBytes, "byte-string conversion");
+-  let out = "";
+-  for (let i = 0; i < buf.length; i++) out += String.fromCharCode(buf[i]);
+-  return out as unknown as ByteString;
++  return stringFromBytes(buf) as unknown as ByteString;
+ }
+ 
+ /**
+@@ -171,7 +191,7 @@ export async function readBytesFrom(
+   path: string,
+ ): Promise<ByteString> {
+   if (typeof fs.readFileBytes === "function") {
+-    return fs.readFileBytes(path);
++    return await fs.readFileBytes(path);
+   }
+   return bytesFromUint8Array(await fs.readFileBuffer(path));
+ }
+diff --git a/packages/just-bash/src/execution-scope.ts b/packages/just-bash/src/execution-scope.ts
+index 3d3387f..4c6d469 100644
+--- a/packages/just-bash/src/execution-scope.ts
++++ b/packages/just-bash/src/execution-scope.ts
+@@ -56,6 +56,7 @@ export class ExecutionScope {
+   private readonly depthByKind = new Map<string, number>();
+   private readonly cleanupCallbacks: Cleanup[] = [];
+   private poisoned: ExecutionLimitError | ExecutionAbortedError | undefined;
++  private observedExecutionAbort = false;
+   private closed = false;
+   private readonly startedAt = Date.now();
+ 
+@@ -69,6 +70,14 @@ export class ExecutionScope {
+     return this.outputBytes;
+   }
+ 
++  get executionAborted(): boolean {
++    return this.observedExecutionAbort;
++  }
++
++  markExecutionAborted(): void {
++    if (this.signal?.aborted) this.observedExecutionAbort = true;
++  }
++
+   constructor(
+     private readonly limits: Required<ExecutionLimits>,
+     private readonly signal: AbortSignal | undefined = undefined,
+diff --git a/packages/just-bash/src/fs/interface.ts b/packages/just-bash/src/fs/interface.ts
+index 5ad0acc..20cc975 100644
+--- a/packages/just-bash/src/fs/interface.ts
++++ b/packages/just-bash/src/fs/interface.ts
+@@ -173,6 +173,13 @@ export interface IFileSystem {
+    */
+   readFileBuffer(path: string): Promise<Uint8Array>;
+ 
++  /** Optional metadata-only validation before an interpreter rejects a file operation by size. */
++  assertFileAccess?(
++    path: string,
++    bytes: number,
++    op: "read" | "write",
++  ): void | Promise<void>;
++
+   /**
+    * Write content to a file, creating it if it doesn't exist
+    */
+diff --git a/packages/just-bash/src/interpreter/builtin-dispatch.ts b/packages/just-bash/src/interpreter/builtin-dispatch.ts
+index c0ac4ad..0756c0b 100644
+--- a/packages/just-bash/src/interpreter/builtin-dispatch.ts
++++ b/packages/just-bash/src/interpreter/builtin-dispatch.ts
+@@ -357,11 +357,14 @@ async function runWithExecutionDeadline(
+   let abortListener: (() => void) | undefined;
+   let graceTimer: ReturnType<typeof _setTimeoutIfFinite>;
+ 
+-  const commandPromise = Promise.resolve().then(run);
+-  const settled = commandPromise.then(
+-    (result) => ({ kind: "result" as const, result }),
+-    (error: unknown) => ({ kind: "error" as const, error }),
+-  );
++  const settled = (async () => {
++    await Promise.resolve();
++    try {
++      return { kind: "result" as const, result: await run() };
++    } catch (error) {
++      return { kind: "error" as const, error };
++    }
++  })();
+   const aborted = new Promise<{ kind: "abort" } | { kind: "deadline" }>(
+     (resolve) => {
+       const finishAbort = () => {
+@@ -388,7 +391,10 @@ async function runWithExecutionDeadline(
+     // be an extra window for filesystem, descriptor, or budget mutation.
+     revoke();
+     const acknowledged = await Promise.race([
+-      settled.then(() => true),
++      (async () => {
++        await settled;
++        return true;
++      })(),
+       new Promise<false>((resolve) => {
+         graceTimer = _setTimeoutIfFinite(() => resolve(false), graceMs);
+       }),
+diff --git a/packages/just-bash/src/interpreter/defense-aware-command-context.ts b/packages/just-bash/src/interpreter/defense-aware-command-context.ts
+index ecbe0cf..e4e2f07 100644
+--- a/packages/just-bash/src/interpreter/defense-aware-command-context.ts
++++ b/packages/just-bash/src/interpreter/defense-aware-command-context.ts
+@@ -198,6 +198,15 @@ function wrapFileSystem(
+     );
+   }
+ 
++  if (fs.assertFileAccess) {
++    wrappedFs.assertFileAccess = wrapFunction(
++      fs.assertFileAccess.bind(fs),
++      requireDefenseContext,
++      component,
++      "fs.assertFileAccess",
++    );
++  }
++
+   return wrappedFs;
+ }
+ 
+diff --git a/packages/just-bash/src/interpreter/redirections.dup-routing.test.ts b/packages/just-bash/src/interpreter/redirections.dup-routing.test.ts
+index 349d6c4..3a6f021 100644
+--- a/packages/just-bash/src/interpreter/redirections.dup-routing.test.ts
++++ b/packages/just-bash/src/interpreter/redirections.dup-routing.test.ts
+@@ -14,6 +14,31 @@ import { defineCommand } from "../custom-commands.js";
+  * `eval "$CMD" > "$OUT" 2>&1`) sees the leaked stderr corrupt its stream.
+  */
+ describe("fd duplication after redirection (> file 2>&1)", () => {
++  it.each([
++    "&>",
++    "&>>",
++  ])("routes %s to current device stream sinks", async (operator) => {
++    for (const [device, stdout, stderr] of [
++      ["/dev/stdout", "out\nerr\n", ""],
++      ["/dev/stderr", "", "out\nerr\n"],
++      ["/dev/null", "", ""],
++    ]) {
++      const env = new Bash();
++      const result = await env.exec(
++        `{ echo out; echo err >&2; } ${operator} ${device}`,
++      );
++      expect({
++        stdout: result.stdout,
++        stderr: result.stderr,
++        exitCode: result.exitCode,
++      }).toEqual({
++        stdout,
++        stderr,
++        exitCode: 0,
++      });
++    }
++  });
++
+   it("sends command-not-found stderr to the file, not the caller's stdout", async () => {
+     const env = new Bash();
+     const result = await env.exec("nosuchcmd > /tmp/f 2>&1");
+diff --git a/packages/just-bash/src/interpreter/redirections.ts b/packages/just-bash/src/interpreter/redirections.ts
+index d3b7229..598d71e 100644
+--- a/packages/just-bash/src/interpreter/redirections.ts
++++ b/packages/just-bash/src/interpreter/redirections.ts
+@@ -228,6 +228,22 @@ async function openOutputEntry(
+     if (append) await ctx.fs.appendFile(filePath, "", "binary");
+     else await ctx.fs.writeFile(filePath, "", "binary");
+   } catch (error) {
++    const code =
++      error !== null && typeof error === "object"
++        ? ((error as { code?: unknown }).code ??
++          /^(ENOENT|ENOTDIR):/.exec(
++            String((error as { message?: unknown }).message),
++          )?.[1])
++        : undefined;
++    const reason =
++      code === "ENOENT"
++        ? "No such file or directory"
++        : code === "ENOTDIR"
++          ? "Not a directory"
++          : undefined;
++    if (reason !== undefined) {
++      return { error: makeResult("", `bash: ${target}: ${reason}\n`, 1) };
++    }
+     if (!handleWriteError) throw error;
+     return {
+       error: makeResult(
+@@ -1290,15 +1306,35 @@ export async function applyRedirections(
+       }
+ 
+       case "&>": {
+-        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
+-        fd1Sink = { kind: "file", path: filePath, append: false };
++        fd1Sink =
++          target === "/dev/null"
++            ? { kind: "discard" }
++            : target === "/dev/stdout"
++              ? fd1Sink
++              : target === "/dev/stderr"
++                ? fd2Sink
++                : {
++                    kind: "file",
++                    path: ctx.fs.resolvePath(ctx.state.cwd, target),
++                    append: false,
++                  };
+         fd2Sink = fd1Sink;
+         break;
+       }
+ 
+       case "&>>": {
+-        const filePath = ctx.fs.resolvePath(ctx.state.cwd, target);
+-        fd1Sink = { kind: "file", path: filePath, append: true };
++        fd1Sink =
++          target === "/dev/null"
++            ? { kind: "discard" }
++            : target === "/dev/stdout"
++              ? fd1Sink
++              : target === "/dev/stderr"
++                ? fd2Sink
++                : {
++                    kind: "file",
++                    path: ctx.fs.resolvePath(ctx.state.cwd, target),
++                    append: true,
++                  };
+         fd2Sink = fd1Sink;
+         break;
+       }
+diff --git a/packages/just-bash/src/limits.ts b/packages/just-bash/src/limits.ts
+index 8fcb820..77fd0ce 100644
+--- a/packages/just-bash/src/limits.ts
++++ b/packages/just-bash/src/limits.ts
+@@ -100,6 +100,9 @@ export interface ExecutionLimits {
+   /** Maximum worker request or response payload bytes (default: 64 MiB) */
+   maxWorkerMessageBytes?: number;
+ 
++  /** Maximum Python filesystem bridge payload bytes (default: 8 MiB; minimum: 24 bytes) */
++  maxPythonBridgeBytes?: number;
++
+   /** Maximum top-level execution wall time in milliseconds (default: 1 hour) */
+   maxExecutionTimeMs?: number;
+ 
+@@ -196,6 +199,7 @@ const DEFAULT_LIMITS: Required<ExecutionLimits> = {
+   maxArchiveEntryBytes: 512 * 1024 * 1024,
+   maxArchiveEntries: 1000000,
+   maxWorkerMessageBytes: 64 * 1024 * 1024,
++  maxPythonBridgeBytes: 8 * 1024 * 1024,
+   // Prior releases had no top-level deadline. Keep normal compatibility-safe
+   // for long real workloads while retaining a finite defense-in-depth bound.
+   maxExecutionTimeMs: 60 * 60 * 1000,
+@@ -257,6 +261,7 @@ const HARDENED_LIMITS: Required<ExecutionLimits> = {
+   maxArchiveEntryBytes: 64 * 1024 * 1024,
+   maxArchiveEntries: 100_000,
+   maxWorkerMessageBytes: 16 * 1024 * 1024,
++  maxPythonBridgeBytes: 8 * 1024 * 1024,
+   maxExecutionTimeMs: 30_000,
+ };
+ 
+@@ -320,6 +325,8 @@ export function resolveLimits(
+       userLimits.maxArchiveEntries ?? defaults.maxArchiveEntries,
+     maxWorkerMessageBytes:
+       userLimits.maxWorkerMessageBytes ?? defaults.maxWorkerMessageBytes,
++    maxPythonBridgeBytes:
++      userLimits.maxPythonBridgeBytes ?? defaults.maxPythonBridgeBytes,
+     maxExecutionTimeMs:
+       userLimits.maxExecutionTimeMs ?? defaults.maxExecutionTimeMs,
+     maxExtensionCleanupTimeMs:
+diff --git a/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts b/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
+index 871ae3e..3b27546 100644
+--- a/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
++++ b/packages/just-bash/src/security/attacks/defense-context-invariant.test.ts
+@@ -51,6 +51,7 @@ describeDefense("Defense context invariant", () => {
+     // here, and the assertion below then proves the wrapper forwards it.
+     const IFILESYSTEM_METHODS: Record<keyof IFileSystem, true> = {
+       appendFile: true,
++      assertFileAccess: true,
+       chmod: true,
+       cp: true,
+       createExclusive: true,
+diff --git a/packages/just-bash/src/security/defense-in-depth-filesystem-settlement.test.ts b/packages/just-bash/src/security/defense-in-depth-filesystem-settlement.test.ts
+new file mode 100644
+index 0000000..95855a0
+--- /dev/null
++++ b/packages/just-bash/src/security/defense-in-depth-filesystem-settlement.test.ts
+@@ -0,0 +1,117 @@
++import { execFileSync } from "node:child_process";
++import { expect, it } from "vitest";
++
++const tsxLoaderUrl = import.meta.resolve("tsx");
++const bashUrl = new URL("../Bash.ts", import.meta.url).href;
++const filesystemUrl = new URL(
++  "../fs/in-memory-fs/in-memory-fs.ts",
++  import.meta.url,
++).href;
++
++function runScenario(scenario: string): string {
++  return execFileSync(
++    process.execPath,
++    [
++      "--unhandled-rejections=strict",
++      "--import",
++      tsxLoaderUrl,
++      "--input-type=module",
++      "--eval",
++      `
++      import assert from "node:assert/strict";
++      import { setImmediate } from "node:timers/promises";
++      import { Bash } from ${JSON.stringify(bashUrl)};
++      import { InMemoryFs } from ${JSON.stringify(filesystemUrl)};
++
++      const scenario = ${JSON.stringify(scenario)};
++      const started = Promise.withResolvers();
++      const pending = Promise.withResolvers();
++      const fs = new InMemoryFs({ "/input.txt": "content" });
++      let sandboxCallbacks = 0;
++      const read = () => {
++        started.resolve();
++        if (scenario === "late-success") {
++          pending.promise.then(() => { sandboxCallbacks++; });
++        }
++        return pending.promise;
++      };
++      if (scenario === "late-buffer-rejection") {
++        fs.readFileBytes = undefined;
++        fs.readFileBuffer = read;
++      } else {
++        fs.readFileBytes = read;
++      }
++
++      const controller = new AbortController();
++      const customCommands = scenario === "late-lazy-rejection" ? [{
++        name: "deferred-read",
++        trusted: false,
++        load: async () => ({
++          name: "deferred-read",
++          trusted: false,
++          async execute(_args, ctx) {
++            await ctx.fs.readFileBytes("/input.txt");
++            return { stdout: "", stderr: "", exitCode: 0 };
++          },
++        }),
++      }] : undefined;
++      const bash = new Bash({ fs, defenseInDepth: true, customCommands });
++      const command = customCommands ? "deferred-read" : "cat /input.txt";
++      const execution = bash.exec(command, {
++        signal: controller.signal,
++      });
++      await started.promise;
++      if (scenario === "ordinary-success") {
++        pending.resolve("content");
++        const result = await execution;
++        assert.equal(result.exitCode, 0);
++        assert.equal(result.stdout, "content");
++        assert.equal(result.stderr, "");
++      } else {
++        controller.abort();
++        const result = await execution;
++        assert.equal(result.exitCode, 124);
++        assert.equal(result.stdout, "");
++        assert.equal(result.stderr, "bash: execution aborted\\n");
++        if (scenario === "late-success") {
++          pending.resolve("content");
++        } else {
++          pending.reject(Object.assign(new Error("late filesystem rejection"), {
++            code: "EIO",
++          }));
++        }
++      }
++
++      await setImmediate();
++      await setImmediate();
++      assert.equal(sandboxCallbacks, 0);
++      const next = await bash.exec("echo ready");
++      assert.equal(next.exitCode, 0);
++      assert.equal(next.stdout, "ready\\n");
++      assert.equal(next.stderr, "");
++      console.log("settled");
++      `,
++    ],
++    { encoding: "utf8", timeout: 10_000 },
++  );
++}
++
++it("observes a filesystem rejection after an aborted exec returns", () => {
++  expect(runScenario("late-rejection")).toBe("settled\n");
++});
++
++it("observes a binary filesystem rejection after an aborted exec returns", () => {
++  expect(runScenario("late-buffer-rejection")).toBe("settled\n");
++});
++
++it("continues blocking sandbox callbacks after an aborted exec returns", () => {
++  expect(runScenario("late-success")).toBe("settled\n");
++});
++
++it("preserves ordinary awaited filesystem results", () => {
++  expect(runScenario("ordinary-success")).toBe("settled\n");
++});
++
++it("observes a lazy custom command rejection after an aborted exec returns", () => {
++  expect(runScenario("late-lazy-rejection")).toBe("settled\n");
++});
+diff --git a/packages/just-bash/src/types.ts b/packages/just-bash/src/types.ts
+index 52af770..91254f4 100644
+--- a/packages/just-bash/src/types.ts
++++ b/packages/just-bash/src/types.ts
+@@ -65,6 +65,7 @@ export interface ExecResult {
+ export interface BashExecResult extends ExecResult {
+   env: Record<string, string>;
+   metadata?: Record<string, unknown>;
++  executionAborted?: true;
+ }
+ 
+ /** Options for exec calls within commands (internal API) */
+@@ -76,6 +77,13 @@ export interface CommandExecOptions {
+    * Useful for implementing `env -i` semantics safely without shell prefixes.
+    */
+   replaceEnv?: boolean;
++  /**
++   * Initialize a nested shell's environment, as `sh`/`bash` do. Implies `replaceEnv`: `env`
++   * is the child's environment, so its keys are exported, and the shell
++   * initializes startup variables (IFS, OPTIND, SHELLOPTS, ...) without
++   * adding export attributes. Inherited export attributes are preserved.
++   */
++  newShell?: boolean;
+   /**
+    * Working directory for the exec.
+    * Required to prevent bugs where subcommands run in the wrong directory.
+diff --git a/packages/just-bash/src/utils/string-builder.ts b/packages/just-bash/src/utils/string-builder.ts
+new file mode 100644
+index 0000000..079116b
+--- /dev/null
++++ b/packages/just-bash/src/utils/string-builder.ts
+@@ -0,0 +1,42 @@
++const STRING_CHUNK_SIZE = 8192;
++
++export function createStringBuilder(inlineFragments = 0): {
++  append: (value: string) => void;
++  finish: () => string;
++} {
++  const parts: string[] = [];
++  const chunk: string[] = [];
++  let length = 0;
++  let small: string | undefined = inlineFragments > 0 ? "" : undefined;
++  let smallCount = 0;
++
++  return {
++    append(value: string) {
++      if (small !== undefined) {
++        if (smallCount++ < inlineFragments) {
++          small += value;
++          return;
++        }
++        chunk[length++] = small;
++        small = undefined;
++      }
++      chunk[length++] = value;
++      if (length === STRING_CHUNK_SIZE) {
++        parts.push(chunk.join(""));
++        length = 0;
++      }
++    },
++    finish() {
++      if (small !== undefined) return small;
++      chunk.length = length;
++      if (parts.length === 0) return chunk.join("");
++      if (length > 0) {
++        parts.push(chunk.join(""));
++        length = 0;
++        chunk.length = 0;
++      }
++      if (parts.length === 1) return parts[0];
++      return parts.join("");
++    },
++  };
++}

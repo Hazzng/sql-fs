@@ -1160,6 +1160,14 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		throw err;
 	}
 
+	assertFileAccess(inputPath: string, bytes: number, op: "read" | "write"): void {
+		const path = validatePath(inputPath);
+		if (path === DEV_NULL) return;
+		if (op === "write") this.#assertWritable(path, "writeFile");
+		else this.#assertScriptTxAlive();
+		this.#assertExecFileSize(path, bytes, op);
+	}
+
 	#assertWritable(path: string, op: string): void {
 		if (this.#readOnlyDepth > 0) {
 			const ctx = readOnlyContext.getStore();
