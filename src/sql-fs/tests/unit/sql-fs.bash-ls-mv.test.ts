@@ -57,6 +57,22 @@ describe("bash over SqlFs — ls -l modes and mv onto the same file", () => {
 		});
 	});
 
+	it("shows the listed directory's own mode on the . row of ls -la", async () => {
+		expect(await execInScriptScope("mkdir d; chmod 700 d; ls -la d | grep ' \\.$' | cut -d' ' -f1")).toEqual({
+			stdout: "drwx------\n",
+			stderr: "",
+			exitCode: 0,
+		});
+	});
+
+	it("shows the parent's mode on the .. row of ls -la", async () => {
+		expect(await execInScriptScope("mkdir -p p/d; chmod 711 p; ls -la p/d | grep ' \\.\\.$' | cut -d' ' -f1")).toEqual({
+			stdout: "drwx--x--x\n",
+			stderr: "",
+			exitCode: 0,
+		});
+	});
+
 	it("rejects mv onto the same file with GNU's message", async () => {
 		expect(await execInScriptScope("echo x > a; mv a ./a")).toEqual({
 			stdout: "",
