@@ -3,6 +3,8 @@
  * US-003: FS error constructors and SQL error translation
  */
 
+import { DefenseInDepthBox } from "just-bash";
+
 type FsError = Error & { code: string; path?: string };
 
 function makeFsError(code: string, message: string, path?: string): FsError {
@@ -131,7 +133,7 @@ export function createEfbig(path: string, attemptedBytes: number, limitBytes: nu
 
 /** Same parse as `positiveIntEnv`. Local — importing `api/lib/env` would cycle through `sql-fs.ts`. */
 function configuredBytes(name: string, fallback: number): number {
-	const raw = process.env[name];
+	const raw = DefenseInDepthBox.runTrusted(() => process.env[name]);
 	if (raw === undefined || raw === "") return fallback;
 	const n = Number(raw);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;

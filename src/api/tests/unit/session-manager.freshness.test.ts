@@ -24,6 +24,26 @@ afterEach(async () => {
 });
 
 describe("SessionManager authoritative admission lifecycle", () => {
+	it("releases idle session resources when asynchronous dirty clearing rejects", async () => {
+		vi.useFakeTimers();
+		const { fs, manager } = setup();
+		const failure = new Error("dirty clearing failed");
+		Object.assign(fs, {
+			wasDirty: () => true,
+			clearDirty: async () => {
+				throw failure;
+			},
+		});
+		const session = await manager.getOrCreate("default", "sbx");
+		await expect(manager.withSession("default", "sbx", async () => "done")).rejects.toBe(failure);
+		expect(session.inFlight).toBe(0);
+		expect(session.lock.writerHeld).toBe(false);
+		manager.startReaper(10);
+		await vi.advanceTimersByTimeAsync(20);
+		expect(manager.getSession("default", "sbx")).toBeUndefined();
+		expect(fs.disconnect).toHaveBeenCalledOnce();
+	});
+
 	it.each(["withSession", "withSessionRead"] as const)(
 		"%s probes under local protection before the callback",
 		async (method) => {

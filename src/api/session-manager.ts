@@ -668,13 +668,16 @@ export class SessionManager {
 					}
 					return result;
 				} finally {
-					const coherent = asCoherentFs(session.fs);
-					if (coherent === undefined || coherent.wasDirty()) {
-						session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-						session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-						coherent?.clearDirty();
+					try {
+						const coherent = asCoherentFs(session.fs);
+						if (coherent === undefined || coherent.wasDirty()) {
+							session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+							session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+							await coherent?.clearDirty();
+						}
+					} finally {
+						session.inFlight--;
 					}
-					session.inFlight--;
 				}
 			});
 		} catch (error) {

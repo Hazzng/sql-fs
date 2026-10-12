@@ -57,37 +57,11 @@ describe.skipIf(!process.env.DATABASE_URL)("non-script mutation freshness", () =
 					reached.resolve();
 					await release.promise;
 				};
-				if (operation === "composite write") {
-					const write = staleDialect.writeFileComposite.bind(staleDialect);
-					vi.spyOn(staleDialect, "writeFileComposite").mockImplementationOnce(async (...args) => {
-						await pause();
-						return write(...args);
-					});
-				} else if (operation === "composite mkdir") {
-					const mkdir = staleDialect.mkdirComposite.bind(staleDialect);
-					vi.spyOn(staleDialect, "mkdirComposite").mockImplementationOnce(async (...args) => {
-						await pause();
-						return mkdir(...args);
-					});
-				} else if (operation === "composite rm") {
-					const rm = staleDialect.rmComposite.bind(staleDialect);
-					vi.spyOn(staleDialect, "rmComposite").mockImplementationOnce(async (...args) => {
-						await pause();
-						return rm(...args);
-					});
-				} else if (operation === "composite mv") {
-					const mv = staleDialect.mvComposite.bind(staleDialect);
-					vi.spyOn(staleDialect, "mvComposite").mockImplementationOnce(async (...args) => {
-						await pause();
-						return mv(...args);
-					});
-				} else {
-					const context = staleDialect.setSandboxContextWithLock.bind(staleDialect);
-					vi.spyOn(staleDialect, "setSandboxContextWithLock").mockImplementationOnce(async (...args) => {
-						await pause();
-						await context(...args);
-					});
-				}
+				const context = staleDialect.setSandboxContextWithLock.bind(staleDialect);
+				vi.spyOn(staleDialect, "setSandboxContextWithLock").mockImplementationOnce(async (...args) => {
+					await pause();
+					await context(...args);
+				});
 				const mutate = () => {
 					if (operation === "composite write") return stale.writeFile("/attempt", "denied");
 					if (operation === "composite mkdir") return stale.mkdir("/attempt");

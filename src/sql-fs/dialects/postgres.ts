@@ -17,6 +17,7 @@ import {
 	type InodeKind,
 	type InodeRow,
 	type PathCacheEntry,
+	type SandboxGeneration,
 	type SandboxListEntry,
 	type SandboxMeta,
 	type SqlDialect,
@@ -42,10 +43,12 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
 	readonly #blobCache: RedisBlobCache | undefined;
+	readonly #poolMax: number | undefined;
 
-	constructor(connectionString: string, blobCache?: RedisBlobCache) {
+	constructor(connectionString: string, blobCache?: RedisBlobCache, poolMax?: number) {
 		this.connectionString = connectionString;
 		this.#blobCache = blobCache;
+		this.#poolMax = poolMax;
 	}
 
 	// ── Connection ────────────────────────────────────────────────────────────────
@@ -55,7 +58,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		// session, so a tiny `max` is sufficient. Without these caps a runaway
 		// session could exhaust the upstream Postgres connection limit
 		// (especially Neon, where pooler endpoints have small per-tenant caps).
-		const max = envInt("PG_POOL_MAX", 2);
+		const max = this.#poolMax ?? envInt("PG_POOL_MAX", 2);
 		const idleTimeout = envInt("PG_POOL_IDLE_TIMEOUT_S", 30);
 		const connectTimeout = envInt("PG_POOL_CONNECT_TIMEOUT_S", 30);
 		const maxLifetime = envInt("PG_POOL_MAX_LIFETIME_S", 60 * 30);
@@ -149,9 +152,9 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 	}
 
 	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
+		await PostgresDialect.takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ epoch: string }[]>`
 			SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-			       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
 			       set_config('app.sandbox_epoch', s.version::text, true),
 			       s.version AS epoch
 			FROM sandboxes s
@@ -168,6 +171,23 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		const row = rows[0];
 		if (row === undefined) throw createEnoent(sandboxId);
 		return BigInt(row.version);
+	}
+
+	async retireSandboxGeneration(
+		tx: PgTx,
+		sandboxId: string,
+		assertOwnerLease?: () => void,
+	): Promise<SandboxGeneration> {
+		await this.setSandboxContextWithLock(tx, sandboxId);
+		assertOwnerLease?.();
+		const rows = await tx<{ prior_epoch: string; version: string }[]>`
+			UPDATE sandboxes SET version = version + 1
+			WHERE id = ${sandboxId}
+			RETURNING version - 1 AS prior_epoch, version
+		`;
+		const row = rows[0];
+		if (row === undefined) throw createEnoent(sandboxId);
+		return { priorEpoch: BigInt(row.prior_epoch), epoch: BigInt(row.version) };
 	}
 
 	// ── Composite write operations ────────────────────────────────────────────────

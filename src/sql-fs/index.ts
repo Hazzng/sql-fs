@@ -14,12 +14,13 @@
 
 import type { IFileSystem } from "just-bash";
 import { InMemoryFs } from "just-bash";
-import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
+import { loadRedisBlobCacheOptions } from "../redis/blob-cache-options.js";
 import { getRedisClient } from "../redis/client.js";
-import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
+import { runTrustedDbAsync } from "./defense.js";
 import { PostgresDialect } from "./dialects/postgres.js";
+import { raceDriverFault } from "./driver-fault.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
-import { loadScriptTxBufferConfig } from "./script-tx-buffer.js";
+import { type ScriptTxBufferConfig, loadScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 
@@ -29,6 +30,8 @@ export type { InodeKind, SandboxListEntry, StorageBackend } from "./types.js";
  * Options passed to the tenant-aware Postgres factory.
  */
 export interface PostgresBackendOptions {
+	readonly poolMax?: number;
+	readonly scriptTxBuffer?: ScriptTxBufferConfig;
 	readonly connectionString: string;
 	readonly tenantId?: string;
 	readonly blobCache?: RedisBlobCache;
@@ -48,7 +51,7 @@ export async function createPostgresSandboxFs(
 	sandboxId: string,
 	owner = "",
 ): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
-	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache);
+	const dialect = new PostgresDialect(opts.connectionString, opts.blobCache, opts.poolMax);
 	await dialect.connect();
 	// All post-connect work runs inside try/catch so a failure (sandbox bootstrap,
 	// metadata lookup, SqlFs construction, or fs.ready) cannot leak the dialect's
@@ -73,7 +76,7 @@ export async function createPostgresSandboxFs(
 			sandboxId,
 			// #166: the deployment default lives here rather than in SqlFs, so a bare
 			// `new SqlFs(...)` in a test keeps the legacy script-long-transaction shape.
-			scriptTxBuffer: loadScriptTxBufferConfig(),
+			scriptTxBuffer: opts.scriptTxBuffer ?? loadScriptTxBufferConfig(),
 		});
 		await fs.ready();
 		return { fs, resolvedOwner, createdAt };
@@ -109,6 +112,18 @@ export async function destroyPostgresSandbox(connectionString: string, sandboxId
 	}
 }
 
+export async function retirePostgresSandboxGeneration(connectionString: string, sandboxId: string): Promise<void> {
+	const dialect = new PostgresDialect(connectionString);
+	await dialect.connect();
+	try {
+		await raceDriverFault(() =>
+			runTrustedDbAsync(() => dialect.transaction((tx) => dialect.retireSandboxGeneration(tx, sandboxId))),
+		);
+	} finally {
+		await dialect.disconnect();
+	}
+}
+
 /**
  * Creates an IFileSystem instance for the given backend and sandbox ID.
  * For SQL backends, reads DATABASE_URL from process.env.
@@ -128,13 +143,7 @@ export async function createSandboxFs(backend: StorageBackend, sandboxId: string
 			const redisData = blobCacheEnabled ? getRedisClient("data") : undefined;
 			const blobCache =
 				redisData && blobCacheEnabled
-					? new RedisBlobCache(redisData, "default", {
-							ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
-							maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
-							maxInFlight: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT", 32),
-							maxInFlightBytes: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES", 32 * 1024 * 1024),
-							breaker: getRedisCircuitBreaker("data"),
-						})
+					? new RedisBlobCache(redisData, "default", loadRedisBlobCacheOptions())
 					: undefined;
 			const { fs } = await createPostgresSandboxFs({ connectionString: databaseUrl, blobCache }, sandboxId);
 			return fs;
