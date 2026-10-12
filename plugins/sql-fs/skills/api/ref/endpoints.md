@@ -10,7 +10,7 @@ All routes require `Authorization: Bearer <JWT>` unless noted.
 > **banned** for agent use. Use exec equivalents (`cat`, `echo`, `mkdir -p`, `rm -rf`,
 > `find`, `tar`) instead. See `SKILL.md` for the translation table.
 >
-> Allowed non-exec routes: sandbox lifecycle (`POST/GET/DELETE /v1/sandboxes`),
+> Allowed non-exec routes: sandbox lifecycle (`POST/GET/PATCH/DELETE /v1/sandboxes`),
 > `POST /ingest-files` (bulk bootstrap only), `POST /v1/auth/bootstrap`, `POST /v1/auth/bootstrap, POST /v1/auth/admin`.
 
 ---
@@ -145,12 +145,11 @@ Response `201`:
 }
 ```
 
-**Important:** `python`/`javascript`/`network` must be set at creation. They cannot be changed later.
+To change `python`/`javascript`/`network` later, use `PATCH /v1/sandboxes/:id`.
 
 **`network: true` — outbound HTTP**
 
-When `network: true` is set at sandbox creation, supported commands can reach
-external HTTPS endpoints:
+When `network: true` is set, supported commands can reach external HTTPS endpoints:
 
 - `fetch()` inside `js-exec` scripts when `javascript: true` is also set
 - Bash `curl`
@@ -173,6 +172,19 @@ Response `200`:
   "python": false, "javascript": false
 }
 ```
+
+### PATCH /v1/sandboxes/:id — Change runtime flags
+
+```bash
+curl -s -X PATCH "$BASE_URL/v1/sandboxes/$SB" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "network": true }'
+```
+
+Send at least one of `python`, `javascript`, `network`. Omitted flags keep their value.
+The request waits for a running exec to finish, and the next exec runs with the new
+flags. Files are untouched. Response `200` has the same shape as the create response.
 
 ### DELETE /v1/sandboxes/:id — Delete sandbox
 

@@ -154,7 +154,8 @@ interface SqlFsOptions<Tx> {
 export interface ICoherentFs extends IFileSystem {
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
-	ensureFresh(): Promise<void>;
+	/** Resolves true when it replaced the cache with a newer committed view, i.e. someone else changed the sandbox. */
+	ensureFresh(): Promise<boolean>;
 	/** True iff at least one mutation has run since the last clearDirty. */
 	wasDirty(): boolean;
 	/** Resets the dirty flag after session memory accounting. */
@@ -207,7 +208,7 @@ interface CommittedView {
 
 interface FreshnessWaiter {
 	readonly force: boolean;
-	readonly resolve: () => void;
+	readonly resolve: (reloaded: boolean) => void;
 	readonly reject: (error: unknown) => void;
 }
 
@@ -980,7 +981,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		for (const path of entries.keys()) this.#assertStoredPath(validatePath(path), "load reserved virtual device");
 	}
 
-	async #loadCommittedView(force: boolean): Promise<void> {
+	async #loadCommittedView(force: boolean): Promise<boolean> {
 		const view = await this.#db(() =>
 			this.#dialect.transaction(
 				async (tx) => {
@@ -995,7 +996,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				{ isolationLevel: "repeatable read" },
 			),
 		);
-		if (view === undefined) return;
+		if (view === undefined) return false;
 		this.#assertPathCacheNamespace(view.entries);
 		this.#committedView = view;
 		this.#pathCacheBytes = [...view.entries.keys()].reduce((bytes, path) => bytes + path.length + 100, 0);
@@ -1004,9 +1005,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#dirty = false;
 		this.#cachePoisoned = false;
 		this.#startPrewarm(true);
+		return true;
 	}
 
-	#queueFreshness(force: boolean): Promise<void> {
+	#queueFreshness(force: boolean): Promise<boolean> {
 		return new Promise((resolve, reject) => {
 			this.#freshnessQueue.push({ force, resolve, reject });
 			if (this.#freshnessRunning) return;
@@ -1019,8 +1021,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		while (this.#freshnessQueue.length > 0) {
 			const cohort = this.#freshnessQueue.splice(0);
 			try {
-				await this.#loadCommittedView(cohort.some((waiter) => waiter.force));
-				for (const waiter of cohort) waiter.resolve();
+				const reloaded = await this.#loadCommittedView(cohort.some((waiter) => waiter.force));
+				for (const waiter of cohort) waiter.resolve(reloaded);
 			} catch (error) {
 				for (const waiter of cohort) waiter.reject(error);
 			}
@@ -1028,7 +1030,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#freshnessRunning = false;
 	}
 
-	async ensureFresh(): Promise<void> {
+	async ensureFresh(): Promise<boolean> {
 		if (this.#scriptScope)
 			throw Object.assign(new Error("Freshness admission during a script scope"), { code: "EBUSY" });
 		return this.#queueFreshness(false);

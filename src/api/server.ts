@@ -36,7 +36,7 @@ import { execRoutes } from "./routes/exec.js";
 import { fileRoutes } from "./routes/files.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
-import { SessionManager } from "./session-manager.js";
+import { type RuntimeOptions, SessionManager } from "./session-manager.js";
 import { loadTenantConfig } from "./tenants.js";
 
 export const app = new Hono<{ Variables: AuthVariables }>();
@@ -120,6 +120,16 @@ async function persistSandboxMetaFn(tenantId: string, sandboxId: string, meta: S
 	}
 }
 
+async function updateSandboxRuntimeFn(
+	tenantId: string,
+	sandboxId: string,
+	runtime: Partial<RuntimeOptions>,
+): Promise<SandboxMeta | null> {
+	const backend = getOrInitMetaBackend(tenantId);
+	await ensureMetaConnected(backend);
+	return backend.dialect.transaction((tx) => backend.dialect.updateSandboxRuntime(tx, sandboxId, runtime));
+}
+
 async function listSandboxesFn(tenantId: string, owner?: string): Promise<SandboxListEntry[]> {
 	const backend = getOrInitMetaBackend(tenantId);
 	await ensureMetaConnected(backend);
@@ -151,6 +161,7 @@ const sessionManager = new SessionManager({
 			: undefined,
 	getSandboxMetaFn,
 	persistSandboxMetaFn,
+	updateSandboxRuntimeFn,
 	listSandboxesFn,
 });
 

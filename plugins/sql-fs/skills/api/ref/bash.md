@@ -80,7 +80,7 @@ node script.js    # alias for js-exec
 
 ### Network — `network: true`
 
-Network access is opt-in at sandbox creation. With `network: true`:
+Network access is opt-in, at sandbox creation or later with `PATCH /v1/sandboxes/:id`. With `network: true`:
 
 - `curl` can reach outbound HTTPS endpoints
 - `git clone`, `git fetch`, and `git push` can reach HTTPS remotes

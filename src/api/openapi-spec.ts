@@ -381,6 +381,48 @@ export const openapiSpec = {
 					},
 				},
 			},
+			patch: {
+				tags: ["Sandboxes"],
+				summary: "Change runtime flags",
+				description:
+					"Turn `python`, `javascript` or `network` on or off. Omitted flags keep their value. Waits for a running exec to finish; the next exec on any replica runs with the new flags. Files are untouched.",
+				parameters: [sandboxIdParam],
+				requestBody: {
+					required: true,
+					content: {
+						"application/json": {
+							schema: {
+								type: "object",
+								properties: {
+									python: { type: "boolean" },
+									javascript: { type: "boolean" },
+									network: { type: "boolean", example: true },
+								},
+								minProperties: 1,
+								additionalProperties: false,
+							},
+						},
+					},
+				},
+				responses: {
+					"200": {
+						description: "Updated sandbox",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Sandbox" } } },
+					},
+					"400": {
+						description: "Validation error",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"403": {
+						description: "Forbidden",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+					"404": {
+						description: "Not found",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
+				},
+			},
 			delete: {
 				tags: ["Sandboxes"],
 				summary: "Delete sandbox",

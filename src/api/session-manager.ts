@@ -164,8 +164,9 @@ const JS_INVOCATION_REGEX = /\bjs-exec\b|\bnode\b/;
 
 export interface Session {
 	readonly fs: IFileSystem;
-	readonly bash: Bash;
-	readonly runtimeOptions: RuntimeOptions;
+	/** Replaced, with `runtimeOptions`, when another request changes the sandbox's runtime flags. */
+	bash: Bash;
+	runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly sandboxId: string;
 	readonly scriptTx: SessionScopedFs | undefined;
@@ -255,6 +256,12 @@ export interface SessionManagerOptions {
 	 * Called from `persistSandboxMeta` after sandbox creation.
 	 */
 	readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	/** Changes runtime flags in the store and advances the sandbox epoch. Resolves null for a missing sandbox. */
+	readonly updateSandboxRuntimeFn?: (
+		tenantId: string,
+		sandboxId: string,
+		runtime: Partial<RuntimeOptions>,
+	) => Promise<SandboxMeta | null>;
 	/**
 	 * Lists all sandboxes from the persistent store for the given tenant,
 	 * optionally filtered by owner.
@@ -318,6 +325,7 @@ export class SessionManager {
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
 	private readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	private readonly updateSandboxRuntimeFn?: SessionManagerOptions["updateSandboxRuntimeFn"];
 	private readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
 
 	private readonly pythonSem: Semaphore;
@@ -342,6 +350,7 @@ export class SessionManager {
 		blobCacheFactory,
 		getSandboxMetaFn,
 		persistSandboxMetaFn,
+		updateSandboxRuntimeFn,
 		listSandboxesFn,
 		defenseInDepth,
 		defenseAuditMode,
@@ -363,6 +372,7 @@ export class SessionManager {
 		this.blobCacheFactory = blobCacheFactory;
 		this.getSandboxMetaFn = getSandboxMetaFn;
 		this.persistSandboxMetaFn = persistSandboxMetaFn;
+		this.updateSandboxRuntimeFn = updateSandboxRuntimeFn;
 		this.listSandboxesFn = listSandboxesFn;
 		const maxPyWaiters = Number(process.env.MAX_PYTHON_QUEUE ?? "100");
 		const maxJsWaiters = Number(process.env.MAX_JS_QUEUE ?? "100");
@@ -452,6 +462,50 @@ export class SessionManager {
 		return total;
 	}
 
+	private buildBash(sandboxId: string, fs: IFileSystem, resolvedRuntime: RuntimeOptions): Bash {
+		const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
+			? {
+					enabled: true,
+					auditMode: this.defenseAuditMode,
+					onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
+				}
+			: false;
+
+		// NOTE: the `py-exec` warm-host-Python custom command is deliberately
+		// not registered (audit C1 — host sandbox escape). Python sandboxes
+		// run via just-bash's WASM `python3` (`python: true`), which is isolated.
+		// `{}` → no allowlist → full outbound via globalThis.fetch.
+		// `false` → clone/fetch/push blocked; local git still works.
+		// The wrapper removes the destination of a clone that fails partway,
+		// so a refused symlink cannot leave a poisoned index behind.
+		const gitCommand = createGitCommand({
+			network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
+			identity: this.gitIdentity,
+		});
+		const customCommands = [
+			// Override just-bash's built-in nodeStubCommand with a smarter
+			// version that translates `node -e CODE` → `js-exec -c CODE` and
+			// `node FILE` → `js-exec FILE` instead of dumping a help wall.
+			// Only registered when the javascript runtime is enabled so that
+			// non-JS sandboxes keep the default "command not found" behaviour.
+			...(resolvedRuntime.javascript ? [nodeCommand] : []),
+			gitCommand,
+		];
+
+		return new Bash({
+			fs,
+			python: resolvedRuntime.python || undefined,
+			javascript: resolvedRuntime.javascript || undefined,
+			// When network is enabled, grant js-exec unrestricted outbound HTTPS.
+			// just-bash also registers curl through secureFetch; git remote
+			// transport is gated separately above and uses globalThis.fetch.
+			network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
+			env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network),
+			defenseInDepth: defenseInDepthConfig,
+			customCommands: customCommands.length > 0 ? customCommands : undefined,
+		});
+	}
+
 	async getOrCreate(
 		tenantId: string,
 		sandboxId: string,
@@ -481,47 +535,7 @@ export class SessionManager {
 			try {
 				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
 				createdFs = fs;
-				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
-					? {
-							enabled: true,
-							auditMode: this.defenseAuditMode,
-							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
-						}
-					: false;
-
-				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
-				// not registered (audit C1 — host sandbox escape). Python sandboxes
-				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
-				// `{}` → no allowlist → full outbound via globalThis.fetch.
-				// `false` → clone/fetch/push blocked; local git still works.
-				// The wrapper removes the destination of a clone that fails partway,
-				// so a refused symlink cannot leave a poisoned index behind.
-				const gitCommand = createGitCommand({
-					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
-					identity: this.gitIdentity,
-				});
-				const customCommands = [
-					// Override just-bash's built-in nodeStubCommand with a smarter
-					// version that translates `node -e CODE` → `js-exec -c CODE` and
-					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
-					// Only registered when the javascript runtime is enabled so that
-					// non-JS sandboxes keep the default "command not found" behaviour.
-					...(resolvedRuntime.javascript ? [nodeCommand] : []),
-					gitCommand,
-				];
-
-				const bash = new Bash({
-					fs,
-					python: resolvedRuntime.python || undefined,
-					javascript: resolvedRuntime.javascript || undefined,
-					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
-					// just-bash also registers curl through secureFetch; git remote
-					// transport is gated separately above and uses globalThis.fetch.
-					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
-					env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network),
-					defenseInDepth: defenseInDepthConfig,
-					customCommands: customCommands.length > 0 ? customCommands : undefined,
-				});
+				const bash = this.buildBash(sandboxId, fs, resolvedRuntime);
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 				const scriptTxFs = asScriptTxFs(fs);
 				const scriptTx = scriptTxFs !== undefined ? new SessionScopedFs(scriptTxFs) : undefined;
@@ -793,11 +807,39 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * `updateSandboxRuntime` advances the sandbox epoch, so a warm session on any replica learns of
+	 * the change from the reload its next request already pays for, without a per-request read.
+	 */
+	private async syncRuntime(tenantId: string, sandboxId: string, session: Session): Promise<void> {
+		const meta = await this.getSandboxMetaFn?.(tenantId, sandboxId);
+		if (!meta) return;
+		const { python, javascript, network } = meta;
+		const current = session.runtimeOptions;
+		if (python === current.python && javascript === current.javascript && network === current.network) return;
+		session.runtimeOptions = { python, javascript, network };
+		session.bash = this.buildBash(sandboxId, session.fs, session.runtimeOptions);
+	}
+
+	/** Call with the sandbox's exec lock held, so no script runs across the change. */
+	async updateSandboxRuntime(
+		tenantId: string,
+		sandboxId: string,
+		runtime: Partial<RuntimeOptions>,
+	): Promise<SandboxMeta> {
+		if (this.updateSandboxRuntimeFn === undefined) {
+			throw Object.assign(new Error("updateSandboxRuntime not configured"), { code: "ENOTSUP" });
+		}
+		const meta = await this.updateSandboxRuntimeFn(tenantId, sandboxId, runtime);
+		if (meta === null) throw createEnoent(`/${sandboxId}`);
+		return meta;
+	}
+
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 		try {
-			await coherent.ensureFresh();
+			if (await coherent.ensureFresh()) await this.syncRuntime(tenantId, sandboxId, session);
 			session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 			session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
 			if (session.state === "closing")
