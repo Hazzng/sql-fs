@@ -26,6 +26,7 @@ import {
 	jitteredDelayMs,
 	logLockLostAfterCommit,
 } from "./distributed-lock.js";
+import { preservesAmbiguousOutcome } from "./errors.js";
 import { recordHeartbeatGap } from "./event-loop-monitor.js";
 
 // ── Lua scripts ──────────────────────────────────────────────────────────────
@@ -102,6 +103,7 @@ end`;
 export type RWLockMode = "shared" | "exclusive";
 
 export interface DistributedRWLockOptions {
+	readonly onLostAfterWork?: () => Promise<void>;
 	readonly leaseMs: number;
 	readonly renewMs: number;
 	readonly acquireTimeoutMs: number;
@@ -472,7 +474,7 @@ async function runShared<T>(
 			// from the lost-signal abort. Surface the canonical, retryable
 			// LockLostError instead so the client sees a single coherent code and
 			// treats it as "not committed" (the abort fired before any commit).
-			if (lost) throw new LockLostError(keys.readers);
+			if (lost && !preservesAmbiguousOutcome(err)) throw new LockLostError(keys.readers);
 			throw err;
 		}
 		// #175 M1: the read completed. A shared holder runs under a read-only scope
@@ -480,6 +482,7 @@ async function runShared<T>(
 		// but the lapse is worth a log line, since the result may be pre-writer.
 		if (lost) {
 			logLockLostAfterCommit(keys.readers, true);
+			await opts.onLostAfterWork?.();
 			throw new LockLostError(keys.readers);
 		}
 		return result;
@@ -533,11 +536,12 @@ async function runExclusive<T>(
 			// from the lost-signal abort. Surface the canonical, retryable
 			// LockLostError instead so the client sees a single coherent code and
 			// treats it as "not committed" (the abort fired before any commit).
-			if (lost) throw new LockLostError(keys.writer);
+			if (lost && !preservesAmbiguousOutcome(err)) throw new LockLostError(keys.writer);
 			throw err;
 		}
 		if (lost) {
 			logLockLostAfterCommit(keys.writer, false);
+			await opts.onLostAfterWork?.();
 			throw new LockLostAfterCommitError(keys.writer);
 		}
 		return result;

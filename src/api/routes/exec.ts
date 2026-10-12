@@ -18,6 +18,7 @@ import {
 	withOwnedSessionOrRehydrate,
 	withOwnedSessionRead,
 } from "../ownership.js";
+import { sessionLeaseSignal } from "../session-lease-context.js";
 import type { SessionManager } from "../session-manager.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -200,7 +201,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				// F2-L1: abort the exec — and roll its script-tx back BEFORE any commit —
 				// the instant the distributed exec lock is definitively lost. Compose the
 				// lock-lost signal (if a distributed lock is held) with the timeout signal.
-				const execSignal = composeAbortSignals(controller.signal, session.lockLostSignal);
+				const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
 
 				try {
 					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
@@ -310,7 +311,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					// F2-L1: compose the distributed lock's definitive-loss signal with the
 					// timeout/client-disconnect signal so a lapsed lease aborts the exec and
 					// rolls its script-tx back BEFORE any commit.
-					const execSignal = composeAbortSignals(controller.signal, session.lockLostSignal);
+					const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
 					try {
 						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
 							signal: execSignal,
@@ -452,7 +453,7 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					session,
 					body.scripts,
 					totalTimeoutMs,
-					composeAbortSignals(disconnectController.signal, session.lockLostSignal),
+					composeAbortSignals(disconnectController.signal, sessionLeaseSignal()),
 					batchOptions,
 				),
 			);

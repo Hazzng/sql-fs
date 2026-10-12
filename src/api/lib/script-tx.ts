@@ -3,6 +3,7 @@
  */
 
 import { LockLostError } from "../distributed-lock.js";
+import { sessionLeaseSignal } from "../session-lease-context.js";
 import type { Session } from "../session-manager.js";
 
 /**
@@ -36,7 +37,7 @@ export async function runInScriptTx<T>(session: Session, fn: () => Promise<T>): 
 	return scriptTx.run(async () => {
 		const result = await fn();
 		// Keyed off the dedicated lost-signal, not a composed abort: a plain timeout still commits.
-		if (session.lockLostSignal?.aborted === true) {
+		if (sessionLeaseSignal()?.aborted === true) {
 			throw new LockLostError("write aborted: distributed exec lock lost mid-request");
 		}
 		return result;

@@ -56,7 +56,7 @@ describe("execWithRuntimeThrottle establishes the exec file-size context", () =>
 		await sm.withSession(T, sandboxId, (session) => sm.execWithRuntimeThrottle(session, "cat /probe.txt"));
 
 		expect(fs.seen.length).toBeGreaterThan(0);
-		expect(fs.seen).toContainEqual({ maxFileBytes: MAX_EXEC_FILE_BYTES });
+		expect(fs.seen).toContainEqual({ sandboxId, maxFileBytes: MAX_EXEC_FILE_BYTES });
 		expect(fs.seen).not.toContainEqual(undefined);
 	});
 

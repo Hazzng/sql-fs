@@ -177,6 +177,41 @@ describe("MCP tool — file_read", () => {
 		});
 	});
 
+	it.each(
+		["\0", '"', "\\", "€"].flatMap((codepoint) =>
+			[0, Buffer.byteLength(codepoint)].map((byteOffset) => ({ codepoint, byteOffset })),
+		),
+	)("refuses a page without room for $codepoint at byte offset $byteOffset", async ({ codepoint, byteOffset }) => {
+		const text = codepoint.repeat(200);
+		const emptyPage = JSON.stringify({
+			ok: true,
+			path: "/x.txt",
+			content: "",
+			size: Buffer.byteLength(text),
+			totalLines: 1,
+			firstLine: 1,
+			truncated: true,
+			nextByteOffset: byteOffset,
+		});
+		const budget = Buffer.byteLength(JSON.stringify(emptyPage)) - 2 + 1;
+		vi.stubEnv("MAX_MCP_READ_RESPONSE_BYTES", String(budget));
+		vi.resetModules();
+		const { registerTools: registerFresh } = await import("../../mcp/tools.js");
+		const fs = new InMemoryFs();
+		const sessionManager = new SessionManager({ createFs: async () => fs });
+		await sessionManager.getOrCreate("default", SANDBOX_ID, undefined, OWNER);
+		const { server, handlers } = captureToolHandlers();
+		registerFresh(server, sessionManager, OWNER, "default");
+		await fs.writeFile("/x.txt", text);
+		const res = (await requireHandler(handlers, "file_read")({ id: SANDBOX_ID, path: "/x.txt", byteOffset }, {})) as {
+			content: Array<{ text: string }>;
+		};
+		expect(JSON.parse(res.content[0]?.text ?? "")).toMatchObject({
+			ok: false,
+			code: "RESPONSE_BUDGET_TOO_SMALL",
+		});
+	});
+
 	it("keeps the whole serialized reply within the wire cap", async () => {
 		const { callRaw, fs } = await makeEnv();
 		await fs.writeFile("/big.txt", "z".repeat(2 * 1024 * 1024));

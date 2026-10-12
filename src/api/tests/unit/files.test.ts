@@ -9,12 +9,14 @@
  */
 
 import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
+import { extractErrCode, mapFsErrorToStatus } from "../../errors.js";
 import { fileRoutes } from "../../routes/files.js";
 import { SessionManager } from "../../session-manager.js";
 
@@ -409,6 +411,48 @@ describe("GET /v1/sandboxes/:id/tree", () => {
 
 	afterEach(() => {
 		process.env.AUTH_SECRET = "";
+	});
+
+	it.each([
+		{ code: "EWORKER_UNAVAILABLE", status: 503 },
+		{ code: "ESTALE", status: 409 },
+		{ code: "EEXEC_INPUT_LIMIT", status: 413 },
+	])("propagates $code after a successful stat instead of returning a partial tree", async ({ code, status }) => {
+		const { sessionManager, fs } = await makeTestEnv();
+		await fs.mkdir("/myapp");
+		await fs.writeFile("/myapp/a.txt", "a");
+		await fs.writeFile("/myapp/b.txt", "b");
+		const stat = fs.stat.bind(fs);
+		const spy = vi.spyOn(fs, "stat").mockImplementation(async (path) => {
+			if (path === "/myapp/b.txt") throw Object.assign(new Error(code), { code });
+			return stat(path);
+		});
+		const app = makeTestApp(sessionManager);
+		app.onError((err, c) => c.json({ code: extractErrCode(err) }, mapFsErrorToStatus(err) as ContentfulStatusCode));
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/tree?prefix=/myapp`, {
+			headers: { Authorization: `Bearer ${await makeToken()}` },
+		});
+		expect(spy.mock.calls.map(([path]) => path)).toEqual(["/myapp/a.txt", "/myapp/b.txt"]);
+		expect(res.status).toBe(status);
+		expect(await res.json()).toEqual({ code });
+	});
+
+	it.each(["ENOENT", "ENOTDIR"])("skips a path that became unavailable with %s", async (code) => {
+		const { sessionManager, fs } = await makeTestEnv();
+		await fs.mkdir("/myapp");
+		await fs.writeFile("/myapp/a.txt", "a");
+		await fs.writeFile("/myapp/b.txt", "b");
+		const stat = fs.stat.bind(fs);
+		vi.spyOn(fs, "stat").mockImplementation(async (path) => {
+			if (path === "/myapp/b.txt") throw Object.assign(new Error(code), { code });
+			return stat(path);
+		});
+		const app = makeTestApp(sessionManager);
+		const res = await app.request(`/v1/sandboxes/${SANDBOX_ID}/tree?prefix=/myapp`, {
+			headers: { Authorization: `Bearer ${await makeToken()}` },
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual([expect.objectContaining({ path: "/myapp/a.txt" })]);
 	});
 
 	it("tree of nested structure returns all entries", async () => {
