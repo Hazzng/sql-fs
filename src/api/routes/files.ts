@@ -23,6 +23,7 @@ import {
 	MAX_FILE_WRITE_BYTES as MAX_RAW_FILE_WRITE_BYTES,
 } from "../lib/env.js";
 import { type EditOutcome, type WriteOutcome, editFile, ensureParentDir, writeFileAtPath } from "../lib/file-ops.js";
+import { retainedInputBytes } from "../lib/request-input.js";
 import { runInScriptTx } from "../lib/script-tx.js";
 import {
 	forbiddenResponse,
@@ -31,6 +32,7 @@ import {
 	withOwnedSessionRead,
 } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
+import { workerRequestContext } from "../worker-owner/request-context.js";
 
 // Simple extension → MIME type map (null-prototype to prevent prototype pollution)
 const MIME_TYPES: Record<string, string> = Object.assign(Object.create(null) as Record<string, string>, {
@@ -164,12 +166,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 			// parallel. This does not let a GET overtake an in-flight writer —
 			// shared still excludes exclusive — it only removes reader-reader
 			// serialization.
-			result = await withOwnedSessionRead<ReadResult>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
+			result = await workerRequestContext.run({ bytes: retainedInputBytes(filePath), signal: c.req.raw.signal }, () =>
+				withOwnedSessionRead<ReadResult>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 					let stat: FsStat;
 					try {
 						stat = await session.fs.stat(filePath);
@@ -201,7 +199,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 					}
 
 					return { kind: "ok", body, statHeader };
-				},
+				}),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
@@ -244,8 +242,12 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let outcome: WriteOutcome;
 		try {
-			outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), (session) =>
-				writeFileAtPath(session, filePath, content),
+			outcome = await workerRequestContext.run(
+				{ bytes: retainedInputBytes({ filePath, content }), signal: c.req.raw.signal },
+				() =>
+					withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), (session) =>
+						writeFileAtPath(session, filePath, content),
+					),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
@@ -295,12 +297,15 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let result: EditOutcome;
 		try {
-			result = await withOwnedSessionOrRehydrate<EditOutcome>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				(session) => editFile(session, filePath, { oldString, newString, replaceAll }, MAX_RAW_FILE_WRITE_BYTES),
+			result = await workerRequestContext.run(
+				{
+					bytes: retainedInputBytes({ filePath, oldString, newString }),
+					signal: c.req.raw.signal,
+				},
+				() =>
+					withOwnedSessionOrRehydrate<EditOutcome>(sessionManager, tenant, sandboxId, c.get("owner"), (session) =>
+						editFile(session, filePath, { oldString, newString, replaceAll }, MAX_RAW_FILE_WRITE_BYTES),
+					),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
@@ -366,22 +371,24 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let result: DeleteResult;
 		try {
-			result = await withOwnedSessionOrRehydrate<DeleteResult>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
-					try {
-						await session.fs.rm(filePath, { recursive });
-						return { kind: "ok" };
-					} catch (e) {
-						const code = extractErrCode(e);
-						if (code === "ENOENT") return { kind: "not_found" };
-						if (code === "ENOTEMPTY") return { kind: "not_empty" };
-						throw e;
-					}
-				},
+			result = await workerRequestContext.run({ bytes: retainedInputBytes(filePath), signal: c.req.raw.signal }, () =>
+				withOwnedSessionOrRehydrate<DeleteResult>(
+					sessionManager,
+					tenant,
+					sandboxId,
+					c.get("owner"),
+					async (session) => {
+						try {
+							await session.fs.rm(filePath, { recursive });
+							return { kind: "ok" };
+						} catch (e) {
+							const code = extractErrCode(e);
+							if (code === "ENOENT") return { kind: "not_found" };
+							if (code === "ENOTEMPTY") return { kind: "not_empty" };
+							throw e;
+						}
+					},
+				),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
@@ -473,20 +480,22 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		}
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				const writeAll = async (): Promise<void> => {
-					for (const [filePath, content] of fileEntries) {
-						await ensureParentDir(session.fs, filePath);
-						await session.fs.writeFile(filePath, content);
-					}
-				};
+			await workerRequestContext.run({ bytes: retainedInputBytes(files), signal: c.req.raw.signal }, () =>
+				withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+					const writeAll = async (): Promise<void> => {
+						for (const [filePath, content] of fileEntries) {
+							await ensureParentDir(session.fs, filePath);
+							await session.fs.writeFile(filePath, content);
+						}
+					};
 
-				// Audit H10: make the bulk write atomic. Wrap the whole batch in a
-				// single script-tx scope so a mid-batch failure rolls back ALL files
-				// instead of leaving earlier writes committed. Backends without
-				// script-tx support (e.g. in-memory) fall back to the per-entry loop.
-				await runInScriptTx(session, writeAll);
-			});
+					// Audit H10: make the bulk write atomic. Wrap the whole batch in a
+					// single script-tx scope so a mid-batch failure rolls back ALL files
+					// instead of leaving earlier writes committed. Backends without
+					// script-tx support (e.g. in-memory) fall back to the per-entry loop.
+					await runInScriptTx(session, writeAll);
+				}),
+			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			throw err;
@@ -526,12 +535,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let result: MkdirResult;
 		try {
-			result = await withOwnedSessionOrRehydrate<MkdirResult>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
+			result = await workerRequestContext.run({ bytes: retainedInputBytes(dirPath), signal: c.req.raw.signal }, () =>
+				withOwnedSessionOrRehydrate<MkdirResult>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
 					try {
 						await session.fs.mkdir(dirPath, { recursive });
 						return { kind: "ok" };
@@ -540,7 +545,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 						if (code === "EEXIST") return { kind: "exists" };
 						throw e;
 					}
-				},
+				}),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
@@ -577,50 +582,48 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 
 		let entries: TreeEntry[];
 		try {
-			entries = await withOwnedSessionRead<TreeEntry[]>(
-				sessionManager,
-				tenant,
-				sandboxId,
-				c.get("owner"),
-				async (session) => {
-					const allPaths = await sessionManager.getSessionPaths(session);
-					const result: TreeEntry[] = [];
+			entries = await workerRequestContext.run(
+				{ bytes: retainedInputBytes(normalizedPrefix), signal: c.req.raw.signal },
+				() =>
+					withOwnedSessionRead<TreeEntry[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+						const allPaths = await sessionManager.getSessionPaths(session);
+						const result: TreeEntry[] = [];
 
-					for (const p of allPaths) {
-						// Skip the prefix dir itself
-						if (p === normalizedPrefix) continue;
+						for (const p of allPaths) {
+							// Skip the prefix dir itself
+							if (p === normalizedPrefix) continue;
 
-						// Filter by prefix
-						if (normalizedPrefix !== "/") {
-							if (!p.startsWith(`${normalizedPrefix}/`)) continue;
-						}
-
-						// Filter by depth (relative segments below prefix)
-						if (depth !== undefined) {
-							const relative = normalizedPrefix === "/" ? p.slice(1) : p.slice(normalizedPrefix.length + 1);
-							const segments = relative.split("/").filter(Boolean).length;
-							if (segments > depth) continue;
-						}
-
-						try {
-							const stat = await session.fs.stat(p);
-							result.push({
-								path: p,
-								kind: toKind(stat),
-								size: stat.size,
-								mtime: stat.mtime.toISOString(),
-							});
-							if (result.length > MAX_TREE_ENTRIES) {
-								throw Object.assign(new Error("tree too large"), { code: "PAYLOAD_TOO_LARGE" });
+							// Filter by prefix
+							if (normalizedPrefix !== "/") {
+								if (!p.startsWith(`${normalizedPrefix}/`)) continue;
 							}
-						} catch (e) {
-							const code = extractErrCode(e);
-							if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
-						}
-					}
 
-					return result;
-				},
+							// Filter by depth (relative segments below prefix)
+							if (depth !== undefined) {
+								const relative = normalizedPrefix === "/" ? p.slice(1) : p.slice(normalizedPrefix.length + 1);
+								const segments = relative.split("/").filter(Boolean).length;
+								if (segments > depth) continue;
+							}
+
+							try {
+								const stat = await session.fs.stat(p);
+								result.push({
+									path: p,
+									kind: toKind(stat),
+									size: stat.size,
+									mtime: stat.mtime.toISOString(),
+								});
+								if (result.length > MAX_TREE_ENTRIES) {
+									throw Object.assign(new Error("tree too large"), { code: "PAYLOAD_TOO_LARGE" });
+								}
+							} catch (e) {
+								const code = extractErrCode(e);
+								if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
+							}
+						}
+
+						return result;
+					}),
 			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
