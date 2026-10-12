@@ -101,8 +101,13 @@ describe("SqlFs exec file-size ceiling — reads", () => {
 		await expect(inExec(() => fs.readFileBuffer("/big.txt"))).rejects.toMatchObject({ code: "EFBIG" });
 	});
 
+	it("rejects readFileBytes of an over-cap file with EFBIG", async () => {
+		await expect(inExec(() => fs.readFileBytes("/big.txt"))).rejects.toMatchObject({ code: "EFBIG" });
+	});
+
 	it("does not fetch the blob for an over-cap read", async () => {
 		await expect(inExec(() => fs.readFileBuffer("/big.txt"))).rejects.toThrow();
+		await expect(inExec(() => fs.readFileBytes("/big.txt"))).rejects.toThrow();
 
 		expect(getBlobNoTxMock).not.toHaveBeenCalled();
 	});

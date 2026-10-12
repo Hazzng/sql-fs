@@ -8,7 +8,16 @@
  */
 
 import { createHash } from "node:crypto";
-import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
+import {
+	type ByteString,
+	type CpOptions,
+	type FileContent,
+	type FsStat,
+	type IFileSystem,
+	type MkdirOptions,
+	type RmOptions,
+	unsafeBytesFromLatin1,
+} from "just-bash";
 import { LRUCache } from "lru-cache";
 
 import { execContext } from "../api/exec-context.js";
@@ -1986,6 +1995,16 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
 		this.#assertScriptTxAlive();
 		return this.#readBytes(inputPath);
+	}
+
+	/**
+	 * Without it just-bash reads through `readFileBuffer` plus a per-byte `String.fromCharCode`
+	 * concat, and a 5 MB `cat` spent 246 ms, mostly in GC, against 17 ms for this one latin1 decode.
+	 */
+	async readFileBytes(inputPath: string): Promise<ByteString> {
+		this.#assertScriptTxAlive();
+		const bytes = await this.#readBytes(inputPath);
+		return unsafeBytesFromLatin1(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1"));
 	}
 
 	async exists(inputPath: string): Promise<boolean> {
