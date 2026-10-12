@@ -204,7 +204,7 @@ export async function executeSessionRuntime(
 	if (ownsScope) await scope.beginScope();
 	const context: ExecContext = {
 		sandboxId: runtime.sandboxId,
-		maxFileBytes: runtime.execFileLimitBytes ?? MAX_EXEC_FILE_BYTES,
+		maxFileBytes: runtime.execFileLimitBytes === undefined ? MAX_EXEC_FILE_BYTES : runtime.execFileLimitBytes,
 		...(runtime.execInputLimitBytes === undefined
 			? {}
 			: { inputLimitBytes: runtime.execInputLimitBytes, inputBytes: 0 }),
