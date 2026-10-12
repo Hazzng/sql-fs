@@ -19,6 +19,7 @@ from sqlfs import (
     ExecTimeoutError,
     NotFoundError,
     RateLimitError,
+    ServerError,
     ValidationError,
 )
 
@@ -374,6 +375,88 @@ def test_exec_stream_yields_events_until_exit():
     assert events[2].duration_ms == 42
 
 
+@pytest.mark.parametrize(
+    ("code", "retryable", "status", "error_type"),
+    [
+        ("EEXEC_OUTCOME_UNKNOWN", False, 503, ServerError),
+        ("EWORKER_BUSY", True, 503, ServerError),
+        ("EWORKER_UNAVAILABLE", True, 503, ServerError),
+        ("ERUNTIME_BUSY", True, 503, ServerError),
+        ("ECOHERENCE", False, 503, ServerError),
+        ("ELOCKLOST_APPLIED", False, 503, ServerError),
+        ("EDRIVERFAULT", False, 503, ServerError),
+        ("EUNAVAILABLE", False, 503, ServerError),
+        ("ESESSIONCLOSING", True, 503, ServerError),
+        ("ESHUTTINGDOWN", True, 503, ServerError),
+        ("ELOCKTIMEOUT", True, 503, ServerError),
+        ("ELOCKLOST", True, 503, ServerError),
+        ("ECOHERENCE_UNAPPLIED", True, 503, ServerError),
+        ("EEXEC_INPUT_LIMIT", False, 413, ValidationError),
+        ("EFBIG", False, 413, ValidationError),
+        ("ESCRIPTBUFFER", False, 413, ValidationError),
+        ("EREADONLY_VIOLATION", False, 422, ValidationError),
+        ("INTERNAL_ERROR", False, 500, ServerError),
+        ("UNRECOGNIZED_CODE", False, 422, ValidationError),
+    ],
+)
+@respx.mock
+def test_exec_stream_preserves_received_error_without_replay(code, retryable, status, error_type):
+    details = {"source": "worker"}
+    frame = {"error": "execution failed", "code": code, "retryable": retryable, "details": details}
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec").mock(
+        return_value=httpx.Response(
+            200,
+            content=f"event: error\ndata: {json.dumps(frame)}\n\n",
+            headers={"Content-Type": "text/event-stream"},
+        )
+    )
+    sb = make_client(max_retries=3).sandboxes.attach("sb")
+
+    with pytest.raises(error_type) as exc:
+        list(sb.exec_stream("curl -X POST https://example.test/effect", read_only=True))
+    assert str(exc.value) == "execution failed"
+    assert exc.value.code == code
+    assert exc.value.status == status
+    assert exc.value.retryable is retryable
+    assert exc.value.details == details
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize("code", ["EEXEC_INPUT_LIMIT", "EFBIG"])
+@respx.mock
+def test_exec_http_413_uses_same_validation_policy(code):
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
+        return_value=httpx.Response(
+            413,
+            json={
+                "error": "input too large",
+                "code": code,
+                "retryable": False,
+                "details": ["input"],
+            },
+        )
+    )
+    with pytest.raises(ValidationError) as exc:
+        make_client().sandboxes.attach("sb").exec("wc -c large.txt")
+    assert exc.value.code == code
+    assert exc.value.status == 413
+    assert exc.value.retryable is False
+    assert exc.value.details == ["input"]
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_exec_stream_does_not_interpret_untyped_retry_hint_as_boolean():
+    frame = {"error": "unknown", "code": "EEXEC_OUTCOME_UNKNOWN", "retryable": "false"}
+    route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec").mock(
+        return_value=httpx.Response(200, content=f"event: error\ndata: {json.dumps(frame)}\n\n")
+    )
+    with pytest.raises(ServerError) as exc:
+        list(make_client().sandboxes.attach("sb").exec_stream("echo hello"))
+    assert exc.value.retryable is None
+    assert route.call_count == 1
+
+
 @respx.mock
 def test_exec_read_only_sends_flag():
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
@@ -474,7 +557,6 @@ def test_exec_ecoherence_never_retries_even_with_retry_on_5xx():
 
 @respx.mock
 def test_exec_read_only_retries_5xx_automatically():
-    """`read_only=True` execs are always safe to retry — no opt-in needed."""
     ok_body = {
         "stdout": "ok\n",
         "stderr": "",
@@ -485,7 +567,7 @@ def test_exec_read_only_retries_5xx_automatically():
     }
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
         side_effect=[
-            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY", "retryable": True}),
             httpx.Response(200, json=ok_body),
         ]
     )
@@ -498,8 +580,9 @@ def test_exec_read_only_retries_5xx_automatically():
 
 
 @respx.mock
-def test_exec_read_only_retries_ecoherence():
-    """ECOHERENCE on a read can be safely retried — no mutation to double-apply."""
+def test_exec_read_only_never_replays_ecoherence():
+    from sqlfs import ServerError
+
     ok_body = {
         "stdout": "ok\n",
         "stderr": "",
@@ -510,14 +593,17 @@ def test_exec_read_only_retries_ecoherence():
     }
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
         side_effect=[
-            httpx.Response(503, json={"error": "coherence", "code": "ECOHERENCE"}),
+            httpx.Response(
+                503, json={"error": "coherence", "code": "ECOHERENCE", "retryable": False}
+            ),
             httpx.Response(200, json=ok_body),
         ]
     )
     sb = Client(base_url=BASE_URL, token="t.k.n", max_retries=3).sandboxes.attach("sb")
-    r = sb.exec("ls /home/user", read_only=True)
-    assert r.ok is True
-    assert route.call_count == 2
+    with pytest.raises(ServerError) as exc:
+        sb.exec("curl -X POST https://example.test/effect", read_only=True)
+    assert exc.value.code == "ECOHERENCE"
+    assert route.call_count == 1
 
 
 @respx.mock
@@ -533,8 +619,8 @@ def test_exec_retry_on_5xx_opt_in_retries_runtime_busy():
     }
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync").mock(
         side_effect=[
-            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
-            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY", "retryable": True}),
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY", "retryable": True}),
             httpx.Response(200, json=ok_body),
         ]
     )
@@ -570,7 +656,6 @@ def test_exec_retry_on_5xx_default_false_does_not_send_flag():
 
 @respx.mock
 def test_exec_batch_retry_on_5xx_replays_whole_batch():
-    """A 5xx between scripts replays the whole batch when opted-in."""
     ok = {
         "results": [
             {"id": "a", "stdout": "1", "stderr": "", "exitCode": 0, "durationMs": 0},
@@ -579,7 +664,7 @@ def test_exec_batch_retry_on_5xx_replays_whole_batch():
     }
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/exec-sync-batch").mock(
         side_effect=[
-            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY"}),
+            httpx.Response(503, json={"error": "busy", "code": "ERUNTIME_BUSY", "retryable": True}),
             httpx.Response(200, json=ok),
         ]
     )
@@ -623,32 +708,32 @@ def test_ingest_files_base64_encodes():
 
 
 @respx.mock
-def test_ingest_files_blocks_oversized_for_cpython():
+def test_ingest_files_sends_16_mib_once_with_default_limit():
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/ingest-files").mock(
         return_value=httpx.Response(200, json={"status": "ok", "fileCount": 1})
     )
     sb = make_client().sandboxes.attach("sb")
-    big = b"\x00" * (8 * 1024 * 1024 + 1)
-    with pytest.raises(ValidationError) as exc:
-        sb.ingest_files({"big.csv": big})
-    assert exc.value.code == "EFILE_TOO_LARGE_FOR_CPYTHON"
-    limit = 8 * 1024 * 1024
-    assert exc.value.details == [f"big.csv ({len(big)} bytes > {limit} python3 open() limit)"]
-    # Nothing sent over the network.
-    assert route.call_count == 0
+    big = b"a" * (16 * 1024 * 1024)
+    sb.ingest_files({"big.csv": big})
+    assert route.call_count == 1
+    sent = json.loads(route.calls[0].request.content.decode())
+    assert base64.b64decode(sent["files"]["big.csv"]) == big
 
 
 @respx.mock
-def test_ingest_files_allow_oversized_bypasses_cpython_check():
+@pytest.mark.parametrize("allow_oversized", [False, True])
+def test_ingest_files_configured_limit_applies_with_legacy_allow_oversized(allow_oversized):
     route = respx.post(f"{BASE_URL}/v1/sandboxes/sb/ingest-files").mock(
         return_value=httpx.Response(200, json={"status": "ok", "fileCount": 1})
     )
-    sb = make_client().sandboxes.attach("sb")
-    big = b"\x00" * (8 * 1024 * 1024 + 1)
-    sb.ingest_files({"big.csv": big}, allow_oversized=True)
-    assert route.call_count == 1
-    sent = json.loads(route.calls[0].request.content.decode())
-    assert list(sent["files"].keys()) == ["big.csv"]
+    limit = 8 * 1024 * 1024
+    sb = make_client(max_file_size=limit).sandboxes.attach("sb")
+    big = b"\x00" * (16 * 1024 * 1024)
+    with pytest.raises(ValidationError) as exc:
+        sb.ingest_files({"big.csv": big}, allow_oversized=allow_oversized)
+    assert exc.value.code == "EFILE_TOO_LARGE"
+    assert exc.value.details == [f"big.csv ({len(big)} bytes > {limit} limit)"]
+    assert route.call_count == 0
 
 
 # ── Error mapping ────────────────────────────────────────────────────────────

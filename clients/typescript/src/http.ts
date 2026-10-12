@@ -36,11 +36,47 @@ export interface RequestOptions {
 	timeout?: number;
 	idempotent?: boolean;
 	readOnly?: boolean;
+	retryTransportErrors?: boolean;
+	requireExplicitRetryable?: boolean;
 }
 
 const defaultMaxRetries = 3;
 const defaultTimeoutMs = 30_000;
 const retryStatus = new Set([429, 500, 502, 503, 504]);
+const UNKNOWN_OUTCOME_CODES: ReadonlySet<string> = new Set(["EEXEC_OUTCOME_UNKNOWN", "EDRIVERFAULT"]);
+const COMMITTED_WRITE_CODES: ReadonlySet<string> = new Set(["ECOHERENCE", "ELOCKLOST_APPLIED"]);
+const CONNECTION_EXCEPTION_SQLSTATE = /^08[0-9A-Z]{3}$/;
+const STREAM_ERROR_STATUS_BY_CODE: ReadonlyMap<string, number> = new Map([
+	["ENOENT", 404],
+	["EEXIST", 409],
+	["ENOTEMPTY", 409],
+	["ESTALE", 409],
+	["EPERM", 403],
+	["FORBIDDEN", 403],
+	["EISDIR", 400],
+	["ENOTDIR", 400],
+	["ELOOP", 400],
+	["EINVAL", 400],
+	["EREADONLY", 500],
+	["ESESSIONCLOSING", 503],
+	["ESHUTTINGDOWN", 503],
+	["ELOCKTIMEOUT", 503],
+	["ELOCKLOST", 503],
+	["ELOCKLOST_APPLIED", 503],
+	["ECOHERENCE", 503],
+	["EDRIVERFAULT", 503],
+	["ECOHERENCE_UNAPPLIED", 503],
+	["EWORKER_BUSY", 503],
+	["EWORKER_UNAVAILABLE", 503],
+	["EEXEC_OUTCOME_UNKNOWN", 503],
+	["ERUNTIME_BUSY", 503],
+	["EUNAVAILABLE", 503],
+	["ESCRIPTBUFFER", 413],
+	["EEXEC_INPUT_LIMIT", 413],
+	["EFBIG", 413],
+	["EREADONLY_VIOLATION", 422],
+	["INTERNAL_ERROR", 500],
+]);
 
 export function encodePath(path: string): string {
 	return path
@@ -141,12 +177,13 @@ export class Transport {
 		const timeout = options.timeout ?? this.timeout;
 		const idempotent = options.idempotent ?? true;
 		const readOnly = options.readOnly ?? false;
+		const retryTransportErrors = options.retryTransportErrors ?? true;
 		for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
 			let response: Response;
 			try {
 				response = await this.fetchWithTimeout(url, { method, headers, body }, timeout);
 			} catch (error) {
-				if (attempt >= this.maxRetries || (!idempotent && !readOnly)) {
+				if (!retryTransportErrors || attempt >= this.maxRetries || (!idempotent && !readOnly)) {
 					throw new TransportError(`network error after ${attempt + 1} attempts: ${formatError(error)}`);
 				}
 				await sleepBackoff(attempt);
@@ -159,6 +196,8 @@ export class Transport {
 				(await shouldRetryResponse(response, {
 					idempotent,
 					readOnly,
+					method,
+					requireExplicitRetryable: options.requireExplicitRetryable ?? false,
 				}))
 			) {
 				const retryAfter = parseRetryAfter(response);
@@ -249,64 +288,67 @@ export class Transport {
 	}
 }
 
-interface ParsedError {
-	body: Record<string, unknown>;
-	code?: string;
-	message: string;
-	details?: unknown;
+async function raiseForStatus(response: Response): Promise<never> {
+	return raiseApiError(response.status, await readJsonObject(response.clone()), parseRetryAfter(response));
 }
 
-async function raiseForStatus(response: Response): Promise<never> {
-	const parsed = await parseErrorBody(response);
-	const options = { code: parsed.code, status: response.status, details: parsed.details };
-	if (response.status === 401 || response.status === 403) {
-		throw new AuthError(parsed.message, options);
+export function statusForStreamError(code: string): number {
+	return STREAM_ERROR_STATUS_BY_CODE.get(code) ?? 422;
+}
+
+export function raiseApiError(status: number, body: Record<string, unknown>, retryAfter?: number): never {
+	const message = typeof body.error === "string" ? body.error : `HTTP ${status}`;
+	const options = {
+		code: typeof body.code === "string" ? body.code : undefined,
+		status,
+		details: body.details,
+		retryable: typeof body.retryable === "boolean" ? body.retryable : undefined,
+	};
+	if (status === 401 || status === 403) {
+		throw new AuthError(message, options);
 	}
-	if (response.status === 404) {
-		throw new NotFoundError(parsed.message, options);
+	if (status === 404) {
+		throw new NotFoundError(message, options);
 	}
-	if (response.status === 408) {
-		throw new ExecTimeoutError(parsed.message, {
+	if (status === 408) {
+		throw new ExecTimeoutError(message, {
 			...options,
-			durationMs: typeof parsed.body.durationMs === "number" ? parsed.body.durationMs : undefined,
+			durationMs: typeof body.durationMs === "number" ? body.durationMs : undefined,
 		});
 	}
-	if (response.status === 409) {
-		throw new ConflictError(parsed.message, options);
+	if (status === 409) {
+		throw new ConflictError(message, options);
 	}
-	if (response.status === 400 || response.status === 422) {
-		throw new ValidationError(parsed.message, options);
+	if (status === 400 || status === 413 || status === 422) {
+		throw new ValidationError(message, options);
 	}
-	if (response.status === 429) {
-		throw new RateLimitError(parsed.message, { ...options, retryAfter: parseRetryAfter(response) });
+	if (status === 429) {
+		throw new RateLimitError(message, { ...options, retryAfter });
 	}
-	if (response.status >= 500 && response.status < 600) {
-		throw new ServerError(parsed.message, options);
+	if (status >= 500 && status < 600) {
+		throw new ServerError(message, options);
 	}
-	throw new SQLFSError(parsed.message, options);
-}
-
-async function parseErrorBody(response: Response): Promise<ParsedError> {
-	const body = await readJsonObject(response.clone());
-	const code = typeof body.code === "string" ? body.code : undefined;
-	const message = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
-	return { body, code, message, details: body.details };
+	throw new SQLFSError(message, options);
 }
 
 async function shouldRetryResponse(
 	response: Response,
-	options: { idempotent: boolean; readOnly: boolean },
+	options: { idempotent: boolean; readOnly: boolean; method: string; requireExplicitRetryable: boolean },
 ): Promise<boolean> {
-	if (response.status === 503 && !options.readOnly) {
-		const parsed = await parseErrorBody(response.clone());
-		if (parsed.code === "ECOHERENCE") {
-			return false;
-		}
-	}
-	if (!options.idempotent && !options.readOnly) {
-		return false;
-	}
-	return true;
+	const body = await readJsonObject(response.clone());
+	const code = typeof body.code === "string" ? body.code : "";
+	if (code === "EEXEC_OUTCOME_UNKNOWN") return false;
+	if (COMMITTED_WRITE_CODES.has(code)) return false;
+	if (options.requireExplicitRetryable && body.retryable !== true) return false;
+	const safeRead = options.idempotent && (options.method === "GET" || options.method === "HEAD");
+	if (
+		safeRead &&
+		response.status === 503 &&
+		(code === "EDRIVERFAULT" || code === "EUNAVAILABLE" || CONNECTION_EXCEPTION_SQLSTATE.test(code))
+	)
+		return true;
+	if (UNKNOWN_OUTCOME_CODES.has(code) || CONNECTION_EXCEPTION_SQLSTATE.test(code)) return false;
+	return body.retryable !== false && (options.idempotent || options.readOnly);
 }
 
 function parseRetryAfter(response: Response): number | undefined {

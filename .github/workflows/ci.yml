@@ -46,6 +46,28 @@ jobs:
 
       - run: pnpm test:unit
 
+  typescript-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: clients/typescript/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
   build:
     name: Build
     runs-on: ubuntu-latest
