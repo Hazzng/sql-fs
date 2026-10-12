@@ -34,10 +34,12 @@ describe("bash over SqlFs — mv and cp onto an existing file", () => {
 		});
 	});
 
-	// just-bash follows POSIX rename here (success, no change), not GNU mv's error.
 	it("leaves a file unchanged when it is moved onto itself", async () => {
 		const r = await env.bash.exec("echo a > f; mv f ./f; echo rc=$?; cat f");
-		expect({ stdout: r.stdout, stderr: r.stderr }).toEqual({ stdout: "rc=0\na\n", stderr: "" });
+		expect({ stdout: r.stdout, stderr: r.stderr }).toEqual({
+			stdout: "rc=1\na\n",
+			stderr: "mv: 'f' and './f' are the same file\n",
+		});
 	});
 
 	it("gives a file the same identity through stat and lstat", async () => {
