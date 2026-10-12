@@ -12,12 +12,42 @@
  */
 
 import { execFile } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const run = promisify(execFile);
-const fixture = fileURLToPath(new URL("./fixtures/driver-fault.ts", import.meta.url));
+let directory: string | undefined;
+let fixture: string;
+
+beforeAll(() => {
+	directory = mkdtempSync(join(tmpdir(), "sql-fs-driver-fault-"));
+	writeFileSync(join(directory, "package.json"), '{"type":"module"}\n');
+	symlinkSync(
+		fileURLToPath(new URL("../../../node_modules", import.meta.url)),
+		join(directory, "node_modules"),
+		"junction",
+	);
+	for (const relative of ["errors", "driver-fault", "tests/fixtures/driver-fault"]) {
+		const source = fileURLToPath(new URL(`../${relative}.ts`, import.meta.url));
+		const target = join(directory, `${relative}.js`);
+		mkdirSync(dirname(target), { recursive: true });
+		const { outputText } = transpileModule(readFileSync(source, "utf8"), {
+			fileName: source,
+			compilerOptions: { module: ModuleKind.ES2022, target: ScriptTarget.ES2022 },
+		});
+		writeFileSync(target, outputText);
+	}
+	fixture = join(directory, "tests/fixtures/driver-fault.js");
+});
+
+afterAll(() => {
+	if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
+});
 
 interface ChildResult {
 	readonly code: number;
@@ -27,7 +57,7 @@ interface ChildResult {
 
 async function runFixture(mode: string): Promise<ChildResult> {
 	try {
-		const { stdout, stderr } = await run("npx", ["tsx", fixture, mode], {
+		const { stdout, stderr } = await run(process.execPath, [fixture, mode], {
 			timeout: 60_000,
 			// Short enough that the fixture's "stuck" await is declared stuck well inside the test
 			// timeout; the production default is 5s.

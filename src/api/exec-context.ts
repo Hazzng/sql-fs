@@ -19,8 +19,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 export interface ExecContext {
+	readonly sandboxId?: string;
 	/** Largest file this script may read whole or produce. See MAX_EXEC_FILE_BYTES. */
 	readonly maxFileBytes: number;
+	readonly inputLimitBytes?: number;
+	inputBytes?: number;
 	/**
 	 * The first EFBIG this script tripped, recorded as well as thrown.
 	 *
@@ -41,3 +44,20 @@ export interface ExecContext {
 }
 
 export const execContext = new AsyncLocalStorage<ExecContext>();
+
+export function consumeExecInput(context: ExecContext | undefined, bytes: number, source: string): void {
+	if (context?.inputLimitBytes === undefined) return;
+	if (context.exceeded !== undefined) throw context.exceeded;
+	const consumed = context.inputBytes ?? 0;
+	if (bytes > context.inputLimitBytes - consumed) {
+		const error = Object.assign(
+			new Error(
+				`Exec input limit exceeded while reading ${source}: ${consumed} bytes consumed, ${bytes} bytes requested; the aggregate limit is ${context.inputLimitBytes} bytes. Reduce the data read by one script.`,
+			),
+			{ code: "EEXEC_INPUT_LIMIT", retryable: false },
+		);
+		context.exceeded = error;
+		throw error;
+	}
+	context.inputBytes = consumed + bytes;
+}

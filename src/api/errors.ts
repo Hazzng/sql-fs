@@ -32,6 +32,10 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ESTALE",
 	"ECOHERENCE_UNAPPLIED",
 	"ERUNTIME_BUSY",
+	"EWORKER_BUSY",
+	"EWORKER_UNAVAILABLE",
+	"EEXEC_OUTCOME_UNKNOWN",
+	"EEXEC_INPUT_LIMIT",
 	"EREADONLY",
 	"EREADONLY_VIOLATION",
 	"EDRIVERFAULT",
@@ -68,6 +72,16 @@ const RETRYABLE_SQLSTATES: ReadonlySet<string> = new Set(["53300", "53400", "57P
 /** SQLSTATE class 08 — connection_exception (08000, 08003, 08006, 08P01, ...). */
 const CONNECTION_EXCEPTION_SQLSTATE = /^08[0-9A-Z]{3}$/;
 
+export function preservesAmbiguousOutcome(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as Error & { code?: string }).code;
+	return (
+		code !== undefined &&
+		(CONNECTION_EXCEPTION_SQLSTATE.test(code) ||
+			["EEXEC_OUTCOME_UNKNOWN", "ECOHERENCE", "ELOCKLOST_APPLIED", "EDRIVERFAULT"].includes(code))
+	);
+}
+
 function isConnectionClassSqlState(code: string | undefined): boolean {
 	if (code === undefined) return false;
 	return CONNECTION_EXCEPTION_SQLSTATE.test(code) || RETRYABLE_SQLSTATES.has(code);
@@ -98,6 +112,8 @@ const RETRY_SAFE_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ELOCKLOST",
 	"ECOHERENCE_UNAPPLIED",
 	"ERUNTIME_BUSY",
+	"EWORKER_BUSY",
+	"EWORKER_UNAVAILABLE",
 ]);
 
 /**
@@ -234,6 +250,9 @@ export function mapFsErrorToStatus(err: Error): number {
 			return 503;
 		case "ECOHERENCE_UNAPPLIED":
 			return 503;
+		case "EWORKER_BUSY":
+		case "EWORKER_UNAVAILABLE":
+		case "EEXEC_OUTCOME_UNKNOWN":
 		case "ERUNTIME_BUSY":
 			return 503;
 		case "ESCRIPTBUFFER":
@@ -244,6 +263,8 @@ export function mapFsErrorToStatus(err: Error): number {
 			// Known-not-applied (the buffer is discarded before any transaction opens)
 			// but absent from RETRY_SAFE_ERROR_CODES: that set also promises the
 			// condition is transient, and an identical re-run hits the identical cap.
+			return 413;
+		case "EEXEC_INPUT_LIMIT":
 			return 413;
 		case "EFBIG":
 			// #168: the script asked to read or produce a file above the exec ceiling.
