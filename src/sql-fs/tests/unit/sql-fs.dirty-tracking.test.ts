@@ -1,14 +1,3 @@
-/**
- * Phase D: Dirty-tracking unit tests for SqlFs.
- *
- * Every mutation method must flip `wasDirty()` to true; `clearDirty()` must
- * reset it. Missing one method means silent cross-replica coherence bugs
- * because `publishVersionIfDirty` will skip the INCR and other replicas
- * keep serving stale cache.
- *
- * Tests use a mocked SqlDialect — no database required.
- */
-
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
@@ -215,8 +204,6 @@ describe("SqlFs reload()", () => {
 		await fs.reload();
 
 		expect(fs.getAllPaths()).toEqual(["/", "/home"]);
-		// reload clears the dirty flag so the publisher doesn't bump the version
-		// on a turn that only did a cache refresh.
 		expect(fs.wasDirty()).toBe(false);
 	});
 

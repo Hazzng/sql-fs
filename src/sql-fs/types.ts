@@ -117,6 +117,11 @@ export interface TransactionOptions {
 	readonly isolationLevel?: "repeatable read" | "serializable";
 }
 
+export interface SandboxGeneration {
+	readonly priorEpoch: bigint;
+	readonly epoch: bigint;
+}
+
 /**
  * SqlDialect abstracts all database-specific SQL operations so that SqlFs
  * can work with Postgres, MySQL, and Azure SQL without modification.
@@ -190,6 +195,8 @@ export interface SqlDialect<Tx = unknown> {
 
 	/** Reads the live fencing epoch for a sandbox (script-entry pinning, see #131). */
 	getSandboxEpoch(tx: Tx, sandboxId: string): Promise<bigint>;
+
+	retireSandboxGeneration?(tx: Tx, sandboxId: string, assertOwnerLease?: () => void): Promise<SandboxGeneration>;
 
 	/**
 	 * Returns true if a sandbox row with the given ID exists in the database.

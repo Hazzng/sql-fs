@@ -11,8 +11,10 @@ import { createHash } from "node:crypto";
 import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
 import { LRUCache } from "lru-cache";
 
-import { execContext } from "../api/exec-context.js";
+import { LockLostError } from "../api/distributed-lock.js";
+import { consumeExecInput, execContext } from "../api/exec-context.js";
 import { readOnlyContext } from "../api/read-only-context.js";
+import { ownerLeaseLost } from "../api/worker-owner/cancellation.js";
 import { runTrustedDbAsync } from "./defense.js";
 import { raceDriverFault } from "./driver-fault.js";
 import {
@@ -152,13 +154,15 @@ interface SqlFsOptions<Tx> {
  * NOT — call sites must guard via `"reload" in fs` before casting.
  */
 export interface ICoherentFs extends IFileSystem {
+	setOwnerLeaseGuard?(guard: () => void): void;
+	claimGeneration?(): Promise<void>;
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
 	ensureFresh(): Promise<void>;
 	/** True iff at least one mutation has run since the last clearDirty. */
 	wasDirty(): boolean;
 	/** Resets the dirty flag after session memory accounting. */
-	clearDirty(): void;
+	clearDirty(): void | Promise<void>;
 	/**
 	 * True iff a recovery `reload()` failed after a transaction COMMIT/abort,
 	 * leaving the in-memory caches holding mutations that never committed to the
@@ -226,6 +230,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #allowSymlinks: boolean;
 	#dirty = false;
 	#cachePoisoned = false;
+	#ownerLeaseGuard: (() => void) | undefined;
 	/**
 	 * In-flight prewarm task. Read by `readFile`/`readFileBuffer` cache-miss
 	 * paths to coalesce reads onto the batched fetch instead of racing it with
@@ -338,6 +343,31 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	poisoned(): boolean {
 		return this.#cachePoisoned;
+	}
+
+	setOwnerLeaseGuard(guard: () => void): void {
+		this.#ownerLeaseGuard = guard;
+	}
+
+	async claimGeneration(): Promise<void> {
+		this.#assertOwnerLease();
+		this.#assertScriptTxAlive();
+		const retire = this.#dialect.retireSandboxGeneration;
+		if (retire === undefined) return;
+		if (this.#scriptScope) throw createEstale(this.#sandboxId);
+		const certificate = await this.#db(() =>
+			this.#dialect.transaction(async (tx) => {
+				const certificate = await retire.call(this.#dialect, tx, this.#sandboxId, () => this.#assertOwnerLease());
+				this.#assertOwnerLease();
+				return certificate;
+			}),
+		);
+		this.#assertScriptTxAlive();
+		if (!this.#cachePoisoned && certificate.priorEpoch === this.#committedView.epoch) {
+			this.#committedView.epoch = certificate.epoch;
+		} else {
+			await this.reload();
+		}
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
@@ -495,6 +525,21 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return [this.#scriptEpoch ?? this.#committedView.epoch];
 	}
 
+	async #assertDurableWriteEpoch(tx: Tx): Promise<void> {
+		this.#assertOwnerLease();
+		this.#assertScriptTxAlive();
+		if (this.#dialect.retireSandboxGeneration === undefined) return;
+		const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+		if (epoch !== this.#committedView.epoch) {
+			throw createEstale(this.#sandboxId);
+		}
+	}
+
+	#assertOwnerLease(): void {
+		this.#ownerLeaseGuard?.();
+		if (ownerLeaseLost()) throw new LockLostError("worker owner generation");
+	}
+
 	async #withBareTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
 		// Composite write methods include their own set_config + pg_advisory_xact_lock in their SQL.
 		// Inside a script scope every write MUST run on the single script-tx so the
@@ -522,14 +567,17 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			}
 			return value;
 		}
-		// No active scope — use a fresh, self-committing transaction (original
-		// behavior, no extra round-trip for the mutation itself).
 		let observedEpoch: bigint | undefined;
 		const result = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
+				if (this.#dialect.retireSandboxGeneration !== undefined) {
+					await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+					await this.#assertDurableWriteEpoch(tx);
+				}
 				const value = await fn(tx);
 				// Publish only after COMMIT; a failed COMMIT must not poison the cache.
 				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				this.#assertOwnerLease();
 				return value;
 			}),
 		);
@@ -560,6 +608,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				const value = await fn(tx);
 				// Publish only after COMMIT; a failed COMMIT must not poison the pin.
 				observedEpoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				this.#assertOwnerLease();
 				return value;
 			}),
 		);
@@ -707,19 +756,23 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		const finalEpoch = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
 				await this.#dialect.setSandboxContextWithLock(tx, this.#sandboxId);
+				this.#assertScriptTxAlive();
 				const epoch = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
 				if (epoch !== this.#committedView.epoch) {
 					throw createEstale(this.#sandboxId);
 				}
 				this.#scriptEpoch = epoch;
 				for (const op of ops) {
+					this.#assertOwnerLease();
 					const produced = await (op.run as (handle: Tx) => Promise<readonly (bigint | undefined)[]>)(tx);
 					for (let i = 0; i < op.minted.length; i++) {
 						const real = produced[i];
 						if (real !== undefined) this.#idRemap.set(op.minted[i]!, real);
 					}
 				}
-				return await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				const result = await this.#dialect.getSandboxEpoch(tx, this.#sandboxId);
+				this.#assertOwnerLease();
+				return result;
 			}),
 		);
 		this.#scriptEpoch = finalEpoch;
@@ -995,6 +1048,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 				{ isolationLevel: "repeatable read" },
 			),
 		);
+		this.#assertScriptTxAlive();
 		if (view === undefined) return;
 		this.#assertPathCacheNamespace(view.entries);
 		this.#committedView = view;
@@ -1029,6 +1083,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async ensureFresh(): Promise<void> {
+		this.#assertScriptTxAlive();
 		if (this.#scriptScope)
 			throw Object.assign(new Error("Freshness admission during a script scope"), { code: "EBUSY" });
 		return this.#queueFreshness(false);
@@ -1080,10 +1135,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	async ready(): Promise<void> {
+		this.#assertScriptTxAlive();
 		await this.#queueFreshness(true);
 	}
 
 	async reload(): Promise<void> {
+		this.#assertScriptTxAlive();
 		if (this.#scriptScope) return;
 		await this.#queueFreshness(true);
 	}
@@ -1099,6 +1156,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	beginScriptScope(): void {
+		this.#assertScriptTxAlive();
 		if (this.#scriptScope) {
 			throw new Error("beginScriptScope: a script scope is already active");
 		}
@@ -1152,7 +1210,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 */
 	#assertExecFileSize(path: string, bytes: number, op: "read" | "write"): void {
 		const ctx = execContext.getStore();
-		if (ctx === undefined || bytes <= ctx.maxFileBytes) return;
+		if (ctx === undefined || ctx.maxFileBytes === null || bytes <= ctx.maxFileBytes) return;
 		const err = createEfbig(path, bytes, ctx.maxFileBytes, op);
 		// Recorded as well as thrown: bash swallows a read rejection into a phantom
 		// "No such file or directory". See ExecContext.exceeded.
@@ -1169,6 +1227,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	}
 
 	#assertWritable(path: string, op: string): void {
+		this.#assertScriptTxAlive();
 		if (this.#readOnlyDepth > 0) {
 			const ctx = readOnlyContext.getStore();
 			if (ctx !== undefined) ctx.violated = true;
@@ -1191,6 +1250,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	async endScriptScope(): Promise<void> {
 		if (!this.#scriptScope) return;
+		if (ownerLeaseLost()) {
+			await this.abortScriptScope();
+			throw new LockLostError("worker owner before flush");
+		}
 
 		// #169 M3: never COMMIT a condemned scope. After a driver fault every later fs op throws
 		// via `#assertScriptTxAlive`, but bash swallows those into a nonzero exit rather than
@@ -1213,6 +1276,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			await this.#flushMutations();
 			await this.#settleLaggingScriptEpoch();
 			if (this.#scriptTxEnd !== undefined) {
+				this.#assertOwnerLease();
 				this.#scriptTxEnd();
 				// The COMMIT is the last driver await of the scope and hangs the same way on a
 				// driver fault (#169), so it races too — a request that cannot learn whether it
@@ -1564,6 +1628,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		let fullBytes: Uint8Array;
 
 		if (existing && existing.kind === INODE_KIND.FILE && existing.contentSha256 !== null) {
+			consumeExecInput(execContext.getStore(), existing.size, path);
 			// Buffered: there is no script-tx to read consistently with, and there are no
 			// in-flight inode mutations to be consistent WITH — the blob is content-addressed
 			// and already committed — so take the lock-free read transaction instead of
@@ -1949,6 +2014,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// Before the cache lookup on purpose: a warm cache makes the DB round trip free
 		// but not the megabytes of string work the caller is about to do with the bytes.
 		this.#assertExecFileSize(path, entry.size, "read");
+		consumeExecInput(execContext.getStore(), entry.size, path);
 
 		const generation = this.#contentGeneration;
 		const cached = this.#contentCache.get(entry.inodeId);

@@ -64,20 +64,22 @@ describe("PostgresDialect.setSandboxContext — read-only, no advisory lock", ()
 });
 
 describe("PostgresDialect.setSandboxContextWithLock — writer path", () => {
-	it("issues a single SELECT with set_config and pg_advisory_xact_lock(hashtextextended)", async () => {
+	it("takes the advisory lock before reading the sandbox epoch", async () => {
 		const dialect = new PostgresDialect("postgres://stub");
 		const { tx, calls } = makeFakeTx([{ epoch: "0" }]);
 		const sandboxId = "sandbox-abc-123";
 
 		await dialect.setSandboxContextWithLock(tx, sandboxId);
 
-		expect(calls).toHaveLength(1);
+		expect(calls).toHaveLength(2);
 
-		expect(calls[0]!.sql).toContain("set_config");
-		expect(calls[0]!.sql).toContain("app.sandbox_id");
 		expect(calls[0]!.sql).toContain("pg_advisory_xact_lock");
 		expect(calls[0]!.sql).toContain("hashtextextended");
-		expect(calls[0]!.values).toEqual([sandboxId, sandboxId, sandboxId]);
+		expect(calls[0]!.values).toEqual([sandboxId]);
+		expect(calls[1]!.sql).toContain("set_config");
+		expect(calls[1]!.sql).toContain("app.sandbox_id");
+		expect(calls[1]!.sql).not.toContain("pg_advisory_xact_lock");
+		expect(calls[1]!.values).toEqual([sandboxId, sandboxId]);
 	});
 
 	it("throws ENOENT when the sandbox row is absent", async () => {
