@@ -2,7 +2,6 @@
  * Sandbox CRUD routes.
  * US-059: POST /v1/sandboxes — create sandbox
  * US-060: GET /v1/sandboxes/:id — get sandbox info
- * PATCH /v1/sandboxes/:id — change runtime flags (python, javascript, network)
  * US-061: DELETE /v1/sandboxes/:id — delete sandbox
  */
 
@@ -239,8 +238,8 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 		}
 		const runtime = parsed.data;
 		try {
-			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, c.get("owner"), () =>
-				sessionManager.updateSandboxRuntime(tenant, id, runtime),
+			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, c.get("owner"), (session) =>
+				sessionManager.updateSandboxRuntime(session, runtime),
 			);
 			return c.json({
 				id,

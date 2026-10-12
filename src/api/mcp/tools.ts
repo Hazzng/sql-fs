@@ -484,8 +484,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		async ({ id, ...runtime }) => {
 			let result: Record<string, unknown>;
 			try {
-				const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, () =>
-					sessionManager.updateSandboxRuntime(tenant, id, runtime),
+				const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, (session) =>
+					sessionManager.updateSandboxRuntime(session, runtime),
 				);
 				result = { id, python: meta.python, javascript: meta.javascript, network: meta.network };
 			} catch (err) {

@@ -184,8 +184,6 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
  * 53400/57P03          out of capacity, not a caller bug (#174). Only the
  *                      capacity SQLSTATEs are advertised retryable (#175).
- * EEXEC_FS       → 500  through the default arm: a filesystem error escaped bash.exec,
- *                      which is an interpreter gap rather than a missing sandbox.
  * others         → 500  Internal Server Error
  *
  * Status alone never answers "is a retry safe?" — six distinct codes share 503.
@@ -274,7 +272,6 @@ export function extractErrCode(e: unknown): string | undefined {
 	return fe.message.match(/^([A-Z]+):/)?.[1];
 }
 
-/** Codes an `IFileSystem` call raises when a path is missing or the wrong kind; see `execFsError`. */
 const SCRIPT_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"ENOENT",
 	"EEXIST",
@@ -302,7 +299,6 @@ export function execFsError(err: unknown): Error | undefined {
 	});
 }
 
-/** The API's `app.onError`. A 5xx is logged because nothing else records why it happened. */
 export function apiErrorHandler(err: Error, c: Context): Response {
 	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
 	if (status >= 500) {

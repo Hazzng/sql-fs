@@ -1,11 +1,3 @@
-/**
- * A filesystem error that escapes `bash.exec` is an interpreter failure, not "sandbox not found".
- *
- * Repro on real just-bash over SqlFs: the redirect target's directory disappears while the
- * command runs, and just-bash lets the deferred write's ENOENT reject the exec. Before the fix
- * that reached clients as `404 ENOENT` (MCP: "sandbox not found") and was logged nowhere.
- */
-
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

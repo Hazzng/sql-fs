@@ -650,10 +650,7 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 	}
 
-	/**
-	 * Advances `version` with the flags, under the writer lock, so every replica's next freshness
-	 * check reloads and rebuilds its shell with them. Returns null when the sandbox does not exist.
-	 */
+	/** Advancing `version` is what makes every replica's next freshness check rebuild its shell. */
 	async updateSandboxRuntime(
 		tx: PgTx,
 		sandboxId: string,

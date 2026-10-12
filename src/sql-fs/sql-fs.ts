@@ -105,10 +105,6 @@ type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
 type CreateExclusiveOpts = Parameters<NonNullable<IFileSystem["createExclusive"]>>[1];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
-/**
- * just-bash hands redirect output over as a latin1 byte string with encoding "binary"; UTF-8
- * encoding it regardless turned every byte above 0x7f into two, so `cat a > b` corrupted b.
- */
 function encodeContent(content: FileContent, options: WriteFileOpts): Uint8Array {
 	if (typeof content !== "string") return content;
 	const encoding = (typeof options === "string" ? options : options?.encoding) ?? "utf8";
@@ -136,7 +132,6 @@ interface MutationSpec<Tx> {
 	readonly mints?: number;
 	/** Bytes the recorded closure keeps alive; defaults to `PER_MUTATION_BASE_BYTES`. */
 	readonly bytes?: number;
-	/** See `BufferedMutation.supersedes`. */
 	readonly supersedes?: string;
 	/**
 	 * Method syntax, not a property: it makes the parameter bivariant, which keeps
@@ -175,7 +170,7 @@ interface SqlFsOptions<Tx> {
 export interface ICoherentFs extends IFileSystem {
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
-	/** Resolves true when it replaced the cache with a newer committed view, i.e. someone else changed the sandbox. */
+	/** Resolves true when it loaded a new committed view. */
 	ensureFresh(): Promise<boolean>;
 	/** True iff at least one mutation has run since the last clearDirty. */
 	wasDirty(): boolean;
@@ -692,9 +687,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * `endScriptScope` would happily flush the truncated prefix.
 	 */
 	#recordMutation(m: BufferedMutation): void {
-		// just-bash 3.6 opens every `>` target with an empty writeFile and writes the output in a
-		// second one. Back to back, the second alone commits the same state, so the first is
-		// dropped; its minted id is already dead because pathCache now points at the second's.
+		// just-bash 3.6 opens every `>` target with an empty writeFile and writes the output in a second one.
 		const last = this.#mutations[this.#mutations.length - 1];
 		const superseding = m.supersedes !== undefined && last?.supersedes === m.supersedes;
 		const ops = this.#mutations.length + (superseding ? 0 : 1);
@@ -2014,10 +2007,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return this.#readBytes(inputPath);
 	}
 
-	/**
-	 * Without it just-bash reads through `readFileBuffer` plus a per-byte `String.fromCharCode`
-	 * concat, and a 5 MB `cat` spent 246 ms, mostly in GC, against 17 ms for this one latin1 decode.
-	 */
+	/** Without it just-bash builds the string one byte at a time, which dominated large reads. */
 	async readFileBytes(inputPath: string): Promise<ByteString> {
 		this.#assertScriptTxAlive();
 		const bytes = await this.#readBytes(inputPath);

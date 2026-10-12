@@ -164,7 +164,6 @@ const JS_INVOCATION_REGEX = /\bjs-exec\b|\bnode\b/;
 
 export interface Session {
 	readonly fs: IFileSystem;
-	/** Replaced, with `runtimeOptions`, when another request changes the sandbox's runtime flags. */
 	bash: Bash;
 	runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
@@ -807,10 +806,6 @@ export class SessionManager {
 		}
 	}
 
-	/**
-	 * `updateSandboxRuntime` advances the sandbox epoch, so a warm session on any replica learns of
-	 * the change from the reload its next request already pays for, without a per-request read.
-	 */
 	private async syncRuntime(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		const meta = await this.getSandboxMetaFn?.(tenantId, sandboxId);
 		if (!meta) return;
@@ -821,17 +816,13 @@ export class SessionManager {
 		session.bash = this.buildBash(sandboxId, session.fs, session.runtimeOptions);
 	}
 
-	/** Call with the sandbox's exec lock held, so no script runs across the change. */
-	async updateSandboxRuntime(
-		tenantId: string,
-		sandboxId: string,
-		runtime: Partial<RuntimeOptions>,
-	): Promise<SandboxMeta> {
+	/** Takes the locked session so no script runs across the change. */
+	async updateSandboxRuntime(session: Session, runtime: Partial<RuntimeOptions>): Promise<SandboxMeta> {
 		if (this.updateSandboxRuntimeFn === undefined) {
 			throw Object.assign(new Error("updateSandboxRuntime not configured"), { code: "ENOTSUP" });
 		}
-		const meta = await this.updateSandboxRuntimeFn(tenantId, sandboxId, runtime);
-		if (meta === null) throw createEnoent(`/${sandboxId}`);
+		const meta = await this.updateSandboxRuntimeFn(session.tenantId, session.sandboxId, runtime);
+		if (meta === null) throw createEnoent(`/${session.sandboxId}`);
 		return meta;
 	}
 

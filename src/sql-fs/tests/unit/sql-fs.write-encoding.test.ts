@@ -1,8 +1,3 @@
-/**
- * just-bash writes redirect output as a latin1 byte string with encoding "binary". SqlFs used to
- * UTF-8 encode every string, so a byte above 0x7f came back as two and `cat a > b` corrupted b.
- */
-
 import { beforeEach, describe, expect, it } from "vitest";
 import { type BashOverSqlFs, bashOverSqlFs } from "../fixtures/bash-over-sqlfs.js";
 

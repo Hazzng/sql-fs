@@ -1,9 +1,3 @@
-/**
- * just-bash 3.6 opens every `>` target with `writeFile(path, "")` and writes the output as a
- * second `writeFile` at command end. Inside a buffered script scope the journal keeps only the
- * second when nothing was recorded between them, so a redirect flushes one composite, not two.
- */
-
 import { Bash } from "just-bash";
 import { describe, expect, it } from "vitest";
 import { SqlFs } from "../../sql-fs.js";
@@ -16,20 +10,19 @@ async function runScript(script: string, maxOps: number = BUFFER_ON.maxOps) {
 	const bash = new Bash({ cwd: "/home/user", fs });
 	probe.calls.length = 0;
 	fs.beginScriptScope();
-	// A rejected redirect write escapes `bash.exec` intact, so the cap error can land here or at flush.
-	let flushError: string | undefined;
+	let scriptError: string | undefined;
 	let result = { exitCode: -1 };
 	try {
 		result = await bash.exec(script);
 		await fs.endScriptScope();
 	} catch (err) {
-		flushError = (err as Error & { code?: string }).code;
+		scriptError = (err as Error & { code?: string }).code;
 		await fs.abortScriptScope();
 	}
 	return {
 		fs,
 		result,
-		flushError,
+		scriptError,
 		composites: probe.calls.filter((c) => c === "writeFileComposite").length,
 	};
 }
@@ -61,6 +54,6 @@ describe("bash over SqlFs — `>` flushes one composite per redirect", () => {
 	it("counts a collapsed redirect once against the op cap", async () => {
 		const one = await runScript("echo hi > /home/user/out", 1);
 		const two = await runScript("echo 1 > /home/user/a; echo 2 > /home/user/b", 1);
-		expect({ one: one.flushError, two: two.flushError }).toEqual({ one: undefined, two: "ESCRIPTBUFFER" });
+		expect({ one: one.scriptError, two: two.scriptError }).toEqual({ one: undefined, two: "ESCRIPTBUFFER" });
 	});
 });

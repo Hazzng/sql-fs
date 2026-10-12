@@ -1,11 +1,3 @@
-/**
- * PATCH /v1/sandboxes/:id changes runtime flags on a sandbox that already exists.
- *
- * The store contract the Postgres dialect implements is mirrored here: the update rewrites the
- * flags and advances the sandbox epoch. Two SessionManagers over one probe dialect stand in for
- * two replicas, so the test covers a warm session that never saw the PATCH.
- */
-
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

@@ -135,11 +135,6 @@ describe("SqlFs.readFileBuffer", () => {
 	});
 });
 
-// ── readFileBytes tests ────────────────────────────────────────────────────────
-// just-bash's `readBytesFrom` prefers this over readFileBuffer + per-byte concat. The
-// contract is latin1-shaped: char i === byte i, for every byte value including NUL and
-// bytes that are not valid UTF-8.
-
 describe("SqlFs.readFileBytes", () => {
 	const fileContent = new Uint8Array([0x00, 0x41, 0x7f, 0x80, 0xc3, 0xa9, 0xff]);
 	const filePath = "/data.bin";

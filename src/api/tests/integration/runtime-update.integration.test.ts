@@ -60,7 +60,7 @@ describe.skipIf(!process.env.DATABASE_URL || !process.env.REDIS_URL)("runtime fl
 	}
 
 	function update(sm: SessionManager, runtime: Partial<RuntimeOptions>) {
-		return sm.withSessionOrRehydrate(tenant, id, () => sm.updateSandboxRuntime(tenant, id, runtime));
+		return sm.withSessionOrRehydrate(tenant, id, (session) => sm.updateSandboxRuntime(session, runtime));
 	}
 
 	it("stores the new flag and keeps the omitted ones", async () => {
