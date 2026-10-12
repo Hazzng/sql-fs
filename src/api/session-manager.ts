@@ -1,27 +1,46 @@
 import type { Redis } from "ioredis";
-import { Bash } from "just-bash";
-import type { BashExecResult, DefenseInDepthConfig, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import type { BashExecResult, ExecOptions, IFileSystem } from "just-bash";
 import { createEnoent } from "../sql-fs/errors.js";
-import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
+import { createPostgresSandboxFs, destroyPostgresSandbox, retirePostgresSandboxGeneration } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
-import { SessionScopedFs } from "../sql-fs/session-scoped-fs.js";
-import type { ICoherentFs, IReadOnlyScopeFs, IScriptTxFs } from "../sql-fs/sql-fs.js";
+import type { ScriptTxBufferConfig } from "../sql-fs/script-tx-buffer.js";
+import type { ICoherentFs, IReadOnlyScopeFs } from "../sql-fs/sql-fs.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
-import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "./commands/git-command.js";
-import { nodeCommand } from "./commands/node-command.js";
-import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
+import type { GitIdentity } from "./commands/git-command.js";
+import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
-import { type ExecContext, execContext } from "./exec-context.js";
+import { preservesAmbiguousOutcome } from "./errors.js";
 import { logAudit } from "./lib/audit.js";
-import { MAX_EXEC_FILE_BYTES } from "./lib/env.js";
-import { posixNormalizePath } from "./lib/paths.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
 // escape (RCE + secret/credential exfil — audit C1). The WASM `python3`
 // command from just-bash (enabled via `python: true` below) is the safe path.
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { RWLock } from "./rw-lock.js";
+import { sessionLeaseContext } from "./session-lease-context.js";
+import {
+	type RuntimeOptions,
+	type SessionRuntime,
+	buildGitIdentity,
+	buildSandboxBaseEnv,
+	createSessionRuntime,
+	executeSessionRuntime,
+} from "./session-runtime/engine.js";
+export { buildGitIdentity, buildSandboxBaseEnv, deriveExecGitCredentials } from "./session-runtime/engine.js";
+export type { RuntimeOptions, SessionScriptScope } from "./session-runtime/engine.js";
+
 import type { TenantConfig } from "./tenants.js";
+import { WorkerFileSystem, WorkerScriptScope } from "./worker-owner/filesystem.js";
+import { assertWorkerMessageBudget } from "./worker-owner/message-budget.js";
+import {
+	WorkerOwnerPool,
+	type WorkerPoolOptions,
+	type WorkerReservation,
+	loadWorkerPoolOptions,
+	workerReservation,
+} from "./worker-owner/pool.js";
+import type { ShellExecutionLimits } from "./worker-owner/protocol.js";
+import { OutcomeUnknownError } from "./worker-owner/protocol.js";
 
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
@@ -45,104 +64,7 @@ function asReadOnlyFs(fs: IFileSystem): IReadOnlyScopeFs | undefined {
 	return undefined;
 }
 
-function asScriptTxFs(fs: IFileSystem): IScriptTxFs | undefined {
-	const partial = fs as Partial<IScriptTxFs>;
-	if (
-		typeof partial.beginScriptScope === "function" &&
-		typeof partial.endScriptScope === "function" &&
-		typeof partial.abortScriptScope === "function" &&
-		typeof partial.reload === "function" &&
-		typeof partial.wasDirty === "function" &&
-		typeof partial.clearDirty === "function"
-	) {
-		return fs as IScriptTxFs;
-	}
-	return undefined;
-}
-
-/**
- * Per-sandbox runtime opt-in flags. Runtimes must be declared at session creation
- * because `just-bash` decides which commands to register when the `Bash` instance is built.
- */
-export interface RuntimeOptions {
-	readonly python: boolean;
-	readonly javascript: boolean;
-	/**
-	 * When true, network-capable runtimes may use outbound HTTPS: `js-exec`
-	 * gets unrestricted `fetch`, just-bash registers `curl`, and git remote
-	 * transport can clone/fetch/push. Defaults to false (secure-by-default).
-	 */
-	readonly network: boolean;
-}
-
 const DEFAULT_RUNTIME_OPTIONS: RuntimeOptions = { python: false, javascript: false, network: false };
-
-export function buildSandboxBaseEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-	const out: Record<string, string> = Object.create(null);
-	const token = env.GITHUB_TOKEN;
-	if (token) {
-		out.GITHUB_TOKEN = token;
-		out.GIT_HTTP_USER = "x-access-token";
-		out.GIT_HTTP_PASSWORD = token;
-	}
-	return out;
-}
-
-/**
- * The deployment's default commit identity. It goes to just-git as its fallback identity rather
- * than into the sandbox env: GIT_AUTHOR_* env outranks `git -c user.*` and repo config, so as
- * env it silently overrode both. Author values win; committer values fill in.
- */
-export function buildGitIdentity(env: NodeJS.ProcessEnv = process.env): GitIdentity | undefined {
-	const name = env.GIT_AUTHOR_NAME || env.GIT_COMMITTER_NAME;
-	const email = env.GIT_AUTHOR_EMAIL || env.GIT_COMMITTER_EMAIL;
-	return name && email ? { name, email } : undefined;
-}
-
-const SANDBOX_NETWORK_CREDENTIAL_KEYS = new Set([
-	"GITHUB_TOKEN",
-	"GIT_HTTP_BEARER_TOKEN",
-	"GIT_HTTP_USER",
-	"GIT_HTTP_PASSWORD",
-]);
-
-/**
- * Re-derive git's HTTP credentials from a per-request `GITHUB_TOKEN`.
- *
- * just-bash merges the exec env over the base env key by key, so an override of `GITHUB_TOKEN`
- * alone leaves `GIT_HTTP_PASSWORD` holding the deployment token — `git clone`/`push` would keep
- * authenticating as the server while `curl $GITHUB_TOKEN` used the caller's. Each alias is
- * derived independently, so a request that pins only one half (`GIT_HTTP_USER: "oauth2"` for a
- * non-GitHub host, say) keeps it and still has the other half re-derived rather than inherited.
- * Only sandboxes that carry the credentials at all (network-enabled) are touched.
- */
-export function deriveExecGitCredentials(
-	env: Record<string, string> | undefined,
-	network: boolean,
-): Record<string, string> | undefined {
-	if (env === undefined || !network) return env;
-	if (!Object.hasOwn(env, "GITHUB_TOKEN")) return env;
-	const out: Record<string, string> = Object.assign(Object.create(null), env);
-	// An empty override means "no credentials": just-git only sends basic auth when both halves
-	// are non-empty, so the pair below stays inert rather than falling back to the server token.
-	// A request-supplied GIT_HTTP_BEARER_TOKEN still outranks the pair inside just-git.
-	if (!Object.hasOwn(env, "GIT_HTTP_USER")) out.GIT_HTTP_USER = "x-access-token";
-	if (!Object.hasOwn(env, "GIT_HTTP_PASSWORD")) out.GIT_HTTP_PASSWORD = env.GITHUB_TOKEN ?? "";
-	return out;
-}
-
-const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MAX_ENV_AUDIT_NAMES = 20;
-const MAX_ENV_AUDIT_NAME_LENGTH = 128;
-
-function buildRuntimeSandboxEnv(baseEnv: Record<string, string>, network: boolean): Record<string, string> | undefined {
-	const out: Record<string, string> = Object.create(null);
-	for (const [key, value] of Object.entries(baseEnv)) {
-		if (!network && SANDBOX_NETWORK_CREDENTIAL_KEYS.has(key)) continue;
-		out[key] = value;
-	}
-	return Object.keys(out).length > 0 ? out : undefined;
-}
 
 const SANDBOX_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -156,18 +78,7 @@ function assertValidSandboxId(sandboxId: string): void {
 	}
 }
 
-/** Matches `python3` or `python` as a standalone word (avoids false positives like `mypython`). */
-const PYTHON_INVOCATION_REGEX = /\bpython3?\b/;
-/** Matches `js-exec` or `node` as a standalone command word (avoids `mynode`, `nodejs-config`, etc). */
-const JS_INVOCATION_REGEX = /\bjs-exec\b|\bnode\b/;
-
-export interface Session {
-	readonly fs: IFileSystem;
-	readonly bash: Bash;
-	readonly runtimeOptions: RuntimeOptions;
-	readonly tenantId: string;
-	readonly sandboxId: string;
-	readonly scriptTx: SessionScopedFs | undefined;
+export interface Session extends SessionRuntime {
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -205,16 +116,6 @@ export interface Session {
 	 * but do not update it, consistent with the read-only contract.
 	 */
 	cwd: string;
-	/**
-	 * AbortSignal that fires when the distributed exec lock is DEFINITIVELY lost
-	 * (lease expired or ownership taken by another holder) for the currently
-	 * locked region. Set by `withExecLockExclusive` / `withExecLockShared` before
-	 * the inner `fn` runs and cleared in their `finally`. Undefined when no
-	 * distributed lock is held (single-replica / Redis disabled). The exec routes
-	 * compose this with their timeout signal so `bash.exec` aborts — and the
-	 * script-tx rolls back — BEFORE any commit on a lost lease (F2-L1).
-	 */
-	lockLostSignal?: AbortSignal;
 }
 
 /** Per-tenant lazy Postgres backend state. */
@@ -224,6 +125,11 @@ interface PerTenantBackend {
 }
 
 export interface SessionManagerOptions {
+	readonly workerEnabled?: boolean;
+	readonly executionLimits?: ShellExecutionLimits;
+	readonly scriptTxBuffer?: ScriptTxBufferConfig;
+	readonly postgresPoolMax?: number;
+	readonly workerOptions?: WorkerPoolOptions;
 	/**
 	 * Tenant configuration used to resolve a tenant id → Postgres connection
 	 * string. Required unless a `createFs` override is supplied.
@@ -301,8 +207,6 @@ export class RuntimeBackpressureError extends Error {
 export class SessionManager {
 	/** Keyed by `${tenantId}:${sandboxId}` to isolate colliding sandbox ids across tenants. */
 	private readonly sessions: Map<string, Session> = new Map();
-	/** Weak references keep warning deduplication bounded by the warm session lifetime. */
-	private readonly unsupportedEnvWarned = new WeakSet<Session>();
 	private readonly pending: Map<string, Promise<Session>> = new Map();
 	private readonly backends: Map<string, PerTenantBackend> = new Map();
 	private readonly tenantConfig: TenantConfig | undefined;
@@ -326,8 +230,21 @@ export class SessionManager {
 	private readonly sandboxBaseEnv: Record<string, string>;
 	private readonly gitIdentity: GitIdentity | undefined;
 	private shuttingDown = false;
+	private readonly workerPool: WorkerOwnerPool | undefined;
+	private readonly workerRecoveries = new WeakMap<
+		WorkerReservation,
+		{ readonly generation: number; readonly task: Promise<void> }
+	>();
+	private readonly executionLimits: ShellExecutionLimits | undefined;
+	private readonly scriptTxBuffer: ScriptTxBufferConfig | undefined;
+	private readonly postgresPoolMax: number | undefined;
 
 	constructor({
+		workerEnabled,
+		workerOptions,
+		executionLimits,
+		scriptTxBuffer,
+		postgresPoolMax,
 		tenantConfig,
 		createFs,
 		destroySandboxFn,
@@ -346,6 +263,9 @@ export class SessionManager {
 		defenseAuditMode,
 	}: SessionManagerOptions) {
 		this.tenantConfig = tenantConfig;
+		this.executionLimits = executionLimits;
+		this.scriptTxBuffer = scriptTxBuffer;
+		this.postgresPoolMax = postgresPoolMax;
 		this.createFsOverride = createFs;
 		this.destroySandboxFn =
 			destroySandboxFn ??
@@ -385,6 +305,17 @@ export class SessionManager {
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 		this.sandboxBaseEnv = buildSandboxBaseEnv();
 		this.gitIdentity = buildGitIdentity();
+		const workers = workerEnabled ?? process.env.SQL_FS_WORKERS_ENABLED === "true";
+		if (workers && (createFs !== undefined || tenantConfig === undefined)) {
+			throw new Error("Worker sessions require tenantConfig and the Postgres filesystem factory");
+		}
+		this.workerPool = workers
+			? new WorkerOwnerPool({
+					...(workerOptions ?? loadWorkerPoolOptions()),
+					defenseInDepth: this.defenseInDepth,
+					defenseAuditMode: this.defenseAuditMode,
+				})
+			: undefined;
 	}
 
 	private sessionKey(tenantId: string, sandboxId: string): string {
@@ -405,7 +336,7 @@ export class SessionManager {
 		const connectionString = this.tenantConfig.getConnectionString(tenantId);
 		const backend: PerTenantBackend = {
 			connectionString,
-			blobCache: this.blobCacheFactory?.(tenantId),
+			blobCache: this.workerPool === undefined ? this.blobCacheFactory?.(tenantId) : undefined,
 		};
 		this.backends.set(tenantId, backend);
 		return backend;
@@ -415,6 +346,7 @@ export class SessionManager {
 		tenantId: string,
 		sandboxId: string,
 		owner = "",
+		openExisting = false,
 	): Promise<{ fs: IFileSystem; resolvedOwner: string; createdAt: string }> {
 		if (this.createFsOverride !== undefined) {
 			return {
@@ -427,8 +359,11 @@ export class SessionManager {
 		return createPostgresSandboxFs(
 			{
 				connectionString: backend.connectionString,
+				poolMax: this.postgresPoolMax,
+				scriptTxBuffer: this.scriptTxBuffer,
 				tenantId,
 				blobCache: backend.blobCache,
+				openExisting,
 			},
 			sandboxId,
 			owner,
@@ -456,14 +391,26 @@ export class SessionManager {
 		sandboxId: string,
 		runtimeOptions?: RuntimeOptions,
 		owner = "",
+		openExisting = false,
 	): Promise<Session> {
 		assertValidSandboxId(sandboxId);
+		if (this.workerPool !== undefined && workerReservation.getStore() === undefined) {
+			return this.workerPool.run(tenantId, this.sessionKey(tenantId, sandboxId), false, () =>
+				this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner, openExisting),
+			);
+		}
 		if (this.shuttingDown) {
 			throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
 		}
 		const key = this.sessionKey(tenantId, sandboxId);
 		const existing = this.sessions.get(key);
 		if (existing !== undefined) {
+			try {
+				await this.attachWorker(existing);
+			} catch (error) {
+				if (this.isSandboxMissing(error)) await existing.destroyPromise;
+				throw error;
+			}
 			existing.lastUsed = Date.now();
 			return existing;
 		}
@@ -478,52 +425,29 @@ export class SessionManager {
 		const creationPromise = (async (): Promise<Session> => {
 			let createdFs: IFileSystem | undefined;
 			try {
-				const { fs, resolvedOwner, createdAt: fsCreatedAt } = await this.buildFs(tenantId, sandboxId, owner);
-				createdFs = fs;
-				const defenseInDepthConfig: DefenseInDepthConfig | false = this.defenseInDepth
-					? {
-							enabled: true,
-							auditMode: this.defenseAuditMode,
-							onViolation: (v: SecurityViolation) => logAudit("defense_in_depth_violation", { sandboxId, ...v }),
-						}
-					: false;
-
-				// NOTE: the `py-exec` warm-host-Python custom command is deliberately
-				// not registered (audit C1 — host sandbox escape). Python sandboxes
-				// run via just-bash's WASM `python3` (`python: true`), which is isolated.
-				// `{}` → no allowlist → full outbound via globalThis.fetch.
-				// `false` → clone/fetch/push blocked; local git still works.
-				// The wrapper removes the destination of a clone that fails partway,
-				// so a refused symlink cannot leave a poisoned index behind.
-				const gitCommand = createGitCommand({
-					network: resolvedRuntime.network ? { fetch: httpsOnlyGitFetch } : false,
-					identity: this.gitIdentity,
-				});
-				const customCommands = [
-					// Override just-bash's built-in nodeStubCommand with a smarter
-					// version that translates `node -e CODE` → `js-exec -c CODE` and
-					// `node FILE` → `js-exec FILE` instead of dumping a help wall.
-					// Only registered when the javascript runtime is enabled so that
-					// non-JS sandboxes keep the default "command not found" behaviour.
-					...(resolvedRuntime.javascript ? [nodeCommand] : []),
-					gitCommand,
-				];
-
-				const bash = new Bash({
+				if (this.workerPool !== undefined) {
+					const session = await this.buildWorkerSession(tenantId, sandboxId, resolvedRuntime, owner, openExisting);
+					this.sessions.set(key, session);
+					return session;
+				}
+				const {
 					fs,
-					python: resolvedRuntime.python || undefined,
-					javascript: resolvedRuntime.javascript || undefined,
-					// When network is enabled, grant js-exec unrestricted outbound HTTPS.
-					// just-bash also registers curl through secureFetch; git remote
-					// transport is gated separately above and uses globalThis.fetch.
-					network: resolvedRuntime.network ? { dangerouslyAllowFullInternetAccess: true } : undefined,
-					env: buildRuntimeSandboxEnv(this.sandboxBaseEnv, resolvedRuntime.network),
-					defenseInDepth: defenseInDepthConfig,
-					customCommands: customCommands.length > 0 ? customCommands : undefined,
-				});
+					resolvedOwner,
+					createdAt: fsCreatedAt,
+				} = await this.buildFs(tenantId, sandboxId, owner, openExisting);
+				createdFs = fs;
+				const runtime = createSessionRuntime(
+					fs,
+					{ tenantId, sandboxId, runtimeOptions: resolvedRuntime },
+					{
+						defenseInDepth: this.defenseInDepth,
+						defenseAuditMode: this.defenseAuditMode,
+						executionLimits: this.executionLimits,
+						baseEnv: this.sandboxBaseEnv,
+						gitIdentity: this.gitIdentity,
+					},
+				);
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
-				const scriptTxFs = asScriptTxFs(fs);
-				const scriptTx = scriptTxFs !== undefined ? new SessionScopedFs(scriptTxFs) : undefined;
 
 				// Shutdown may have begun while buildFs() was running. If so, refuse
 				// to register the session — shutdown's snapshot has already been
@@ -532,12 +456,7 @@ export class SessionManager {
 					throw Object.assign(new Error("ESHUTTINGDOWN: server is shutting down"), { code: "ESHUTTINGDOWN" });
 				}
 				const session: Session = {
-					fs,
-					bash,
-					runtimeOptions: resolvedRuntime,
-					tenantId,
-					sandboxId,
-					scriptTx,
+					...runtime,
 					lastUsed: Date.now(),
 					inFlight: 0,
 					lock: new RWLock(),
@@ -547,7 +466,6 @@ export class SessionManager {
 					createdAt: fsCreatedAt,
 					pathCacheBytes,
 					overBudget: pathCacheBytes > this.pathCacheMaxBytes,
-					cwd: bash.getCwd(),
 				};
 				this.sessions.set(key, session);
 				createdFs = undefined; // ownership transferred to session
@@ -570,6 +488,192 @@ export class SessionManager {
 		return creationPromise;
 	}
 
+	private async buildWorkerSession(
+		tenantId: string,
+		sandboxId: string,
+		runtimeOptions: RuntimeOptions,
+		owner: string,
+		openExisting: boolean,
+	): Promise<Session> {
+		const pool = this.workerPool;
+		if (pool === undefined) throw new Error("worker pool is disabled");
+		const key = this.sessionKey(tenantId, sandboxId);
+		const metadata = await pool.attach({
+			tenantId,
+			sandboxId,
+			runtimeOptions,
+			owner,
+			connectionString: this.getOrInitBackend(tenantId).connectionString,
+			cwd: "/home/user",
+			openExisting,
+		});
+		const fs = new WorkerFileSystem(pool, key);
+		const session: Session = {
+			fs,
+			bash: {
+				exec: (script, options) => this.execWithRuntimeThrottle(session, script, options),
+				getCwd: () => session.cwd,
+				registerCommand: () => {
+					throw new Error("Worker commands must be registered by the worker runtime factory");
+				},
+			},
+			runtimeOptions,
+			tenantId,
+			sandboxId,
+			scriptTx: new WorkerScriptScope(fs),
+			lastUsed: Date.now(),
+			inFlight: 0,
+			lock: new RWLock(),
+			state: "active",
+			owner: metadata.owner,
+			name: null,
+			createdAt: metadata.createdAt,
+			pathCacheBytes: metadata.pathCacheBytes,
+			overBudget: metadata.pathCacheBytes > this.pathCacheMaxBytes,
+			cwd: metadata.cwd,
+		};
+		return session;
+	}
+
+	private async attachWorker(session: Session): Promise<void> {
+		if (this.workerPool === undefined || !(session.fs instanceof WorkerFileSystem)) return;
+		try {
+			await this.workerPool.attach({
+				tenantId: session.tenantId,
+				sandboxId: session.sandboxId,
+				connectionString: this.getOrInitBackend(session.tenantId).connectionString,
+				runtimeOptions: session.runtimeOptions,
+				owner: session.owner,
+				cwd: session.cwd,
+				openExisting: true,
+			});
+		} catch (error) {
+			if (!this.isSandboxMissing(error)) throw error;
+			this.evictMissingSandbox(session.tenantId, session.sandboxId, session);
+			throw createEnoent(`/${session.sandboxId}`);
+		}
+	}
+
+	private isSandboxMissing(error: unknown): boolean {
+		const code = (error as { code?: string } | null)?.code;
+		return code === "ENOENT" || code === "ESANDBOXGONE";
+	}
+
+	private evictMissingSandbox(tenantId: string, sandboxId: string, session: Session): void {
+		if (session.destroyPromise !== undefined) return;
+		session.state = "closing";
+		const key = this.sessionKey(tenantId, sandboxId);
+		session.destroyPromise = session.lock.runExclusive(async () => {
+			try {
+				await this.disconnectFs(session.fs);
+			} finally {
+				if (this.sessions.get(key) === session) this.sessions.delete(key);
+			}
+		});
+	}
+
+	async getSessionPaths(session: Session): Promise<string[]> {
+		return session.fs instanceof WorkerFileSystem ? session.fs.getPaths() : session.fs.getAllPaths();
+	}
+
+	assertWorkerMessageBudget(value: unknown, additionalBytes = 0): void {
+		if (this.workerPool !== undefined) {
+			assertWorkerMessageBudget(
+				value,
+				this.workerPool.options.executionLimits.maxWorkerMessageBytes ?? 64 * 1024 * 1024,
+				additionalBytes,
+			);
+		}
+	}
+
+	getWorkerMetrics() {
+		if (this.workerPool === undefined) return undefined;
+		return {
+			...this.workerPool.metrics,
+			pythonActive: this.pythonSem.inFlight,
+			pythonQueued: this.pythonSem.waiters.length,
+			javascriptActive: this.jsSem.inFlight,
+			javascriptQueued: this.jsSem.waiters.length,
+		};
+	}
+
+	async initializeWorkers(): Promise<void> {
+		await this.workerPool?.start();
+	}
+
+	async crashWorkerForTest(tenantId: string, sandboxId: string): Promise<void> {
+		await this.workerPool?.crashWorkerForTest(this.sessionKey(tenantId, sandboxId));
+	}
+
+	private withWorkerAdmission<T>(
+		tenantId: string,
+		sandboxId: string,
+		shared: boolean,
+		fn: () => Promise<T>,
+	): Promise<T> {
+		return this.workerPool === undefined
+			? fn()
+			: this.workerPool.run(tenantId, this.sessionKey(tenantId, sandboxId), shared, fn);
+	}
+
+	private async recoverWorker(err: unknown): Promise<void> {
+		if (
+			this.workerPool === undefined ||
+			!["EEXEC_OUTCOME_UNKNOWN", "EWORKER_UNAVAILABLE"].includes((err as { code?: string } | null)?.code ?? "")
+		)
+			return;
+		const pool = this.workerPool;
+		const reservation = workerReservation.getStore();
+		if (reservation === undefined) return;
+		const previous = this.workerRecoveries.get(reservation);
+		if (previous?.generation === reservation.slot.generation) return previous.task;
+		const task = (async () => {
+			const identity = await pool.recover((err as { code?: string }).code === "EEXEC_OUTCOME_UNKNOWN");
+			if (identity !== undefined) {
+				await retirePostgresSandboxGeneration(identity.connectionString, identity.sandboxId);
+			}
+		})();
+		this.workerRecoveries.set(reservation, { generation: reservation.slot.generation, task });
+		await task;
+	}
+
+	private async lostWorkerOutcome(error?: unknown): Promise<void> {
+		const reservation = workerReservation.getStore();
+		if (
+			reservation === undefined ||
+			(!reservation.execDispatched && !reservation.committedFsWrite && !reservation.creatingAttachDispatched)
+		)
+			return;
+		const unknown = new OutcomeUnknownError();
+		try {
+			await this.recoverWorker(unknown);
+		} catch {}
+		throw preservesAmbiguousOutcome(error) ? error : unknown;
+	}
+
+	private async withWorkerLease<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		return sessionLeaseContext.run({ lostSignal: signal }, async () => {
+			const reservation = workerReservation.getStore();
+			if (reservation === undefined) return fn(signal);
+			reservation.lostSignal = signal;
+			let result: T;
+			try {
+				result = await fn(signal);
+			} catch (error) {
+				const code = (error as { code?: string } | null)?.code;
+				if (signal?.aborted || code === "ELOCKLOST") await this.lostWorkerOutcome(error);
+				if (code === "ERUNTIME_BUSY" && (reservation.execDispatched || reservation.committedFsWrite)) {
+					throw new OutcomeUnknownError(
+						"EEXEC_OUTCOME_UNKNOWN: an earlier operation in this request may have applied; do not replay the request",
+					);
+				}
+				throw error;
+			}
+			if (signal?.aborted) await this.lostWorkerOutcome();
+			return result;
+		});
+	}
+
 	getSession(tenantId: string, sandboxId: string): Session | undefined {
 		return this.sessions.get(this.sessionKey(tenantId, sandboxId));
 	}
@@ -580,11 +684,18 @@ export class SessionManager {
 		fn: (lostSignal?: AbortSignal) => Promise<T>,
 	): Promise<T> {
 		assertValidSandboxId(sandboxId);
-		if (this.redis === undefined) return fn();
-		if (!this.rwlockEnabled) {
-			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, this.execLockOptions);
+		if (this.workerPool !== undefined && workerReservation.getStore()?.key !== this.sessionKey(tenantId, sandboxId)) {
+			return this.withWorkerAdmission(tenantId, sandboxId, false, () =>
+				this.withExecLockExclusive(tenantId, sandboxId, fn),
+			);
 		}
-		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "exclusive", fn, this.execLockOptions);
+		if (this.redis === undefined) return this.withWorkerLease(fn);
+		const guarded = (signal: AbortSignal) => this.withWorkerLease(fn, signal);
+		const options = { ...this.execLockOptions, onLostAfterWork: () => this.lostWorkerOutcome() };
+		if (!this.rwlockEnabled) {
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), guarded, options);
+		}
+		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "exclusive", guarded, options);
 	}
 
 	private async withExecLockShared<T>(
@@ -593,7 +704,14 @@ export class SessionManager {
 		fn: (lostSignal?: AbortSignal) => Promise<T>,
 	): Promise<T> {
 		assertValidSandboxId(sandboxId);
-		if (this.redis === undefined) return fn();
+		if (this.workerPool !== undefined && workerReservation.getStore()?.key !== this.sessionKey(tenantId, sandboxId)) {
+			return this.withWorkerAdmission(tenantId, sandboxId, true, () =>
+				this.withExecLockShared(tenantId, sandboxId, fn),
+			);
+		}
+		if (this.redis === undefined) return this.withWorkerLease(fn);
+		const guarded = (signal: AbortSignal) => this.withWorkerLease(fn, signal);
+		const options = { ...this.execLockOptions, onLostAfterWork: () => this.lostWorkerOutcome() };
 		// Flag-off (rolling deploy): the distributed RW lock keyspace is disabled,
 		// so readers fall back to the SAME legacy single-key SET-NX lock that
 		// flag-off writers take (`withExecLockExclusive`). This serializes reads
@@ -604,12 +722,12 @@ export class SessionManager {
 		if (!this.rwlockEnabled) {
 			// readOnly: the shared entry points run under a read-only scope, so a
 			// lease lost after `fn` returned still means "nothing applied" (#175 M1).
-			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), fn, {
-				...this.execLockOptions,
+			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), guarded, {
+				...options,
 				readOnly: true,
 			});
 		}
-		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", fn, this.execLockOptions);
+		return withDistributedRWLock(this.redis, rwLockKeys(tenantId, sandboxId), "shared", guarded, options);
 	}
 
 	/** Shared entry logic for all exclusive (write) session wrappers. */
@@ -624,53 +742,61 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		// F2-L1: expose the distributed lock's definitive-loss signal to the exec
-		// routes (which compose it into bash.exec's abort signal) for the duration
-		// of this locked region. Cleared in finally so a stale signal never leaks
-		// into a later turn that re-uses the warm session.
-		session.lockLostSignal = lostSignal;
 		try {
 			return await session.lock.runExclusive(async () => {
-				if (session.state === "closing") {
-					throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), {
-						code: "ESESSIONCLOSING",
-					});
-				}
+				if (session.state === "closing")
+					throw Object.assign(new Error("Session is shutting down"), { code: "ESESSIONCLOSING" });
 				session.inFlight++;
 				session.lastUsed = Date.now();
+				let primaryError: unknown;
+				let failed = false;
+				let result: T | undefined;
 				try {
+					await this.attachWorker(session);
+					const reservation = workerReservation.getStore();
+					if (reservation !== undefined) {
+						reservation.lostSignal = lostSignal;
+						reservation.phase = "running";
+					}
 					await this.ensureFreshCache(tenantId, sandboxId, session);
-				} catch (error) {
-					session.inFlight--;
-					throw error;
-				}
-				try {
-					const result = await fn(session);
+					result = await fn(session);
 					if (asCoherentFs(session.fs)?.poisoned()) {
 						throw Object.assign(
 							new Error("ECOHERENCE_UNAPPLIED: recovery failed; nothing was applied, retry is safe"),
 							{ code: "ECOHERENCE_UNAPPLIED" },
 						);
 					}
-					return result;
-				} finally {
+				} catch (error) {
+					primaryError = error;
+					failed = true;
 					try {
-						const coherent = asCoherentFs(session.fs);
-						if (coherent === undefined || coherent.wasDirty()) {
-							session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
-							session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
-							await coherent?.clearDirty();
-						}
-					} finally {
-						session.inFlight--;
-					}
+						await this.recoverWorker(error);
+					} catch {}
 				}
+				try {
+					const coherent = asCoherentFs(session.fs);
+					if (coherent === undefined || coherent.wasDirty()) {
+						session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
+						session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
+						await coherent?.clearDirty();
+					}
+				} catch (error) {
+					if (!failed) {
+						try {
+							await this.recoverWorker(error);
+						} catch {}
+						primaryError = error;
+						failed = true;
+					}
+				} finally {
+					session.inFlight--;
+				}
+				if (failed) throw primaryError;
+				return result as T;
 			});
 		} catch (error) {
 			if ((error as { code?: string }).code === "ENOENT") await session.destroyPromise;
 			throw error;
-		} finally {
-			session.lockLostSignal = undefined;
 		}
 	}
 
@@ -693,12 +819,6 @@ export class SessionManager {
 			throw Object.assign(new Error("ESESSIONCLOSING: session is being destroyed"), { code: "ESESSIONCLOSING" });
 		}
 
-		// F2-L1: expose the distributed shared lock's definitive-loss signal to the
-		// exec routes for this locked region (see withSessionEntry). Cleared in
-		// finally so it never leaks into a later turn reusing this warm session.
-		// NOTE: multiple readers share one warm session; they all observe the same
-		// lockLostSignal, which is correct — a shared-lock loss invalidates them all.
-		session.lockLostSignal = lostSignal;
 		try {
 			return await session.lock.runShared(async () => {
 				if (session.state === "closing") {
@@ -710,6 +830,12 @@ export class SessionManager {
 				session.inFlight++;
 				session.lastUsed = Date.now();
 				try {
+					await this.attachWorker(session);
+					const reservation = workerReservation.getStore();
+					if (reservation !== undefined) {
+						reservation.lostSignal = lostSignal;
+						reservation.phase = "running";
+					}
 					await this.ensureFreshCache(tenantId, sandboxId, session);
 				} catch (error) {
 					session.inFlight--;
@@ -729,6 +855,9 @@ export class SessionManager {
 					try {
 						result = await readOnlyContext.run(ctx, () => fn(session));
 					} catch (err) {
+						try {
+							await this.recoverWorker(err);
+						} catch {}
 						const errCode = (err as Error & { code?: string }).code;
 						// Audit the violation even when an unrelated error (e.g. AbortError
 						// from a timeout) wins as the thrown error. Bash can record an
@@ -790,8 +919,6 @@ export class SessionManager {
 		} catch (error) {
 			if ((error as { code?: string }).code === "ENOENT") await session.destroyPromise;
 			throw error;
-		} finally {
-			session.lockLostSignal = undefined;
 		}
 	}
 
@@ -799,6 +926,7 @@ export class SessionManager {
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 		try {
+			if (!(session.fs instanceof WorkerFileSystem)) await coherent.claimGeneration?.();
 			await coherent.ensureFresh();
 			session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 			session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
@@ -812,13 +940,7 @@ export class SessionManager {
 				}
 				throw error;
 			}
-			if (session.state !== "closing") {
-				session.state = "closing";
-				session.destroyPromise = session.lock.runExclusive(async () => {
-					await this.disconnectFs(session.fs);
-					this.sessions.delete(this.sessionKey(tenantId, sandboxId));
-				});
-			}
+			this.evictMissingSandbox(tenantId, sandboxId, session);
 			throw createEnoent(`/${sandboxId}`);
 		}
 	}
@@ -890,7 +1012,7 @@ export class SessionManager {
 		const resolvedRuntime: RuntimeOptions = meta
 			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
-		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
+		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "", true);
 		if (meta?.owner) session.owner = meta.owner;
 		if (meta?.name !== undefined) session.name = meta.name;
 		if (meta?.createdAt !== undefined) session.createdAt = meta.createdAt;
@@ -938,7 +1060,7 @@ export class SessionManager {
 		const resolvedRuntime: RuntimeOptions = meta
 			? { python: meta.python, javascript: meta.javascript, network: meta.network }
 			: (runtimeOptions ?? DEFAULT_RUNTIME_OPTIONS);
-		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "");
+		const session = await this.getOrCreate(tenantId, sandboxId, resolvedRuntime, meta?.owner ?? "", true);
 		if (meta?.owner) {
 			session.owner = meta.owner;
 		}
@@ -1019,6 +1141,8 @@ export class SessionManager {
 		this.stopReaper();
 
 		const drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
+		const deadline = Date.now() + drainTimeoutMs;
+		await this.workerPool?.shutdown(Math.max(0, deadline - Date.now()));
 
 		// Mark every session closing so new entries reject early.
 		for (const session of this.sessions.values()) {
@@ -1035,7 +1159,6 @@ export class SessionManager {
 			}
 		}
 
-		const deadline = Date.now() + drainTimeoutMs;
 		const sessionsSnapshot = [...this.sessions.entries()];
 		await Promise.allSettled(
 			sessionsSnapshot.map(async ([key, session]) => {
@@ -1172,120 +1295,33 @@ export class SessionManager {
 	}
 
 	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
-		const usesPython = session.runtimeOptions.python && PYTHON_INVOCATION_REGEX.test(script);
-		const usesJs = session.runtimeOptions.javascript && JS_INVOCATION_REGEX.test(script);
-
-		// Apply the session-tracked cwd as the starting directory for this exec,
-		// unless the caller has already supplied an explicit cwd in the request.
-		// just-bash runs each exec against a copy of the interpreter state, so
-		// any `cd` executed inside a script does not survive the call. We bridge
-		// that gap by reading result.env.PWD (always populated by just-bash) and
-		// storing it back on the session after every non-readOnly exec.
-		const resolvedOpts: ExecOptions = {
-			...opts,
-			cwd: opts?.cwd ?? session.cwd,
-			env: deriveExecGitCredentials(opts?.env, session.runtimeOptions.network),
-		};
-		// Bash cannot export these names. Warn once per warm session with a bounded
-		// sample, without ever logging values or retaining caller-controlled names.
-		if (!this.unsupportedEnvWarned.has(session) && resolvedOpts.env !== undefined) {
-			const variableNames: string[] = [];
-			let omittedNameCount = 0;
-			let truncatedNameCount = 0;
-			for (const name in resolvedOpts.env) {
-				if (!Object.hasOwn(resolvedOpts.env, name) || SHELL_NAME.test(name)) continue;
-				if (variableNames.length >= MAX_ENV_AUDIT_NAMES) {
-					omittedNameCount++;
-					continue;
-				}
-				variableNames.push(name.slice(0, MAX_ENV_AUDIT_NAME_LENGTH));
-				if (name.length > MAX_ENV_AUDIT_NAME_LENGTH) truncatedNameCount++;
-			}
-			if (variableNames.length > 0) {
-				this.unsupportedEnvWarned.add(session);
-				logAudit("exec_env_not_exported", {
-					tenantId: session.tenantId,
-					sandboxId: session.sandboxId,
-					variableNames,
-					omittedNameCount,
-					truncatedNameCount,
-					severity: "warn",
-				});
-			}
+		if (session.fs instanceof WorkerFileSystem && this.workerPool !== undefined) {
+			const pool = this.workerPool;
+			const fs = session.fs;
+			return this.withRuntimeSlots(session, opts?.signal, async () => {
+				const { signal, ...options } = opts ?? {};
+				const result = await pool.send<BashExecResult>(
+					{ kind: "exec", script, options: { ...options, cwd: options.cwd ?? session.cwd } },
+					signal,
+				);
+				const metadata = pool.metadata;
+				if (metadata !== undefined) session.cwd = metadata.cwd;
+				fs.refreshMetadata();
+				return result;
+			});
 		}
 
-		// readOnly execs skip scriptTx entirely: the FS rejects all writes via
-		// EREADONLY before any DB call, so the per-script transaction has
-		// nothing to commit, and beginScope/endScope on the shared SessionScopedFs
-		// would race across concurrent parallel readers.
-		const inReadOnlyScope = readOnlyContext.getStore() !== undefined;
-		const runExec = async (ctx: ExecContext): Promise<BashExecResult> => {
-			if (!inReadOnlyScope && session.scriptTx !== undefined) {
-				session.scriptTx.beginScope();
-				try {
-					const result = await session.bash.exec(script, resolvedOpts);
-					// F2-L1: just-bash treats an aborted run as a RESOLVED result (exit
-					// 124), not a rejection — so a definitive lock loss would otherwise
-					// fall through to endScope() and COMMIT a partially-run script under a
-					// lease we no longer hold. If the lock's lost-signal fired, ROLL BACK
-					// instead and surface ELOCKLOST so the client retries a write that
-					// never committed (rather than getting a committed-then-failed lie).
-					// NOTE: a plain timeout abort still commits (audit L7) — we key off the
-					// dedicated lockLostSignal, not the composed exec signal.
-					if (session.lockLostSignal?.aborted === true) {
-						await session.scriptTx.abortScope();
-						throw new LockLostError("exec aborted: distributed exec lock lost mid-script");
-					}
-					// #168: bash normalized the EFBIG into a phantom "No such file or directory"
-					// and a plain exit 1, so the script "succeeded" and is about to commit.
-					// Roll it back and surface the real error — partially applying a script whose
-					// failure the client was told was a missing file is the worse outcome.
-					if (ctx.exceeded !== undefined) {
-						await session.scriptTx.abortScope();
-						throw ctx.exceeded;
-					}
-					await session.scriptTx.endScope();
-					return result;
-				} catch (err) {
-					await session.scriptTx.abortScope();
-					throw err;
-				}
-			}
-			const readOnlyResult = await session.bash.exec(script, resolvedOpts);
-			if (ctx.exceeded !== undefined) throw ctx.exceeded;
-			return readOnlyResult;
-		};
+		return this.withRuntimeSlots(session, opts?.signal, () => executeSessionRuntime(session, script, opts));
+	}
 
-		// #168: the one chokepoint every exec surface (sync, SSE, batch, MCP) funnels
-		// through, so the script's file-size ceiling is established here and nowhere
-		// else. Scoped to the call rather than set on the shared session FS — see
-		// `exec-context.ts` for why a flag would be wrong.
-		const execFn = (): Promise<BashExecResult> => {
-			const ctx: ExecContext = { maxFileBytes: MAX_EXEC_FILE_BYTES };
-			return execContext.run(ctx, () => runExec(ctx));
-		};
-
-		const updateCwd = (result: BashExecResult): BashExecResult => {
-			// readOnly execs must not mutate session state — they run in shared
-			// lock mode and may execute concurrently with other readers.
-			if (!inReadOnlyScope) {
-				const finalCwd = result.env?.PWD;
-				// Validate before storing: reject null bytes (security) and un-normalized segments, so a
-				// script that does `export PWD=…` cannot corrupt session.cwd. A RELATIVE value is dropped
-				// rather than rooted — `foo` is not evidence that `/foo` exists, and keeping the last
-				// known-good cwd beats inventing one the next exec would start from.
-				if (typeof finalCwd === "string" && finalCwd.startsWith("/") && !finalCwd.includes("\0")) {
-					session.cwd = posixNormalizePath(finalCwd);
-				}
-			}
-			return result;
-		};
-
-		if (!usesPython && !usesJs) {
-			return updateCwd(await execFn());
-		}
-
-		const signal = opts?.signal;
+	private async withRuntimeSlots<T>(
+		session: Session,
+		signal: AbortSignal | undefined,
+		fn: () => Promise<T>,
+	): Promise<T> {
+		const usesPython = session.runtimeOptions.python;
+		const usesJs = session.runtimeOptions.javascript;
+		if (!usesPython && !usesJs) return fn();
 		if (usesPython) await this.acquireSlot(this.pythonSem, signal);
 		if (usesJs) {
 			try {
@@ -1297,7 +1333,7 @@ export class SessionManager {
 		}
 
 		try {
-			return updateCwd(await execFn());
+			return await fn();
 		} finally {
 			if (usesJs) this.releaseSlot(this.jsSem);
 			if (usesPython) this.releaseSlot(this.pythonSem);

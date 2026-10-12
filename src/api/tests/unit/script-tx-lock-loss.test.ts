@@ -13,6 +13,7 @@ import { SessionScopedFs } from "../../../sql-fs/session-scoped-fs.js";
 import type { IScriptTxFs } from "../../../sql-fs/sql-fs.js";
 import { editFile, writeFileAtPath } from "../../lib/file-ops.js";
 import { runInScriptTx } from "../../lib/script-tx.js";
+import { sessionLeaseContext } from "../../session-lease-context.js";
 import type { Session } from "../../session-manager.js";
 
 /**
@@ -93,40 +94,47 @@ function makeScriptTxFs(fs: InMemoryFs): { scriptTxFs: IScriptTxFs; calls: strin
 	return { scriptTxFs: scoped, calls };
 }
 
-function makeSession(lockLost: boolean, fs: InMemoryFs = new InMemoryFs()): { session: Session; calls: string[] } {
+function makeSession(lockLost: boolean, fs: InMemoryFs = new InMemoryFs()) {
 	const { scriptTxFs, calls } = makeScriptTxFs(fs);
 	const controller = new AbortController();
 	if (lockLost) controller.abort();
 	const session = {
 		fs,
 		scriptTx: new SessionScopedFs(scriptTxFs),
-		lockLostSignal: controller.signal,
 	} as unknown as Session;
-	return { session, calls };
+	return {
+		session,
+		calls,
+		withLease: <T>(fn: () => Promise<T>) => sessionLeaseContext.run({ lostSignal: controller.signal }, fn),
+	};
 }
 
 describe("runInScriptTx", () => {
 	it("commits when the lock held for the whole write", async () => {
-		const { session, calls } = makeSession(false);
+		const { session, calls, withLease } = makeSession(false);
 
-		await expect(runInScriptTx(session, async () => "written")).resolves.toBe("written");
+		await expect(withLease(() => runInScriptTx(session, async () => "written"))).resolves.toBe("written");
 		expect(calls).toEqual(["begin", "end"]);
 	});
 
 	it("rolls back and reports ELOCKLOST when the lease was lost mid-write", async () => {
-		const { session, calls } = makeSession(true);
+		const { session, calls, withLease } = makeSession(true);
 
-		await expect(runInScriptTx(session, async () => "written")).rejects.toMatchObject({ code: "ELOCKLOST" });
+		await expect(withLease(() => runInScriptTx(session, async () => "written"))).rejects.toMatchObject({
+			code: "ELOCKLOST",
+		});
 		expect(calls).toEqual(["begin", "abort"]);
 	});
 
 	it("rolls back on the write's own failure", async () => {
-		const { session, calls } = makeSession(false);
+		const { session, calls, withLease } = makeSession(false);
 
 		await expect(
-			runInScriptTx(session, async () => {
-				throw new Error("write failed");
-			}),
+			withLease(() =>
+				runInScriptTx(session, async () => {
+					throw new Error("write failed");
+				}),
+			),
 		).rejects.toThrow("write failed");
 		expect(calls).toEqual(["begin", "abort"]);
 	});
@@ -142,9 +150,11 @@ describe("editFile under a lost lease", () => {
 	it("leaves the file at its pre-edit content instead of committing the write", async () => {
 		const fs = new InMemoryFs();
 		await fs.writeFile("/f.txt", "before\n");
-		const { session, calls } = makeSession(true, fs);
+		const { session, calls, withLease } = makeSession(true, fs);
 
-		await expect(editFile(session, "/f.txt", { oldString: "before", newString: "after" }, 1024)).rejects.toMatchObject({
+		await expect(
+			withLease(() => editFile(session, "/f.txt", { oldString: "before", newString: "after" }, 1024)),
+		).rejects.toMatchObject({
 			code: "ELOCKLOST",
 		});
 		expect(calls).toEqual(["begin", "abort"]);
@@ -156,9 +166,11 @@ describe("editFile under a lost lease", () => {
 	it("commits the edit when the lease held", async () => {
 		const fs = new InMemoryFs();
 		await fs.writeFile("/f.txt", "before\n");
-		const { session, calls } = makeSession(false, fs);
+		const { session, calls, withLease } = makeSession(false, fs);
 
-		await expect(editFile(session, "/f.txt", { oldString: "before", newString: "after" }, 1024)).resolves.toEqual({
+		await expect(
+			withLease(() => editFile(session, "/f.txt", { oldString: "before", newString: "after" }, 1024)),
+		).resolves.toEqual({
 			kind: "ok",
 			replacements: 1,
 			size: 6,
@@ -171,11 +183,11 @@ describe("editFile under a lost lease", () => {
 describe("writeFileAtPath under a lost lease", () => {
 	it("leaves neither the file nor its created parents behind", async () => {
 		const fs = new InMemoryFs();
-		const { session, calls } = makeSession(true, fs);
+		const { session, calls, withLease } = makeSession(true, fs);
 
-		await expect(writeFileAtPath(session, "/nested/dir/new.txt", new TextEncoder().encode("hi"))).rejects.toMatchObject(
-			{ code: "ELOCKLOST" },
-		);
+		await expect(
+			withLease(() => writeFileAtPath(session, "/nested/dir/new.txt", new TextEncoder().encode("hi"))),
+		).rejects.toMatchObject({ code: "ELOCKLOST" });
 		expect(calls).toEqual(["begin", "abort"]);
 		expect(await fs.exists("/nested/dir/new.txt")).toBe(false);
 		// The parents the write created go back too, or the rollback left half the change standing.
@@ -185,9 +197,11 @@ describe("writeFileAtPath under a lost lease", () => {
 
 	it("commits the file and its parents when the lease held", async () => {
 		const fs = new InMemoryFs();
-		const { session, calls } = makeSession(false, fs);
+		const { session, calls, withLease } = makeSession(false, fs);
 
-		await expect(writeFileAtPath(session, "/nested/dir/new.txt", new TextEncoder().encode("hi"))).resolves.toEqual({
+		await expect(
+			withLease(() => writeFileAtPath(session, "/nested/dir/new.txt", new TextEncoder().encode("hi"))),
+		).resolves.toEqual({
 			kind: "ok",
 		});
 		expect(calls).toEqual(["begin", "end"]);

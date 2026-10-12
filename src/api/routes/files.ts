@@ -583,7 +583,7 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 				sandboxId,
 				c.get("owner"),
 				async (session) => {
-					const allPaths = session.fs.getAllPaths();
+					const allPaths = await sessionManager.getSessionPaths(session);
 					const result: TreeEntry[] = [];
 
 					for (const p of allPaths) {
@@ -614,8 +614,8 @@ export function fileRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 								throw Object.assign(new Error("tree too large"), { code: "PAYLOAD_TOO_LARGE" });
 							}
 						} catch (e) {
-							// Surface the size guard; otherwise skip paths that can't be stat'd.
-							if ((e as { code?: string }).code === "PAYLOAD_TOO_LARGE") throw e;
+							const code = extractErrCode(e);
+							if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
 						}
 					}
 

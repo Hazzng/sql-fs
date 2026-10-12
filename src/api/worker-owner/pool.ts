@@ -299,6 +299,7 @@ export interface WorkerReservation {
 	identity?: OwnerIdentity;
 	phase: "lock_wait" | "running" | "recovering";
 	mayHaveEffects: boolean;
+	creatingAttachDispatched: boolean;
 	execDispatched: boolean;
 	committedFsWrite: boolean;
 	scopeOpen: boolean;
@@ -382,6 +383,7 @@ export class WorkerOwnerPool {
 			slot,
 			phase: "lock_wait",
 			mayHaveEffects: false,
+			creatingAttachDispatched: false,
 			execDispatched: false,
 			committedFsWrite: false,
 			scopeOpen: false,
@@ -448,6 +450,7 @@ export class WorkerOwnerPool {
 				signal,
 				() => {
 					if (mayApply(command)) reservation.mayHaveEffects = true;
+					if (command.kind === "attach" && mayApply(command)) reservation.creatingAttachDispatched = true;
 					if (command.kind === "exec") reservation.execDispatched = true;
 				},
 			);

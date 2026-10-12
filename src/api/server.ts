@@ -301,8 +301,10 @@ app.onError((err, c) => {
  * Exported so the race is testable; the bootstrap below is the only production caller.
  */
 export async function runStartupMigrations(): Promise<void> {
-	if (process.env.SKIP_STARTUP_MIGRATIONS === "true") return;
-	await raceDriverFault(() => runMigrations(tenantConfig), { refTimer: true });
+	if (process.env.SKIP_STARTUP_MIGRATIONS !== "true") {
+		await raceDriverFault(() => runMigrations(tenantConfig), { refTimer: true });
+	}
+	await sessionManager.initializeWorkers();
 }
 
 // ── Server bootstrap (only when run as entry point) ───────────────────────────

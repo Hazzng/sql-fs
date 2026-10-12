@@ -341,15 +341,12 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 		expect(second.runtimeOptions).toEqual({ python: true, javascript: false, network: false });
 	});
 
-	it("non-Python script bypasses semaphore entirely", async () => {
+	it("releases the enabled Python reservation after an ordinary shell script", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
 		const session = await sm.getOrCreate(T, "sandbox-no-py", { python: true, javascript: false, network: false });
 		stubBashExec(session, async () => ({ stdout: "hi", stderr: "", exitCode: 0, env: {} }));
 
 		await sm.execWithRuntimeThrottle(session, "echo hi");
-		// If the script had consumed a slot, pythonInFlight would have been incremented
-		// to 1. Probing: kick off a Python exec and ensure it is not stuck on the semaphore
-		// (which would be the case if the echo above had wrongfully consumed the only slot).
 		stubBashExec(session, async () => ({ stdout: "2", stderr: "", exitCode: 0, env: {} }));
 		const result = await sm.execWithRuntimeThrottle(session, "python3 -c 'print(1+1)'");
 		expect(result.stdout).toBe("2");
@@ -374,7 +371,7 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 		expect(execCount).toBe(3);
 	});
 
-	it("regex does not match mypython_script or python-config (word boundary)", async () => {
+	it("reserves enabled Python capacity for dynamically formed command names", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentPython: 1 });
 		const session = await sm.getOrCreate(T, "sandbox-regex", { python: true, javascript: false, network: false });
 
@@ -388,14 +385,12 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 			return { stdout: "", stderr: "", exitCode: 0, env: {} };
 		});
 
-		// These scripts should NOT match the python-word-boundary regex and should run in parallel,
-		// even though the concurrency cap is 1.
 		await Promise.all([
-			sm.execWithRuntimeThrottle(session, "echo mypython_script"),
-			sm.execWithRuntimeThrottle(session, "echo python-config"),
-			sm.execWithRuntimeThrottle(session, "echo pythonic"),
+			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(1)'"),
+			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(2)'"),
+			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(3)'"),
 		]);
-		expect(peak).toBeGreaterThan(1);
+		expect(peak).toBe(1);
 	});
 
 	it("semaphore allows up to N concurrent Python executions, queues the (N+1)th until a slot frees", async () => {
@@ -479,7 +474,7 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 		expect(execCount).toBe(3);
 	});
 
-	it("JS regex does not match mynode/nodejs_tool/js-exec-helper etc (word boundary)", async () => {
+	it("reserves enabled JavaScript capacity for dynamically formed command names", async () => {
 		const sm = new SessionManager({ createFs: makeCreateFs(), maxConcurrentJs: 1 });
 		const session = await sm.getOrCreate(T, "sandbox-js-regex", { python: false, javascript: true, network: false });
 
@@ -494,11 +489,11 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 		});
 
 		await Promise.all([
-			sm.execWithRuntimeThrottle(session, "echo mynode"),
-			sm.execWithRuntimeThrottle(session, "echo nodejs_tool"),
-			sm.execWithRuntimeThrottle(session, "echo myjs-exec-helper"),
+			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(1)'"),
+			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(2)'"),
+			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(3)'"),
 		]);
-		expect(peak).toBeGreaterThan(1);
+		expect(peak).toBe(1);
 	});
 
 	it("12 parallel js-exec scripts with cap=4 run in 3 batches of 4", async () => {
@@ -593,13 +588,18 @@ describe("SessionManager combined python + js semaphores", () => {
 		});
 		const session = await sm.getOrCreate(T, "sandbox-both", { python: true, javascript: true, network: false });
 
+		const pySession = await sm.getOrCreate(T, "sandbox-py-only", { python: true, javascript: false, network: false });
+		const jsSession = await sm.getOrCreate(T, "sandbox-js-only", { python: false, javascript: true, network: false });
 		const releasers: Array<() => void> = [];
-		stubBashExec(session, async () => {
+		const execute = async () => {
 			await new Promise<void>((resolve) => {
 				releasers.push(resolve);
 			});
 			return { stdout: "", stderr: "", exitCode: 0, env: {} };
-		});
+		};
+		stubBashExec(session, execute);
+		stubBashExec(pySession, execute);
+		stubBashExec(jsSession, execute);
 
 		// Launch a combined script first — it acquires python, then js.
 		const combined = sm.execWithRuntimeThrottle(session, "python3 x.py && js-exec y.ts");
@@ -608,9 +608,9 @@ describe("SessionManager combined python + js semaphores", () => {
 		expect(releasers.length).toBe(1);
 
 		// While combined holds both slots, a python-only script must queue.
-		const pyOnly = sm.execWithRuntimeThrottle(session, "python3 -c 'p'");
+		const pyOnly = sm.execWithRuntimeThrottle(pySession, "python3 -c 'p'");
 		// And a js-only script must also queue.
-		const jsOnly = sm.execWithRuntimeThrottle(session, "js-exec -c 'j'");
+		const jsOnly = sm.execWithRuntimeThrottle(jsSession, "js-exec -c 'j'");
 		await new Promise((r) => setTimeout(r, 10));
 		expect(releasers.length).toBe(1); // neither has started
 

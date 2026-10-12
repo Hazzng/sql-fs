@@ -75,6 +75,7 @@ async function dispatch(command: OwnerCommand, request: OwnerRequest, signal: Ab
 				poolMax: options.pgPoolMax,
 				scriptTxBuffer: options.scriptTxBuffer,
 				blobCache,
+				openExisting: identity.openExisting,
 			},
 			identity.sandboxId,
 			identity.owner,
