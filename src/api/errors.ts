@@ -3,6 +3,8 @@
  * US-056: Hono server bootstrap
  */
 
+import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { sanitizeFsError } from "../sql-fs/errors.js";
 
 /**
@@ -37,6 +39,7 @@ export const SAFE_FS_ERROR_CODES: ReadonlySet<string> = new Set([
 	"EDRIVERFAULT",
 	"EFBIG",
 	"ESCRIPTBUFFER",
+	"EEXEC_FS",
 ]);
 
 /**
@@ -181,6 +184,8 @@ export function clientSafeErrorCode(err: unknown, fallback = "INTERNAL_ERROR"): 
  * 08xxx/53300/  → 503  Service Unavailable — the DB refused the connection or is
  * 53400/57P03          out of capacity, not a caller bug (#174). Only the
  *                      capacity SQLSTATEs are advertised retryable (#175).
+ * EEXEC_FS       → 500  through the default arm: a filesystem error escaped bash.exec,
+ *                      which is an interpreter gap rather than a missing sandbox.
  * others         → 500  Internal Server Error
  *
  * Status alone never answers "is a retry safe?" — six distinct codes share 503.
@@ -267,4 +272,56 @@ export function extractErrCode(e: unknown): string | undefined {
 	const fe = e as Error & { code?: string };
 	if (fe.code) return fe.code;
 	return fe.message.match(/^([A-Z]+):/)?.[1];
+}
+
+/** Codes an `IFileSystem` call raises when a path is missing or the wrong kind; see `execFsError`. */
+const SCRIPT_FS_ERROR_CODES: ReadonlySet<string> = new Set([
+	"ENOENT",
+	"EEXIST",
+	"EISDIR",
+	"ENOTDIR",
+	"ENOTEMPTY",
+	"ELOOP",
+	"EPERM",
+	"EINVAL",
+]);
+
+/**
+ * Bash turns a failed filesystem call into a message and a non-zero exit, so one of these codes
+ * escaping `bash.exec` is an interpreter gap (a deferred redirect write, a flush that found the
+ * cache ahead of the database), not a statement about the request. Left as is, ENOENT reached
+ * clients as the same 404 a missing sandbox gets.
+ */
+export function execFsError(err: unknown): Error | undefined {
+	const code = extractErrCode(err);
+	if (code === undefined || !SCRIPT_FS_ERROR_CODES.has(code)) return undefined;
+	const detail = sanitizeFsError(err as Error).message;
+	return Object.assign(new Error(`EEXEC_FS: the script hit a filesystem error the shell did not handle (${detail})`), {
+		code: "EEXEC_FS",
+		cause: err,
+	});
+}
+
+/** The API's `app.onError`. A 5xx is logged because nothing else records why it happened. */
+export function apiErrorHandler(err: Error, c: Context): Response {
+	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
+	if (status >= 500) {
+		console.error(
+			JSON.stringify({
+				event: "http_error",
+				method: c.req.method,
+				path: c.req.path,
+				status,
+				code: extractErrCode(err) ?? "INTERNAL_ERROR",
+				error: err.message,
+			}),
+		);
+	}
+	// #175: six distinct codes share 503, and they disagree about durability.
+	// `retryable` is the discriminator so a client never has to enumerate codes
+	// to learn whether a retry can double-apply a write.
+	return c.json(
+		{ error: clientSafeErrorMessage(err), code: clientSafeErrorCode(err), retryable: isRetryableError(err) },
+		status,
+	);
 }

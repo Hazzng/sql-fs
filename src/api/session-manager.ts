@@ -11,6 +11,7 @@ import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "./command
 import { nodeCommand } from "./commands/node-command.js";
 import { LockLostError, execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
+import { execFsError, extractErrCode } from "./errors.js";
 import { type ExecContext, execContext } from "./exec-context.js";
 import { logAudit } from "./lib/audit.js";
 import { MAX_EXEC_FILE_BYTES } from "./lib/env.js";
@@ -1257,9 +1258,24 @@ export class SessionManager {
 		// through, so the script's file-size ceiling is established here and nowhere
 		// else. Scoped to the call rather than set on the shared session FS — see
 		// `exec-context.ts` for why a flag would be wrong.
-		const execFn = (): Promise<BashExecResult> => {
+		const execFn = async (): Promise<BashExecResult> => {
 			const ctx: ExecContext = { maxFileBytes: MAX_EXEC_FILE_BYTES };
-			return execContext.run(ctx, () => runExec(ctx));
+			try {
+				return await execContext.run(ctx, () => runExec(ctx));
+			} catch (err) {
+				const escaped = execFsError(err);
+				if (escaped === undefined) throw err;
+				console.error(
+					JSON.stringify({
+						event: "exec_fs_error",
+						tenantId: session.tenantId,
+						sandboxId: session.sandboxId,
+						code: extractErrCode(err),
+						error: (err as Error).message,
+					}),
+				);
+				throw escaped;
+			}
 		};
 
 		const updateCwd = (result: BashExecResult): BashExecResult => {

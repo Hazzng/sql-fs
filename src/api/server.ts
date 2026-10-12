@@ -18,7 +18,7 @@ import { translateSqlError } from "../sql-fs/errors.js";
 import { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import { type AuthVariables, createAuthMiddleware, loadStaticMcpAuthConfig } from "./auth.js";
-import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError, mapFsErrorToStatus } from "./errors.js";
+import { apiErrorHandler } from "./errors.js";
 import {
 	DEFAULT_SAMPLE_INTERVAL_MS,
 	DEFAULT_STALL_THRESHOLD_MS,
@@ -273,17 +273,7 @@ app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 
 // ── Global error handler ───────────────────────────────────────────────────────
 
-app.onError((err, c) => {
-	const status = mapFsErrorToStatus(err) as ContentfulStatusCode;
-	const code = clientSafeErrorCode(err);
-	const message = clientSafeErrorMessage(err);
-	// #175: six distinct codes share 503, and they disagree about durability.
-	// `retryable` is the discriminator so a client never has to enumerate codes
-	// to learn whether a retry can double-apply a write.
-	const retryable = isRetryableError(err);
-
-	return c.json({ error: message, code, retryable }, status);
-});
+app.onError(apiErrorHandler);
 
 /**
  * Boot migrations, behind the same driver-fault race as every other DB await (#169 M5).

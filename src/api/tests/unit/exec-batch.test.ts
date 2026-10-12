@@ -5,9 +5,9 @@ import type { IFileSystem } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
+import { apiErrorHandler } from "../../errors.js";
 import { execRoutes } from "../../routes/exec.js";
 import { SessionManager } from "../../session-manager.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "test-secret-for-exec-batch-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -29,7 +29,7 @@ function makeTestApp(sessionManager: SessionManager) {
 	const app = new Hono<{ Variables: AuthVariables }>();
 	app.use("/v1/*", authMiddleware);
 	app.route("/v1/sandboxes", execRoutes(sessionManager));
-	app.onError(testErrorHandler);
+	app.onError(apiErrorHandler);
 	return app;
 }
 

@@ -14,10 +14,10 @@ import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
+import { apiErrorHandler } from "../../errors.js";
 import { fileRoutes } from "../../routes/files.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "test-secret-writefiles-atomicity-at-least-32b!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -59,7 +59,7 @@ describe.skipIf(!process.env.DATABASE_URL)("writeFiles atomicity (H10, real Post
 		app.route("/v1/sandboxes", fileRoutes(sessionManager));
 		// Shares the production error handler so FS errors map to their status
 		// (e.g. EISDIR → 400) instead of a generic 500.
-		app.onError(testErrorHandler);
+		app.onError(apiErrorHandler);
 	});
 
 	it("rolls back the whole batch when one entry fails mid-write (no partial persist)", async () => {

@@ -800,6 +800,11 @@ export const openapiSpec = {
 						description: "readOnly script attempted to mutate the filesystem",
 						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 					},
+					"500": {
+						description:
+							"`EEXEC_FS`: a filesystem error escaped the shell instead of becoming a message and a non-zero exit, for example a redirect whose target directory the script removed. The script's changes are rolled back. Not retryable: the same script fails the same way.",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 					"503": execUnavailableResponse,
 				},
 			},

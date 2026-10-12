@@ -1,7 +1,8 @@
 /**
- * #181: the test scaffolding must carry production's error contract, not a copy
- * of the leaky pre-#174 one. Guards both halves — that the shared handler still
- * redacts, and that no test file has quietly grown its own handler again.
+ * #181: test apps must carry production's error contract, not a copy of the leaky
+ * pre-#174 one. Guards both halves — that `apiErrorHandler`, which test apps mount
+ * as their `onError`, still redacts, and that no test file has quietly grown its
+ * own handler again.
  */
 
 import { readFileSync, readdirSync } from "node:fs";
@@ -9,7 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
-import { testErrorHandler } from "../helpers/error-handler.js";
+import { apiErrorHandler } from "../../errors.js";
 
 const TESTS_DIR = fileURLToPath(new URL("../", import.meta.url));
 const SELF = "test-app-error-shape.test.ts";
@@ -32,7 +33,7 @@ function appThrowing(err: Error): Hono {
 	app.get("/boom", () => {
 		throw err;
 	});
-	app.onError(testErrorHandler);
+	app.onError(apiErrorHandler);
 	return app;
 }
 
