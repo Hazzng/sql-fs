@@ -96,6 +96,16 @@ type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
 type CreateExclusiveOpts = Parameters<NonNullable<IFileSystem["createExclusive"]>>[1];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
+/**
+ * just-bash hands redirect output over as a latin1 byte string with encoding "binary"; UTF-8
+ * encoding it regardless turned every byte above 0x7f into two, so `cat a > b` corrupted b.
+ */
+function encodeContent(content: FileContent, options: WriteFileOpts): Uint8Array {
+	if (typeof content !== "string") return content;
+	const encoding = (typeof options === "string" ? options : options?.encoding) ?? "utf8";
+	return new Uint8Array(Buffer.from(content, encoding));
+}
+
 export const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 
 /**
@@ -1446,10 +1456,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	// ── IFileSystem: write operations with pathCache updates ─────────────────────
 
-	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+	async writeFile(inputPath: string, content: FileContent, options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return;
-		await this.#withNamespaceMutation([path], () => this.#writeFileAt(path, content, undefined));
+		const bytes = encodeContent(content, options);
+		await this.#withNamespaceMutation([path], () => this.#writeFileAt(path, bytes, undefined));
 	}
 
 	/**
@@ -1473,7 +1484,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		});
 	}
 
-	async #writeFileAt(path: string, content: FileContent, createMode: number | undefined): Promise<void> {
+	async #writeFileAt(path: string, bytes: Uint8Array, createMode: number | undefined): Promise<void> {
 		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "writeFile");
 		// Refuse to clobber an existing directory with a file (audit H2 #13). This
@@ -1481,7 +1492,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 		const { name, parentEntry } = this.#requireParentDir(path);
 
-		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		this.#assertExecFileSize(path, bytes.byteLength, "write");
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
 		const mtime = new Date();
@@ -1531,19 +1541,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#dirty = true;
 	}
 
-	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+	async appendFile(inputPath: string, content: FileContent, options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return;
-		await this.#withNamespaceMutation([path], () => this.#appendFileAt(path, content));
+		const bytes = encodeContent(content, options);
+		await this.#withNamespaceMutation([path], () => this.#appendFileAt(path, bytes));
 	}
 
-	async #appendFileAt(path: string, content: FileContent): Promise<void> {
+	async #appendFileAt(path: string, bytes: Uint8Array): Promise<void> {
 		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "appendFile");
 		// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const mtime = new Date();
 
 		const existing = this.#pathCache.get(path);
