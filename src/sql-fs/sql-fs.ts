@@ -136,6 +136,8 @@ interface MutationSpec<Tx> {
 	readonly mints?: number;
 	/** Bytes the recorded closure keeps alive; defaults to `PER_MUTATION_BASE_BYTES`. */
 	readonly bytes?: number;
+	/** See `BufferedMutation.supersedes`. */
+	readonly supersedes?: string;
 	/**
 	 * Method syntax, not a property: it makes the parameter bivariant, which keeps
 	 * `SqlFs<PgTx>` assignable to `SqlFs<unknown>` the way it was before the journal
@@ -646,7 +648,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#assertScriptTxAlive();
 			const minted: bigint[] = [];
 			for (let i = 0; i < mints; i++) minted.push(this.#mintInodeId());
-			this.#recordMutation({ kind: op.kind, minted, bytes: op.bytes ?? PER_MUTATION_BASE_BYTES, run: op.run });
+			this.#recordMutation({
+				kind: op.kind,
+				minted,
+				bytes: op.bytes ?? PER_MUTATION_BASE_BYTES,
+				supersedes: op.supersedes,
+				run: op.run,
+			});
 			return minted;
 		}
 		const produced = op.composite ? await this.#withBareTx(op.run) : await this.#withWriteTx(op.run);
@@ -684,14 +692,20 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * `endScriptScope` would happily flush the truncated prefix.
 	 */
 	#recordMutation(m: BufferedMutation): void {
-		const ops = this.#mutations.length + 1;
-		const bytes = this.#mutationBytes + m.bytes;
+		// just-bash 3.6 opens every `>` target with an empty writeFile and writes the output in a
+		// second one. Back to back, the second alone commits the same state, so the first is
+		// dropped; its minted id is already dead because pathCache now points at the second's.
+		const last = this.#mutations[this.#mutations.length - 1];
+		const superseding = m.supersedes !== undefined && last?.supersedes === m.supersedes;
+		const ops = this.#mutations.length + (superseding ? 0 : 1);
+		const bytes = this.#mutationBytes + m.bytes - (superseding ? last!.bytes : 0);
 		if (ops > this.#scriptTxBuffer.maxOps || bytes > this.#scriptTxBuffer.maxBytes) {
 			const err = createEscriptbuffer(ops, bytes, this.#scriptTxBuffer.maxOps, this.#scriptTxBuffer.maxBytes);
 			this.#scriptTxLost ??= err;
 			throw err;
 		}
-		this.#mutations.push(m);
+		if (superseding) this.#mutations[this.#mutations.length - 1] = m;
+		else this.#mutations.push(m);
 		this.#mutationBytes = bytes;
 	}
 
@@ -1421,10 +1435,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		sha256: Uint8Array,
 		blobBytes: Uint8Array | undefined,
 	): Omit<MutationSpec<Tx>, "mints"> {
+		const supersedes = `${parentInodeId}:${name}`;
 		if (this.#dialect.writeFileComposite) {
 			return {
 				kind,
 				composite: true,
+				supersedes,
 				run: async (tx) => [
 					await this.#dialect.writeFileComposite!(
 						tx,
@@ -1443,6 +1459,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return {
 			kind,
 			composite: false,
+			supersedes,
 			// Only reachable on a dialect without `commitBlob`, where `blobBytes` is the
 			// content and the journal must carry it because the insert is part of the replay.
 			bytes: PER_MUTATION_BASE_BYTES + (blobBytes?.byteLength ?? 0),
