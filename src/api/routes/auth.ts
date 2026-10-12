@@ -11,6 +11,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import { parseNonNegativeInt } from "../../redis/config.js";
 import type { AuthVariables } from "../auth.js";
+import type { IngressAdmission } from "../ingress-admission.js";
 import { logAudit } from "../lib/audit.js";
 import { constantTimeEqual } from "../lib/constant-time.js";
 import { signToken } from "../lib/jwt.js";
@@ -41,7 +42,7 @@ function expiresAt(expiresIn: string): string | null {
 	return new Date(Date.now() + (seconds as number) * 1000).toISOString();
 }
 
-export function authRoutes(): Hono<{ Variables: AuthVariables }> {
+export function authRoutes(ingress?: IngressAdmission): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
 
 	// ── Rate limiters ──────────────────────────────────────────────────────────
@@ -95,6 +96,7 @@ export function authRoutes(): Hono<{ Variables: AuthVariables }> {
 
 			await next();
 		},
+		async (c, next) => (ingress === undefined ? next() : ingress.bootstrapMiddleware(c, next)),
 		validateBody(bootstrapBodySchema),
 		async (c) => {
 			const ip = clientIp(c);
@@ -160,6 +162,7 @@ export function authRoutes(): Hono<{ Variables: AuthVariables }> {
 
 			await next();
 		},
+		async (c, next) => (ingress === undefined ? next() : ingress.middleware(c, next)),
 		validateBody(tokenBodySchema),
 		async (c) => {
 			const ip = clientIp(c);

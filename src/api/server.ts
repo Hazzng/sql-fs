@@ -8,9 +8,9 @@ import { swaggerUI } from "@hono/swagger-ui";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { getRedisCircuitBreaker } from "../redis/circuit-breaker.js";
+import { loadRedisBlobCacheOptions } from "../redis/blob-cache-options.js";
 import { closeRedisClient, getRedisClient } from "../redis/client.js";
-import { parseNonNegativeInt, parsePositiveInt } from "../redis/config.js";
+import { parsePositiveInt } from "../redis/config.js";
 import { startEvictionPolicyCheck } from "../redis/eviction-policy.js";
 import { PostgresDialect } from "../sql-fs/dialects/postgres.js";
 import { installDriverFaultGuard, raceDriverFault } from "../sql-fs/driver-fault.js";
@@ -27,6 +27,7 @@ import {
 	stopEventLoopMonitor,
 } from "./event-loop-monitor.js";
 import { loadExecLockOptions } from "./exec-lock-config.js";
+import { IngressAdmission, loadIngressOptions } from "./ingress-admission.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { runMigrations } from "./migrations.js";
@@ -38,6 +39,7 @@ import { ingestRoutes } from "./routes/ingest.js";
 import { sandboxRoutes } from "./routes/sandboxes.js";
 import { SessionManager } from "./session-manager.js";
 import { loadTenantConfig } from "./tenants.js";
+import { renderWorkerMetrics } from "./worker-owner/metrics.js";
 
 export const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -55,15 +57,7 @@ const redisDataClient = blobCacheEnvEnabled ? getRedisClient("data") : undefined
 const execLockOptions = redisClient ? loadExecLockOptions() : undefined;
 const rwlockEnabled = process.env.REDIS_RWLOCK_ENABLED !== "false";
 const blobCacheEnabled = redisDataClient !== undefined && blobCacheEnvEnabled;
-const blobCacheOptions = blobCacheEnabled
-	? {
-			ttlMs: parseNonNegativeInt("REDIS_BLOB_CACHE_TTL_MS", 24 * 60 * 60 * 1000),
-			maxBytes: parseNonNegativeInt("REDIS_BLOB_MAX_BYTES", 8 * 1024 * 1024),
-			maxInFlight: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT", 32),
-			maxInFlightBytes: parsePositiveInt("REDIS_BLOB_SET_MAX_IN_FLIGHT_BYTES", 32 * 1024 * 1024),
-			breaker: getRedisCircuitBreaker("data"),
-		}
-	: undefined;
+const blobCacheOptions = blobCacheEnabled ? loadRedisBlobCacheOptions() : undefined;
 
 // Per-tenant metadata dialects for session rehydration on cold replicas. Each
 // tenant gets a single long-lived dialect (connection-pooled internally).
@@ -172,10 +166,9 @@ app.use("*", async (c, next) => {
 });
 
 // ── Global request body-size backstop (audit H11) ─────────────────────────────
-// Hard ceiling applied BEFORE auth/handlers so a multi-GB body can never be
-// buffered into memory (OOM). Sits above the tighter per-route limits
-// (raw-file write, bulk write, ingest). Configurable via MAX_REQUEST_BODY_BYTES.
 const MAX_REQUEST_BODY_BYTES = Number(process.env.MAX_REQUEST_BODY_BYTES ?? `${256 * 1024 * 1024}`);
+export const ingressAdmission =
+	process.env.SQL_FS_WORKERS_ENABLED === "true" ? new IngressAdmission(loadIngressOptions()) : undefined;
 const bodyLimitMiddleware = bodyLimit({
 	maxSize: MAX_REQUEST_BODY_BYTES,
 	onError: (c) =>
@@ -188,17 +181,26 @@ const bodyLimitMiddleware = bodyLimit({
 			413 as ContentfulStatusCode,
 		),
 });
-app.use("/v1/*", bodyLimitMiddleware);
-app.use("/mcp", bodyLimitMiddleware);
+if (ingressAdmission === undefined) {
+	app.use("/v1/*", bodyLimitMiddleware);
+	app.use("/mcp", bodyLimitMiddleware);
+}
 
 // ── Auth middleware (all /v1/* routes) ────────────────────────────────────────
 
 const authMiddleware = createAuthMiddleware(tenantConfig);
 app.use("/v1/*", authMiddleware);
+app.use("/metrics", authMiddleware);
+if (ingressAdmission !== undefined) {
+	app.use("/v1/*", (c, next) => {
+		if (c.req.method === "POST" && ["/v1/auth/bootstrap", "/v1/auth/admin"].includes(c.req.path)) return next();
+		return ingressAdmission.middleware(c, next);
+	});
+}
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.route("/v1/auth", authRoutes());
+app.route("/v1/auth", authRoutes(ingressAdmission));
 app.route("/v1/sandboxes", sandboxRoutes(sessionManager));
 app.route("/v1/sandboxes", fileRoutes(sessionManager));
 app.route("/v1/sandboxes", execRoutes(sessionManager));
@@ -235,11 +237,18 @@ app.use("/mcp", async (c, next) => {
 	}
 });
 app.use("/mcp", mcpAuthMiddleware);
+if (ingressAdmission !== undefined) {
+	app.use("/mcp", ingressAdmission.mcpMiddleware);
+}
 app.all("/mcp", (c) => handleMcpRequest(c.req.raw, sessionManager, c.get("owner"), c.get("tenant")));
 
 // ── Health endpoints ───────────────────────────────────────────────────────────
 
 app.get("/healthz", (c) => c.json({ status: "ok" }));
+app.get("/metrics", (c) => {
+	c.header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+	return c.body(renderWorkerMetrics(sessionManager.getWorkerMetrics(), ingressAdmission?.metrics));
+});
 app.get("/readyz", async (c) => {
 	// #168: the lag histogram had no egress but a console.log, so nothing could poll how close this
 	// replica was running to the 2 s Redis commandTimeout. Reading it does not reset the histogram,
@@ -281,6 +290,7 @@ app.onError((err, c) => {
 	// `retryable` is the discriminator so a client never has to enumerate codes
 	// to learn whether a retry can double-apply a write.
 	const retryable = isRetryableError(err);
+	if (code === "EWORKER_BUSY") c.header("Retry-After", "1");
 
 	return c.json({ error: message, code, retryable }, status);
 });
@@ -357,6 +367,7 @@ if (isMain) {
 			if (shuttingDown) return;
 			shuttingDown = true;
 			console.log(JSON.stringify({ event: "shutdown_begin" }));
+			ingressAdmission?.close();
 			stopEventLoopMonitor();
 			// Force-exit guard so a hung Postgres or Redis cleanup cannot keep
 			// the process alive past the orchestrator's grace period.

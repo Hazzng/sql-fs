@@ -1,3 +1,4 @@
+import { preservesAmbiguousOutcome } from "../errors.js";
 import { readOnlyContext } from "../read-only-context.js";
 import type { SessionManager } from "../session-manager.js";
 import type { Session } from "../session-manager.js";
@@ -30,6 +31,12 @@ export interface ExecuteBatchOptions {
 }
 
 const MAX_BATCH_PARALLELISM = 16;
+
+function isExecutionAbort(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as Error & { code?: string }).code;
+	return code === "ABORTED" || (code === undefined && error.name === "AbortError");
+}
 
 async function runSequential(
 	sessionManager: SessionManager,
@@ -75,7 +82,7 @@ async function runSequential(
 			clearTimeout(timer);
 			outerSignal?.removeEventListener("abort", abortFromOuter);
 
-			if (timedOut) {
+			if (timedOut && controller.signal.aborted && execResult.executionAborted === true) {
 				results.push({
 					id: entry.id,
 					stdout: "",
@@ -93,9 +100,10 @@ async function runSequential(
 					durationMs: Date.now() - scriptStart,
 				});
 			}
-		} catch {
+		} catch (error) {
 			clearTimeout(timer);
 			outerSignal?.removeEventListener("abort", abortFromOuter);
+			if (typeof (error as { code?: unknown })?.code === "string" && !isExecutionAbort(error)) throw error;
 			if (timedOut) {
 				results.push({
 					id: entry.id,
@@ -148,9 +156,10 @@ async function runParallel(
 	try {
 		const cap = Math.min(scripts.length, MAX_BATCH_PARALLELISM);
 		let cursor = 0;
+		let terminalFailure = false;
 
 		const runWorker = async (): Promise<void> => {
-			while (true) {
+			while (!terminalFailure) {
 				const idx = cursor++;
 				if (idx >= scripts.length) break;
 
@@ -192,14 +201,29 @@ async function runParallel(
 					const execResult = await sessionManager.execWithRuntimeThrottle(session, entry.script, {
 						signal: signalToUse,
 					});
-					results[idx] = {
-						id: entry.id,
-						stdout: execResult.stdout,
-						stderr: execResult.stderr,
-						exitCode: execResult.exitCode,
-						durationMs: Date.now() - scriptStart,
-					};
-				} catch {
+					const executionTimedOut =
+						(timedOut || perScriptTimedOut) && signalToUse.aborted && execResult.executionAborted === true;
+					results[idx] = executionTimedOut
+						? {
+								id: entry.id,
+								stdout: "",
+								stderr: "",
+								exitCode: -1,
+								durationMs: Date.now() - scriptStart,
+								error: "timeout",
+							}
+						: {
+								id: entry.id,
+								stdout: execResult.stdout,
+								stderr: execResult.stderr,
+								exitCode: execResult.exitCode,
+								durationMs: Date.now() - scriptStart,
+							};
+				} catch (error) {
+					if (typeof (error as { code?: unknown })?.code === "string" && !isExecutionAbort(error)) {
+						terminalFailure = true;
+						throw error;
+					}
 					results[idx] = {
 						id: entry.id,
 						stdout: "",
@@ -224,7 +248,11 @@ async function runParallel(
 		for (let i = 0; i < cap; i++) {
 			workers.push(runWorker());
 		}
-		await Promise.all(workers);
+		const settled = await Promise.allSettled(workers);
+		const failure =
+			settled.find((result) => result.status === "rejected" && preservesAmbiguousOutcome(result.reason)) ??
+			settled.find((result) => result.status === "rejected");
+		if (failure?.status === "rejected") throw failure.reason;
 	} finally {
 		clearTimeout(deadlineTimer);
 		outerSignal?.removeEventListener("abort", onOuterAbort);
