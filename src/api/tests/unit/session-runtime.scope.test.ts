@@ -1,6 +1,7 @@
 import { InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";
 import { BUFFER_ON, makeProbeDialect } from "../../../sql-fs/tests/fixtures/buffered-dialect.js";
 import { consumeExecInput, execContext } from "../../exec-context.js";
@@ -8,7 +9,6 @@ import { runInScriptTx } from "../../lib/script-tx.js";
 import { readOnlyContext } from "../../read-only-context.js";
 import { sessionLeaseContext } from "../../session-lease-context.js";
 import { createSessionRuntime, executeSessionRuntime } from "../../session-runtime/engine.js";
-import { ownerCancellation } from "../../worker-owner/cancellation.js";
 
 const filesystems: SqlFs[] = [];
 const identity = {

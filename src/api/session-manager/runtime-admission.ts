@@ -103,7 +103,6 @@ export class RuntimeAdmission {
 					if (waiter.onAbort !== undefined && waiter.signal !== undefined) {
 						waiter.signal.removeEventListener("abort", waiter.onAbort);
 					}
-					// Remove from queue so the closure doesn't outlive the request.
 					const idx = sem.waiters.indexOf(waiter);
 					if (idx >= 0) sem.waiters.splice(idx, 1);
 					reject(err);
@@ -125,8 +124,6 @@ export class RuntimeAdmission {
 	}
 
 	private releaseSlot(sem: Semaphore): void {
-		// Skip waiters that already settled (aborted/timed out) but haven't
-		// been spliced — defensive belt-and-braces.
 		while (sem.waiters.length > 0) {
 			const next = sem.waiters.shift();
 			if (next === undefined) break;

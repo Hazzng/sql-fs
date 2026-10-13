@@ -23,7 +23,6 @@ export interface TenantBackendsOptions {
 	readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
 }
 
-/** Per-tenant lazy Postgres backend state. */
 interface PerTenantBackend {
 	readonly connectionString: string;
 	readonly blobCache: RedisBlobCache | undefined;

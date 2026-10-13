@@ -58,9 +58,7 @@ async function disconnectFs(fs: IFileSystem): Promise<void> {
 	if (!("disconnect" in fs) || typeof fs.disconnect !== "function") return;
 	try {
 		await fs.disconnect();
-	} catch {
-		// Pool teardown is best effort.
-	}
+	} catch {}
 }
 
 function estimatePathCacheBytes(fs: IFileSystem): number {
@@ -229,7 +227,6 @@ export class SessionCatalog {
 				? resident.lock.runShared(protectedWork)
 				: resident.lock.runExclusive(protectedWork));
 		} catch (error) {
-			// Missing eviction takes exclusive protection, so await it only after releasing our own lock.
 			if ((error as { code?: string }).code === "ENOENT") await resident.destroyPromise;
 			throw error;
 		}
@@ -309,7 +306,6 @@ export class SessionCatalog {
 		for (const [key, resident] of this.sessions) {
 			if (resident.state === "closing" || resident.inFlight !== 0) continue;
 			if (resident.overBudget || now - resident.lastUsed > this.idleMs) {
-				// Captured sessions must reject before entering the lock after eviction.
 				resident.state = "closing";
 				this.sessions.delete(key);
 				void resident.lock.runExclusive(() => disconnectFs(resident.session.fs));
@@ -341,9 +337,7 @@ export class SessionCatalog {
 						resident.lock.runExclusive(async () => {}),
 						new Promise<void>((resolve) => setTimeout(resolve, remaining)),
 					]);
-				} catch {
-					// Drain is bounded and best effort.
-				}
+				} catch {}
 				this.sessions.delete(key);
 				await disconnectFs(resident.session.fs);
 			}),

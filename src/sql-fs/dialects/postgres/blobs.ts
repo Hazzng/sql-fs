@@ -63,7 +63,6 @@ export class PostgresBlobs implements BlobOperations {
 				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
 			`,
 		);
-		// Fire-and-forget Redis backfill — see upsertBlob.
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, data);
 		}
@@ -78,9 +77,6 @@ export class PostgresBlobs implements BlobOperations {
 		const data = rows[0]?.data;
 		if (!data) return null;
 		const bytes = new Uint8Array(data);
-		// Fire-and-forget backfill — see upsertBlob. The next reader hits Redis;
-		// if the SET hasn't finished yet they pay one more PG round-trip, which
-		// is strictly better than holding the advisory lock on every writer.
 		if (this.#blobCache !== undefined) {
 			void this.#blobCache.set(sha256, bytes);
 		}
@@ -107,8 +103,6 @@ export class PostgresBlobs implements BlobOperations {
 	async getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>> {
 		if (maxBytes <= 0) return [];
 
-		// If RLS is later added to `inodes` requiring app.sandbox_id, this query
-		// will need to set that context first; today the WHERE filter suffices.
 		const metaRows = await this.db()<{ inode_id: string; content_sha256: Buffer; size: string }[]>`
 			WITH ranked AS (
 				SELECT
@@ -155,7 +149,6 @@ export class PostgresBlobs implements BlobOperations {
 				const hex = Buffer.from(r.sha256).toString("hex");
 				const bytes = new Uint8Array(r.data);
 				pgHits.set(hex, bytes);
-				// Fire-and-forget Redis backfill — see getBlob.
 				if (this.#blobCache !== undefined) {
 					const sha = missByHex.get(hex);
 					if (sha !== undefined) void this.#blobCache.set(sha, bytes);

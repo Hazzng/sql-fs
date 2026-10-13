@@ -28,8 +28,6 @@ export async function bulkIngest(
 	if (!ctxRow?.root_inode) throw new Error("bulkIngest: sandbox not found or has no root inode");
 	const rootInodeId = BigInt(ctxRow.root_inode);
 
-	// ── Phase A: resolve/create ancestor directories by depth level ──────────
-
 	const dirMap = new Map<string, bigint>();
 	dirMap.set("/", rootInodeId);
 
@@ -134,8 +132,6 @@ export async function bulkIngest(
 		}
 	}
 
-	// ── Phase B: detect existing file dirents for overwrite handling ──────────
-
 	const filesWithHash = files.map((f) => {
 		const parts = f.path.split("/").filter(Boolean);
 		const name = parts[parts.length - 1]!;
@@ -176,7 +172,6 @@ export async function bulkIngest(
 		existingFileMap.set(`${row.parent_inode_id}:${row.name}`, BigInt(row.inode_id));
 	}
 
-	// ── Phase C: bulk insert blobs ────────────────────────────────────────────
 	// F6: commit the CAS blobs in their OWN short tx (own pool connection, no
 	// advisory lock — `blobs` is unscoped CAS) BEFORE the inode/dirent work in
 	// the script-tx, so the hot-blob `ON CONFLICT DO UPDATE` tuple lock is
@@ -200,8 +195,6 @@ export async function bulkIngest(
 		await blobs.commitBatch(blobRows);
 	}
 
-	// ── Phase D: bulk insert file inodes ─────────────────────────────────────
-
 	const inodeInserts = filesWithHash.map((f) => ({
 		sandbox_id: sandboxId,
 		kind: INODE_KIND.FILE,
@@ -212,8 +205,6 @@ export async function bulkIngest(
 	const insertedInodes = await tx<{ id: string; mtime: string }[]>`
 			INSERT INTO inodes ${tx(inodeInserts)} RETURNING id, mtime
 		`;
-
-	// ── Phase E: link dirents — upsert for overwrites, clean up old inodes ───
 
 	const toUpdate: Array<[string, string, string]> = [];
 	const oldInodeIds: bigint[] = [];
@@ -270,8 +261,6 @@ export async function bulkIngest(
 	if (toInsert.length > 0) {
 		await tx`INSERT INTO dirents ${tx(toInsert)}`;
 	}
-
-	// ── Phase F: build result cache entries from INSERT RETURNING data ────────
 
 	for (let i = 0; i < filesWithHash.length; i++) {
 		const f = filesWithHash[i]!;

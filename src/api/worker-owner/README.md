@@ -1,6 +1,6 @@
 # Worker ownership
 
-Worker-owner owns the resident filesystem, command outcomes, worker replacement, and durable generation retirement. [SessionManager](../session-manager.ts) owns session lifetime, local and distributed locks, request lease context, runtime admission, read-only error mapping, and metadata accounting.
+Worker-owner owns the resident filesystem, command outcomes, worker replacement, and durable generation retirement. [SessionManager](../session-manager.ts) coordinates distributed leases, runtime execution, read-only error mapping, and worker requests. [Session owners](../session-manager/README.md) hold the session lifetime, local locks, runtime admission, backend factories, and metadata accounting.
 
 | Source | Responsibility |
 | --- | --- |

@@ -403,7 +403,6 @@ export class PostgresNamespace implements NamespaceOperations {
 		sandboxId: string,
 		expectedEpoch?: bigint,
 	): Promise<void> {
-		// Build a snake_case patch object for postgres.js dynamic sql(obj) helper
 		const patch: Record<string, string | number | Date | Uint8Array | null> = Object.create(null);
 		if (updates.mode !== undefined) patch.mode = updates.mode;
 		if (updates.size !== undefined) patch.size = updates.size;
@@ -451,7 +450,6 @@ export class PostgresNamespace implements NamespaceOperations {
 	}
 
 	async insertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<void> {
-		// Derive sandbox_id from the parent inode to avoid needing it as a parameter.
 		await tx`
 			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
 			SELECT ${String(parentId)}, ${name}, ${String(inodeId)}, sandbox_id
@@ -461,7 +459,6 @@ export class PostgresNamespace implements NamespaceOperations {
 	}
 
 	async upsertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<bigint | null> {
-		// Capture the old inode_id (if any) before the upsert, then return it after.
 		const rows = await tx<{ old_inode_id: string | null }[]>`
 			WITH existing AS (
 				SELECT inode_id FROM dirents

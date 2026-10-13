@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import type { ICoherentFs } from "../../../sql-fs/sql-fs.js";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
@@ -8,7 +9,6 @@ import { type DistributedRWLockOptions, rwLockKeys } from "../../distributed-rw-
 import { sessionLeaseSignal } from "../../session-lease-context.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
-import { ownerCancellation } from "../../worker-owner/cancellation.js";
 import { loadWorkerPoolOptions } from "../../worker-owner/pool.js";
 
 describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => {
