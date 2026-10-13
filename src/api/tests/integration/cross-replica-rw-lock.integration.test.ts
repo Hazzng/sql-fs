@@ -36,10 +36,6 @@ function timed<T>(label: string, p: Promise<T>, timeoutMs = DEFAULT_TIMEOUT_MS):
 	]);
 }
 
-function versionKey(sandboxId: string): string {
-	return `vfs:${TENANT}:ver:${sandboxId}`;
-}
-
 const ACQUIRE_TIMEOUT_MS = 10_000;
 
 describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
@@ -63,7 +59,7 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 				/* ignore */
 			}
 			const { writer, readers } = rwLockKeys(TENANT, id);
-			await redis.del(writer, readers, versionKey(id));
+			await redis.del(writer, readers);
 		}
 	});
 
@@ -271,14 +267,12 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 		expect(remaining).toBe(0);
 	});
 
-	it("version visible to B after A's write — lock release waits for publishVersionIfDirty", async () => {
+	it("B reads committed file content and paths after A writes", async () => {
 		const sandboxId = newId();
 		const smA = makeSm();
 		const smB = makeSm();
 		await warm(smA, smB, sandboxId);
 
-		// A writes a file. publishVersionIfDirty bumps the Redis version key
-		// before the exclusive lock is released.
 		await timed(
 			"A-write",
 			smA.withSession(TENANT, sandboxId, async (s) => {
@@ -286,8 +280,6 @@ describe.skipIf(SKIP)("Phase 3 — cross-replica RW lock integration", () => {
 			}),
 		);
 
-		// B's next readOnly turn must see /visible.txt (proves ordering:
-		// publishVersionIfDirty → ensureFreshCache reload → fn runs).
 		await timed(
 			"B-read",
 			smB.withSessionRead(TENANT, sandboxId, async (s) => {

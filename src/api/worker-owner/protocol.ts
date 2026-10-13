@@ -16,6 +16,7 @@ export interface OwnerIdentity {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly owner: string;
 	readonly cwd: string;
+	readonly openExisting?: boolean;
 }
 
 export interface OwnerMetadata {
@@ -34,6 +35,7 @@ export type OwnerCommand =
 	| { readonly kind: "paths" }
 	| { readonly kind: "reload" }
 	| { readonly kind: "fresh" }
+	| { readonly kind: "runtime"; readonly runtimeOptions: RuntimeOptions }
 	| { readonly kind: "bulkIngest"; readonly files: BulkIngestFile[] }
 	| { readonly kind: "beginScope" | "endScope" | "abortScope" | "disconnect" | "clearDirty" | "shutdown" };
 
@@ -79,6 +81,8 @@ export class OutcomeUnknownError extends Error {
 
 export function mayApply(command: OwnerCommand): boolean {
 	switch (command.kind) {
+		case "attach":
+			return command.identity.openExisting !== true;
 		case "exec":
 		case "writeFile":
 		case "appendFile":

@@ -2,6 +2,7 @@ import { once } from "node:events";
 import { MessageChannel, Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assertWorkerMessageBudget } from "../../worker-owner/message-budget.js";
+import { mayApply } from "../../worker-owner/protocol.js";
 import type { OwnerCommand, OwnerReply, OwnerRequest } from "../../worker-owner/protocol.js";
 
 const channels: MessageChannel[] = [];
@@ -80,6 +81,20 @@ async function runtimeFixture(maxBytes = 1024) {
 }
 
 describe("worker runtime reply budgets", () => {
+	it("treats only initial sandbox-creating attachments as potentially applied", () => {
+		const identity = {
+			tenantId: "tenant",
+			sandboxId: "sandbox",
+			connectionString: "postgres://unused",
+			owner: "owner",
+			cwd: "/home/user",
+			runtimeOptions: { python: false, javascript: false, network: false },
+		};
+		expect(mayApply({ kind: "attach", identity })).toBe(true);
+		expect(mayApply({ kind: "attach", identity: { ...identity, openExisting: false } })).toBe(true);
+		expect(mayApply({ kind: "attach", identity: { ...identity, openExisting: true } })).toBe(false);
+	});
+
 	it("bounds a failed execution after a write and forbids replay", async () => {
 		const fixture = await runtimeFixture();
 		const reply = await fixture.send({ kind: "exec", script: "write then fail", options: {} });

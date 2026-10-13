@@ -171,7 +171,7 @@ interface SqlFsOptions<Tx> {
  */
 export interface ICoherentFs extends IFileSystem {
 	setOwnerLeaseGuard?(guard: () => void): void;
-	claimGeneration?(): Promise<void>;
+	claimGeneration?(): Promise<boolean>;
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
 	/** Resolves true when it loaded a new committed view. */
@@ -366,11 +366,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#ownerLeaseGuard = guard;
 	}
 
-	async claimGeneration(): Promise<void> {
+	async claimGeneration(): Promise<boolean> {
 		this.#assertOwnerLease();
 		this.#assertScriptTxAlive();
 		const retire = this.#dialect.retireSandboxGeneration;
-		if (retire === undefined) return;
+		if (retire === undefined) return false;
 		if (this.#scriptScope) throw createEstale(this.#sandboxId);
 		const certificate = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
@@ -382,9 +382,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#assertScriptTxAlive();
 		if (!this.#cachePoisoned && certificate.priorEpoch === this.#committedView.epoch) {
 			this.#committedView.epoch = certificate.epoch;
-		} else {
-			await this.reload();
+			return false;
 		}
+		await this.reload();
+		return true;
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────

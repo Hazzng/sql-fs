@@ -1,21 +1,16 @@
-/**
- * F2-L1 regression: a DEFINITIVE distributed-lock loss mid-exec must abort the
- * exec so its script-tx ROLLS BACK BEFORE any commit, surface the retryable
- * LockLostError, and NOT bump the version counter (no committed-then-lie).
- * A TRANSIENT renew blip must NOT abort the exec.
- *
- * No real Redis — the FakeRedis mirrors the RW lock's ZSET + string-key surface
- * (same shape as distributed-rw-lock.test.ts / session-manager.exec-lock.test.ts)
- * with a switch to force the exclusive RENEW to report definitive loss.
- */
-
 import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { rwLockKeys } from "../../distributed-rw-lock.js";
+import { sessionLeaseSignal } from "../../session-lease-context.js";
 import { SessionManager } from "../../session-manager.js";
-
-// ── FakeRedis (ZSET-aware, with forced exclusive renew loss + version INCR) ─────
+import {
+	WorkerOwnerPool,
+	type WorkerReservation,
+	loadWorkerPoolOptions,
+	workerReservation,
+} from "../../worker-owner/pool.js";
 
 interface StringEntry {
 	value: string;
@@ -25,7 +20,6 @@ interface StringEntry {
 class FakeRedis {
 	strings = new Map<string, StringEntry>();
 	zsets = new Map<string, Map<string, number>>();
-	counters = new Map<string, number>();
 
 	/** When true, RENEW_EXCLUSIVE reports a DEFINITIVE ownership loss (returns 0). */
 	forceExclusiveRenewLost = false;
@@ -55,23 +49,6 @@ class FakeRedis {
 		if (this.strings.has(key)) return null;
 		this.strings.set(key, { value, expiresAt: Date.now() + ms });
 		return "OK";
-	}
-
-	// Version-counter surface used by publishVersionIfDirty / ensureFreshCache.
-	async incr(key: string): Promise<number> {
-		const next = (this.counters.get(key) ?? 0) + 1;
-		this.counters.set(key, next);
-		return next;
-	}
-	async expire(_key: string, _seconds: number): Promise<number> {
-		return 1;
-	}
-	async getex(key: string, _ex: "EX", _seconds: number): Promise<string | null> {
-		const v = this.counters.get(key);
-		return v === undefined ? null : String(v);
-	}
-	async del(key: string): Promise<number> {
-		return this.counters.delete(key) ? 1 : 0;
 	}
 
 	async eval(script: string, numKeys: number, ...args: string[]): Promise<unknown> {
@@ -153,12 +130,6 @@ function asRedis(f: FakeRedis): Redis {
 
 // ── Recording script-tx FS ──────────────────────────────────────────────────────
 //
-// A Proxy over InMemoryFs (so bash.exec has a real filesystem to run against)
-// that also satisfies IScriptTxFs + ICoherentFs and records begin/end/abort so we
-// can assert the script-tx rolled back rather than committed. `wasDirty()` returns
-// true only while a scope committed (endScope) and false after an abort — this is
-// what publishVersionIfDirty consults to decide whether to INCR the version.
-
 interface ScriptTxRecord {
 	begins: number;
 	ends: number;
@@ -225,7 +196,164 @@ const T = "default";
 const FAST_LOCK = { leaseMs: 5_000, renewMs: 60, acquireTimeoutMs: 3_000, acquireRetryMs: 10, readerLeaseMs: 5_000 };
 
 describe("F2-L1: abort exec on definitive lease loss before commit", () => {
-	it("definitive loss mid-exec → script-tx ROLLS BACK, no version INCR, retryable ELOCKLOST", async () => {
+	it.each([
+		{ name: "a creating attach dispatched to the worker", openExisting: false, dispatch: true, expected: true },
+		{ name: "an existing-only attach dispatched to the worker", openExisting: true, dispatch: true, expected: false },
+		{ name: "a creating attach rejected before dispatch", openExisting: false, dispatch: false, expected: false },
+	])("records only $name as a possible create", async ({ openExisting, dispatch, expected }) => {
+		const pool = new WorkerOwnerPool(loadWorkerPoolOptions({ SQL_FS_WORKER_COUNT: "1" }));
+		const reservationState: { creatingAttachDispatched?: boolean } = {};
+		try {
+			await pool.run("tenant", "sandbox", false, async () => {
+				const reservation = workerReservation.getStore();
+				if (reservation === undefined) throw new Error("worker reservation was not created");
+				reservationState.creatingAttachDispatched = reservation.creatingAttachDispatched;
+				const thread = {
+					dead: false,
+					ready: Promise.resolve(),
+					request: async (
+						_generation: number,
+						_command: unknown,
+						_readOnly: boolean,
+						_lostSignal: AbortSignal | undefined,
+						_signal: AbortSignal | undefined,
+						onDispatch: (() => void) | undefined,
+					) => {
+						if (dispatch) onDispatch?.();
+						throw Object.assign(new Error("lease lost"), { code: "ELOCKLOST" });
+					},
+					terminate: async () => 0,
+				};
+				(reservation.slot as unknown as { thread?: unknown }).thread = thread;
+				await expect(
+					pool.attach({
+						tenantId: "tenant",
+						sandboxId: "sandbox",
+						runtimeOptions: { python: false, javascript: false, network: false },
+						owner: "owner",
+						connectionString: "postgres://unused",
+						cwd: "/home/user",
+						openExisting,
+					}),
+				).rejects.toMatchObject({ code: "ELOCKLOST" });
+				reservationState.creatingAttachDispatched = reservation.creatingAttachDispatched;
+			});
+		} finally {
+			await pool.shutdown(0);
+		}
+		expect(reservationState.creatingAttachDispatched).toBe(expected);
+	});
+
+	it.each([
+		{
+			name: "a dispatched creating attach",
+			reservation: { creatingAttachDispatched: true, mayHaveEffects: true, scopeOpen: false },
+			outcome: "EEXEC_OUTCOME_UNKNOWN",
+			recoveries: 1,
+		},
+		{
+			name: "an existing-only attach",
+			reservation: { creatingAttachDispatched: false, mayHaveEffects: false, scopeOpen: false },
+			outcome: "ELOCKLOST",
+			recoveries: 0,
+		},
+		{
+			name: "an attach rejected before dispatch",
+			reservation: { creatingAttachDispatched: false, mayHaveEffects: false, scopeOpen: false },
+			outcome: "ELOCKLOST",
+			recoveries: 0,
+		},
+		{
+			name: "a buffered write that remains in its scope",
+			reservation: { creatingAttachDispatched: false, mayHaveEffects: true, scopeOpen: true },
+			outcome: "ELOCKLOST",
+			recoveries: 0,
+		},
+	])("classifies lease loss after $name", async ({ reservation: state, outcome, recoveries }) => {
+		const sm = new SessionManager({});
+		const recoverWorker = vi
+			.spyOn(sm as unknown as { recoverWorker(error: unknown): Promise<void> }, "recoverWorker")
+			.mockResolvedValue(undefined);
+		const withWorkerLease = (
+			sm as unknown as {
+				withWorkerLease<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>;
+			}
+		).withWorkerLease.bind(sm);
+		const reservation = {
+			key: "default:lease-outcome",
+			slot: {},
+			phase: "running",
+			execDispatched: false,
+			committedFsWrite: false,
+			...state,
+		} as unknown as WorkerReservation;
+		const error = Object.assign(new Error("lease lost"), { code: "ELOCKLOST" });
+
+		await expect(
+			workerReservation.run(reservation, () => withWorkerLease(async () => Promise.reject(error))),
+		).rejects.toMatchObject({ code: outcome });
+		expect(recoverWorker).toHaveBeenCalledTimes(recoveries);
+		await sm.shutdown();
+	});
+
+	it("keeps overlapping shared leases independent when one reader finishes before the other loses ownership", async () => {
+		const redis = new FakeRedis();
+		const sm = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			redis: asRedis(redis),
+			execLockOptions: FAST_LOCK,
+		});
+		await sm.getOrCreate(T, "sbx-overlap");
+		let finishFirst: () => void = () => {};
+		const firstCanFinish = new Promise<void>((resolve) => {
+			finishFirst = resolve;
+		});
+		let startedFirst: () => void = () => {};
+		const firstStarted = new Promise<void>((resolve) => {
+			startedFirst = resolve;
+		});
+		let firstSignal: AbortSignal | undefined;
+		const first = sm.withSessionRead(T, "sbx-overlap", async () => {
+			firstSignal = sessionLeaseSignal();
+			startedFirst();
+			await firstCanFinish;
+			expect(sessionLeaseSignal()).toBe(firstSignal);
+		});
+		await firstStarted;
+		let startedSecond: () => void = () => {};
+		const secondStarted = new Promise<void>((resolve) => {
+			startedSecond = resolve;
+		});
+		let firstFinished: () => void = () => {};
+		const firstHasFinished = new Promise<void>((resolve) => {
+			firstFinished = resolve;
+		});
+		const second = sm.withSessionRead(T, "sbx-overlap", async () => {
+			const signal = sessionLeaseSignal();
+			expect(signal).toBeDefined();
+			expect(signal).not.toBe(firstSignal);
+			const lost = new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+			startedSecond();
+			await firstHasFinished;
+			expect(sessionLeaseSignal()).toBe(signal);
+			expect(signal?.aborted).toBe(false);
+			redis.getZset(rwLockKeys(T, "sbx-overlap").readers).clear();
+			await lost;
+			expect(sessionLeaseSignal()).toBe(signal);
+			expect(sessionLeaseSignal()?.aborted).toBe(true);
+			expect(firstSignal?.aborted).toBe(false);
+		});
+		const rejected = expect(second).rejects.toMatchObject({ code: "ELOCKLOST" });
+		await secondStarted;
+		finishFirst();
+		await first;
+		firstFinished();
+		await rejected;
+		expect(sessionLeaseSignal()).toBeUndefined();
+		await sm.shutdown();
+	});
+
+	it("definitive loss mid-exec rolls back the script transaction with retryable ELOCKLOST", async () => {
 		const redis = new FakeRedis();
 		const record: ScriptTxRecord = { begins: 0, ends: 0, aborts: 0 };
 		const sm = new SessionManager({
@@ -237,14 +365,14 @@ describe("F2-L1: abort exec on definitive lease loss before commit", () => {
 		const err = await sm
 			.withSession(T, "sbx-loss", async (session) => {
 				// The lost-signal must be exposed to the exec path for this region.
-				expect(session.lockLostSignal).toBeDefined();
+				expect(sessionLeaseSignal()).toBeDefined();
 				// Force the heartbeat's next renew to report a definitive loss, then
 				// run a script slow enough that the abort interrupts it mid-flight.
 				// The route layer composes lockLostSignal into the exec signal; mimic
 				// that here so bash.exec actually observes the abort.
 				redis.forceExclusiveRenewLost = true;
 				return sm.execWithRuntimeThrottle(session, "for i in $(seq 1 50); do sleep 0.05; done; echo done", {
-					signal: session.lockLostSignal,
+					signal: sessionLeaseSignal(),
 				});
 			})
 			.then(
@@ -261,8 +389,6 @@ describe("F2-L1: abort exec on definitive lease loss before commit", () => {
 		expect(record.aborts).toBe(1);
 		expect(record.ends).toBe(0);
 
-		// No version bump was published (the write did not commit).
-
 		await sm.shutdown();
 	});
 
@@ -277,14 +403,13 @@ describe("F2-L1: abort exec on definitive lease loss before commit", () => {
 
 		let captured: AbortSignal | undefined;
 		await sm.withSession(T, "sbx-clear", async (session) => {
-			captured = session.lockLostSignal;
+			captured = sessionLeaseSignal();
 			expect(captured).toBeDefined();
 			return sm.execWithRuntimeThrottle(session, "echo hi");
 		});
 
 		// After the region the field is cleared; the captured signal never aborted.
-		const after = sm.getSession(T, "sbx-clear");
-		expect(after?.lockLostSignal).toBeUndefined();
+		expect(sessionLeaseSignal()).toBeUndefined();
 		expect(captured?.aborted).toBe(false);
 
 		await sm.shutdown();
@@ -313,12 +438,12 @@ describe("F2-L1: abort exec on definitive lease loss before commit", () => {
 		};
 
 		const result = await sm.withSession(T, "sbx-transient", async (session) => {
-			expect(session.lockLostSignal?.aborted).toBe(false);
+			expect(sessionLeaseSignal()?.aborted).toBe(false);
 			const r = await sm.execWithRuntimeThrottle(session, "for i in $(seq 1 6); do sleep 0.05; done; echo ok", {
-				signal: session.lockLostSignal,
+				signal: sessionLeaseSignal(),
 			});
 			// Signal stayed un-aborted across the transient blip.
-			expect(session.lockLostSignal?.aborted).toBe(false);
+			expect(sessionLeaseSignal()?.aborted).toBe(false);
 			return r;
 		});
 

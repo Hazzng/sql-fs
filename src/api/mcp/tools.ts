@@ -295,6 +295,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
 						reply = replyFor(end);
 					}
+					if (end === start && start < selectedBytes.byteLength) return { kind: "budget_too_small" } as const;
 					return { kind: "ok", reply } as const;
 				});
 
@@ -312,7 +313,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 						});
 					case "budget_too_small":
 						return fail(
-							`MAX_MCP_READ_RESPONSE_BYTES (${MAX_READ_RESPONSE_BYTES}) is too small to hold a response envelope for this path`,
+							`MAX_MCP_READ_RESPONSE_BYTES (${MAX_READ_RESPONSE_BYTES}) is too small to hold a usable response for this path`,
 							{ code: "RESPONSE_BUDGET_TOO_SMALL", path: filePath },
 						);
 					default:
@@ -886,7 +887,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					args.id,
 					owner,
 					async (session) => {
-						const allPaths = session.fs.getAllPaths();
+						const allPaths = await sessionManager.getSessionPaths(session);
 						const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
 						const result: Record<string, string> = Object.create(null);
 						const readErrors: string[] = [];

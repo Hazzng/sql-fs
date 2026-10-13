@@ -19,6 +19,7 @@ import { getRedisClient } from "../redis/client.js";
 import { runTrustedDbAsync } from "./defense.js";
 import { PostgresDialect } from "./dialects/postgres.js";
 import { raceDriverFault } from "./driver-fault.js";
+import { createEnoent } from "./errors.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
 import { type ScriptTxBufferConfig, loadScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { SqlFs } from "./sql-fs.js";
@@ -35,6 +36,7 @@ export interface PostgresBackendOptions {
 	readonly connectionString: string;
 	readonly tenantId?: string;
 	readonly blobCache?: RedisBlobCache;
+	readonly openExisting?: boolean;
 }
 
 /**
@@ -59,17 +61,24 @@ export async function createPostgresSandboxFs(
 	try {
 		let resolvedOwner = owner;
 		let createdAt = new Date().toISOString();
-		try {
-			await dialect.transaction(async (tx) => {
-				const result = await dialect.createSandbox(tx, sandboxId, owner);
-				createdAt = result.createdAt;
-			});
-		} catch (e) {
-			const sqlErr = e as { code?: string };
-			if (sqlErr.code !== "23505") throw e;
+		if (opts.openExisting) {
 			const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
-			resolvedOwner = meta?.owner ?? "";
-			createdAt = meta?.createdAt ?? createdAt;
+			if (meta === null) throw createEnoent(`/${sandboxId}`);
+			resolvedOwner = meta.owner ?? "";
+			createdAt = meta.createdAt ?? createdAt;
+		} else {
+			try {
+				await dialect.transaction(async (tx) => {
+					const result = await dialect.createSandbox(tx, sandboxId, owner);
+					createdAt = result.createdAt;
+				});
+			} catch (e) {
+				const sqlErr = e as { code?: string };
+				if (sqlErr.code !== "23505") throw e;
+				const meta = await dialect.transaction(async (tx) => dialect.getSandboxMeta(tx, sandboxId));
+				resolvedOwner = meta?.owner ?? "";
+				createdAt = meta?.createdAt ?? createdAt;
+			}
 		}
 		const fs = new SqlFs({
 			dialect,

@@ -55,6 +55,42 @@ describe("SessionManager.shutdown", () => {
 		await sm.shutdown();
 		expect(fs1.disconnect).toHaveBeenCalledTimes(1);
 	});
+
+	it.each([80, 100])("shares one drain budget when workers take %i ms", async (workerDrainMs) => {
+		const fs = makeFakeFs();
+		const sm = new SessionManager({ createFs: async () => fs, workerEnabled: false });
+		const session = await sm.getOrCreate(T, "held-session");
+		let releaseLock!: () => void;
+		const held = new Promise<void>((resolve) => {
+			releaseLock = resolve;
+		});
+		const operation = session.lock.runExclusive(() => held);
+		await Promise.resolve();
+		const workerShutdown = vi.fn(() => new Promise<void>((resolve) => setTimeout(resolve, workerDrainMs)));
+		(sm as unknown as { workerPool: { shutdown: typeof workerShutdown } }).workerPool = { shutdown: workerShutdown };
+		vi.useFakeTimers();
+		let completed = false;
+		const shutdown = sm.shutdown({ drainTimeoutMs: 100 }).then(() => {
+			completed = true;
+		});
+		try {
+			await vi.advanceTimersByTimeAsync(99);
+			expect(completed).toBe(false);
+			expect(fs.disconnect).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(3);
+			expect(completed).toBe(true);
+			expect(session.lock.writerHeld).toBe(true);
+			expect(fs.disconnect).toHaveBeenCalledTimes(1);
+			expect(sm.getSession(T, "held-session")).toBeUndefined();
+			expect(workerShutdown).toHaveBeenCalledWith(100);
+		} finally {
+			releaseLock();
+			await operation;
+			await vi.runAllTimersAsync();
+			await shutdown;
+			vi.useRealTimers();
+		}
+	});
 });
 
 describe("SessionManager.destroy resilience", () => {

@@ -60,6 +60,65 @@ afterEach(() => {
 });
 
 describe("lease lost after the guarded work completed", () => {
+	it.each(["legacy", "shared", "exclusive"])("fences a lost %s outcome before releasing Redis", async (mode) => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const events: string[] = [];
+		class RecordedRedis extends LosingRedis {
+			override async eval(script: string): Promise<number | string | null> {
+				if (
+					script.includes('"del"') ||
+					script.includes('"DEL"') ||
+					(script.includes('"ZREM"') && !script.includes("ZREMRANGEBYSCORE"))
+				)
+					events.push("release");
+				return super.eval(script);
+			}
+		}
+		const unknown = Object.assign(new Error("unknown after dispatch"), { code: "EEXEC_OUTCOME_UNKNOWN" });
+		const onLostAfterWork = async (): Promise<void> => {
+			events.push("fence");
+			throw unknown;
+		};
+		const finishAfterLoss = async (signal: AbortSignal): Promise<string> => {
+			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+			return "completed";
+		};
+		const redis = new RecordedRedis();
+		const pending =
+			mode === "legacy"
+				? withDistributedLock(redis.client, KEY, finishAfterLoss, { ...FAST, onLostAfterWork })
+				: withDistributedRWLock(redis.client, KEYS, mode === "shared" ? "shared" : "exclusive", finishAfterLoss, {
+						...FAST_RW,
+						onLostAfterWork,
+					});
+		await expect(pending).rejects.toBe(unknown);
+		expect(events).toEqual(["fence", "release"]);
+	});
+	it.each(
+		["legacy", "shared", "exclusive"].flatMap((mode) =>
+			["08006", "08P01", "EEXEC_OUTCOME_UNKNOWN", "ECOHERENCE", "EDRIVERFAULT"].map((code) => ({ mode, code })),
+		),
+	)("preserves $code when $mode ownership is lost during an ambiguous outcome", async ({ mode, code }) => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const expected = Object.assign(new Error("ambiguous outcome"), { code });
+		const failAfterLoss = async (signal: AbortSignal): Promise<never> => {
+			await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+			throw expected;
+		};
+		const pending =
+			mode === "legacy"
+				? withDistributedLock(new LosingRedis().client, KEY, failAfterLoss, FAST)
+				: withDistributedRWLock(
+						new LosingRedis().client,
+						KEYS,
+						mode === "shared" ? "shared" : "exclusive",
+						failAfterLoss,
+						FAST_RW,
+					);
+		await expect(pending).rejects.toBe(expected);
+		expect(isRetryableError(expected)).toBe(false);
+	});
+
 	it("withDistributedLock throws the non-retryable ELOCKLOST_APPLIED", async () => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		const err = await withDistributedLock(new LosingRedis().client, KEY, slowSuccess, FAST).catch((e) => e);

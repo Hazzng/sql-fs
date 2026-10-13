@@ -16,6 +16,7 @@ import {
 	type ProbeTicketHolder,
 	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
+import { preservesAmbiguousOutcome } from "./errors.js";
 import { recordHeartbeatGap } from "./event-loop-monitor.js";
 
 const RELEASE_SCRIPT = `
@@ -33,6 +34,7 @@ else
 end`;
 
 export interface DistributedLockOptions {
+	readonly onLostAfterWork?: () => Promise<void>;
 	readonly leaseMs: number;
 	readonly renewMs: number;
 	readonly acquireTimeoutMs: number;
@@ -305,13 +307,14 @@ export async function withDistributedLock<T>(
 			// from the lost-signal abort. Surface the canonical, retryable
 			// LockLostError instead so the client sees a single coherent code and
 			// treats it as "not committed" (the abort fired before any commit).
-			if (lost) throw new LockLostError(key);
+			if (lost && !preservesAmbiguousOutcome(err)) throw new LockLostError(key);
 			throw err;
 		}
 		// #175 M1: `fn` RETURNED, so its transaction already committed. A retryable
 		// ELOCKLOST here tells an auto-retrying client to re-apply a durable write.
 		if (lost) {
 			logLockLostAfterCommit(key, merged.readOnly === true);
+			await merged.onLostAfterWork?.();
 			if (merged.readOnly === true) throw new LockLostError(key);
 			throw new LockLostAfterCommitError(key);
 		}
