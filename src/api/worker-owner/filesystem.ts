@@ -1,10 +1,10 @@
 import path from "node:path";
 import type { IFileSystem } from "just-bash";
+import { type ScriptScope, runInScriptScope } from "../../sql-fs/script-scope.js";
 import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../sql-fs/types.js";
-import type { SessionScriptScope } from "../session-runtime/engine.js";
 import type { WorkerOwnerPool } from "./pool.js";
-import type { OwnerCommand } from "./protocol.js";
+import type { OwnerCommand, OwnerCommandKind, OwnerResult } from "./protocol.js";
 
 export class WorkerFileSystem implements ICoherentFs {
 	private dirty = false;
@@ -16,9 +16,9 @@ export class WorkerFileSystem implements ICoherentFs {
 		private readonly key: string,
 	) {}
 
-	async call<T>(command: OwnerCommand): Promise<T> {
+	async call<K extends OwnerCommandKind>(command: OwnerCommand<K>): Promise<OwnerResult<K>> {
 		try {
-			return await this.pool.send<T>(command);
+			return await this.pool.send(command);
 		} finally {
 			this.refreshMetadata();
 		}
@@ -129,7 +129,7 @@ export class WorkerFileSystem implements ICoherentFs {
 	}
 }
 
-export class WorkerScriptScope implements SessionScriptScope {
+export class WorkerScriptScope implements ScriptScope {
 	private active = false;
 	constructor(private readonly fs: WorkerFileSystem) {}
 	get isActive(): boolean {
@@ -157,17 +157,6 @@ export class WorkerScriptScope implements SessionScriptScope {
 		}
 	}
 	async run<T>(fn: () => Promise<T>): Promise<T> {
-		const ownsScope = !this.active;
-		if (ownsScope) await this.beginScope();
-		try {
-			const result = await fn();
-			if (ownsScope) await this.endScope();
-			return result;
-		} catch (error) {
-			try {
-				if (ownsScope) await this.abortScope();
-			} catch {}
-			throw error;
-		}
+		return runInScriptScope(this, fn);
 	}
 }

@@ -1,5 +1,12 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkerOwnerPool, loadWorkerPoolOptions, workerReservation } from "../../worker-owner/pool.js";
+import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { MockOwnerWorker, latestMockWorker } from "../fixtures/mock-owner-worker.js";
+
+vi.mock("node:worker_threads", async () => {
+	const { MockOwnerWorker } = await import("../fixtures/mock-owner-worker.js");
+	return { Worker: MockOwnerWorker };
+});
 
 function checkpoint() {
 	let release = () => {};
@@ -10,7 +17,10 @@ function checkpoint() {
 }
 
 describe("worker pool memory pressure", () => {
-	afterEach(() => vi.restoreAllMocks());
+	afterEach(() => {
+		vi.restoreAllMocks();
+		MockOwnerWorker.instances.length = 0;
+	});
 
 	it.each(["rss", "external"] as const)(
 		"rejects another shared reader under %s pressure and admits it after recovery",
@@ -28,15 +38,24 @@ describe("worker pool memory pressure", () => {
 			vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory, rss }));
 			const started = checkpoint();
 			const finish = checkpoint();
-			let reportExternal = (_bytes: number) => {};
+			let reportExternal = async (_bytes: number) => {};
 			const active = pool.run("tenant", "sandbox", true, async () => {
-				const reservation = workerReservation.getStore();
-				if (reservation === undefined) throw new Error("Reader was not reserved");
-				reportExternal = (bytes) => {
-					reservation.slot.external = bytes;
-				};
+				await pool.attach({
+					tenantId: "tenant",
+					sandboxId: "sandbox",
+					connectionString: "unused",
+					owner: "owner",
+					cwd: "/home/user",
+					runtimeOptions: { python: false, javascript: false, network: false },
+					openExisting: true,
+				});
+				const worker = latestMockWorker();
+				reportExternal = AsyncLocalStorage.bind(async (bytes: number) => {
+					worker.externalBytes = bytes;
+					await pool.send({ kind: "paths" });
+				});
 				if (pressure === "rss") rss = options.maxRssBytes;
-				else reportExternal(options.maxExternalBytes);
+				else await reportExternal(options.maxExternalBytes);
 				started.release();
 				await finish.reached;
 			});
@@ -49,14 +68,14 @@ describe("worker pool memory pressure", () => {
 				expect(rejected).not.toHaveBeenCalled();
 				expect(pool.metrics).toMatchObject({ active: 1, admitted: 1, refused: 1, queued: 0, busyWorkers: 1 });
 				rss = memory.rss;
-				reportExternal(0);
+				await reportExternal(0);
 				const recovered = vi.fn(async () => "healthy reader");
 				await expect(pool.run("tenant", "sandbox", true, recovered)).resolves.toBe("healthy reader");
 				expect(recovered).toHaveBeenCalledOnce();
 				expect(pool.metrics).toMatchObject({ active: 1, admitted: 2, queued: 0, completed: 1 });
 			} finally {
 				rss = memory.rss;
-				reportExternal(0);
+				await reportExternal(0);
 				finish.release();
 				await active;
 				await pool.shutdown(0);

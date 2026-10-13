@@ -4,7 +4,7 @@ import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
 import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
-import type { OwnerCommand } from "../../worker-owner/protocol.js";
+import type { OwnerCommand, OwnerCommandKind, OwnerResult } from "../../worker-owner/protocol.js";
 
 const TENANTS = ["worker-runtime-a", "worker-runtime-b"] as const;
 
@@ -93,18 +93,18 @@ describe.skipIf(!process.env.DATABASE_URL)("worker runtime admission for dynamic
 			let activeRpc = 0;
 			let peakRpc = 0;
 			let dispatched = 0;
-			vi.spyOn(WorkerOwnerPool.prototype, "send").mockImplementation(async function <T>(
+			vi.spyOn(WorkerOwnerPool.prototype, "send").mockImplementation(async function <K extends OwnerCommandKind>(
 				this: WorkerOwnerPool,
-				command: OwnerCommand,
+				command: OwnerCommand<K>,
 				signal?: AbortSignal,
 				forceReadOnly?: boolean,
-			): Promise<T> {
-				if (command.kind !== "exec") return send.call(this, command, signal, forceReadOnly) as Promise<T>;
+			): Promise<OwnerResult<K>> {
+				if (command.kind !== "exec") return send.bind(this)<K>(command, signal, forceReadOnly);
 				dispatched++;
 				activeRpc++;
 				peakRpc = Math.max(peakRpc, activeRpc);
 				try {
-					return (await send.call(this, command, signal, forceReadOnly)) as T;
+					return await send.bind(this)<K>(command, signal, forceReadOnly);
 				} finally {
 					activeRpc--;
 				}

@@ -26,7 +26,7 @@ Python type checking targets the oldest supported interpreter. `pnpm check:pytho
 | --- | --- | --- |
 | Filesystem, transactions, caching, RLS | `src/sql-fs/`, especially `sql-fs.ts`, `types.ts`, `dialects/postgres.ts` | `src/sql-fs/tests/`, `pnpm verify:local` |
 | HTTP validation, auth, execution, ingest | `src/api/routes/`, `auth.ts`, `validation.ts`, `session-manager.ts` | `src/api/tests/unit/`, `scripts/verify/contracts.mjs` |
-| Worker ownership, budgets, recovery | `src/api/worker-owner/`, `src/api/ingress-admission.ts` | worker tests in `src/api/tests/`, `scripts/verify/sdk-clients.mjs` |
+| Worker ownership, budgets, recovery | [Ownership map](src/api/worker-owner/README.md), `src/api/worker-owner/`, `src/api/ingress-admission.ts` | worker tests in `src/api/tests/`, `scripts/verify/sdk-clients.mjs` |
 | Redis control/data isolation | `src/redis/`, `src/sql-fs/redis-blob-cache.ts` | `src/redis/tests/`, integration suite |
 | MCP | `src/api/mcp/` | MCP unit tests and HTTP contract verification |
 | TypeScript SDK | `clients/typescript/src/` | `pnpm check:typescript`, live SDK verification |
