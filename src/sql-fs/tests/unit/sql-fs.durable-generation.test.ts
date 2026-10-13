@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { ownerCancellation } from "../../../api/worker-owner/cancellation.js";
-import { PostgresDialect } from "../../dialects/postgres.js";
 import { SqlFs } from "../../sql-fs.js";
 import { makeProbeDialect } from "../fixtures/buffered-dialect.js";
+import { makePausedPostgresRetirement } from "../fixtures/postgres-retirement.js";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 	let resolve!: (value: T) => void;
@@ -28,20 +28,8 @@ describe("durable generation hooks", () => {
 
 	it("does not retire the replacement generation after losing its lease while waiting for the writer lock", async () => {
 		const probe = makeProbeDialect();
-		const postgres = new PostgresDialect("postgres://unused");
-		const blocked = deferred<void>();
-		const resume = deferred<void>();
-		let waitForLock = true;
-		vi.spyOn(postgres, "setSandboxContextWithLock").mockImplementation(async () => {
-			if (waitForLock) {
-				waitForLock = false;
-				blocked.resolve();
-				await resume.promise;
-			}
-		});
-		const tx = async () => [{ prior_epoch: String(probe.version), version: String(++probe.version) }];
-		probe.dialect.retireSandboxGeneration = (_tx, id, ...guard) =>
-			postgres.retireSandboxGeneration(tx as never, id, ...guard);
+		const { blocked, resume, retire } = makePausedPostgresRetirement(probe);
+		probe.dialect.retireSandboxGeneration = retire;
 		const stale = new SqlFs({ dialect: probe.dialect, sandboxId: "durable" });
 		const replacement = new SqlFs({ dialect: probe.dialect, sandboxId: "durable" });
 		await Promise.all([stale.ready(), replacement.ready()]);
