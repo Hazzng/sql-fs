@@ -5,7 +5,6 @@ dist/
 !.env.example
 *.tsbuildinfo
 .claude/worktrees/
-docs/
 
 # Load-test harness runtime state: logs, pids, generated migration scripts
 # and .run/token, which is a live bearer token.
