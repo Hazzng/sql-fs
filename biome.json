@@ -27,6 +27,6 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python"]
+		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python", "tools/oxlint/anti-slop"]
 	}
 }

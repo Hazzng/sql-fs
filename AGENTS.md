@@ -58,6 +58,8 @@ Live contract and SDK verification validates observed `/v1` operations, status c
 
 Use strict TypeScript, `unknown` at external boundaries, and explicit return types on exported functions. Keep the existing Biome style, tabs and 120-column lines. Run `pnpm lint:fix` for formatting and inspect its diff. Keep tests near their source in `tests/`; use real Postgres integration tests for transaction or isolation behavior. Assert observable results and clean up every sandbox a test creates.
 
+Oxlint complements Biome: `pnpm lint` runs both, and CI runs that command. `pnpm lint:fix` applies Biome fixes and then checks Oxlint. Keep Biome rules until equivalent coverage is verified. See [the anti-slop policy](tools/oxlint/anti-slop/README.md) for enabled rules, test-fixture exceptions, and vendored-source update instructions.
+
 Unit tests run with two Vitest workers to bound CPU and WASM memory pressure. Do not increase parallelism or weaken a timeout assertion to hide a failure. Reproduce the failing behavior first. Commit hooks check staged TypeScript style and types, plus Python style and types when relevant.
 
 Migrations are handwritten numbered SQL files. Add the next migration without editing an applied migration. The boot runner applies them for each configured tenant. There is no Drizzle schema or generation step.

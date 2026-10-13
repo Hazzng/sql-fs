@@ -63,6 +63,8 @@ Use disposable services for fault injection and multi-tenant tests. The suite ru
 
 Read [AGENTS.md](AGENTS.md) for coding rules and [DEVELOPER.md](DEVELOPER.md) before changing sessions, transactions, locks, or caches.
 
+Oxlint complements Biome: `pnpm lint` runs both, and CI runs that command. `pnpm lint:fix` applies Biome fixes and then checks Oxlint. Keep Biome rules until equivalent coverage is verified. See [the anti-slop policy](tools/oxlint/anti-slop/README.md) for enabled rules, test-fixture exceptions, and vendored-source update instructions.
+
 1. Branch from `main` and implement the change with focused tests.
 2. Run `pnpm check`.
 3. Run `pnpm verify:local` for runtime, database, dependency, or SDK behavior changes.
