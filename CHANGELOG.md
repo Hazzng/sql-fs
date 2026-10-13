@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.0
+
+### Minor Changes
+
+- [#234](https://github.com/Hazzng/sql-fs/pull/234) Thanks [@Hazzng](https://github.com/Hazzng)! - Change a sandbox's runtime flags after creation, and fix several exec problems.
+
+  - `PATCH /v1/sandboxes/:id` and the MCP tool `sandbox_update` turn `network`, `python` or `javascript` on or off for an existing sandbox. The update waits for a running exec. When a flag changes, the next exec on every replica rebuilds its shell with the new flags; files are untouched.
+  - A filesystem error that escapes a script now returns `500 EEXEC_FS` with `retryable: false`, not the `404 ENOENT` a missing sandbox gets. The server logs it as `exec_fs_error`, and logs every other 5xx as `http_error`.
+  - Redirects no longer corrupt non-ASCII bytes: `cat a > b` used to turn `é` (`c3 a9`) into `c3 83 c2 a9`.
+  - Reading a large file inside a script is faster: `cat` of a 5 MB file went from 1,020 ms to 35 ms over HTTP against Postgres. The exec file-size limit still applies.
+  - Each `>` redirect costs one commit operation instead of two. A 2,000-redirect loop went from 23.7 s to 17.1 s.
+
+### Patch Changes
+
+- [#220](https://github.com/Hazzng/sql-fs/pull/220) Thanks [@Hazzng](https://github.com/Hazzng)! - Validate the durable PostgreSQL epoch before every filesystem request and load changed paths with that epoch in one transaction. Readers now return fresh committed data or an availability error after writer process loss. Remove Redis version publication, path snapshots, and publication retries while retaining distributed locks and immutable blob caching.
+
+- [#230](https://github.com/Hazzng/sql-fs/pull/230) Thanks [@Hazzng](https://github.com/Hazzng)! - `cmd &> /dev/stderr`, `&> /dev/stdout` and `&>>` to either no longer fail the whole exec with a 404. just-bash 3.6 sent `&>` targets through the filesystem, which has no `/dev`; the local just-bash patch now routes them to the current stdout/stderr like `>` does, until vercel-labs/just-bash#562 is released.
+
+- [#232](https://github.com/Hazzng/sql-fs/pull/232) Thanks [@Hazzng](https://github.com/Hazzng)! - `ls -l` now shows each entry's real permissions, so `chmod 755 f; ls -l f` prints `-rwxr-xr-x` instead of a hardcoded `-rw-r--r--`. `mv a ./a` now fails with GNU's `mv: 'a' and './a' are the same file` and exit status 1 instead of succeeding silently. Both are fixed in the local just-bash patch until upstream fixes them.
+
 ## 1.0.2
 
 ### Patch Changes
