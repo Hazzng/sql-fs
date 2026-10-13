@@ -123,7 +123,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			};
 
 			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
-			session.name = name;
+			sessionManager.initializeSessionMetadata(session, owner, name);
 			await sessionManager.persistSandboxMeta(tenant, id, {
 				owner,
 				name,

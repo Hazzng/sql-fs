@@ -589,16 +589,21 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 				meta.set(sandboxId, sandboxMeta);
 			},
 		});
-		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
-			session.owner = "agent-1";
-			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
-				owner: "agent-1",
-				name: null,
-				python: false,
-				javascript: false,
-				network: false,
-			});
-		});
+		await ownerManager.withSession(
+			"default",
+			SANDBOX_ID,
+			async () => {
+				await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+					owner: "agent-1",
+					name: null,
+					python: false,
+					javascript: false,
+					network: false,
+				});
+			},
+			undefined,
+			"agent-1",
+		);
 
 		const coldReplica = new SessionManager({
 			createFs: async () => new InMemoryFs(),
