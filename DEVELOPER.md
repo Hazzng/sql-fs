@@ -144,6 +144,10 @@ On error, `abortScriptScope` discards the journal or rolls back the transaction,
 
 The session runtime opens a script scope only if the filesystem implements `IScriptTxFs`. `SqlFs` implements it. The `InMemoryFs` used in tests does not, so those execs run without a scope.
 
+## Ownership checks
+
+`pnpm check:architecture` enforces the worker module's named adapter imports and the script-scope completion owner. The allowed imports live in `scripts/check-architecture-boundaries.mjs`, with fixture tests beside the checker. Add a new adapter only when it has a real external responsibility; keep dispatch history, reservation state, and outcome classification inside worker ownership. The shared lease-loss context lives in `src/execution/owner-cancellation.ts` so filesystem fencing does not import worker internals.
+
 ## Worker owners run scripts off the main thread
 
 Worker owners are off by default. If `SQL_FS_WORKERS_ENABLED=true`, Bash and `SqlFs` run in a fixed pool of worker threads from `src/api/worker-owner/`, two by default. Each worker builds its own Postgres filesystem and Redis client in `runtime.ts`. The main thread keeps a `WorkerFileSystem` proxy in the session and sends commands to the pool. The same flag turns on ingress admission in `src/api/ingress-admission.ts`, which limits in-flight requests and bytes for each replica and each tenant. Admission rules, rollout prerequisites and tuning variables are in [Worker owners](CONFIGURATION.md#worker-owners).

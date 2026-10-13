@@ -11,7 +11,7 @@ if (!isMainThread && workerData?.runtime?.endsWith("/api/worker-owner/runtime.js
 	const delegated = new AsyncLocalStorage();
 	const contextIds = new WeakMap();
 	let nextContextId = 0;
-	for (const method of ["readFile", "readFileBuffer"]) {
+	for (const method of ["readFile", "readFileBuffer", "readFileBytes"]) {
 		const original = SqlFs.prototype[method];
 		SqlFs.prototype[method] = async function (path, ...options) {
 			const marker = typeof path === "string" && path.startsWith(prefix) ? path.slice(prefix.length) : "";

@@ -9,6 +9,8 @@ Run `pnpm security:audit` to check production Node dependencies for high and cri
 The security workflow audits locked Python runtime dependencies and configures CodeQL for TypeScript and Python. Dependabot proposes dependency updates weekly after its configuration reaches the default branch.
 The patched `just-bash` dependency needs manual upgrades and its runtime regression tests.
 
+The separate all-dependency audit (`pnpm audit --audit-level=high`) also includes development tools. The October guardrails follow-up found 15 high and three critical advisory entries in that broader audit, including Vitest and Tinypool. These are outside the production-only CI gate and remain an outstanding dependency-maintenance task. The OpenAPI validator dependencies had no advisory entries in that run. A passing production audit does not establish that the development toolchain is free of advisories.
+
 Two targeted overrides in `pnpm-workspace.yaml` replace vulnerable exact pins in `guarded-fetch` and `express-rate-limit`. Remove an override when its parent dependency selects a fixed version, then rerun the audit and runtime verification.
 
 The October 2026 audit retains [GHSA-hp3w-g68c-fv3c](https://github.com/advisories/GHSA-hp3w-g68c-fv3c), a moderate precision-formatting exception in `sprintf-js` with no published fixed version. Local probes of the installed runtime returned command errors for `printf '%.101f' 1` and the equivalent `awk` call, then executed another command successfully. This does not prove every format path is unaffected. The advisory remains visible in `pnpm audit`; the high-severity gate does not suppress it.

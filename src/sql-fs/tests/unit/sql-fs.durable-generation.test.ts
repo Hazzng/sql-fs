@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ownerCancellation } from "../../../api/worker-owner/cancellation.js";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import { SqlFs } from "../../sql-fs.js";
 import { makeProbeDialect } from "../fixtures/buffered-dialect.js";

@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import sys
 import time
 from hashlib import sha256
@@ -16,6 +17,13 @@ def equal(actual, expected, label):
     checks.append(label)
 
 
+def is_json_content_type(value):
+    if not value:
+        return False
+    subtype = value.split(";", 1)[0].strip().lower().split("/", 1)[-1]
+    return subtype == "json" or subtype.endswith("+json")
+
+
 def observe(response):
     entry = {
         "method": response.request.method,
@@ -24,10 +32,34 @@ def observe(response):
         "at": time.monotonic(),
         "retryAfter": response.headers.get("Retry-After"),
     }
-    if response.status_code >= 400:
+    request_content_type = response.request.headers.get("content-type")
+    response_content_type = response.headers.get("content-type")
+    entry["requestContentType"] = request_content_type
+    entry["responseContentType"] = response_content_type
+    entry["requestBodyPresent"] = bool(response.request.content) or request_content_type is not None
+    capture_dir = Path(os.environ["SDK_VERIFY_CAPTURE_DIR"])
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    capture_id = os.environ["SDK_VERIFY_MARKER"]
+    if entry["requestBodyPresent"]:
+        capture_path = capture_dir / f"{capture_id}-{mode}-python-request-{len(requests)}.json"
+        if is_json_content_type(request_content_type):
+            capture_path.write_bytes(response.request.content)
+        else:
+            capture_path = capture_path.with_suffix(".bin")
+            capture_path.write_bytes(response.request.content)
+        entry["requestBodyFile"] = str(capture_path)
+    if (response_content_type or "").split(";", 1)[0].strip().lower() == "text/event-stream":
+        entry["responseBodyPresent"] = True
+    else:
         response.read()
-        body = response.json()
-        entry.update(code=body.get("code"), retryable=body.get("retryable"))
+        response_bytes = response.content
+        response_path = capture_dir / f"{capture_id}-{mode}-python-response-{len(requests)}.bin"
+        response_path.write_bytes(response_bytes)
+        entry["responseBodyFile"] = str(response_path)
+        entry["responseBodyPresent"] = bool(response_bytes)
+        if response.status_code >= 400 and is_json_content_type(response_content_type):
+            body = json.loads(response_bytes)
+            entry.update(code=body.get("code"), retryable=body.get("retryable"))
     requests.append(entry)
 
 
@@ -66,6 +98,15 @@ with httpx.Client(event_hooks={"response": [observe]}) as http:
             read = sandbox.fs.read("/home/user/sdk/binary.bin")
             equal(read.content, binary, "Python binary round trip")
             equal([read.stat.kind, read.stat.size], ["file", 6], "Python binary stat")
+            arbitrary_bytes = bytes([0, 255, 10, 128, 1])
+            for extension in ("json", "txt"):
+                path = f"/home/user/sdk/arbitrary.{extension}"
+                sandbox.fs.write(path, arbitrary_bytes)
+                equal(
+                    sandbox.fs.read(path).content,
+                    arbitrary_bytes,
+                    f"Python arbitrary bytes with {extension} filename",
+                )
             sandbox.fs.write_files(
                 {"/home/user/sdk/a.txt": "A", "/home/user/sdk/b.txt": "B"}
             )

@@ -25,6 +25,8 @@ This command creates a unique Compose project with Postgres 16 and separate Redi
 
 The command ignores `.env` and inherited deployment settings. It fails if Docker is unavailable or integration tests skip. It removes only its own containers and volumes on exit. Evidence remains under the printed `scripts/verify/.run/<run-id>/` directory. Inspect `proof.json`, request logs, service logs, and `integration.json` there after a failure. Correct the cause before rerunning.
 
+For ownership, script completion, worker protocol, or tenant isolation changes, run `pnpm verify:architecture`. It adds the existing worker-failure, SSE-finalization, input-budget, and multi-tenant harnesses to the standard checks. CI runs this expanded profile and uploads its evidence. Both profiles build the TypeScript SDK before running live clients.
+
 For an interrupted host or a killed shell, list leftover projects with `docker compose ls`. Remove only the `sqlfs-verify-*` project named by your run. Do not reset a shared development database to repair a verification run.
 
 ## Start a development server

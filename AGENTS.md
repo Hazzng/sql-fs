@@ -10,9 +10,12 @@ Use Node 22 from `.node-version`, pnpm 10.30.3 from `package.json`, Python 3.12,
 pnpm setup:dev          # install all three packages from their lockfiles; install git hooks
 pnpm check          # types, formatting, unit tests, builds, and both SDKs; no services or .env needed
 pnpm verify:local   # isolated Postgres/Redis, HTTP/MCP contracts, integration tests, and both live SDKs
+pnpm verify:architecture # also worker failure, stream finalization, input budgets, and multi-tenant proofs
 ```
 
 `pnpm verify:local` uses random loopback ports and a unique Compose project, applies migrations through server startup, and removes only its own containers and volumes. It ignores `.env` and inherited deployment settings. It writes logs and JSON proof to `scripts/verify/.run/`. A missing Docker daemon or skipped integration test fails the command.
+
+`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI uses this expanded profile. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
@@ -32,6 +35,14 @@ Python type checking targets the oldest supported interpreter. `pnpm check:pytho
 | TypeScript SDK | `clients/typescript/src/` | `pnpm check:typescript`, live SDK verification |
 | Python SDK | `clients/python/src/sqlfs/` | `pnpm check:python`, live SDK verification |
 | SQL migrations | `src/sql-fs/migrations/postgres/`, `src/api/migrations.ts` | migrations and RLS integration tests |
+
+## Ownership and API contracts
+
+`pnpm check:architecture` checks production TypeScript imports and script-scope calls. Worker internals stay in `src/api/worker-owner/`; the checker lists the permitted named imports for session management, ingress, request context, and metrics. Mutable reservation state must not be imported by callers. Put completion policy in `src/sql-fs/script-scope.ts`; routes use the shared helper instead of calling begin/end/abort themselves. `src/execution/owner-cancellation.ts` holds the lease-loss context shared by execution and filesystem fencing.
+
+The boundary checker uses TypeScript symbols to follow named imports, re-exports, aliases, and literal dynamic imports. Its fixture tests must reject a forbidden import and duplicated completion policy. Tests of worker mechanics can still access their owner's internals. Nonliteral imports, CommonJS loaders, and direct reflective scope calls are rejected outside their owners. The checker catches source-level regressions; it is not a security sandbox or a whole-program dataflow analysis.
+
+Live contract and SDK verification validates observed `/v1` operations, status codes, media types, and JSON bodies against `/openapi.json`. Update `src/api/openapi-spec.ts` when changing an API contract. The schema checker does not replace the existing streaming, binary-content, retry, and persistence assertions. Unexercised operations and query/header parameter semantics require their own coverage.
 
 ## Invariants
 

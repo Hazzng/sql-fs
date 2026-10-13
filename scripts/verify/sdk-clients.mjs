@@ -1,21 +1,57 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { LocalApiRun, delay, repo, sha256 } from "./local-api.mjs";
+import { isJsonMediaType } from "./openapi-contract.mjs";
 
 const run = new LocalApiRun("sdk-clients");
 const ingestMiB = Number(process.env.SDK_VERIFY_INGEST_MIB ?? "16");
 assert.ok(Number.isSafeInteger(ingestMiB) && ingestMiB > 8 && ingestMiB <= 50, "SDK ingest size must be above 8 and at most 50 MiB");
 const observations = [];
+let openapiContract;
 const coverage = [];
 let failure;
+const schemaValidation = {
+	typescript: { exchanges: 0, requestSchemas: 0, responseSchemas: 0 },
+	python: { exchanges: 0, requestSchemas: 0, responseSchemas: 0 },
+};
 
 function observedFetch(sdk) {
 	return async (url, init) => {
 		const response = await fetch(url, init);
+		const requestHeaders = new Headers(init?.headers);
+		const requestContentType = requestHeaders.get("content-type");
+		const requestBodyPresent = init?.body !== undefined && init.body !== null;
+		const requestBody = response.status < 400 && isJsonMediaType(requestContentType) && typeof init?.body === "string"
+			? JSON.parse(init.body)
+			: init?.body;
+		const responseContentType = response.headers.get("content-type");
+		const responseSchema = openapiContract?.responseSchema(init?.method ?? "GET", new URL(url).pathname, response.status, responseContentType);
+		const responseBody = isJsonMediaType(responseContentType) && responseSchema?.format !== "binary"
+			? await response.clone().json()
+			: undefined;
+		const validation = openapiContract?.validateExchange({
+			method: init?.method ?? "GET",
+			path: new URL(url).pathname,
+			status: response.status,
+			requestContentType,
+			requestBody,
+			requestBodyPresent,
+			validateRequestSchema: response.status < 400,
+			responseContentType,
+			responseBody,
+			responseBodyPresent: response.body !== null,
+		});
+		if (validation) {
+			const counts = schemaValidation[sdk];
+			counts.exchanges += Number(validation.exchangeValidated);
+			counts.requestSchemas += Number(validation.requestSchemaValidated);
+			counts.responseSchemas += Number(validation.responseSchemaValidated);
+		}
 		const entry = {
 			sdk,
 			method: init?.method ?? "GET",
@@ -36,6 +72,15 @@ function observedFetch(sdk) {
 }
 
 async function python(server, owner, mode, extra = {}) {
+	const captureDir = mkdtempSync(join(tmpdir(), "sql-fs-sdk-capture-"));
+	try {
+		return await runPythonWithCapture(server, owner, mode, extra, captureDir);
+	} finally {
+		rmSync(captureDir, { recursive: true, force: true });
+	}
+}
+
+async function runPythonWithCapture(server, owner, mode, extra, captureDir) {
 	const child = spawn(process.env.VERIFY_PYTHON ?? "python3", [join(repo, "scripts/verify/sdk-python.py"), mode], {
 		cwd: repo,
 		env: {
@@ -45,6 +90,7 @@ async function python(server, owner, mode, extra = {}) {
 			SDK_VERIFY_SUB: owner.sub,
 			SDK_VERIFY_TOKEN: owner.token,
 			SDK_VERIFY_MARKER: run.runId,
+			SDK_VERIFY_CAPTURE_DIR: captureDir,
 			...extra,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
@@ -64,7 +110,45 @@ async function python(server, owner, mode, extra = {}) {
 	run.record({ phase: "python-sdk", mode, status, stderr });
 	assert.equal(status, 0, run.redact(stderr));
 	const proof = JSON.parse(stdout);
-	for (const request of proof.requests) run.record({ phase: "sdk-http-response", sdk: "python", ...request });
+	for (const request of proof.requests) {
+		const requestBody = request.requestBodyFile
+			? request.requestBodyFile.endsWith(".json")
+				? request.status < 400
+					? JSON.parse(readFileSync(request.requestBodyFile, "utf8"))
+					: undefined
+				: readFileSync(request.requestBodyFile)
+			: undefined;
+		const responseBodyBytes = request.responseBodyFile ? readFileSync(request.responseBodyFile) : Buffer.alloc(0);
+		const responseSchema = openapiContract?.responseSchema(
+			request.method, request.path, request.status, request.responseContentType,
+		);
+		let responseBody;
+		if (responseBodyBytes.length && isJsonMediaType(request.responseContentType) && responseSchema?.format !== "binary") {
+			responseBody = JSON.parse(responseBodyBytes.toString("utf8"));
+		} else if (responseBodyBytes.length && request.responseContentType?.toLowerCase().startsWith("text/") && request.responseContentType !== "text/event-stream") {
+			responseBody = responseBodyBytes;
+		}
+		const validation = openapiContract?.validateExchange({
+			...request,
+			requestBody,
+			requestBodyPresent: request.requestBodyPresent,
+			validateRequestSchema: request.status < 400,
+			responseBody,
+			responseBodyPresent: request.responseBodyPresent,
+		});
+		if (validation) {
+			const counts = schemaValidation.python;
+			counts.exchanges += Number(validation.exchangeValidated);
+			counts.requestSchemas += Number(validation.requestSchemaValidated);
+			counts.responseSchemas += Number(validation.responseSchemaValidated);
+		}
+		delete request.requestBodyFile;
+		delete request.responseBodyFile;
+		delete request.responseBodyPresent;
+		delete request.responseContentType;
+		delete request.requestContentType;
+		run.record({ phase: "sdk-http-response", sdk: "python", ...request });
+	}
 	run.checks.push(...proof.checks);
 	observations.push(...proof.requests.map((request) => ({ sdk: "python", ...request })));
 	if (proof.sandboxId) owner.sandboxes.add(proof.sandboxId);
@@ -115,6 +199,8 @@ try {
 		SDK_VERIFY_MARKER: run.runId,
 		NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=./scripts/verify/sdk-faults.mjs`.trim(),
 	});
+	const spec = (await run.request(server, null, "GET", "/openapi.json")).body;
+	openapiContract = new (await import("./openapi-contract.mjs")).OpenApiContract(spec);
 	const owner = await run.owner(undefined, `${run.runId}-typescript`);
 	const client = new Client({
 		baseUrl: server.base,
@@ -142,6 +228,16 @@ try {
 	const bytes = await sandbox.fs.read("/home/user/sdk/binary.bin");
 	run.equal([...bytes.content], [...binary], "TypeScript binary round trip");
 	run.equal([bytes.stat.kind, bytes.stat.size], ["file", 6], "TypeScript binary stat");
+	const arbitraryBytes = Uint8Array.from([0, 255, 10, 128, 1]);
+	for (const extension of ["json", "txt"]) {
+		const path = `/home/user/sdk/arbitrary.${extension}`;
+		await sandbox.fs.write(path, arbitraryBytes);
+		run.equal(
+			[...(await sandbox.fs.read(path)).content],
+			[...arbitraryBytes],
+			`TypeScript arbitrary bytes with ${extension} filename`,
+		);
+	}
 	await sandbox.fs.writeFiles({ "/home/user/sdk/a.txt": "A", "/home/user/sdk/b.txt": "B" });
 	await sandbox.ingestFiles({ "nested/ingested.txt": "ingested" }, { basePath: "/home/user/sdk" });
 	run.equal(await sandbox.fs.readText("/home/user/sdk/nested/ingested.txt"), "ingested", "TypeScript ingest persisted");
@@ -262,6 +358,8 @@ try {
 	owner.sandboxes.delete(streamUnknown.id);
 	run.equal(await client.sandboxes.list(), [], "TypeScript SDK lifecycle cleanup");
 	coverage.push("typescript-real-worker-death-no-replay-fresh-postgres", "typescript-readonly-script-death-no-replay");
+	run.equal(schemaValidation.typescript.requestSchemas > 0, true, "TypeScript SDK request schemas validated");
+	run.equal(schemaValidation.typescript.responseSchemas > 0, true, "TypeScript SDK response schemas validated");
 	const pythonOwner = await run.owner(undefined, `${run.runId}-python`);
 	await python(server, pythonOwner, "normal");
 	const pythonLarge = await python(server, pythonOwner, "large-ingest");
@@ -326,12 +424,16 @@ try {
 		"Verifier terminates exactly six actual workers",
 	);
 	run.equal(server.log.includes('"defense_in_depth_violation"'), false, "SDK API produces no defense violations");
+	run.equal(schemaValidation.python.requestSchemas > 0, true, "Python SDK request schemas validated");
+	run.equal(schemaValidation.python.responseSchemas > 0, true, "Python SDK response schemas validated");
 } catch (error) {
 	failure = error;
 } finally {
 	await run.finish(failure, {
 		coverage,
 		observations,
+		schemaValidation,
+		contractCoverageLimitations: ["Path/query/header parameters are not schema-validated by this verifier", "SSE event payloads retain existing behavior assertions and are not OpenAPI-schema-validated"],
 		faultInjection: "Verifier-only preload terminates actual worker after dispatch; no public fault route",
 		unknownDurability: "Fresh Postgres filesystem confirms killed buffered write was not committed",
 		compiledTypeScriptEntrySha256: existsSync(join(repo, "clients/typescript/dist/index.js"))

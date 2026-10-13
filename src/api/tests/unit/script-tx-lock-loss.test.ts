@@ -9,13 +9,13 @@
 
 import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { SessionScopedFs } from "../../../sql-fs/session-scoped-fs.js";
 import type { IScriptTxFs } from "../../../sql-fs/sql-fs.js";
 import { editFile, writeFileAtPath } from "../../lib/file-ops.js";
 import { runInScriptTx } from "../../lib/script-tx.js";
 import { sessionLeaseContext } from "../../session-lease-context.js";
 import type { Session } from "../../session-manager.js";
-import { ownerCancellation } from "../../worker-owner/cancellation.js";
 
 /**
  * Backing fs with the rollback `InMemoryFs` lacks: the scope snapshots on open and restores on

@@ -2,6 +2,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+profile=${1:-standard}
+if (( $# > 1 )) || [[ "$profile" != standard && "$profile" != architecture ]]; then
+	echo 'Usage: bash scripts/verify-local.sh [standard|architecture]' >&2
+	exit 2
+fi
+
 command -v docker >/dev/null
 if docker compose version >/dev/null 2>&1; then
 	compose_command=(docker compose)
@@ -41,6 +47,7 @@ verify_env=(env -i "PATH=$PATH" "HOME=$HOME"
 	"VERIFY_PYTHON=$PWD/clients/python/.venv/bin/python")
 
 pnpm build
+pnpm --dir clients/typescript build
 "${verify_env[@]}" node scripts/verify/contracts.mjs
 "${verify_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$evidence/integration.json"
 node --input-type=module - "$evidence/integration.json" <<'JS'
@@ -52,3 +59,9 @@ assert.equal(report.numFailedTests, 0, "Integration tests must pass");
 assert.equal(report.numPendingTests, 0, "Integration tests must not silently skip");
 JS
 "${verify_env[@]}" node scripts/verify/sdk-clients.mjs
+
+if [[ "$profile" == architecture ]]; then
+	for suite in worker-failures sse-finalization input-budgets tenants; do
+		"${verify_env[@]}" node "scripts/verify/$suite.mjs"
+	done
+fi

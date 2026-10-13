@@ -32,6 +32,8 @@ jobs:
 
       - run: pnpm lint
 
+      - run: pnpm check:architecture
+
       - name: Check verification scripts
         run: pnpm check:scripts
 
@@ -102,7 +104,7 @@ jobs:
   integration:
     name: Integration & API
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -115,7 +117,7 @@ jobs:
           python-version: "3.12"
       - run: pip install uv==0.9.18
       - run: pnpm setup:dev
-      - run: pnpm verify:local
+      - run: pnpm verify:architecture
       - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4

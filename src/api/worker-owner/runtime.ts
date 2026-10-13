@@ -1,5 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 import type { IFileSystem } from "just-bash";
+import { ownerCancellation } from "../../execution/owner-cancellation.js";
 import { loadRedisBlobCacheOptions } from "../../redis/blob-cache-options.js";
 import { closeRedisClient, getRedisClient } from "../../redis/client.js";
 import { createPostgresSandboxFs } from "../../sql-fs/index.js";
@@ -13,7 +14,6 @@ import {
 	createSessionRuntime,
 	executeSessionRuntime,
 } from "../session-runtime/engine.js";
-import { ownerCancellation } from "./cancellation.js";
 import { budgetWorkerReply } from "./message-budget.js";
 import type { WorkerPoolOptions } from "./pool.js";
 import {
