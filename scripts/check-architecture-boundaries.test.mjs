@@ -163,13 +163,15 @@ it("rejects dynamic module loaders, aliased require calls, and reflected scope c
 			"interface Scope { endScope(): Promise<void> }\nexport function finish(scope: Scope) { return Reflect.apply(scope.endScope, scope, []); }\n",
 		"src/api/parenthesized-scope.ts":
 			"interface Scope { beginScope(): Promise<void> }\nexport function start(scope: Scope) { return (scope.beginScope)(); }\n",
+		"src/api/parenthesized-alias.ts":
+			"interface Scope { beginScope(): Promise<void> }\nexport function start(scope: Scope) { const begin = (scope.beginScope); return begin(); }\n",
 		"src/api/worker-owner/loader.ts": "void import('node:module');\n",
 		"src/api/legitimate.ts": "void import('./helper.js');\n",
 		"src/api/helper.ts": "export const value = 1;\n",
 	});
 	const diagnostics = checkArchitectureBoundaries(root);
 	assert.equal(diagnostics.filter(({ code }) => code === "WORKER_INTERNAL_DYNAMIC_IMPORT").length, 3);
-	assert.equal(diagnostics.filter(({ code }) => code === "SCRIPT_SCOPE_COMPLETION_OWNER").length, 2);
+	assert.equal(diagnostics.filter(({ code }) => code === "SCRIPT_SCOPE_COMPLETION_OWNER").length, 3);
 	assert.ok(!diagnostics.some(({ file }) => file === "src/api/legitimate.ts"));
 	assert.ok(!diagnostics.some(({ file }) => file === "src/api/worker-owner/loader.ts"));
 });

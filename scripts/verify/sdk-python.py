@@ -35,6 +35,7 @@ def observe(response):
     request_content_type = response.request.headers.get("content-type")
     response_content_type = response.headers.get("content-type")
     entry["requestContentType"] = request_content_type
+    response_media_type = (response_content_type or "").split(";", 1)[0].strip().lower()
     entry["responseContentType"] = response_content_type
     entry["requestBodyPresent"] = (
         bool(response.request.content) or request_content_type is not None
@@ -65,9 +66,7 @@ def observe(response):
             int(os.environ["SDK_VERIFY_AUTH_FD"]), "w", encoding="utf-8", closefd=False
         ) as auth_pipe:
             auth_pipe.write(json.dumps(auth_exchange) + "\n")
-    elif (response_content_type or "").split(";", 1)[
-        0
-    ].strip().lower() == "text/event-stream":
+    elif response_media_type == "text/event-stream":
         entry["responseBodyPresent"] = True
     else:
         response.read()

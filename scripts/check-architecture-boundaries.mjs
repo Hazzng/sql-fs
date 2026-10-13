@@ -389,7 +389,7 @@ export function checkArchitectureBoundaries(root) {
 					}
 				}
 				if (ast.isVariableDeclaration(node) && ast.isIdentifier(node.name) && node.initializer !== undefined) {
-					const initializer = node.initializer;
+					const initializer = unwrapParentheses(node.initializer);
 					const operation = ast.isPropertyAccessExpression(initializer)
 						? initializer.name.text
 						: ast.isElementAccessExpression(initializer) && ast.isStringLiteral(initializer.argumentExpression)

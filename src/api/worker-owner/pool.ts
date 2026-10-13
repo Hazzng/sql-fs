@@ -525,7 +525,13 @@ export class WorkerOwnerPool {
 			result = await fn(signal);
 		} catch (error) {
 			if (signal?.aborted || workerFailureCode(error) === "ELOCKLOST") await this.leaseLostAfterWork(error);
-			throw current.outcome.runtimeFailure(error);
+			const failure = current.outcome.runtimeFailure(error);
+			if (workerFailureCode(error) === "ECOHERENCE" && failure !== error) {
+				try {
+					await this.recover(failure);
+				} catch {}
+			}
+			throw failure;
 		}
 		if (signal?.aborted) await this.leaseLostAfterWork();
 		return result;

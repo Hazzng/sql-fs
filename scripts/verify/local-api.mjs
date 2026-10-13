@@ -316,7 +316,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 				requestBodyPresent: json !== undefined || raw !== undefined,
 				validateRequestSchema,
 				responseContentType,
-				responseBody: body,
+				responseBody: bytes.length ? body : undefined,
 				responseBodyPresent: bytes.length > 0,
 			});
 			if (validation) {
@@ -327,7 +327,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 			if (status !== null) this.equal(response.status, status, `${method} ${path}: HTTP ${status}`);
 			return { status: response.status, ms: elapsed, body };
 		} catch (error) {
-			this.record({ phase: "openapi-validation-failed", method, path, status: response.status, error: error.message });
+			this.record({ phase: "request-validation-failed", method, path, status: response.status, error: error.message });
 			throw error;
 		}
 	}

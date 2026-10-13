@@ -85,7 +85,7 @@ test("retains failed contract exchanges in redacted requests.jsonl", async () =>
 			.map((line) => JSON.parse(line));
 		assert.equal(records[0].path, "/v1/example");
 		assert.equal(records[0].response.json.ok, "[REDACTED JWT]");
-		assert.equal(records[1].phase, "openapi-validation-failed");
+		assert.equal(records[1].phase, "request-validation-failed");
 		assert.equal(evidence.includes("eyJhbGci.fake.signature"), false);
 	} finally {
 		globalThis.fetch = originalFetch;
@@ -112,18 +112,66 @@ test("writes observed request and response schema counts into proof.json", async
 	}
 });
 
-
 test("retains evidence when response-schema lookup rejects an unknown operation", async () => {
 	const { run, cleanup } = harness();
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async () => new Response("not documented", { status: 404 });
 	try {
 		await assert.rejects(run.request({ base: "http://local", index: 0 }, null, "GET", "/v1/missing"), /no GET operation/);
-		const records = readFileSync(join(run.evidence, "requests.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const records = readFileSync(join(run.evidence, "requests.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
 		assert.equal(records[0].path, "/v1/missing");
 		assert.equal(records[0].status, 404);
 		assert.equal(records[0].response.text, "not documented");
-		assert.equal(records[1].phase, "openapi-validation-failed");
+		assert.equal(records[1].phase, "request-validation-failed");
+	} finally {
+		globalThis.fetch = originalFetch;
+		cleanup();
+	}
+});
+
+test("rejects empty JSON response bodies and retains wire evidence", async () => {
+	const { run, cleanup } = harness();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response(null, { headers: { "Content-Type": "application/json" } });
+	try {
+		await assert.rejects(
+			run.request({ base: "http://local", index: 0 }, null, "POST", "/v1/example", { json: { value: "valid" } }),
+			/JSON response body is missing/,
+		);
+		const records = readFileSync(join(run.evidence, "requests.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		assert.equal(records[0].response.bytes, 0);
+		assert.equal(records[1].phase, "request-validation-failed");
+	} finally {
+		globalThis.fetch = originalFetch;
+		cleanup();
+	}
+});
+
+test("labels unexpected documented statuses without blaming OpenAPI validation", async () => {
+	const { run, cleanup } = harness();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () =>
+		new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+	try {
+		await assert.rejects(
+			run.request({ base: "http://local", index: 0 }, null, "POST", "/v1/example", {
+				json: { value: "valid" },
+				status: 201,
+			}),
+			/HTTP 201/,
+		);
+		const records = readFileSync(join(run.evidence, "requests.jsonl"), "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		assert.equal(records[1].phase, "request-validation-failed");
+		assert.deepEqual(run.schemaValidation, { exchanges: 1, requestSchemas: 1, responseSchemas: 1 });
 	} finally {
 		globalThis.fetch = originalFetch;
 		cleanup();

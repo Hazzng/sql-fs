@@ -268,7 +268,7 @@ test("validates UTF-8 text request and response schemas and rejects invalid text
 	assert.throws(() => contract.validateExchange({ ...value, responseBody: Buffer.from("x") }), /response:/);
 	assert.throws(
 		() => contract.validateExchange({ ...value, responseBody: Buffer.from([0xff]) }),
-		/encoded data/,
+		/response: body is not valid UTF-8/,
 	);
 });
 

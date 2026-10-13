@@ -40,14 +40,19 @@ function matchingMedia(content, actualType) {
 
 function decodeText(value, label) {
 	if (typeof value === "string") return value;
-	if (Buffer.isBuffer(value)) return new TextDecoder("utf-8", { fatal: true }).decode(value);
+	let bytes;
 	if (ArrayBuffer.isView(value)) {
-		return new TextDecoder("utf-8", { fatal: true }).decode(
-			new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
-		);
+		bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+	} else if (value instanceof ArrayBuffer) {
+		bytes = new Uint8Array(value);
+	} else {
+		assert.fail(`${label}: text payload must be a UTF-8 string`);
 	}
-	if (value instanceof ArrayBuffer) return new TextDecoder("utf-8", { fatal: true }).decode(value);
-	assert.fail(`${label}: text payload must be a UTF-8 string`);
+	try {
+		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	} catch {
+		assert.fail(`${label}: body is not valid UTF-8`);
+	}
 }
 
 function pathPattern(path) {
