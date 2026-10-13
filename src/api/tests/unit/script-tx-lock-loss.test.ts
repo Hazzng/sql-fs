@@ -15,6 +15,7 @@ import { editFile, writeFileAtPath } from "../../lib/file-ops.js";
 import { runInScriptTx } from "../../lib/script-tx.js";
 import { sessionLeaseContext } from "../../session-lease-context.js";
 import type { Session } from "../../session-manager.js";
+import { ownerCancellation } from "../../worker-owner/cancellation.js";
 
 /**
  * Backing fs with the rollback `InMemoryFs` lacks: the scope snapshots on open and restores on
@@ -143,6 +144,34 @@ describe("runInScriptTx", () => {
 		const session = { fs: new InMemoryFs(), scriptTx: undefined } as unknown as Session;
 
 		await expect(runInScriptTx(session, async () => "written")).resolves.toBe("written");
+	});
+	it("rolls back when the dedicated worker owner lease is lost", async () => {
+		const { session, calls } = makeSession(false);
+		const words = new Int32Array(new SharedArrayBuffer(8));
+		Atomics.store(words, 1, 1);
+
+		await expect(
+			ownerCancellation.run(words, () => runInScriptTx(session, async () => "written")),
+		).rejects.toMatchObject({
+			code: "ELOCKLOST",
+		});
+		expect(calls).toEqual(["begin", "abort"]);
+	});
+
+	it("keeps the direct no-scope path when a lease signal is already aborted", async () => {
+		const lease = new AbortController();
+		lease.abort();
+		const session = { fs: new InMemoryFs(), scriptTx: undefined } as unknown as Session;
+
+		await expect(
+			sessionLeaseContext.run({ lostSignal: lease.signal }, () =>
+				runInScriptTx(session, async () => {
+					await session.fs.writeFile("/direct", "written");
+					return "returned";
+				}),
+			),
+		).resolves.toBe("returned");
+		expect(await session.fs.readFile("/direct")).toBe("written");
 	});
 });
 

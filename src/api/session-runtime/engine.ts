@@ -1,5 +1,6 @@
 import { Bash } from "just-bash";
 import type { BashExecResult, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
+import { type ScriptScope, runInScriptScope } from "../../sql-fs/script-scope.js";
 import { SessionScopedFs } from "../../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IScriptTxFs } from "../../sql-fs/sql-fs.js";
 import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "../commands/git-command.js";
@@ -9,22 +10,15 @@ import { type ExecContext, consumeExecInput, execContext } from "../exec-context
 import { logAudit } from "../lib/audit.js";
 import { MAX_EXEC_FILE_BYTES } from "../lib/env.js";
 import { posixNormalizePath } from "../lib/paths.js";
+import { assertScriptLeaseHeld } from "../lib/script-lease.js";
 import { readOnlyContext } from "../read-only-context.js";
 import { sessionLeaseSignal } from "../session-lease-context.js";
-import { ownerLeaseLost } from "../worker-owner/cancellation.js";
+export type { ScriptScope as SessionScriptScope } from "../../sql-fs/script-scope.js";
 
 export interface RuntimeOptions {
 	readonly python: boolean;
 	readonly javascript: boolean;
 	readonly network: boolean;
-}
-
-export interface SessionScriptScope {
-	readonly isActive: boolean;
-	beginScope(): void | Promise<void>;
-	endScope(): Promise<void>;
-	abortScope(): Promise<void>;
-	run<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface SessionRuntime {
@@ -33,7 +27,7 @@ export interface SessionRuntime {
 	readonly runtimeOptions: RuntimeOptions;
 	readonly tenantId: string;
 	readonly sandboxId: string;
-	readonly scriptTx: SessionScriptScope | undefined;
+	readonly scriptTx: ScriptScope | undefined;
 	readonly execInputLimitBytes?: number;
 	readonly execFileLimitBytes?: number | null;
 	cwd: string;
@@ -200,8 +194,6 @@ export async function executeSessionRuntime(
 	warnUnsupportedEnv(runtime, resolved.env);
 	const readOnly = readOnlyContext.getStore() !== undefined;
 	const scope = readOnly ? undefined : runtime.scriptTx;
-	const ownsScope = scope !== undefined && !scope.isActive;
-	if (ownsScope) await scope.beginScope();
 	const context: ExecContext = {
 		sandboxId: runtime.sandboxId,
 		maxFileBytes: runtime.execFileLimitBytes === undefined ? MAX_EXEC_FILE_BYTES : runtime.execFileLimitBytes,
@@ -209,27 +201,18 @@ export async function executeSessionRuntime(
 			? {}
 			: { inputLimitBytes: runtime.execInputLimitBytes, inputBytes: 0 }),
 	};
-	try {
+	const result = await runInScriptScope(scope, async () => {
 		consumeExecInput(context, Buffer.byteLength(resolved.stdin ?? "", "utf8"), "stdin");
 		const result = await execContext.run(context, () => runtime.bash.exec(script, resolved));
-		if (scope !== undefined && (sessionLeaseSignal()?.aborted === true || ownerLeaseLost())) {
-			throw new LockLostError("exec aborted: distributed exec lock lost mid-script");
-		}
+		if (scope !== undefined) assertScriptLeaseHeld("exec aborted: distributed exec lock lost mid-script");
 		if (context.exceeded !== undefined) throw context.exceeded;
-		if (ownsScope) await scope.endScope();
-		const cwd = result.env?.PWD;
-		if (!readOnly && typeof cwd === "string" && cwd.startsWith("/") && !cwd.includes("\0")) {
-			runtime.cwd = posixNormalizePath(cwd);
-		}
 		return result;
-	} catch (error) {
-		if (ownsScope) {
-			try {
-				await scope.abortScope();
-			} catch {}
-		}
-		throw error;
+	});
+	const cwd = result.env?.PWD;
+	if (!readOnly && typeof cwd === "string" && cwd.startsWith("/") && !cwd.includes("\0")) {
+		runtime.cwd = posixNormalizePath(cwd);
 	}
+	return result;
 }
 
 export async function closeSessionRuntime(runtime: SessionRuntime): Promise<void> {

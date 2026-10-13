@@ -154,4 +154,49 @@ describe("SessionScopedFs", () => {
 		await expect(ssf.run(async () => Promise.reject(new Error("boom")))).rejects.toThrow("boom");
 		expect(calls).toEqual(["begin"]);
 	});
+	it("preserves the body error when abort also fails", async () => {
+		const { inner } = makeStatefulInner();
+		const primary = new Error("body failed");
+		vi.spyOn(inner, "abortScriptScope").mockRejectedValue(new Error("abort failed"));
+		const scope = new SessionScopedFs(inner);
+
+		await expect(scope.run(async () => Promise.reject(primary))).rejects.toBe(primary);
+	});
+
+	it("preserves the commit error when abort also fails", async () => {
+		const { inner } = makeStatefulInner();
+		const primary = new Error("commit failed");
+		vi.spyOn(inner, "endScriptScope").mockRejectedValue(primary);
+		vi.spyOn(inner, "abortScriptScope").mockRejectedValue(new Error("abort failed"));
+		const scope = new SessionScopedFs(inner);
+
+		await expect(scope.run(async () => "done")).rejects.toBe(primary);
+	});
+
+	it("does not invoke the body or abort when begin throws", async () => {
+		const { inner } = makeStatefulInner();
+		const primary = new Error("begin failed");
+		vi.spyOn(inner, "beginScriptScope").mockImplementation(() => {
+			throw primary;
+		});
+		const scope = new SessionScopedFs(inner);
+		const body = vi.fn(async () => "unused");
+
+		await expect(scope.run(body)).rejects.toBe(primary);
+
+		expect(body).not.toHaveBeenCalled();
+		expect(inner.abortScriptScope).not.toHaveBeenCalled();
+		expect(scope.isActive).toBe(false);
+	});
+
+	it("commits a returned rejected outcome instead of leaving the scope open", async () => {
+		const { inner, calls } = makeStatefulInner();
+		const scope = new SessionScopedFs(inner);
+		const outcome = { kind: "rejected", reason: "no matching edit" };
+
+		await expect(scope.run(async () => outcome)).resolves.toBe(outcome);
+
+		expect(scope.isActive).toBe(false);
+		expect(calls).toEqual(["begin", "end"]);
+	});
 });

@@ -1,7 +1,7 @@
 import type { Redis } from "ioredis";
 import type { BashExecResult, ExecOptions, IFileSystem } from "just-bash";
 import { createEnoent } from "../sql-fs/errors.js";
-import { createPostgresSandboxFs, destroyPostgresSandbox, retirePostgresSandboxGeneration } from "../sql-fs/index.js";
+import { createPostgresSandboxFs, destroyPostgresSandbox } from "../sql-fs/index.js";
 import type { RedisBlobCache } from "../sql-fs/redis-blob-cache.js";
 import type { ScriptTxBufferConfig } from "../sql-fs/script-tx-buffer.js";
 import type { ICoherentFs, IReadOnlyScopeFs } from "../sql-fs/sql-fs.js";
@@ -9,7 +9,7 @@ import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import type { GitIdentity } from "./commands/git-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
-import { execFsError, extractErrCode, preservesAmbiguousOutcome } from "./errors.js";
+import { execFsError, extractErrCode } from "./errors.js";
 import { logAudit } from "./lib/audit.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
@@ -32,15 +32,8 @@ export type { RuntimeOptions, SessionScriptScope } from "./session-runtime/engin
 import type { TenantConfig } from "./tenants.js";
 import { WorkerFileSystem, WorkerScriptScope } from "./worker-owner/filesystem.js";
 import { assertWorkerMessageBudget } from "./worker-owner/message-budget.js";
-import {
-	WorkerOwnerPool,
-	type WorkerPoolOptions,
-	type WorkerReservation,
-	loadWorkerPoolOptions,
-	workerReservation,
-} from "./worker-owner/pool.js";
+import { WorkerOwnerPool, type WorkerPoolOptions, loadWorkerPoolOptions } from "./worker-owner/pool.js";
 import type { ShellExecutionLimits } from "./worker-owner/protocol.js";
-import { OutcomeUnknownError } from "./worker-owner/protocol.js";
 
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {
 	const partial = fs as Partial<ICoherentFs>;
@@ -240,10 +233,6 @@ export class SessionManager {
 	private readonly gitIdentity: GitIdentity | undefined;
 	private shuttingDown = false;
 	private readonly workerPool: WorkerOwnerPool | undefined;
-	private readonly workerRecoveries = new WeakMap<
-		WorkerReservation,
-		{ readonly generation: number; readonly task: Promise<void> }
-	>();
 	private readonly executionLimits: ShellExecutionLimits | undefined;
 	private readonly scriptTxBuffer: ScriptTxBufferConfig | undefined;
 	private readonly postgresPoolMax: number | undefined;
@@ -424,7 +413,7 @@ export class SessionManager {
 		openExisting = false,
 	): Promise<Session> {
 		assertValidSandboxId(sandboxId);
-		if (this.workerPool !== undefined && workerReservation.getStore() === undefined) {
+		if (this.workerPool !== undefined && !this.workerPool.hasReservation()) {
 			return this.workerPool.run(tenantId, this.sessionKey(tenantId, sandboxId), false, () =>
 				this.getOrCreate(tenantId, sandboxId, runtimeOptions, owner, openExisting),
 			);
@@ -636,62 +625,10 @@ export class SessionManager {
 			: this.workerPool.run(tenantId, this.sessionKey(tenantId, sandboxId), shared, fn);
 	}
 
-	private async recoverWorker(err: unknown): Promise<void> {
-		if (
-			this.workerPool === undefined ||
-			!["EEXEC_OUTCOME_UNKNOWN", "EWORKER_UNAVAILABLE"].includes((err as { code?: string } | null)?.code ?? "")
-		)
-			return;
-		const pool = this.workerPool;
-		const reservation = workerReservation.getStore();
-		if (reservation === undefined) return;
-		const previous = this.workerRecoveries.get(reservation);
-		if (previous?.generation === reservation.slot.generation) return previous.task;
-		const task = (async () => {
-			const identity = await pool.recover((err as { code?: string }).code === "EEXEC_OUTCOME_UNKNOWN");
-			if (identity !== undefined) {
-				await retirePostgresSandboxGeneration(identity.connectionString, identity.sandboxId);
-			}
-		})();
-		this.workerRecoveries.set(reservation, { generation: reservation.slot.generation, task });
-		await task;
-	}
-
-	private async lostWorkerOutcome(error?: unknown): Promise<void> {
-		const reservation = workerReservation.getStore();
-		if (
-			reservation === undefined ||
-			(!reservation.execDispatched && !reservation.committedFsWrite && !reservation.creatingAttachDispatched)
-		)
-			return;
-		const unknown = new OutcomeUnknownError();
-		try {
-			await this.recoverWorker(unknown);
-		} catch {}
-		throw preservesAmbiguousOutcome(error) ? error : unknown;
-	}
-
-	private async withWorkerLease<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
-		return sessionLeaseContext.run({ lostSignal: signal }, async () => {
-			const reservation = workerReservation.getStore();
-			if (reservation === undefined) return fn(signal);
-			reservation.lostSignal = signal;
-			let result: T;
-			try {
-				result = await fn(signal);
-			} catch (error) {
-				const code = (error as { code?: string } | null)?.code;
-				if (signal?.aborted || code === "ELOCKLOST") await this.lostWorkerOutcome(error);
-				if (code === "ERUNTIME_BUSY" && (reservation.execDispatched || reservation.committedFsWrite)) {
-					throw new OutcomeUnknownError(
-						"EEXEC_OUTCOME_UNKNOWN: an earlier operation in this request may have applied; do not replay the request",
-					);
-				}
-				throw error;
-			}
-			if (signal?.aborted) await this.lostWorkerOutcome();
-			return result;
-		});
+	private withWorkerLease<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+		return sessionLeaseContext.run({ lostSignal: signal }, () =>
+			this.workerPool === undefined ? fn(signal) : this.workerPool.withLease(signal, fn),
+		);
 	}
 
 	getSession(tenantId: string, sandboxId: string): Session | undefined {
@@ -704,14 +641,14 @@ export class SessionManager {
 		fn: (lostSignal?: AbortSignal) => Promise<T>,
 	): Promise<T> {
 		assertValidSandboxId(sandboxId);
-		if (this.workerPool !== undefined && workerReservation.getStore()?.key !== this.sessionKey(tenantId, sandboxId)) {
+		if (this.workerPool !== undefined && !this.workerPool.hasReservation(this.sessionKey(tenantId, sandboxId))) {
 			return this.withWorkerAdmission(tenantId, sandboxId, false, () =>
 				this.withExecLockExclusive(tenantId, sandboxId, fn),
 			);
 		}
 		if (this.redis === undefined) return this.withWorkerLease(fn);
 		const guarded = (signal: AbortSignal) => this.withWorkerLease(fn, signal);
-		const options = { ...this.execLockOptions, onLostAfterWork: () => this.lostWorkerOutcome() };
+		const options = { ...this.execLockOptions, onLostAfterWork: async () => this.workerPool?.leaseLostAfterWork() };
 		if (!this.rwlockEnabled) {
 			return withDistributedLock(this.redis, execLockKey(tenantId, sandboxId), guarded, options);
 		}
@@ -724,14 +661,14 @@ export class SessionManager {
 		fn: (lostSignal?: AbortSignal) => Promise<T>,
 	): Promise<T> {
 		assertValidSandboxId(sandboxId);
-		if (this.workerPool !== undefined && workerReservation.getStore()?.key !== this.sessionKey(tenantId, sandboxId)) {
+		if (this.workerPool !== undefined && !this.workerPool.hasReservation(this.sessionKey(tenantId, sandboxId))) {
 			return this.withWorkerAdmission(tenantId, sandboxId, true, () =>
 				this.withExecLockShared(tenantId, sandboxId, fn),
 			);
 		}
 		if (this.redis === undefined) return this.withWorkerLease(fn);
 		const guarded = (signal: AbortSignal) => this.withWorkerLease(fn, signal);
-		const options = { ...this.execLockOptions, onLostAfterWork: () => this.lostWorkerOutcome() };
+		const options = { ...this.execLockOptions, onLostAfterWork: async () => this.workerPool?.leaseLostAfterWork() };
 		// Flag-off (rolling deploy): the distributed RW lock keyspace is disabled,
 		// so readers fall back to the SAME legacy single-key SET-NX lock that
 		// flag-off writers take (`withExecLockExclusive`). This serializes reads
@@ -773,11 +710,7 @@ export class SessionManager {
 				let result: T | undefined;
 				try {
 					await this.attachWorker(session);
-					const reservation = workerReservation.getStore();
-					if (reservation !== undefined) {
-						reservation.lostSignal = lostSignal;
-						reservation.phase = "running";
-					}
+					this.workerPool?.markRunning(lostSignal);
 					await this.ensureFreshCache(tenantId, sandboxId, session);
 					result = await fn(session);
 					if (asCoherentFs(session.fs)?.poisoned()) {
@@ -790,7 +723,7 @@ export class SessionManager {
 					primaryError = error;
 					failed = true;
 					try {
-						await this.recoverWorker(error);
+						await this.workerPool?.recover(error);
 					} catch {}
 				}
 				try {
@@ -803,7 +736,7 @@ export class SessionManager {
 				} catch (error) {
 					if (!failed) {
 						try {
-							await this.recoverWorker(error);
+							await this.workerPool?.recover(error);
 						} catch {}
 						primaryError = error;
 						failed = true;
@@ -851,11 +784,7 @@ export class SessionManager {
 				session.lastUsed = Date.now();
 				try {
 					await this.attachWorker(session);
-					const reservation = workerReservation.getStore();
-					if (reservation !== undefined) {
-						reservation.lostSignal = lostSignal;
-						reservation.phase = "running";
-					}
+					this.workerPool?.markRunning(lostSignal);
 					await this.ensureFreshCache(tenantId, sandboxId, session);
 				} catch (error) {
 					session.inFlight--;
@@ -876,7 +805,7 @@ export class SessionManager {
 						result = await readOnlyContext.run(ctx, () => fn(session));
 					} catch (err) {
 						try {
-							await this.recoverWorker(err);
+							await this.workerPool?.recover(err);
 						} catch {}
 						const errCode = (err as Error & { code?: string }).code;
 						// Audit the violation even when an unrelated error (e.g. AbortError
@@ -1361,7 +1290,7 @@ export class SessionManager {
 			const fs = session.fs;
 			return this.withRuntimeSlots(session, opts?.signal, async () => {
 				const { signal, ...options } = opts ?? {};
-				const result = await pool.send<BashExecResult>(
+				const result = await pool.send(
 					{ kind: "exec", script, options: { ...options, cwd: options.cwd ?? session.cwd } },
 					signal,
 				);

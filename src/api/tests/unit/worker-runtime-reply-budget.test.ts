@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { MessageChannel, Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionScriptScope } from "../../session-runtime/engine.js";
 import { assertWorkerMessageBudget } from "../../worker-owner/message-budget.js";
 import { mayApply } from "../../worker-owner/protocol.js";
 import type { OwnerCommand, OwnerReply, OwnerRequest } from "../../worker-owner/protocol.js";
@@ -18,13 +19,14 @@ afterEach(() => {
 	vi.doUnmock("../../../sql-fs/index.js");
 });
 
-async function runtimeFixture(maxBytes = 1024) {
+async function runtimeFixture(maxBytes = 1024, scriptTx?: SessionScriptScope) {
 	const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
 	const channel = new MessageChannel();
 	channels.push(channel);
 	let receive!: (request: OwnerRequest) => void;
 	let writes = 0;
 	const runtime = {
+		scriptTx,
 		cwd: "/home/user",
 		fs: {
 			getAllPaths: () => [],
@@ -61,9 +63,9 @@ async function runtimeFixture(maxBytes = 1024) {
 	await import("../../worker-owner/runtime.js");
 	await ready;
 	let sequence = 0;
-	async function send(command: OwnerCommand): Promise<OwnerReply> {
+	async function send(command: OwnerCommand, cancellation = new SharedArrayBuffer(8)): Promise<OwnerReply> {
 		const reply = new Promise<OwnerReply>((resolve) => channel.port2.once("message", resolve));
-		receive({ id: ++sequence, generation: 1, command, readOnly: false, cancellation: new SharedArrayBuffer(8) });
+		receive({ id: ++sequence, generation: 1, command, readOnly: false, cancellation });
 		return reply;
 	}
 	await send({
@@ -130,6 +132,71 @@ describe("worker runtime reply budgets", () => {
 		expect(() => assertWorkerMessageBudget(reply, 1024)).not.toThrow();
 		expect(fixture.exit).not.toHaveBeenCalled();
 	});
+	it("preserves the explicit scope completion error when abort also fails", async () => {
+		const fixture = await runtimeFixture();
+		fixture.runtime.scriptTx = {
+			isActive: true,
+			beginScope: () => {},
+			endScope: async () => {
+				throw Object.assign(new Error("commit failed"), { code: "ECOMMIT" });
+			},
+			abortScope: async () => {
+				throw Object.assign(new Error("abort failed"), { code: "EABORT" });
+			},
+			run: (fn) => fn(),
+		};
+
+		const reply = await fixture.send({ kind: "endScope" });
+		expect(reply).toMatchObject({ ok: false, error: { code: "ECOMMIT", message: "commit failed" } });
+	});
+
+	it("physically completes an already-active resident scope", async () => {
+		let active = true;
+		const fixture = await runtimeFixture();
+		fixture.runtime.scriptTx = {
+			get isActive() {
+				return active;
+			},
+			beginScope: () => {},
+			endScope: async () => {
+				active = false;
+			},
+			abortScope: async () => {},
+			run: (fn) => fn(),
+		};
+
+		expect(await fixture.send({ kind: "endScope" })).toMatchObject({ ok: true });
+		expect(active).toBe(false);
+	});
+
+	it("preserves lease loss before explicit completion when abort also fails", async () => {
+		const fixture = await runtimeFixture();
+		const end = vi.fn(async () => {});
+		fixture.runtime.scriptTx = {
+			isActive: true,
+			beginScope: () => {},
+			endScope: end,
+			abortScope: async () => {
+				throw new Error("abort failed");
+			},
+			run: (fn) => fn(),
+		};
+		const cancellation = new SharedArrayBuffer(8);
+		Atomics.store(new Int32Array(cancellation), 1, 1);
+
+		const reply = await fixture.send({ kind: "endScope" }, cancellation);
+
+		expect(reply).toMatchObject({
+			ok: false,
+			error: {
+				code: "ELOCKLOST",
+				message:
+					"ELOCKLOST: lock worker owner lease lost was lost during operation (lease expired or heartbeat failed)",
+			},
+		});
+		expect(end).not.toHaveBeenCalled();
+	});
+
 	it("retires a native worker when even a minimal failure cannot fit", async () => {
 		const worker = new Worker(
 			'const { workerData } = require("node:worker_threads"); import("tsx/esm/api").then(({ register }) => { register(); return import(workerData.runtime); });',
