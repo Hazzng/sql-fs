@@ -23,6 +23,10 @@ sql-fs gives AI agents isolated bash sandboxes without a VM for each one. [just-
 - **Deduplicated.** Postgres stores each file's content once, keyed by SHA-256, across all sandboxes.
 - **Scales out.** Replicas keep no state. A Redis lock lets one replica write a sandbox at a time, and readers run in parallel.
 
+## Development and agent setup
+
+Read [AGENTS.md](AGENTS.md) for implementation instructions and [CONTRIBUTING.md](CONTRIBUTING.md) for setup. Run `pnpm setup:dev`, then `pnpm check` for all credential-free checks and `pnpm verify:local` for disposable database and API verification.
+
 ## Run it locally
 
 1. Start Postgres and Redis:
@@ -113,8 +117,7 @@ Most deployments need only these settings. [CONFIGURATION.md](CONFIGURATION.md) 
 
 | Variable | Description |
 |---|---|
-| `FS_BACKEND` | `postgres` or `memory`. Required. |
-| `DATABASE_URL` | Postgres connection string. Required for `postgres`, unless `TENANT_DATABASES` maps one database per tenant. |
+| `DATABASE_URL` | Postgres connection string. Required unless `TENANT_DATABASES` maps one database per tenant. |
 | `AUTH_SECRET` | Signs and verifies bearer JWTs. Required. |
 | `REDIS_URL` | Redis for distributed locks. Required for more than one replica. |
 | `REDIS_DATA_URL` | Redis for the blob cache, on its own connection. Defaults to `REDIS_URL`. Needs `maxmemory-policy allkeys-lru` or `allkeys-lfu`. |
@@ -125,7 +128,7 @@ Most deployments need only these settings. [CONFIGURATION.md](CONFIGURATION.md) 
 ```bash
 docker build -t sql-fs-api .
 docker run -p 8080:8080 \
-	-e FS_BACKEND=postgres -e DATABASE_URL=postgres://... -e AUTH_SECRET=... \
+	-e DATABASE_URL=postgres://... -e AUTH_SECRET=... \
 	sql-fs-api
 ```
 
@@ -139,7 +142,7 @@ pnpm typecheck          # tsc --noEmit
 pnpm lint:fix           # Biome format and lint
 pnpm test:unit          # no database needed
 pnpm test:integration   # needs DATABASE_URL and REDIS_URL
-pnpm db:generate        # new migration from schema changes, applied at the next boot
+pnpm verify:local       # disposable services, integration tests, HTTP/MCP and SDK checks
 pnpm db:gc              # delete orphaned blobs
 pnpm changeset          # record a change for the next release
 ```

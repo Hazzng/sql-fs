@@ -39,7 +39,7 @@ jobs:
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --ignore-workspace --frozen-lockfile
 
       - name: Test
         run: pnpm test
@@ -168,7 +168,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --ignore-workspace --frozen-lockfile
 
       - name: Build
         run: pnpm build

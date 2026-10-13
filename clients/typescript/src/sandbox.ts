@@ -309,7 +309,7 @@ function parseStatHeader(raw: string | null): FileStat | undefined {
 	try {
 		const value = JSON.parse(raw) as unknown;
 		return isRecord(value) ? fileStatFromApi(value) : undefined;
-	} catch (_error) {
+	} catch {
 		return undefined;
 	}
 }

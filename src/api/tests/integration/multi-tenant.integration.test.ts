@@ -12,7 +12,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { Redis } from "ioredis";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
 import { apiErrorHandler } from "../../errors.js";
 import { signToken } from "../../lib/jwt.js";
@@ -152,18 +152,33 @@ describe.skipIf(SKIP)("Phase 5 — multi-tenant Postgres routing", () => {
 		if (!redis) throw new Error("Redis client not initialized");
 		const { sessionManager } = makeApp(multiTenantConfig, redis);
 		const sandboxId = `phase5-shared-${randomUUID()}`;
-		const holdMs = 300;
-		const started = Date.now();
-		await Promise.all([
-			sessionManager.withSession(TENANT_A, sandboxId, async (session) => {
-				await session.bash.exec(`sleep ${holdMs / 1000} && echo A > /home/user/a.txt`);
-			}),
-			sessionManager.withSession(TENANT_B, sandboxId, async (session) => {
-				await session.bash.exec(`sleep ${holdMs / 1000} && echo B > /home/user/b.txt`);
-			}),
-		]);
-		expect(Date.now() - started).toBeLessThan(holdMs + 250);
-		await Promise.all([sessionManager.destroy(TENANT_A, sandboxId), sessionManager.destroy(TENANT_B, sandboxId)]);
+		const entered = new Set<string>();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const settled = Promise.allSettled(
+			[TENANT_A, TENANT_B].map((tenant) =>
+				sessionManager.withSession(tenant, sandboxId, async (session) => {
+					entered.add(tenant);
+					await gate;
+					const result = await session.bash.exec("echo independent > /home/user/value; cat /home/user/value");
+					return { stdout: result.stdout, exitCode: result.exitCode };
+				}),
+			),
+		);
+		try {
+			await vi.waitFor(() => expect(entered).toEqual(new Set([TENANT_A, TENANT_B])), { timeout: 10000 });
+			release();
+			expect(await settled).toEqual([
+				{ status: "fulfilled", value: { stdout: "independent\n", exitCode: 0 } },
+				{ status: "fulfilled", value: { stdout: "independent\n", exitCode: 0 } },
+			]);
+		} finally {
+			release();
+			await settled;
+			await Promise.all([sessionManager.destroy(TENANT_A, sandboxId), sessionManager.destroy(TENANT_B, sandboxId)]);
+		}
 	});
 
 	it("isolates create, exec, ingest, export, unknown tenant handling, and destroy across tenants", async () => {

@@ -168,7 +168,7 @@ describe("POST /v1/sandboxes/:id/exec-sync client disconnect", () => {
 					abandonExec = () => reject(new DOMException("The operation was aborted", "AbortError"));
 					opts?.signal?.addEventListener("abort", abandonExec, { once: true });
 					// The script commits half its work, then hangs past the disconnect.
-					fs.writeFile("/committed.txt", "half-done").then(execStarted);
+					void fs.writeFile("/committed.txt", "half-done").then(execStarted, reject);
 				}),
 		);
 

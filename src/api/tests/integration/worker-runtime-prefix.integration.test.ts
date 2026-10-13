@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { createServer } from "node:http";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";
@@ -75,11 +75,16 @@ describe.skipIf(!process.env.DATABASE_URL)("worker runtime backpressure after a 
 			const id = await create(owner, { python: true, javascript: false, network: readonly });
 			const competitorId = await create(owner, { python: true, javascript: false, network: false });
 			const requests: { method?: string; body: string }[] = [];
-			const server = createServer(async (request, response) => {
+			const respond = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
 				let body = "";
 				for await (const chunk of request) body += chunk.toString();
 				requests.push({ method: request.method, body });
 				response.end("applied");
+			};
+			const server = createServer((request, response) => {
+				void respond(request, response).catch((error: unknown) => {
+					response.destroy(error instanceof Error ? error : new Error("HTTP proof handler failed"));
+				});
 			});
 			server.listen(0, "127.0.0.1");
 			await once(server, "listening");

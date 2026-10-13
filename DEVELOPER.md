@@ -2,7 +2,7 @@
 
 This guide explains how a request moves through sql-fs, how the caches and locks keep it correct, and what sql-fs does not guarantee. Read it before you change `session-manager.ts`, `sql-fs.ts` or dialect code.
 
-Commands and coding standards are in [CLAUDE.md](CLAUDE.md). Environment variables are in [CONFIGURATION.md](CONFIGURATION.md). The reproductions for the distributed, memory and durability issues #164-#175 are in `thoughts/shared/research/2026-09-18_prod-readiness-harness.md`. Most of those failures are out of reach of a unit test or a single replica.
+Commands and coding standards are in [AGENTS.md](AGENTS.md). Environment variables are in [CONFIGURATION.md](CONFIGURATION.md). The reproductions for the distributed, memory and durability issues #164-#175 are in `thoughts/shared/research/2026-09-18_prod-readiness-harness.md`. Most of those failures are out of reach of a unit test or a single replica.
 
 ## Postgres is the source of truth
 
@@ -137,12 +137,16 @@ sql-fs measures freshness when it admits a request. After a lost lease, a script
 
 A write exec runs its script inside a script scope. If the script creates five files and then fails, none of the five persist. `SCRIPT_TX_BUFFERED` picks one of two implementations:
 
-- **Buffered** is the default (`SCRIPT_TX_BUFFERED=true`, #166). Each mutation updates the caches and appends to an in-memory journal. `endScriptScope` replays the journal in one short transaction that holds the advisory lock. `commitBlob` still writes file bytes immediately. CLAUDE.md covers the rest under "Caching strategy": the caches running ahead of the database, placeholder inode ids, buffer caps, and errors at commit time.
+- **Buffered** is the default (`SCRIPT_TX_BUFFERED=true`, #166). Each mutation updates the caches and appends to an in-memory journal. `endScriptScope` replays the journal in one short transaction that holds the advisory lock. `commitBlob` still writes file bytes immediately. The cache can lead the database until scope finalization. `src/sql-fs/script-tx-buffer.ts` implements the journal and buffer limits; failed flushes must reload committed state or poison the cache.
 - **Legacy** is `SCRIPT_TX_BUFFERED=false`. The first write opens a transaction that stays open until the script ends. That transaction holds a pooled connection for the whole script, and long scripts can exhaust a transaction pooler. That cost is why legacy is no longer the default.
 
 On error, `abortScriptScope` discards the journal or rolls back the transaction, and then reloads committed state. If the reload fails, `SqlFs` marks the cache poisoned, and the next `ensureFresh()` reloads it.
 
 The session runtime opens a script scope only if the filesystem implements `IScriptTxFs`. `SqlFs` implements it. The `InMemoryFs` used in tests does not, so those execs run without a scope.
+
+## Ownership checks
+
+`pnpm check:architecture` enforces the worker module's named adapter imports and the script-scope completion owner. The allowed imports live in `scripts/check-architecture-boundaries.mjs`, with fixture tests beside the checker. Add a new adapter only when it has a real external responsibility; keep dispatch history, reservation state, and outcome classification inside worker ownership. The shared lease-loss context lives in `src/execution/owner-cancellation.ts` so filesystem fencing does not import worker internals.
 
 ## Worker owners run scripts off the main thread
 

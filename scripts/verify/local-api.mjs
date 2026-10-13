@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { containerResources, startApiContainer, stopApiContainer } from "./container-api.mjs";
+import { isJsonMediaType, OpenApiContract } from "./openapi-contract.mjs";
 
 export const repo = fileURLToPath(new URL("../../", import.meta.url));
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,6 +55,7 @@ export class LocalApiRun {
 		this.artifacts = [];
 		this.owners = [];
 		this.checks = [];
+		this.schemaValidation = { exchanges: 0, requestSchemas: 0, responseSchemas: 0 };
 		this.cleanup = [];
 		this.clients = [];
 		this.secrets = [
@@ -68,7 +70,7 @@ export class LocalApiRun {
 		]
 			.map((name) => process.env[name])
 			.filter(Boolean);
-		for (const value of [...this.secrets]) {
+		for (const value of this.secrets.slice()) {
 			try {
 				const password = decodeURIComponent(new URL(value).password);
 				if (password) this.secrets.push(password);
@@ -245,14 +247,19 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 		return owner;
 	}
 
+	enableOpenApiValidation(spec) {
+		this.openapiContract = new OpenApiContract(spec);
+	}
+
 	async request(
 		server,
 		owner,
 		method,
 		path,
-		{ json, raw, status = 200, timeoutMs = 180000, signal, headers = {} } = {},
+		{ json, raw, status = 200, timeoutMs = 180000, signal, headers = {}, validateRequestSchema = true } = {},
 	) {
 		const started = performance.now();
+		const requestBody = json !== undefined ? JSON.stringify(json) : raw;
 		const response = await fetch(server.base + path, {
 			method,
 			headers: {
@@ -261,7 +268,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 				...(raw !== undefined && { "Content-Type": "application/octet-stream" }),
 				...headers,
 			},
-			body: json !== undefined ? JSON.stringify(json) : raw,
+			...(requestBody !== undefined && { body: requestBody }),
 			signal: AbortSignal.any([
 				AbortSignal.timeout(timeoutMs),
 				...(this.cleaning ? [] : [this.interrupted.signal]),
@@ -269,25 +276,60 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 			]),
 		});
 		const bytes = Buffer.from(await response.arrayBuffer());
-		const body =
-			response.headers.get("content-type")?.includes("application/json") && bytes.length ? JSON.parse(bytes) : bytes;
-		const result = { status: response.status, ms: performance.now() - started, body };
+		const responseContentType = response.headers.get("content-type");
 		const describe = (value) =>
 			Buffer.isBuffer(value)
 				? { bytes: value.length, sha256: sha256(value), ...(value.length < 4096 && { text: value.toString() }) }
 				: value;
+		const wireResponse = { bytes: bytes.length, sha256: sha256(bytes) };
+		if (bytes.length < 4096) {
+			if (isJsonMediaType(responseContentType)) {
+				try {
+					wireResponse.json = JSON.parse(bytes);
+				} catch {
+					wireResponse.text = bytes.toString();
+				}
+			} else wireResponse.text = bytes.toString();
+		}
+		const elapsed = performance.now() - started;
 		this.record({
 			server: server.index,
 			owner: owner?.sub,
 			method,
 			path,
 			status: response.status,
-			ms: result.ms,
+			ms: elapsed,
 			request: describe(json ?? raw ?? null),
-			response: describe(body),
+			response: wireResponse,
 		});
-		if (status !== null) this.equal(response.status, status, `${method} ${path}: HTTP ${status}`);
-		return result;
+		try {
+			const responseSchema = this.openapiContract?.responseSchema(method, path, response.status, responseContentType);
+			const body = isJsonMediaType(responseContentType) && bytes.length && responseSchema?.format !== "binary"
+				? JSON.parse(bytes)
+				: bytes;
+			const validation = this.openapiContract?.validateExchange({
+				method,
+				path,
+				status: response.status,
+				requestContentType: headers["Content-Type"] ?? headers["content-type"] ?? (json !== undefined ? "application/json" : raw !== undefined ? "application/octet-stream" : undefined),
+				requestBody: json !== undefined ? json : raw,
+				requestBodyPresent: json !== undefined || raw !== undefined,
+				validateRequestSchema,
+				responseContentType,
+				responseBody: bytes.length ? body : undefined,
+				responseBodyPresent: bytes.length > 0,
+			});
+			if (validation) {
+				this.schemaValidation.exchanges += Number(validation.exchangeValidated);
+				this.schemaValidation.requestSchemas += Number(validation.requestSchemaValidated);
+				this.schemaValidation.responseSchemas += Number(validation.responseSchemaValidated);
+			}
+			if (status !== null) this.equal(response.status, status, `${method} ${path}: HTTP ${status}`);
+			return { status: response.status, ms: elapsed, body };
+		} catch (error) {
+			this.record({ phase: "request-validation-failed", method, path, status: response.status, error: error.message });
+			throw error;
+		}
 	}
 
 	async create(server, owner, options = {}) {
@@ -370,6 +412,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 			cleanup: this.cleanup,
 			ownedServersStopped: this.servers.every(({ child }) => child.exitCode !== null || child.signalCode !== null),
 			...detail,
+			schemaValidation: { ...this.schemaValidation, ...detail.schemaValidation },
 			...(error && { error: error.stack }),
 		};
 		writeFileSync(join(this.evidence, "proof.json"), `${JSON.stringify(this.redact(proof), null, 2)}\n`);

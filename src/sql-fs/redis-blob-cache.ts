@@ -178,11 +178,10 @@ export class RedisBlobCache {
 		// Redis to assemble the entire response array before returning, spiking
 		// memory on both client and server.
 		const CHUNK = 1024;
-		const out: Array<Uint8Array | null> = new Array(sha256s.length);
+		const out: Array<Uint8Array | null> = [];
+		out.length = sha256s.length;
 		try {
-			const mgetBuffer = (
-				this.#client as unknown as { mgetBuffer(...keys: string[]): Promise<Array<Buffer | null>> }
-			).mgetBuffer.bind(this.#client);
+			const mgetBuffer = this.#client.mgetBuffer.bind(this.#client);
 			for (let i = 0; i < sha256s.length; i += CHUNK) {
 				const slice = sha256s.slice(i, i + CHUNK);
 				const keys = slice.map((s) => this.#key(s));

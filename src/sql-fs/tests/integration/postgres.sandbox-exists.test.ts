@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { PostgresDialect } from "../../postgres.js";
+import { PostgresDialect } from "../../dialects/postgres.js";
 
 const DB_URL = process.env.DATABASE_URL;
 

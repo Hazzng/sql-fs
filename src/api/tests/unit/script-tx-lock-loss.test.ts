@@ -9,6 +9,7 @@
 
 import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { SessionScopedFs } from "../../../sql-fs/session-scoped-fs.js";
 import type { IScriptTxFs } from "../../../sql-fs/sql-fs.js";
 import { editFile, writeFileAtPath } from "../../lib/file-ops.js";
@@ -143,6 +144,35 @@ describe("runInScriptTx", () => {
 		const session = { fs: new InMemoryFs(), scriptTx: undefined } as unknown as Session;
 
 		await expect(runInScriptTx(session, async () => "written")).resolves.toBe("written");
+	});
+
+	it("rolls back when the dedicated worker owner lease is lost", async () => {
+		const { session, calls } = makeSession(false);
+		const words = new Int32Array(new SharedArrayBuffer(8));
+		Atomics.store(words, 1, 1);
+
+		await expect(
+			ownerCancellation.run(words, () => runInScriptTx(session, async () => "written")),
+		).rejects.toMatchObject({
+			code: "ELOCKLOST",
+		});
+		expect(calls).toEqual(["begin", "abort"]);
+	});
+
+	it("keeps the direct no-scope path when a lease signal is already aborted", async () => {
+		const lease = new AbortController();
+		lease.abort();
+		const session = { fs: new InMemoryFs(), scriptTx: undefined } as unknown as Session;
+
+		await expect(
+			sessionLeaseContext.run({ lostSignal: lease.signal }, () =>
+				runInScriptTx(session, async () => {
+					await session.fs.writeFile("/direct", "written");
+					return "returned";
+				}),
+			),
+		).resolves.toBe("returned");
+		expect(await session.fs.readFile("/direct")).toBe("written");
 	});
 });
 

@@ -28,6 +28,7 @@ try {
 	}
 	const spec = (await run.request(server, null, "GET", "/openapi.json")).body;
 	run.equal(spec.info.title, "SQL-FS API", "OpenAPI identity");
+	run.enableOpenApiValidation(spec);
 	run.equal(
 		spec.info.version,
 		JSON.parse(readFileSync(join(repo, "package.json"))).version,
@@ -38,6 +39,7 @@ try {
 		headers: { "X-Auth-Secret": "incorrect-verification-secret" },
 		json: { sub: owner.sub },
 		status: 403,
+		validateRequestSchema: false,
 	});
 	const authenticated = await run.request(server, null, "POST", "/v1/auth/bootstrap", {
 		headers: { "X-Auth-Secret": process.env.AUTH_SECRET },
@@ -54,7 +56,7 @@ try {
 		"Creation persists seed bytes",
 	);
 	const outsider = await run.owner();
-	await run.request(server, outsider, "GET", sandbox.path, { status: 403 });
+	await run.request(server, outsider, "GET", sandbox.path, { status: 403, validateRequestSchema: false });
 	coverage.push("sandbox-lifecycle");
 
 	const first = await exec(sandbox, 'printf "execution-proof\\n" > /home/user/proof.txt; cat /home/user/proof.txt');

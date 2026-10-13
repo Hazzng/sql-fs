@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readFileSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
+import { retirePostgresSandboxGeneration } from "../../sql-fs/index.js";
 import type { ScriptTxBufferConfig } from "../../sql-fs/script-tx-buffer.js";
 import { positiveIntEnv } from "../lib/env.js";
 import { readOnlyContext } from "../read-only-context.js";
@@ -10,15 +11,18 @@ import { assertWorkerMessageBudget } from "./message-budget.js";
 import {
 	OutcomeUnknownError,
 	type OwnerCommand,
+	type OwnerCommandKind,
 	type OwnerEvent,
 	type OwnerIdentity,
 	type OwnerMetadata,
 	type OwnerReply,
 	type OwnerRequest,
+	type OwnerResult,
 	type ShellExecutionLimits,
 	mayApply,
 } from "./protocol.js";
 import { workerRequestContext } from "./request-context.js";
+import { RequestOutcome, workerFailureCode } from "./request-outcome.js";
 
 export interface WorkerPoolOptions {
 	readonly count: number;
@@ -239,9 +243,9 @@ class OwnerThread {
 		return this.initialized && !this.dead;
 	}
 
-	async request(
+	async request<K extends OwnerCommandKind>(
 		generation: number,
-		command: OwnerCommand,
+		command: OwnerCommand<K>,
 		readOnly: boolean,
 		lostSignal?: AbortSignal,
 		signal?: AbortSignal,
@@ -274,7 +278,7 @@ class OwnerThread {
 					reject,
 					safeToRetry: !mayApply(command),
 				});
-				const request: OwnerRequest = { id, generation, command, readOnly, cancellation };
+				const request: OwnerRequest<K> = { id, generation, command, readOnly, cancellation };
 				try {
 					this.worker.postMessage(request);
 					onDispatch?.();
@@ -329,22 +333,18 @@ interface WorkerSlot {
 	retiring?: boolean;
 }
 
-export interface WorkerReservation {
+interface WorkerReservation {
 	readonly key: string;
 	readonly slot: WorkerSlot;
 	lostSignal?: AbortSignal;
 	identity?: OwnerIdentity;
 	phase: "lock_wait" | "running" | "recovering";
-	mayHaveEffects: boolean;
-	creatingAttachDispatched: boolean;
-	execDispatched: boolean;
-	committedFsWrite: boolean;
-	scopeOpen: boolean;
+	readonly outcome: RequestOutcome;
+	recovery?: { readonly generation: number; readonly task: Promise<void> };
 }
 
-export const workerReservation = new AsyncLocalStorage<WorkerReservation>();
-
 export class WorkerOwnerPool {
+	private readonly reservationContext = new AsyncLocalStorage<WorkerReservation>();
 	private readonly slots: WorkerSlot[];
 	private readonly admission: FairAdmission;
 	private readonly reservations = new Map<string, WorkerSlot>();
@@ -397,7 +397,7 @@ export class WorkerOwnerPool {
 	}
 
 	async run<T>(tenant: string, key: string, shared: boolean, fn: () => Promise<T>, bytes = 1024): Promise<T> {
-		const existing = workerReservation.getStore();
+		const existing = this.reservationContext.getStore();
 		if (existing?.key === key) return fn();
 		if (this.closing)
 			throw Object.assign(new Error("ESHUTTINGDOWN: execution pool is draining"), { code: "ESHUTTINGDOWN" });
@@ -419,15 +419,11 @@ export class WorkerOwnerPool {
 			key,
 			slot,
 			phase: "lock_wait",
-			mayHaveEffects: false,
-			creatingAttachDispatched: false,
-			execDispatched: false,
-			committedFsWrite: false,
-			scopeOpen: false,
+			outcome: new RequestOutcome(),
 		};
 		this.liveReservations.add(reservation);
 		try {
-			return await workerReservation.run(reservation, fn);
+			return await this.reservationContext.run(reservation, fn);
 		} finally {
 			this.liveReservations.delete(reservation);
 			release();
@@ -453,12 +449,12 @@ export class WorkerOwnerPool {
 			await slot.thread.ready;
 			if (slot.residentKey !== reservation.key) {
 				if (slot.residentKey !== undefined) {
-					await this.send<void>({ kind: "disconnect" }, undefined, true);
+					await this.send({ kind: "disconnect" }, undefined, true);
 					slot.residentKey = undefined;
 					slot.metadata = undefined;
 				}
 				slot.generation++;
-				await this.send<void>({ kind: "attach", identity }, undefined, true);
+				await this.send({ kind: "attach", identity }, undefined, true);
 				slot.residentKey = reservation.key;
 			}
 		})();
@@ -472,7 +468,11 @@ export class WorkerOwnerPool {
 		return slot.metadata;
 	}
 
-	async send<T>(command: OwnerCommand, signal?: AbortSignal, forceReadOnly?: boolean): Promise<T> {
+	async send<K extends OwnerCommandKind>(
+		command: OwnerCommand<K>,
+		signal?: AbortSignal,
+		forceReadOnly?: boolean,
+	): Promise<OwnerResult<K>> {
 		const reservation = this.current();
 		const { slot, lostSignal } = reservation;
 		if (slot.thread === undefined) throw new Error("worker owner is not attached");
@@ -485,17 +485,10 @@ export class WorkerOwnerPool {
 				forceReadOnly ?? ctx !== undefined,
 				lostSignal,
 				signal,
-				() => {
-					if (mayApply(command)) reservation.mayHaveEffects = true;
-					if (command.kind === "attach" && mayApply(command)) reservation.creatingAttachDispatched = true;
-					if (command.kind === "exec") reservation.execDispatched = true;
-				},
+				() => reservation.outcome.dispatched(command),
 			);
 		} catch (error) {
-			if (reservation.mayHaveEffects && (error as { code?: string }).code === "EWORKER_UNAVAILABLE") {
-				throw new OutcomeUnknownError();
-			}
-			throw error;
+			throw reservation.outcome.transportFailure(error);
 		}
 		if (reply.generation !== slot.generation) throw new OutcomeUnknownError();
 		if (reply.metadata !== undefined) slot.metadata = reply.metadata;
@@ -503,32 +496,84 @@ export class WorkerOwnerPool {
 		if (ctx !== undefined && reply.readOnlyViolated) ctx.violated = true;
 		if (!reply.ok)
 			throw Object.assign(new Error(reply.error.message), { name: reply.error.name, code: reply.error.code });
-		if (command.kind === "beginScope") reservation.scopeOpen = true;
-		if (command.kind === "endScope" || command.kind === "abortScope") reservation.scopeOpen = false;
-		if (mayApply(command) && command.kind !== "exec" && !reservation.scopeOpen && ctx === undefined) {
-			reservation.committedFsWrite = true;
-		}
-		return reply.value as T;
+		reservation.outcome.acknowledged(command, ctx !== undefined);
+		return reply.value as OwnerResult<K>;
 	}
 
 	get metadata(): OwnerMetadata | undefined {
 		return this.current().slot.metadata;
 	}
 
-	async recover(unknownWrite = true): Promise<OwnerIdentity | undefined> {
-		const reservation = this.current();
-		if (unknownWrite) this.unknownOutcomes++;
-		reservation.phase = "recovering";
-		await reservation.slot.thread?.terminate();
-		reservation.slot.residentKey = undefined;
-		reservation.slot.metadata = undefined;
-		return reservation.identity;
+	hasReservation(key?: string): boolean {
+		const current = this.reservationContext.getStore();
+		return current !== undefined && (key === undefined || current.key === key);
+	}
+
+	markRunning(signal?: AbortSignal): void {
+		const current = this.reservationContext.getStore();
+		if (current === undefined) return;
+		current.lostSignal = signal;
+		current.phase = "running";
+	}
+
+	async withLease<T>(signal: AbortSignal | undefined, fn: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+		const current = this.reservationContext.getStore();
+		if (current === undefined) return fn(signal);
+		current.lostSignal = signal;
+		let result: T;
+		try {
+			result = await fn(signal);
+		} catch (error) {
+			if (signal?.aborted || workerFailureCode(error) === "ELOCKLOST") await this.leaseLostAfterWork(error);
+			const failure = current.outcome.runtimeFailure(error);
+			if (workerFailureCode(error) === "ECOHERENCE" && failure !== error) {
+				try {
+					await this.recover(failure);
+				} catch {}
+			}
+			throw failure;
+		}
+		if (signal?.aborted) await this.leaseLostAfterWork();
+		return result;
+	}
+
+	async leaseLostAfterWork(error?: unknown): Promise<void> {
+		const failure = this.reservationContext.getStore()?.outcome.leaseLoss(error);
+		if (failure === undefined) return;
+		try {
+			await this.recover(new OutcomeUnknownError());
+		} catch {}
+		throw failure;
+	}
+
+	async recover(error: unknown): Promise<void> {
+		const code = workerFailureCode(error);
+		if (code !== "EEXEC_OUTCOME_UNKNOWN" && code !== "EWORKER_UNAVAILABLE") return;
+		const reservation = this.reservationContext.getStore();
+		if (reservation === undefined) return;
+		const { slot, identity } = reservation;
+		const { generation, thread } = slot;
+		if (reservation.recovery?.generation === generation) return reservation.recovery.task;
+		const task = (async () => {
+			if (code === "EEXEC_OUTCOME_UNKNOWN") this.unknownOutcomes++;
+			reservation.phase = "recovering";
+			await thread?.terminate();
+			if (slot.generation === generation && slot.thread === thread) {
+				slot.residentKey = undefined;
+				slot.metadata = undefined;
+			}
+			if (identity !== undefined) {
+				await retirePostgresSandboxGeneration(identity.connectionString, identity.sandboxId);
+			}
+		})();
+		reservation.recovery = { generation, task };
+		await task;
 	}
 
 	async disconnect(key: string): Promise<void> {
-		const current = workerReservation.getStore();
+		const current = this.reservationContext.getStore();
 		if (current?.key === key && current.slot.readers === 1 && current.slot.residentKey === key) {
-			await this.send<void>({ kind: "disconnect" }, undefined, true);
+			await this.send({ kind: "disconnect" }, undefined, true);
 			current.slot.residentKey = undefined;
 			current.slot.metadata = undefined;
 			return;
@@ -573,7 +618,7 @@ export class WorkerOwnerPool {
 	}
 
 	private current(): WorkerReservation {
-		const current = workerReservation.getStore();
+		const current = this.reservationContext.getStore();
 		if (current === undefined) throw new Error("worker filesystem requires an admitted session operation");
 		return current;
 	}

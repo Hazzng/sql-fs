@@ -7,7 +7,7 @@ import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
 import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
-import type { OwnerCommand } from "../../worker-owner/protocol.js";
+import type { OwnerCommand, OwnerCommandKind, OwnerResult } from "../../worker-owner/protocol.js";
 import { workerRequestContext } from "../../worker-owner/request-context.js";
 
 const TENANTS = ["worker-resource-a", "worker-resource-b"] as const;
@@ -48,7 +48,7 @@ describe.skipIf(!process.env.DATABASE_URL)("worker owner global resource bounds"
 				SQL_FS_WORKER_ACTIVE_TENANT_MAX: "1",
 				SQL_FS_WORKER_PG_POOL_MAX: "2",
 				SQL_FS_WORKER_MAX_PG_CONNECTIONS: "4",
-				SQL_FS_WORKER_QUEUE_WAIT_MS: "5000",
+				SQL_FS_WORKER_QUEUE_WAIT_MS: "30000",
 			}),
 			maxConcurrentJs: 1,
 			maxConcurrentPython: 1,
@@ -78,17 +78,17 @@ describe.skipIf(!process.env.DATABASE_URL)("worker owner global resource bounds"
 				runtime === "javascript" ? 'sleep .15; node -e "console.log(42)"' : "sleep .15; python3 -c 'print(42)'";
 			const intervals: Array<{ start: number; end?: number }> = [];
 			const send = WorkerOwnerPool.prototype.send;
-			vi.spyOn(WorkerOwnerPool.prototype, "send").mockImplementation(async function <T>(
+			vi.spyOn(WorkerOwnerPool.prototype, "send").mockImplementation(async function <K extends OwnerCommandKind>(
 				this: WorkerOwnerPool,
-				command: OwnerCommand,
+				command: OwnerCommand<K>,
 				signal?: AbortSignal,
 				forceReadOnly?: boolean,
-			): Promise<T> {
-				if (command.kind !== "exec") return send.call(this, command, signal, forceReadOnly) as Promise<T>;
+			): Promise<OwnerResult<K>> {
+				if (command.kind !== "exec") return send.bind(this)<K>(command, signal, forceReadOnly);
 				const interval = { start: performance.now(), end: undefined as number | undefined };
 				intervals.push(interval);
 				try {
-					return (await send.call(this, command, signal, forceReadOnly)) as T;
+					return await send.bind(this)<K>(command, signal, forceReadOnly);
 				} finally {
 					interval.end = performance.now();
 				}

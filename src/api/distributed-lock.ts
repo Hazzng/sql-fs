@@ -256,7 +256,7 @@ export async function withDistributedLock<T>(
 		// measure event-loop lag (a GC pause / sync stall that delays renewal past
 		// the lease is otherwise silent until LockLostError surfaces post-hoc).
 		const expectedFireAt = Date.now() + delayMs;
-		renewTimer = setTimeout(async () => {
+		const renew = async (): Promise<void> => {
 			if (stopped) return;
 			recordHeartbeatGap({ lock: "exec", key, expectedFireAt, renewMs, leaseMs });
 			// Cap renewal command wait so a stalled Redis can't block release.
@@ -293,6 +293,11 @@ export async function withDistributedLock<T>(
 				// Transient blip with lease still valid — retry soon, do not give up.
 				scheduleRenew(renewRetryMs);
 			}
+		};
+		renewTimer = setTimeout(() => {
+			void renew().catch(() => {
+				if (!stopped) markLost();
+			});
 		}, delayMs);
 	};
 	scheduleRenew(renewMs);

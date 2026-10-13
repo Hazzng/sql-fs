@@ -93,18 +93,20 @@ if (mode === "absorb-uncaught") {
 	process.exit(0);
 } else if (mode === "lookalike-uncaught") {
 	setImmediate(() => {
+		setTimeout(() => {
+			process.stdout.write("MASKED\n");
+			process.exit(0);
+		}, 500);
 		throw lookalike();
 	});
-	await new Promise((r) => setTimeout(r, 500));
-	process.stdout.write("MASKED\n");
-	process.exit(0);
 } else if (mode === "unrelated-uncaught") {
 	setImmediate(() => {
+		setTimeout(() => {
+			process.stdout.write("MASKED\n");
+			process.exit(0);
+		}, 500);
 		throw new Error("an ordinary bug");
 	});
-	await new Promise((r) => setTimeout(r, 500));
-	process.stdout.write("MASKED\n");
-	process.exit(0);
 } else if (mode === "unrelated-rejection") {
 	void Promise.reject(new Error("an ordinary rejection"));
 	await new Promise((r) => setTimeout(r, 500));

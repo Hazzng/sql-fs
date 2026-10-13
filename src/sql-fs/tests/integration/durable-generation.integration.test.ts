@@ -1,6 +1,6 @@
 import type postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { ownerCancellation } from "../../../api/worker-owner/cancellation.js";
+import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import { retirePostgresSandboxGeneration } from "../../index.js";
 import { SqlFs } from "../../sql-fs.js";

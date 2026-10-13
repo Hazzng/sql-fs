@@ -102,7 +102,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		const results = await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/shared.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -123,7 +123,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to the same path", () => {
 		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/target.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -161,7 +161,7 @@ describe.skipIf(!DB_URL)("Postgres: N concurrent PUTs to distinct paths", () => 
 		await sm.withSession("default", sbId, () => Promise.resolve(), undefined, "tester");
 
 		await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/f-${i}.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -209,7 +209,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		});
 
 		const reads = await Promise.all(
-			Array.from({ length: N }, () =>
+			Array.from({ length: N }, async () =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/gone.txt`, {
 					headers: { Authorization: `Bearer ${token}` },
 				}),
@@ -229,7 +229,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		const keep = 5;
 
 		await Promise.all(
-			Array.from({ length: total }, (_, i) =>
+			Array.from({ length: total }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/f-${i}.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -239,7 +239,7 @@ describe.skipIf(!DB_URL)("Postgres: write-delete-read — pathCache cleared afte
 		);
 
 		await Promise.all(
-			Array.from({ length: keep }, (_, i) =>
+			Array.from({ length: keep }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/f-${i}.txt`, {
 					method: "DELETE",
 					headers: { Authorization: `Bearer ${token}` },
@@ -302,7 +302,7 @@ describe.skipIf(!DB_URL)("Postgres: overwrite consistency — contentCache stays
 		});
 
 		await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/home/user/counter.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -467,7 +467,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 			// The order-independent invariant is that the PUT always succeeds (it
 			// mkdir -p's its own parent) and only the explicit mkdir can lose, with
 			// EEXIST.
-			const [r1, r2] = await Promise.all(ops);
+			const [r1, r2] = await Promise.all([Promise.resolve(ops[0]), Promise.resolve(ops[1])]);
 			const [mkdirRes, putRes] = label === "mkdir-first" ? [r1, r2] : [r2, r1];
 			expect(putRes.status, `${label} put`).toBe(204);
 			expect([204, 409], `${label} mkdir`).toContain(mkdirRes.status);
@@ -599,7 +599,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 			// "whichever runs first" means: the DELETE always succeeds, and the GET
 			// either sees the whole pre-delete file or sees it gone — never a torn
 			// or partial read.
-			const [first, second] = await Promise.all(ops);
+			const [first, second] = await Promise.all([Promise.resolve(ops[0]), Promise.resolve(ops[1])]);
 			const [deleteRes, readRes] = label === "delete-first" ? [first, second] : [second, first];
 
 			expect(deleteRes.status, `${label} delete`).toBe(204);
@@ -732,7 +732,7 @@ describe.skipIf(!DB_URL)("Postgres ordering scenarios — SqlFs POSIX semantics 
 							),
 						] as const);
 
-			await Promise.all(ops);
+			await Promise.all([Promise.resolve(ops[0]), Promise.resolve(ops[1])]);
 
 			// /b must always exist (mv always runs)
 			expect(await sm.withSession("default", sbId, (s) => s.fs.exists("/home/user/b")), `${label}: /b`).toBe(true);

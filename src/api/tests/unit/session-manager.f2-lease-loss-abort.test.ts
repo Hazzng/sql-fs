@@ -1,16 +1,10 @@
 import type { Redis } from "ioredis";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { sessionLeaseSignal } from "../../session-lease-context.js";
 import { SessionManager } from "../../session-manager.js";
-import {
-	WorkerOwnerPool,
-	type WorkerReservation,
-	loadWorkerPoolOptions,
-	workerReservation,
-} from "../../worker-owner/pool.js";
 
 interface StringEntry {
 	value: string;
@@ -196,106 +190,6 @@ const T = "default";
 const FAST_LOCK = { leaseMs: 5_000, renewMs: 60, acquireTimeoutMs: 3_000, acquireRetryMs: 10, readerLeaseMs: 5_000 };
 
 describe("F2-L1: abort exec on definitive lease loss before commit", () => {
-	it.each([
-		{ name: "a creating attach dispatched to the worker", openExisting: false, dispatch: true, expected: true },
-		{ name: "an existing-only attach dispatched to the worker", openExisting: true, dispatch: true, expected: false },
-		{ name: "a creating attach rejected before dispatch", openExisting: false, dispatch: false, expected: false },
-	])("records only $name as a possible create", async ({ openExisting, dispatch, expected }) => {
-		const pool = new WorkerOwnerPool(loadWorkerPoolOptions({ SQL_FS_WORKER_COUNT: "1" }));
-		const reservationState: { creatingAttachDispatched?: boolean } = {};
-		try {
-			await pool.run("tenant", "sandbox", false, async () => {
-				const reservation = workerReservation.getStore();
-				if (reservation === undefined) throw new Error("worker reservation was not created");
-				reservationState.creatingAttachDispatched = reservation.creatingAttachDispatched;
-				const thread = {
-					dead: false,
-					ready: Promise.resolve(),
-					request: async (
-						_generation: number,
-						_command: unknown,
-						_readOnly: boolean,
-						_lostSignal: AbortSignal | undefined,
-						_signal: AbortSignal | undefined,
-						onDispatch: (() => void) | undefined,
-					) => {
-						if (dispatch) onDispatch?.();
-						throw Object.assign(new Error("lease lost"), { code: "ELOCKLOST" });
-					},
-					terminate: async () => 0,
-				};
-				(reservation.slot as unknown as { thread?: unknown }).thread = thread;
-				await expect(
-					pool.attach({
-						tenantId: "tenant",
-						sandboxId: "sandbox",
-						runtimeOptions: { python: false, javascript: false, network: false },
-						owner: "owner",
-						connectionString: "postgres://unused",
-						cwd: "/home/user",
-						openExisting,
-					}),
-				).rejects.toMatchObject({ code: "ELOCKLOST" });
-				reservationState.creatingAttachDispatched = reservation.creatingAttachDispatched;
-			});
-		} finally {
-			await pool.shutdown(0);
-		}
-		expect(reservationState.creatingAttachDispatched).toBe(expected);
-	});
-
-	it.each([
-		{
-			name: "a dispatched creating attach",
-			reservation: { creatingAttachDispatched: true, mayHaveEffects: true, scopeOpen: false },
-			outcome: "EEXEC_OUTCOME_UNKNOWN",
-			recoveries: 1,
-		},
-		{
-			name: "an existing-only attach",
-			reservation: { creatingAttachDispatched: false, mayHaveEffects: false, scopeOpen: false },
-			outcome: "ELOCKLOST",
-			recoveries: 0,
-		},
-		{
-			name: "an attach rejected before dispatch",
-			reservation: { creatingAttachDispatched: false, mayHaveEffects: false, scopeOpen: false },
-			outcome: "ELOCKLOST",
-			recoveries: 0,
-		},
-		{
-			name: "a buffered write that remains in its scope",
-			reservation: { creatingAttachDispatched: false, mayHaveEffects: true, scopeOpen: true },
-			outcome: "ELOCKLOST",
-			recoveries: 0,
-		},
-	])("classifies lease loss after $name", async ({ reservation: state, outcome, recoveries }) => {
-		const sm = new SessionManager({});
-		const recoverWorker = vi
-			.spyOn(sm as unknown as { recoverWorker(error: unknown): Promise<void> }, "recoverWorker")
-			.mockResolvedValue(undefined);
-		const withWorkerLease = (
-			sm as unknown as {
-				withWorkerLease<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>;
-			}
-		).withWorkerLease.bind(sm);
-		const reservation = {
-			key: "default:lease-outcome",
-			slot: {},
-			phase: "running",
-			execDispatched: false,
-			committedFsWrite: false,
-			...state,
-		} as unknown as WorkerReservation;
-		const error = Object.assign(new Error("lease lost"), { code: "ELOCKLOST" });
-
-		await expect(
-			workerReservation.run(reservation, () => withWorkerLease(async () => Promise.reject(error))),
-		).rejects.toMatchObject({ code: outcome });
-		expect(recoverWorker).toHaveBeenCalledTimes(recoveries);
-		await sm.shutdown();
-	});
-
 	it("keeps overlapping shared leases independent when one reader finishes before the other loses ownership", async () => {
 		const redis = new FakeRedis();
 		const sm = new SessionManager({

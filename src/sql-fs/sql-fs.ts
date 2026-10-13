@@ -23,7 +23,7 @@ import { LRUCache } from "lru-cache";
 import { LockLostError } from "../api/distributed-lock.js";
 import { consumeExecInput, execContext } from "../api/exec-context.js";
 import { readOnlyContext } from "../api/read-only-context.js";
-import { ownerLeaseLost } from "../api/worker-owner/cancellation.js";
+import { ownerLeaseLost } from "../execution/owner-cancellation.js";
 import { runTrustedDbAsync } from "./defense.js";
 import { raceDriverFault } from "./driver-fault.js";
 import {
@@ -2420,7 +2420,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// Remove src subtree and any existing dest subtree from cache
 		for (const p of srcPaths) this.#cacheDelete(p);
 		const destPrefix = dest === "/" ? "/" : `${dest}/`;
-		for (const key of [...this.#pathCache.keys()]) {
+		for (const key of Array.from(this.#pathCache.keys())) {
 			if (key === dest || key.startsWith(destPrefix)) this.#cacheDelete(key);
 		}
 
