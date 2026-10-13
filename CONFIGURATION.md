@@ -1,13 +1,14 @@
 # Configuration
 
-The server reads every setting from an environment variable. `FS_BACKEND` and `AUTH_SECRET` are always required, and `DATABASE_URL` is required for the `postgres` backend. Sizes are in bytes and durations are in milliseconds, unless the variable name says otherwise.
+The server reads every setting from an environment variable. `FS_BACKEND` and `AUTH_SECRET` are always required. The `postgres` backend also needs `TENANT_DATABASES` or `DATABASE_URL`. Sizes are in bytes and durations are in milliseconds, unless the variable name says otherwise.
 
 ## Core
 
 | Variable | Default | Description |
 |---|---|---|
 | `FS_BACKEND` | Required | `postgres` or `memory`. |
-| `DATABASE_URL` | Required for `postgres` | Postgres connection string. The migration runner uses it at boot. On Neon, use the pooler endpoint. |
+| `TENANT_DATABASES` | Unset | JSON object that maps each tenant id to its Postgres connection string, for example `{"acme":"postgres://..."}`. A tenant id can use `A-Z`, `a-z`, `0-9`, `_`, `.` and `-`. The server reads the tenant from the JWT `tenant` claim and runs migrations on every tenant database at boot. If it is set, the server ignores `DATABASE_URL`. |
+| `DATABASE_URL` | Required for `postgres` without `TENANT_DATABASES` | Postgres connection string for one tenant, with the id `default`. The migration runner uses it at boot. On Neon, use the pooler endpoint. |
 | `DATABASE_DIRECT_URL` | `DATABASE_URL` | Direct connection, without a pooler. Only drizzle-kit (`pnpm db:generate`) uses it. |
 | `AUTH_SECRET` | Required | Signs and verifies bearer JWTs. |
 | `ADMIN_SECRET` | Unset | Secret for `POST /v1/auth/admin`. If it is unset, that endpoint returns `500 ADMIN_NOT_CONFIGURED`. |
@@ -32,7 +33,7 @@ The server reads every setting from an environment variable. `FS_BACKEND` and `A
 | Variable | Default | Description |
 |---|---|---|
 | `MAX_REQUEST_BODY_BYTES` | 256 MiB | HTTP body limit. Inline mode checks it before authentication. Worker mode checks authentication first, then applies the smaller of this limit and the tenant ingress byte quota to the encoded JSON body. |
-| `MAX_FILE_WRITE_BYTES` | 50 MiB | Largest file that one write accepts. It applies to `PUT`, `PATCH`, MCP `file_write` and each entry of a batch write. Above 50 MiB, the content cache cannot hold the file, and each such file costs about 4 times its size in memory for `SESSION_IDLE_MS`. |
+| `MAX_FILE_WRITE_BYTES` | 50 MiB | Largest file that one write accepts. It applies to `PUT`, `PATCH`, MCP `file_write` and each entry of a batch write. Above 50 MiB, the content cache cannot hold the file, and each such file costs about 4 times its size in memory for `SESSION_IDLE_MS`. On Linux, one write also uses about 7 times the file size above the replica's baseline while it runs. `--max-old-space-size` does not limit that memory. Size the container from `baseline + 7 * MAX_FILE_WRITE_BYTES * concurrent large writes`. In one measurement at the default, the kernel killed a 512 MiB container on one write, and a 768 MiB container survived. |
 | `MAX_BULK_WRITE_BYTES` | `MAX_FILE_WRITE_BYTES` | Total decoded bytes in one batch write: `POST /writeFiles`, or the `files` map on `POST /v1/sandboxes`. The request body can be twice this size, for JSON escaping. |
 | `MAX_BULK_WRITE_FILES` | `1000` | Entries in one batch write. |
 | `MAX_EXEC_FILE_BYTES` | 8 MiB | Largest file that a script can read or write whole. Above it, the exec fails with `EFBIG` (413, not retryable). To remove it in worker mode, see [Large files](#large-files). |
@@ -57,6 +58,8 @@ The server reads every setting from an environment variable. `FS_BACKEND` and `A
 | `MAX_CONCURRENT_JS` | `5` | JavaScript executions that run at the same time in one process. Each one uses up to 64 MB. |
 | `MAX_PYTHON_QUEUE` | `100` | Python executions that can wait for a slot. Above it, new ones fail with `ERUNTIME_BUSY` (503). |
 | `MAX_JS_QUEUE` | `100` | JavaScript executions that can wait for a slot. Above it, new ones fail with `ERUNTIME_BUSY` (503). |
+| `PYTHON_QUEUE_TIMEOUT_MS` | `60000` | Time a Python execution can wait for a slot. After it, the execution fails with `ERUNTIME_BUSY` (503). |
+| `JS_QUEUE_TIMEOUT_MS` | `60000` | Time a JavaScript execution can wait for a slot. After it, the execution fails with `ERUNTIME_BUSY` (503). |
 | `JUST_BASH_DEFENSE_IN_DEPTH` | `false` | If `true`, just-bash replaces `setTimeout`, `eval`, `Function` and dynamic `import` while a script runs. |
 | `JUST_BASH_DEFENSE_AUDIT_MODE` | `true` | If defense in depth is on, log violations instead of throwing. |
 | `GITHUB_TOKEN` | Unset | GitHub token that the server exports into every `network: true` sandbox, for `curl` and `git` over HTTPS. Any code in those sandboxes can read it, so set it only for trusted agents. A per-request `env` overrides it. |

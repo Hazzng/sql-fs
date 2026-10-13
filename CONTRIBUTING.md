@@ -66,11 +66,11 @@ Before you push, run `pnpm typecheck && pnpm lint:fix && pnpm test:unit`. CI run
 
 ## Integration tests run one file at a time
 
-The integration tests live in `src/sql-fs/tests/integration/` and `src/api/tests/integration/`. A suite skips if `DATABASE_URL` is unset. The cross-replica, multi-tenant, worker-owner, heartbeat and blob cache suites also need `REDIS_URL`.
+The integration tests live in `src/sql-fs/tests/integration/` and `src/api/tests/integration/`. The database-backed suites skip if `DATABASE_URL` is unset. Two files do not use the database. `heartbeat-gap.redis.integration.test.ts` needs only `REDIS_URL`, and `git-network.integration.test.ts` runs on an `InMemoryFs` with no prerequisites. The cross-replica, multi-tenant, worker-owner, and blob cache suites need `REDIS_URL` as well as `DATABASE_URL`.
 
-`pnpm test:integration` passes `--no-file-parallelism`, because every file shares one database and its `max_connections`. Parallel files run out of connection slots unless you raise that limit.
+`pnpm test:integration` passes `--no-file-parallelism`, because the database-backed files share one database and its `max_connections`. Parallel files run out of connection slots unless you raise that limit.
 
-No suite runs migration DDL against the shared database. A `deadlock detected` error in a run is a real bug, so investigate it instead of re-running.
+One suite runs migration DDL against the shared database. In `src/sql-fs/tests/integration/postgres.test.ts`, the `fs_resolve` tests apply `0001_rls_and_procs.sql` to `DATABASE_URL` in `beforeAll`. The migration and multi-tenant suites create their own databases and migrate those. A `deadlock detected` error in a run is a real bug, so investigate it instead of re-running.
 
 ## Read the standards before you change code
 

@@ -107,7 +107,7 @@ If a batch request (`exec-sync-batch` or `bash_exec_batch`) sets `readOnly: true
 
 Postgres sits behind all three. Every miss falls through to it.
 
-A blob cache entry never needs invalidation, because content never changes under its hash. A blob larger than `REDIS_BLOB_MAX_BYTES` (8 MB by default) skips Redis, so one large file cannot push the working set out. The Redis instance must use an evicting `maxmemory-policy`. See [Redis eviction policy](CONFIGURATION.md#redis-eviction-policy).
+A blob cache entry never needs invalidation, because content never changes under its hash. A blob larger than `REDIS_BLOB_MAX_BYTES` (8 MB by default) skips Redis, so one large file cannot push the working set out. The blob cache lives on the data Redis in `REDIS_DATA_URL`, which falls back to `REDIS_URL`. The data Redis must use `allkeys-lru` or `allkeys-lfu`. The control Redis in `REDIS_URL` holds the exec locks and must use `noeviction`, because an evicting policy can delete a live lock. See [Redis eviction policy](CONFIGURATION.md#redis-eviction-policy).
 
 The in-process caches can go stale between requests. Nothing reads them between requests, and `ensureFresh()` checks them before the next callback.
 
@@ -157,7 +157,7 @@ Two semaphores on each replica cap concurrent language runtimes. A CPython WASM 
 | `pythonSem` | `MAX_CONCURRENT_PYTHON`, default 5 | the session has `python: true` |
 | `jsSem` | `MAX_CONCURRENT_JS`, default 5 | the session has `javascript: true` |
 
-The session's runtime flags decide the slot, not the script text. Every exec on a sandbox with Python enabled takes a Python slot, even `ls`. A session with neither flag takes no slot. Waiters run in FIFO order. The queue limit and the wait timeout are in [CONFIGURATION.md](CONFIGURATION.md). The caps apply per replica, so three replicas allow 15 concurrent Python execs.
+The session's runtime flags decide the slot, not the script text. Every exec on a sandbox with Python enabled takes a Python slot, even `ls`. A session with neither flag takes no slot. To change `python`, `javascript`, or `network` after creation, send `PATCH /v1/sandboxes/:id` or call the MCP tool `sandbox_update`. The next exec takes its slot from the new flags. Waiters run in FIFO order. `MAX_PYTHON_QUEUE` and `MAX_JS_QUEUE` cap the number of waiters. `PYTHON_QUEUE_TIMEOUT_MS` and `JS_QUEUE_TIMEOUT_MS` cap the wait, 60s by default. See [CONFIGURATION.md](CONFIGURATION.md). The caps apply per replica, so three replicas allow 15 concurrent Python execs.
 
 ## Each tenant gets its own database
 

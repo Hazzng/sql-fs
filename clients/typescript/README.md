@@ -146,9 +146,15 @@ The SDK retries network errors and 429, 500, 502, 503, and 504 responses up to `
 
 `exec` and `execBatch` retry only if two things are true. You passed `readOnly: true` or `retryOn5xx: true`, and the server marked the error `retryable: true`. A retry runs the whole script or batch again. Set `retryOn5xx: true` only for scripts that are safe to repeat.
 
-The SDK never retries the codes `EEXEC_OUTCOME_UNKNOWN`, `ECOHERENCE`, and `ELOCKLOST_APPLIED`. `ECOHERENCE` and `ELOCKLOST_APPLIED` mean that the write was applied.
+The SDK never retries the codes `EEXEC_OUTCOME_UNKNOWN`, `ECOHERENCE`, and `ELOCKLOST_APPLIED`. `ELOCKLOST_APPLIED` means that the write was applied. `ECOHERENCE` means that the write may have been applied.
 
-An exec outcome is unknown when you get a `ServerError` with code `EEXEC_OUTCOME_UNKNOWN`, or a `TransportError` whose message starts with `script outcome unknown`. The script may have run, and earlier scripts in a batch may have committed. Read the sandbox state before you run anything else.
+An exec outcome is unknown when you get any of these errors:
+
+- A `ServerError` with code `EEXEC_OUTCOME_UNKNOWN`, `EDRIVERFAULT`, or `ECOHERENCE`.
+- A `TransportError` from `exec` or `execBatch` whose message starts with `network error after`.
+- A `TransportError` whose message starts with `script outcome unknown`.
+
+The script may have run, and earlier scripts in a batch may have committed. Read the sandbox state before you run anything else.
 
 ## Further reading
 

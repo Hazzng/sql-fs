@@ -15,7 +15,9 @@ Import it as `sqlfs`. It needs Python 3.9 or later. To install from a checkout o
 ```python
 from sqlfs import Client
 
-with Client(base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001") as client:
+with Client(
+    base_url="https://api.example.com", auth_secret="<AUTH_SECRET>", sub="agent-001"
+) as client:
     sb = client.sandboxes.create(name="demo", python=True)
     try:
         result = sb.exec("echo hello && ls /home/user")
@@ -47,23 +49,29 @@ The server has its own limits. By default it accepts 50 MiB per file in `fs.writ
 ## Methods and defaults
 
 ```python
-client.sandboxes.create(name=None, env=None, files=None, python=False, javascript=False, network=False)  # -> Sandbox
-client.sandboxes.list()           # -> list[SandboxRecord]
-client.sandboxes.get(id)          # -> SandboxInfo
-client.sandboxes.attach(id)       # -> Sandbox, no network call
-client.sandboxes.delete(id)       # same as sb.delete()
+client.sandboxes.create(
+    name=None, env=None, files=None, python=False, javascript=False, network=False
+)  # -> Sandbox
+client.sandboxes.list()  # -> list[SandboxRecord]
+client.sandboxes.get(id)  # -> SandboxInfo
+client.sandboxes.attach(id)  # -> Sandbox, no network call
+client.sandboxes.delete(id)  # same as sb.delete()
 
-sb.fs.read(path)                  # -> ReadResult with .content (bytes), .stat, and .text()
-sb.fs.read_text(path)             # -> str
-sb.fs.write(path, content)        # str or bytes, creates parent directories
-sb.fs.write_files({path: text})   # many text files in one request
+sb.fs.read(path)  # -> ReadResult with .content (bytes), .stat, and .text()
+sb.fs.read_text(path)  # -> str
+sb.fs.write(path, content)  # str or bytes, creates parent directories
+sb.fs.write_files({path: text})  # many text files in one request
 sb.fs.delete(path, recursive=False)
 sb.fs.mkdir(path, recursive=False)
 sb.fs.tree(prefix=None, depth=None)  # -> list[TreeEntry]
 sb.ingest_files({relative_path: str_or_bytes}, base_path="/home/user/project")  # base64 upload
 
-sb.exec(script, cwd=None, env=None, timeout_ms=30000, debug=False, read_only=False, retry_on_5xx=False)
-sb.exec_batch(scripts, timeout_ms=30000, per_script_timeout_ms=None, read_only=False, retry_on_5xx=False)
+sb.exec(
+    script, cwd=None, env=None, timeout_ms=30000, debug=False, read_only=False, retry_on_5xx=False
+)
+sb.exec_batch(
+    scripts, timeout_ms=30000, per_script_timeout_ms=None, read_only=False, retry_on_5xx=False
+)
 sb.exec_stream(script, cwd=None, env=None, timeout_ms=30000, debug=False, read_only=False)
 ```
 
@@ -126,9 +134,15 @@ The SDK retries network errors and 429, 500, 502, 503, and 504 responses up to `
 
 `exec` and `exec_batch` retry only if two things are true. You passed `read_only=True` or `retry_on_5xx=True`, and the server marked the error `retryable: true`. A retry runs the whole script or batch again. Set `retry_on_5xx=True` only for scripts that are safe to repeat.
 
-The SDK never retries the codes `EEXEC_OUTCOME_UNKNOWN`, `ECOHERENCE`, and `ELOCKLOST_APPLIED`. `ECOHERENCE` and `ELOCKLOST_APPLIED` mean that the write was applied.
+The SDK never retries the codes `EEXEC_OUTCOME_UNKNOWN`, `ECOHERENCE`, and `ELOCKLOST_APPLIED`. `ELOCKLOST_APPLIED` means that the write was applied. `ECOHERENCE` means that the write may have been applied.
 
-An exec outcome is unknown when you get a `ServerError` with code `EEXEC_OUTCOME_UNKNOWN`, or a `TransportError` whose message starts with `script outcome unknown`. The script may have run, and earlier scripts in a batch may have committed. Read the sandbox state before you run anything else.
+An exec outcome is unknown when you get any of these errors:
+
+- A `ServerError` with code `EEXEC_OUTCOME_UNKNOWN`, `EDRIVERFAULT`, or `ECOHERENCE`.
+- A `TransportError` from `exec` or `exec_batch` whose message starts with `network error after`.
+- A `TransportError` whose message starts with `script outcome unknown`.
+
+The script may have run, and earlier scripts in a batch may have committed. Read the sandbox state before you run anything else.
 
 ## Further reading
 

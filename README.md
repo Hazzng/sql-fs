@@ -80,7 +80,7 @@ await sandbox.delete();
 
 The [Python SDK README](clients/python/README.md) and the [TypeScript SDK README](clients/typescript/README.md) cover the full API.
 
-A new sandbox has no network, no Python and no JavaScript. To turn one on, pass `network`, `python` or `javascript` when you create the sandbox. To change them later, call `PATCH /v1/sandboxes/:id` or the MCP tool `sandbox_update`.
+A new sandbox has no network, no Python and no JavaScript. To turn one on, pass `network`, `python` or `javascript` when you create the sandbox. To turn a flag on or off later, set it to `true` or `false` in `PATCH /v1/sandboxes/:id` or the MCP tool `sandbox_update`. A flag that you leave out keeps its current value.
 
 ## How it works
 
@@ -114,7 +114,7 @@ Most deployments need only these settings. [CONFIGURATION.md](CONFIGURATION.md) 
 | Variable | Description |
 |---|---|
 | `FS_BACKEND` | `postgres` or `memory`. Required. |
-| `DATABASE_URL` | Postgres connection string. Required for `postgres`. |
+| `DATABASE_URL` | Postgres connection string. Required for `postgres`, unless `TENANT_DATABASES` maps one database per tenant. |
 | `AUTH_SECRET` | Signs and verifies bearer JWTs. Required. |
 | `REDIS_URL` | Redis for distributed locks. Required for more than one replica. |
 | `REDIS_DATA_URL` | Redis for the blob cache, on its own connection. Defaults to `REDIS_URL`. Needs `maxmemory-policy allkeys-lru` or `allkeys-lfu`. |
