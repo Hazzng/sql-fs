@@ -151,6 +151,29 @@ it("rejects nonliteral imports and CommonJS loaders outside worker-owner", () =>
 	assert.equal(diagnostics.filter(({ code }) => code === "WORKER_INTERNAL_DYNAMIC_IMPORT").length, 10);
 });
 
+it("rejects dynamic module loaders, aliased require calls, and reflected scope completion", () => {
+	const root = project({
+		"src/api/dynamic-node-module.ts":
+			"const moduleApi = await import('node:module');\nconst makeLoader = moduleApi.createRequire;\nconst load = makeLoader(import.meta.url);\nload('./runtime.js');\n",
+		"src/api/dynamic-module.ts":
+			"const { createRequire: makeLoader } = await import('module');\nconst load = makeLoader(import.meta.url);\nload('./runtime.js');\n",
+		"src/api/aliased-require.ts":
+			"const makeLoader = require;\nmakeLoader('./runtime.js');\n",
+		"src/api/reflected-scope.ts":
+			"interface Scope { endScope(): Promise<void> }\nexport function finish(scope: Scope) { return Reflect.apply(scope.endScope, scope, []); }\n",
+		"src/api/parenthesized-scope.ts":
+			"interface Scope { beginScope(): Promise<void> }\nexport function start(scope: Scope) { return (scope.beginScope)(); }\n",
+		"src/api/worker-owner/loader.ts": "void import('node:module');\n",
+		"src/api/legitimate.ts": "void import('./helper.js');\n",
+		"src/api/helper.ts": "export const value = 1;\n",
+	});
+	const diagnostics = checkArchitectureBoundaries(root);
+	assert.equal(diagnostics.filter(({ code }) => code === "WORKER_INTERNAL_DYNAMIC_IMPORT").length, 3);
+	assert.equal(diagnostics.filter(({ code }) => code === "SCRIPT_SCOPE_COMPLETION_OWNER").length, 2);
+	assert.ok(!diagnostics.some(({ file }) => file === "src/api/legitimate.ts"));
+	assert.ok(!diagnostics.some(({ file }) => file === "src/api/worker-owner/loader.ts"));
+});
+
 it("permits literal non-worker imports and rejects indirect scope method calls", () => {
 	const root = project({
 		"src/api/helper.ts": "export const value = 1;\n",

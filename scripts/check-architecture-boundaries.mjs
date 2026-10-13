@@ -157,6 +157,30 @@ function importedNames(node) {
 	return [];
 }
 
+function unwrapParentheses(node) {
+	let expression = node;
+	while (ast.isParenthesizedExpression(expression)) expression = expression.expression;
+	return expression;
+}
+
+function scopeOperationOf(expression, checker, scopeMethodAliases) {
+	const target = unwrapParentheses(expression);
+	if (ast.isPropertyAccessExpression(target) && scopeOperations.has(target.name.text)) return target.name.text;
+	if (
+		ast.isElementAccessExpression(target) &&
+		target.argumentExpression !== undefined &&
+		ast.isStringLiteral(target.argumentExpression) &&
+		scopeOperations.has(target.argumentExpression.text)
+	) {
+		return target.argumentExpression.text;
+	}
+	if (ast.isIdentifier(target)) {
+		const symbol = checker.getSymbolAtLocation(target);
+		if (symbol !== undefined) return scopeMethodAliases.get(symbol);
+	}
+	return undefined;
+}
+
 function enclosingFunctionName(node) {
 	for (let current = node.parent; current !== undefined; current = current.parent) {
 		if (ast.isFunctionDeclaration(current) || ast.isMethodDeclaration(current)) return current.name?.getText();
@@ -205,6 +229,7 @@ export function checkArchitectureBoundaries(root) {
 			if (sourcePath.includes("/tests/")) continue;
 
 			const scopeMethodAliases = new Map();
+			const requireAliases = new Set();
 			const visit = (node) => {
 				if (
 					(ast.isImportDeclaration(node) || ast.isExportDeclaration(node)) &&
@@ -303,6 +328,17 @@ export function checkArchitectureBoundaries(root) {
 					ast.isStringLiteral(node.arguments[0])
 				) {
 					const target = resolveModule(absoluteRoot, node.arguments[0], checker, project);
+					if (["node:module", "module"].includes(node.arguments[0].text) && !sourcePath.startsWith("src/api/worker-owner/")) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"WORKER_INTERNAL_DYNAMIC_IMPORT",
+								"import explicit ES modules instead of exposing createRequire outside worker-owner",
+							),
+						);
+					}
 					const moduleSymbol = checker.getSymbolAtLocation(node.arguments[0]);
 					const dynamicExports =
 						moduleSymbol === undefined || (moduleSymbol.flags & SymbolFlags.Module) === 0
@@ -364,13 +400,26 @@ export function checkArchitectureBoundaries(root) {
 						if (symbol !== undefined) scopeMethodAliases.set(symbol, operation);
 					}
 				}
+				if (ast.isVariableDeclaration(node) && ast.isIdentifier(node.name) && node.initializer !== undefined) {
+					const initializer = unwrapParentheses(node.initializer);
+					if (ast.isIdentifier(initializer) && initializer.text === "require") {
+						const symbol = checker.getSymbolAtLocation(node.name);
+						if (symbol !== undefined) requireAliases.add(symbol);
+					} else if (ast.isIdentifier(initializer)) {
+						const initializerSymbol = checker.getSymbolAtLocation(initializer);
+						const symbol = checker.getSymbolAtLocation(node.name);
+						if (symbol !== undefined && initializerSymbol !== undefined && requireAliases.has(initializerSymbol)) {
+							requireAliases.add(symbol);
+						}
+					}
+				}
 
 				if (ast.isCallExpression(node)) {
-					const expression = node.expression;
+					const expression = unwrapParentheses(node.expression);
 					if (
 						!sourcePath.startsWith("src/api/worker-owner/") &&
-						ast.isIdentifier(expression) &&
-						expression.text === "require"
+						(ast.isIdentifier(expression) && expression.text === "require" ||
+							ast.isIdentifier(expression) && requireAliases.has(checker.getSymbolAtLocation(expression)))
 					) {
 						diagnostics.push(
 							diagnostic(
@@ -388,18 +437,15 @@ export function checkArchitectureBoundaries(root) {
 						ast.isPropertyAccessExpression(expression) && ["call", "apply", "bind"].includes(expression.name.text)
 							? expression.expression
 							: expression;
-					if (ast.isPropertyAccessExpression(callTarget) && scopeOperations.has(callTarget.name.text)) {
-						operation = callTarget.name.text;
-					} else if (
-						ast.isElementAccessExpression(callTarget) &&
-						callTarget.argumentExpression !== undefined &&
-						ast.isStringLiteral(callTarget.argumentExpression) &&
-						scopeOperations.has(callTarget.argumentExpression.text)
+					operation = scopeOperationOf(callTarget, checker, scopeMethodAliases);
+					if (
+						operation === undefined &&
+						ast.isPropertyAccessExpression(expression) &&
+						expression.expression.getText(sourceFile) === "Reflect" &&
+						expression.name.text === "apply" &&
+						node.arguments.length >= 1
 					) {
-						operation = callTarget.argumentExpression.text;
-					} else if (ast.isIdentifier(callTarget)) {
-						const symbol = checker.getSymbolAtLocation(callTarget);
-						if (symbol !== undefined) operation = scopeMethodAliases.get(symbol);
+						operation = scopeOperationOf(node.arguments[0], checker, scopeMethodAliases);
 					}
 					if (operation !== undefined && !scopeCallAllowed(sourcePath, operation, node)) {
 						diagnostics.push(
