@@ -17,7 +17,8 @@
  * MCP `error: string`).
  */
 
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, stat } from "node:fs/promises";
 import type { BulkIngestFile } from "../sql-fs/types.js";
 import { isValidBase64, isValidBasePath, isValidHostPath, isValidRelativePath } from "./ingest-validation.js";
 import { positiveIntEnv } from "./lib/env.js";
@@ -50,7 +51,50 @@ export type BuildIngestPayloadResult =
 	| { readonly ok: true; readonly bulkFiles: BulkIngestFile[] }
 	| { readonly ok: false; readonly errors: string[] };
 
-export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Promise<BuildIngestPayloadResult> {
+export interface PreparedIngestPayload {
+	readonly bulkFiles: BulkIngestFile[];
+	readonly contentBytes: number;
+	materialize(signal?: AbortSignal): Promise<BuildIngestPayloadResult>;
+}
+
+export type PrepareIngestPayloadResult =
+	| { readonly ok: true; readonly payload: PreparedIngestPayload }
+	| { readonly ok: false; readonly errors: string[] };
+
+type IngestSource =
+	| { readonly path: string; readonly size: number; readonly base64: string }
+	| { readonly path: string; readonly size: number; readonly hostPath: string; readonly relativePath: string };
+
+async function readHostFile(
+	source: Extract<IngestSource, { hostPath: string }>,
+	signal?: AbortSignal,
+): Promise<Uint8Array> {
+	signal?.throwIfAborted();
+	const handle = await open(source.hostPath, constants.O_RDONLY | constants.O_NONBLOCK);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.size !== source.size) throw new Error("Host file changed before ingest");
+		const bytes = Buffer.allocUnsafeSlow(source.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			signal?.throwIfAborted();
+			const result = await handle.read(bytes, offset, Math.min(1024 * 1024, bytes.length - offset), offset);
+			if (result.bytesRead === 0) throw new Error("Host file changed during ingest");
+			offset += result.bytesRead;
+		}
+		signal?.throwIfAborted();
+		const extra = await handle.read(Buffer.allocUnsafeSlow(1), 0, 1, offset);
+		const after = await handle.stat();
+		if (extra.bytesRead !== 0 || !after.isFile() || after.size !== source.size) {
+			throw new Error("Host file changed during ingest");
+		}
+		return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	} finally {
+		await handle.close();
+	}
+}
+
+export async function prepareBulkIngestPayload(args: BuildIngestPayloadArgs): Promise<PrepareIngestPayloadResult> {
 	const { basePath } = args;
 
 	if (!isValidBasePath(basePath)) {
@@ -61,7 +105,11 @@ export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Prom
 	const pathsEntries = Object.entries(args.paths ?? {});
 
 	if (filesEntries.length === 0 && pathsEntries.length === 0) {
-		if (args.allowEmpty) return { ok: true, bulkFiles: [] };
+		if (args.allowEmpty)
+			return {
+				ok: true,
+				payload: { bulkFiles: [], contentBytes: 0, materialize: async () => ({ ok: true, bulkFiles: [] }) },
+			};
 		return { ok: false, errors: ["at least one of `files` or `paths` must be non-empty"] };
 	}
 
@@ -106,52 +154,85 @@ export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Prom
 	const errors = formatValidationErrors({ invalidRel, invalidBase64, invalidHost, duplicateKeys });
 	if (errors.length > 0) return { ok: false, errors };
 
-	const bulkFiles: BulkIngestFile[] = [];
+	const sources: IngestSource[] = [];
 	let totalBytes = 0;
-
 	for (const [rel, b64] of filesEntries) {
-		const content = new Uint8Array(Buffer.from(b64, "base64"));
-		totalBytes += content.byteLength;
-		if (totalBytes > MAX_INGEST_BYTES) {
+		const size = (b64.length / 4) * 3 - (b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0);
+		totalBytes += size;
+		if (totalBytes > MAX_INGEST_BYTES)
 			return { ok: false, errors: [`ingest exceeds byte limit (${MAX_INGEST_BYTES})`] };
-		}
-		bulkFiles.push({ path: `${basePath}/${rel}`, content, mode: 0o644 });
+		sources.push({ path: `${basePath}/${rel}`, size, base64: b64 });
 	}
 
-	if (pathsEntries.length > 0) {
-		const unreadable: string[] = [];
-		// Read host files in bounded-concurrency batches so a large `paths` map
-		// can't open thousands of file descriptors at once (audit H11 #6).
-		for (let i = 0; i < pathsEntries.length; i += MAX_INGEST_PATHS_CONCURRENCY) {
-			const batch = pathsEntries.slice(i, i + MAX_INGEST_PATHS_CONCURRENCY);
-			const readResults = await Promise.allSettled(
-				batch.map(async ([rel, hostPath]) => ({ rel, bytes: await readFile(hostPath) })),
-			);
-			for (let j = 0; j < readResults.length; j++) {
-				const result = readResults[j];
-				if (result === undefined) continue;
-				if (result.status === "rejected") {
-					const entry = batch[j];
-					if (entry !== undefined) unreadable.push(entry[0]);
-					continue;
-				}
-				totalBytes += result.value.bytes.byteLength;
-				if (totalBytes > MAX_INGEST_BYTES) {
+	const unreadable: string[] = [];
+	for (let i = 0; i < pathsEntries.length; i += MAX_INGEST_PATHS_CONCURRENCY) {
+		const batch = pathsEntries.slice(i, i + MAX_INGEST_PATHS_CONCURRENCY);
+		const results = await Promise.allSettled(
+			batch.map(async ([rel, hostPath]) => {
+				const info = await stat(hostPath);
+				if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size < 0)
+					throw new Error("Host ingest requires a regular file");
+				return { path: `${basePath}/${rel}`, size: info.size, hostPath, relativePath: rel };
+			}),
+		);
+		for (let j = 0; j < results.length; j++) {
+			const result = results[j];
+			if (result?.status === "fulfilled") {
+				totalBytes += result.value.size;
+				if (totalBytes > MAX_INGEST_BYTES)
 					return { ok: false, errors: [`ingest exceeds byte limit (${MAX_INGEST_BYTES})`] };
-				}
-				bulkFiles.push({
-					path: `${basePath}/${result.value.rel}`,
-					content: new Uint8Array(result.value.bytes),
-					mode: 0o644,
-				});
+				sources.push(result.value);
+			} else {
+				const entry = batch[j];
+				if (entry) unreadable.push(entry[0]);
 			}
 		}
-		if (unreadable.length > 0) {
-			return { ok: false, errors: [`unreadable host paths: ${unreadable.join(", ")}`] };
-		}
 	}
+	if (unreadable.length > 0) return { ok: false, errors: [`unreadable host paths: ${unreadable.join(", ")}`] };
 
-	return { ok: true, bulkFiles };
+	return {
+		ok: true,
+		payload: {
+			bulkFiles: sources.map(({ path }) => ({ path, content: new Uint8Array(0), mode: 0o644 })),
+			contentBytes: totalBytes,
+			async materialize(signal) {
+				const bulkFiles: BulkIngestFile[] = [];
+				const unreadable: string[] = [];
+				for (let i = 0; i < sources.length; i += MAX_INGEST_PATHS_CONCURRENCY) {
+					signal?.throwIfAborted();
+					const batch = sources.slice(i, i + MAX_INGEST_PATHS_CONCURRENCY);
+					const results = await Promise.allSettled(
+						batch.map(async (source) => ({
+							path: source.path,
+							content:
+								"base64" in source
+									? new Uint8Array(Buffer.from(source.base64, "base64"))
+									: await readHostFile(source, signal),
+							mode: 0o644,
+						})),
+					);
+					signal?.throwIfAborted();
+					for (let j = 0; j < results.length; j++) {
+						const result = results[j];
+						if (result?.status === "fulfilled") bulkFiles.push(result.value);
+						else {
+							const source = batch[j];
+							if (source && "relativePath" in source) unreadable.push(source.relativePath);
+							else if (result?.status === "rejected") throw result.reason;
+						}
+					}
+				}
+				return unreadable.length > 0
+					? { ok: false, errors: [`unreadable host paths: ${unreadable.join(", ")}`] }
+					: { ok: true, bulkFiles };
+			},
+		},
+	};
+}
+
+export async function buildBulkIngestPayload(args: BuildIngestPayloadArgs): Promise<BuildIngestPayloadResult> {
+	const prepared = await prepareBulkIngestPayload(args);
+	return prepared.ok ? prepared.payload.materialize() : prepared;
 }
 
 interface ValidationBuckets {

@@ -13,14 +13,28 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { FsStat } from "just-bash";
 import { z } from "zod";
 import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
-import { clientSafeErrorMessage, extractErrCode } from "../errors.js";
-import { buildBulkIngestPayload } from "../ingest-manifest.js";
+import { extractErrCode } from "../errors.js";
+import { prepareBulkIngestPayload } from "../ingest-manifest.js";
 import { executeBatch } from "../lib/batch-exec.js";
 import { MAX_FILE_WRITE_BYTES as MAX_EDIT_BYTES, positiveIntEnv } from "../lib/env.js";
 import { editFile, writeFileAtPath } from "../lib/file-ops.js";
 import { MAX_PATH_CHARS, posixNormalizePath } from "../lib/paths.js";
-import { withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
+import { retainedInputBytes } from "../lib/request-input.js";
+import { createForbiddenError, isOwnedBy, withOwnedSessionOrRehydrate, withOwnedSessionRead } from "../ownership.js";
+import { sessionLeaseSignal } from "../session-lease-context.js";
 import type { SessionManager } from "../session-manager.js";
+import { workerRequestContext } from "../worker-owner/request-context.js";
+import { withWorkerToolContext } from "./request-context.js";
+import {
+	batchToolError,
+	executionToolError,
+	exportToolError,
+	toolFailure as fail,
+	fileToolError,
+	ingestToolError,
+	metadataToolError,
+	sandboxDeleteToolError,
+} from "./tool-errors.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -36,11 +50,6 @@ const MAX_EXPORT_FILES = Number(process.env.MAX_EXPORT_FILES ?? "10000");
 const MAX_EXPORT_BYTES = Number(process.env.MAX_EXPORT_BYTES ?? `${256 * 1024 * 1024}`);
 /** Steps the export read loop, so it must be a positive integer (0/NaN would hang or no-op). */
 const MAX_EXPORT_CONCURRENCY = positiveIntEnv(process.env.MAX_EXPORT_CONCURRENCY, 16);
-
-/** MCP tools answer with a JSON envelope; every rejection shares this shape. */
-function fail(error: string, extra: Record<string, unknown> = {}): { content: Array<{ type: "text"; text: string }> } {
-	return { content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error, ...extra }) }] };
-}
 
 /** Sandbox paths are absolute; accept a relative one rather than failing on a missing slash. */
 /** Bytes this string will occupy once JSON-escaped into the response, its quotes excluded. */
@@ -104,7 +113,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			javascript: z.boolean().optional(),
 			network: z.boolean().optional().describe("Grant outbound HTTPS (enables curl + git clone/fetch/push)"),
 		},
-		async (args) => {
+		withWorkerToolContext(async (args) => {
 			const id = randomUUID();
 			const name = args.name ?? null;
 			const runtimeOptions = {
@@ -112,81 +121,58 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				javascript: args.javascript ?? false,
 				network: args.network ?? false,
 			};
-			try {
-				const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
-				session.name = name;
-				await sessionManager.persistSandboxMeta(tenant, id, {
-					owner,
-					name,
-					python: runtimeOptions.python,
-					javascript: runtimeOptions.javascript,
-					network: runtimeOptions.network,
-				});
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								id,
-								name,
-								python: runtimeOptions.python,
-								javascript: runtimeOptions.javascript,
-								network: runtimeOptions.network,
-							}),
-						},
-					],
-				};
-			} catch (err) {
-				// Sanitize: getOrCreate/persistSandboxMeta can surface raw SQL/driver
-				// errors (audit H5) — never echo them to the MCP client.
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
-						},
-					],
-				};
-			}
-		},
+
+			const session = await sessionManager.getOrCreate(tenant, id, runtimeOptions, owner);
+			session.name = name;
+			await sessionManager.persistSandboxMeta(tenant, id, {
+				owner,
+				name,
+				python: runtimeOptions.python,
+				javascript: runtimeOptions.javascript,
+				network: runtimeOptions.network,
+			});
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify({
+							id,
+							name,
+							python: runtimeOptions.python,
+							javascript: runtimeOptions.javascript,
+							network: runtimeOptions.network,
+						}),
+					},
+				],
+			};
+		}, metadataToolError),
 	);
 
 	server.tool(
 		"sandbox_list",
 		"List all sandboxes owned by the current user. Returns id, name, owner, createdAt, and runtime flags for each sandbox.",
 		{},
-		async () => {
-			try {
-				const sandboxes = await sessionManager.listSandboxes(tenant, owner);
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({
-								sandboxes: sandboxes.map((s) => ({
-									id: s.id,
-									name: s.name,
-									owner: s.owner,
-									createdAt: s.createdAt.toISOString(),
-									python: s.python,
-									javascript: s.javascript,
-									network: s.network,
-								})),
-							}),
-						},
-					],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
-						},
-					],
-				};
-			}
-		},
+		withWorkerToolContext(async () => {
+			const sandboxes = await sessionManager.listSandboxes(tenant, owner);
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify({
+							sandboxes: sandboxes.map((s) => ({
+								id: s.id,
+								name: s.name,
+								owner: s.owner,
+								createdAt: s.createdAt.toISOString(),
+								python: s.python,
+								javascript: s.javascript,
+								network: s.network,
+							})),
+						}),
+					},
+				],
+			};
+		}, metadataToolError),
 	);
 
 	server.tool(
@@ -206,128 +192,121 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"Resume a truncated read from this byte offset in the file: pass the previous response's nextByteOffset",
 				),
 		},
-		async (args) => {
+		withWorkerToolContext(async (args) => {
 			const filePath = toAbsolute(args.path);
 
-			try {
-				const outcome = await withOwnedSessionRead(sessionManager, tenant, args.id, owner, async (session) => {
-					let stat: FsStat;
-					try {
-						stat = await session.fs.stat(filePath);
-					} catch (e) {
-						if (extractErrCode(e) === "ENOENT") return { kind: "not_found" } as const;
-						throw e;
-					}
-					if (stat.isDirectory) return { kind: "eisdir" } as const;
-					if (stat.size > MAX_READ_FILE_BYTES) return { kind: "file_too_large", size: stat.size } as const;
-
-					const bytes = await session.fs.readFileBuffer(filePath);
-
-					let text: string;
-					try {
-						// `ignoreBOM` keeps a leading U+FEFF in the string rather than consuming it, matching
-						// `editFile`: a read whose content is written back must not silently drop the marker,
-						// and the byte offsets below are only the file's own if the text round-trips exactly.
-						text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-					} catch {
-						return { kind: "not_text" } as const;
-					}
-
-					const paging = args.offset !== undefined || args.limit !== undefined;
-					const totalLines = countLines(text);
-					const firstLine = args.offset ?? 1;
-					const selectionStartChar = paging ? lineStartOffset(text, firstLine) : 0;
-					let selectionEndChar = text.length;
-					// `join("\n")` drops the separator before the next line, so the slice stops one short of it
-					// — but only when that line exists. The empty line after a trailing newline starts AT the
-					// end, so deciding this from the offset kept a newline `split`/`join` would have dropped.
-					if (paging && args.limit !== undefined && firstLine + args.limit <= totalLines) {
-						selectionEndChar = lineStartOffset(text, firstLine + args.limit) - 1;
-					}
-					const selected = paging ? text.slice(selectionStartChar, selectionEndChar) : text;
-
-					// Byte offsets are absolute in the file, not relative to a paged selection, so a resume
-					// means the same thing whether or not the caller repeats the original offset/limit.
-					const selectionStart =
-						selectionStartChar === 0 ? 0 : Buffer.byteLength(text.slice(0, selectionStartChar), "utf8");
-					const selectedBytes = Buffer.from(selected, "utf8");
-					const start = snapToCodepointStart(
-						selectedBytes,
-						args.byteOffset === undefined ? 0 : args.byteOffset - selectionStart,
-					);
-
-					const replyFor = (cut: number): string => {
-						const isTruncated = cut < selectedBytes.byteLength;
-						return JSON.stringify({
-							ok: true,
-							path: filePath,
-							content: selectedBytes.subarray(start, cut).toString("utf8"),
-							size: stat.size,
-							totalLines,
-							firstLine,
-							truncated: isTruncated,
-							...(isTruncated ? { nextByteOffset: selectionStart + cut } : {}),
-						});
-					};
-
-					// Bound what crosses the wire even when the whole file was requested. The budget is in
-					// bytes but the paging controls are in lines, so a line longer than the budget would
-					// strand its own tail — no offset can reach past the first megabyte of one line. The cut
-					// point comes back as `nextByteOffset` for the caller to resume from. Cutting on a
-					// codepoint boundary keeps a split character out of the response without having to guess
-					// afterwards whether a trailing U+FFFD was the file's own or one we made.
-					let end = snapToCodepointStart(
-						selectedBytes,
-						Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
-					);
-					let reply = replyFor(end);
-					// A budget below the envelope has no honest page: the reply would exceed the cap and its
-					// `nextByteOffset` would equal the offset asked for, resuming forever without advancing.
-					if (jsonSize(replyFor(start)) > MAX_READ_RESPONSE_BYTES) {
-						return { kind: "budget_too_small" } as const;
-					}
-					// Sized on the form the wire carries: the MCP transport serializes this text again inside
-					// the JSON-RPC result, re-escaping every backslash, so a page of NULs budgeted on the
-					// inner form lands ~17% over. `end - 1` guarantees progress if the ratio does not.
-					while (end > start && jsonSize(reply) > MAX_READ_RESPONSE_BYTES) {
-						const fit = MAX_READ_RESPONSE_BYTES / jsonSize(reply);
-						const proposed = start + Math.max(1, Math.floor((end - start) * fit));
-						end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
-						reply = replyFor(end);
-					}
-					if (end === start && start < selectedBytes.byteLength) return { kind: "budget_too_small" } as const;
-					return { kind: "ok", reply } as const;
-				});
-
-				switch (outcome.kind) {
-					case "not_found":
-						return fail("file not found", { code: "ENOENT", path: filePath });
-					case "eisdir":
-						return fail("path is a directory", { code: "EISDIR", path: filePath });
-					case "not_text":
-						return fail("file is not valid UTF-8 text", { code: "NOT_TEXT", path: filePath });
-					case "file_too_large":
-						return fail(`file is ${outcome.size} bytes; exceeds the read limit (${MAX_READ_FILE_BYTES})`, {
-							code: "PAYLOAD_TOO_LARGE",
-							path: filePath,
-						});
-					case "budget_too_small":
-						return fail(
-							`MAX_MCP_READ_RESPONSE_BYTES (${MAX_READ_RESPONSE_BYTES}) is too small to hold a usable response for this path`,
-							{ code: "RESPONSE_BUDGET_TOO_SMALL", path: filePath },
-						);
-					default:
-						// Serialized under the budget above, not re-assembled here: rebuilding it would
-						// reintroduce the unmeasured envelope this cap exists to account for.
-						return { content: [{ type: "text" as const, text: outcome.reply }] };
+			const outcome = await withOwnedSessionRead(sessionManager, tenant, args.id, owner, async (session) => {
+				let stat: FsStat;
+				try {
+					stat = await session.fs.stat(filePath);
+				} catch (e) {
+					if (extractErrCode(e) === "ENOENT") return { kind: "not_found" } as const;
+					throw e;
 				}
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") return fail("forbidden");
-				if (code === "ENOENT") return fail("sandbox not found");
-				return fail(clientSafeErrorMessage(err));
+				if (stat.isDirectory) return { kind: "eisdir" } as const;
+				if (stat.size > MAX_READ_FILE_BYTES) return { kind: "file_too_large", size: stat.size } as const;
+
+				const bytes = await session.fs.readFileBuffer(filePath);
+
+				let text: string;
+				try {
+					// `ignoreBOM` keeps a leading U+FEFF in the string rather than consuming it, matching
+					// `editFile`: a read whose content is written back must not silently drop the marker,
+					// and the byte offsets below are only the file's own if the text round-trips exactly.
+					text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+				} catch {
+					return { kind: "not_text" } as const;
+				}
+
+				const paging = args.offset !== undefined || args.limit !== undefined;
+				const totalLines = countLines(text);
+				const firstLine = args.offset ?? 1;
+				const selectionStartChar = paging ? lineStartOffset(text, firstLine) : 0;
+				let selectionEndChar = text.length;
+				// `join("\n")` drops the separator before the next line, so the slice stops one short of it
+				// — but only when that line exists. The empty line after a trailing newline starts AT the
+				// end, so deciding this from the offset kept a newline `split`/`join` would have dropped.
+				if (paging && args.limit !== undefined && firstLine + args.limit <= totalLines) {
+					selectionEndChar = lineStartOffset(text, firstLine + args.limit) - 1;
+				}
+				const selected = paging ? text.slice(selectionStartChar, selectionEndChar) : text;
+
+				// Byte offsets are absolute in the file, not relative to a paged selection, so a resume
+				// means the same thing whether or not the caller repeats the original offset/limit.
+				const selectionStart =
+					selectionStartChar === 0 ? 0 : Buffer.byteLength(text.slice(0, selectionStartChar), "utf8");
+				const selectedBytes = Buffer.from(selected, "utf8");
+				const start = snapToCodepointStart(
+					selectedBytes,
+					args.byteOffset === undefined ? 0 : args.byteOffset - selectionStart,
+				);
+
+				const replyFor = (cut: number): string => {
+					const isTruncated = cut < selectedBytes.byteLength;
+					return JSON.stringify({
+						ok: true,
+						path: filePath,
+						content: selectedBytes.subarray(start, cut).toString("utf8"),
+						size: stat.size,
+						totalLines,
+						firstLine,
+						truncated: isTruncated,
+						...(isTruncated ? { nextByteOffset: selectionStart + cut } : {}),
+					});
+				};
+
+				// Bound what crosses the wire even when the whole file was requested. The budget is in
+				// bytes but the paging controls are in lines, so a line longer than the budget would
+				// strand its own tail — no offset can reach past the first megabyte of one line. The cut
+				// point comes back as `nextByteOffset` for the caller to resume from. Cutting on a
+				// codepoint boundary keeps a split character out of the response without having to guess
+				// afterwards whether a trailing U+FFFD was the file's own or one we made.
+				let end = snapToCodepointStart(
+					selectedBytes,
+					Math.min(start + MAX_READ_RESPONSE_BYTES, selectedBytes.byteLength),
+				);
+				let reply = replyFor(end);
+				// A budget below the envelope has no honest page: the reply would exceed the cap and its
+				// `nextByteOffset` would equal the offset asked for, resuming forever without advancing.
+				if (jsonSize(replyFor(start)) > MAX_READ_RESPONSE_BYTES) {
+					return { kind: "budget_too_small" } as const;
+				}
+				// Sized on the form the wire carries: the MCP transport serializes this text again inside
+				// the JSON-RPC result, re-escaping every backslash, so a page of NULs budgeted on the
+				// inner form lands ~17% over. `end - 1` guarantees progress if the ratio does not.
+				while (end > start && jsonSize(reply) > MAX_READ_RESPONSE_BYTES) {
+					const fit = MAX_READ_RESPONSE_BYTES / jsonSize(reply);
+					const proposed = start + Math.max(1, Math.floor((end - start) * fit));
+					end = snapToCodepointStart(selectedBytes, Math.min(proposed, end - 1));
+					reply = replyFor(end);
+				}
+				if (end === start && start < selectedBytes.byteLength) return { kind: "budget_too_small" } as const;
+				return { kind: "ok", reply } as const;
+			});
+
+			switch (outcome.kind) {
+				case "not_found":
+					return fail("file not found", { code: "ENOENT", path: filePath });
+				case "eisdir":
+					return fail("path is a directory", { code: "EISDIR", path: filePath });
+				case "not_text":
+					return fail("file is not valid UTF-8 text", { code: "NOT_TEXT", path: filePath });
+				case "file_too_large":
+					return fail(`file is ${outcome.size} bytes; exceeds the read limit (${MAX_READ_FILE_BYTES})`, {
+						code: "PAYLOAD_TOO_LARGE",
+						path: filePath,
+					});
+				case "budget_too_small":
+					return fail(
+						`MAX_MCP_READ_RESPONSE_BYTES (${MAX_READ_RESPONSE_BYTES}) is too small to hold a usable response for this path`,
+						{ code: "RESPONSE_BUDGET_TOO_SMALL", path: filePath },
+					);
+				default:
+					// Serialized under the budget above, not re-assembled here: rebuilding it would
+					// reintroduce the unmeasured envelope this cap exists to account for.
+					return { content: [{ type: "text" as const, text: outcome.reply }] };
 			}
-		},
+		}, fileToolError),
 	);
 
 	server.tool(
@@ -338,7 +317,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			path: z.string().min(1).max(MAX_PATH_CHARS).describe("Absolute path inside the sandbox, e.g. /src/index.ts"),
 			content: z.string().describe("Full file content. Replaces the file entirely."),
 		},
-		async (args) => {
+		withWorkerToolContext(async (args, extra) => {
 			const filePath = toAbsolute(args.path);
 			// Encode once: `writeFile` would otherwise re-encode the same string internally.
 			const encoded = new TextEncoder().encode(args.content);
@@ -350,22 +329,19 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 				});
 			}
 
-			try {
-				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
-					writeFileAtPath(session, filePath, encoded),
-				);
+			const outcome = await workerRequestContext.run(
+				{ bytes: retainedInputBytes(args) + encoded.byteLength, signal: extra?.signal },
+				() =>
+					withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
+						writeFileAtPath(session, filePath, encoded),
+					),
+			);
 
-				if (outcome.kind === "eisdir") return fail("path is a directory", { code: "EISDIR", path: filePath });
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: true, path: filePath, size }) }],
-				};
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") return fail("forbidden");
-				if (code === "ENOENT") return fail("sandbox not found");
-				return fail(clientSafeErrorMessage(err));
-			}
-		},
+			if (outcome.kind === "eisdir") return fail("path is a directory", { code: "EISDIR", path: filePath });
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify({ ok: true, path: filePath, size }) }],
+			};
+		}, fileToolError),
 	);
 
 	server.tool(
@@ -378,68 +354,64 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			newString: z.string().describe("Replacement text. Pass an empty string to delete the matched text."),
 			replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring a unique match"),
 		},
-		async (args) => {
+		withWorkerToolContext(async (args) => {
 			if (args.oldString === args.newString) return fail("oldString and newString must differ");
 			const filePath = toAbsolute(args.path);
 
-			try {
-				const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
-					editFile(
-						session,
-						filePath,
-						{ oldString: args.oldString, newString: args.newString, replaceAll: args.replaceAll },
-						MAX_EDIT_BYTES,
-					),
-				);
+			const outcome = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, (session) =>
+				editFile(
+					session,
+					filePath,
+					{ oldString: args.oldString, newString: args.newString, replaceAll: args.replaceAll },
+					MAX_EDIT_BYTES,
+				),
+			);
 
-				switch (outcome.kind) {
-					case "not_found":
-						return fail("file not found", { code: "ENOENT", path: filePath });
-					case "eisdir":
-						return fail("path is a directory", { code: "EISDIR", path: filePath });
-					case "binary":
-						return fail("file is not valid UTF-8 text", { code: "EDIT_BINARY", path: filePath });
-					case "no_match":
-						return fail("oldString does not appear in the file", { code: "EDIT_NO_MATCH", path: filePath });
-					case "not_unique":
-						return fail(`oldString appears ${outcome.count} times; pass replaceAll or include more context`, {
-							code: "EDIT_NOT_UNIQUE",
-							occurrences: outcome.count,
-							path: filePath,
-						});
-					case "too_large":
-						return fail("edited file exceeds the size limit", { code: "PAYLOAD_TOO_LARGE", path: filePath });
-					case "lone_surrogate":
-						return fail("oldString and newString must be well-formed text; a lone surrogate matches half a character", {
-							code: "EDIT_LONE_SURROGATE",
-							path: filePath,
-						});
-					default:
-						return {
-							content: [
-								{
-									type: "text" as const,
-									text: JSON.stringify({
-										ok: true,
-										path: filePath,
-										replacements: outcome.replacements,
-										size: outcome.size,
-									}),
-								},
-							],
-						};
-				}
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") return fail("forbidden");
-				if (code === "ENOENT") return fail("sandbox not found");
-				return fail(clientSafeErrorMessage(err));
+			switch (outcome.kind) {
+				case "not_found":
+					return fail("file not found", { code: "ENOENT", path: filePath });
+				case "eisdir":
+					return fail("path is a directory", { code: "EISDIR", path: filePath });
+				case "binary":
+					return fail("file is not valid UTF-8 text", { code: "EDIT_BINARY", path: filePath });
+				case "no_match":
+					return fail("oldString does not appear in the file", { code: "EDIT_NO_MATCH", path: filePath });
+				case "not_unique":
+					return fail(`oldString appears ${outcome.count} times; pass replaceAll or include more context`, {
+						code: "EDIT_NOT_UNIQUE",
+						occurrences: outcome.count,
+						path: filePath,
+					});
+				case "too_large":
+					return fail("edited file exceeds the size limit", { code: "PAYLOAD_TOO_LARGE", path: filePath });
+				case "lone_surrogate":
+					return fail("oldString and newString must be well-formed text; a lone surrogate matches half a character", {
+						code: "EDIT_LONE_SURROGATE",
+						path: filePath,
+					});
+				default:
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: JSON.stringify({
+									ok: true,
+									path: filePath,
+									replacements: outcome.replacements,
+									size: outcome.size,
+								}),
+							},
+						],
+					};
 			}
-		},
+		}, fileToolError),
 	);
 
-	server.tool("sandbox_delete", "Delete a sandbox and all its files", { id: z.string() }, async (args) => {
-		try {
+	server.tool(
+		"sandbox_delete",
+		"Delete a sandbox and all its files",
+		{ id: z.string() },
+		withWorkerToolContext(async (args) => {
 			await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async () => undefined);
 			const existed = await sessionManager.destroy(tenant, args.id);
 			if (!existed) {
@@ -450,28 +422,8 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			return {
 				content: [{ type: "text" as const, text: JSON.stringify({ ok: true }) }],
 			};
-		} catch (err) {
-			const code = (err as Error & { code?: string }).code;
-			if (code === "FORBIDDEN") {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-				};
-			}
-			if (code === "ENOENT") {
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
-				};
-			}
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
-					},
-				],
-			};
-		}
-	});
+		}, sandboxDeleteToolError),
+	);
 
 	server.tool(
 		"sandbox_update",
@@ -482,25 +434,13 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			javascript: z.boolean().optional(),
 			network: z.boolean().optional().describe("Grant outbound HTTPS (enables curl + git clone/fetch/push)"),
 		},
-		async ({ id, ...runtime }) => {
-			let result: Record<string, unknown>;
-			try {
-				const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, (session) =>
-					sessionManager.updateSandboxRuntime(session, runtime),
-				);
-				result = { id, python: meta.python, javascript: meta.javascript, network: meta.network };
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				const error =
-					code === "FORBIDDEN"
-						? "forbidden"
-						: code === "ENOENT"
-							? "sandbox not found"
-							: clientSafeErrorMessage(err, "internal error");
-				result = { ok: false, error };
-			}
+		withWorkerToolContext(async ({ id, ...runtime }) => {
+			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, (session) =>
+				sessionManager.updateSandboxRuntime(session, runtime),
+			);
+			const result = { id, python: meta.python, javascript: meta.javascript, network: meta.network };
 			return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
-		},
+		}, sandboxDeleteToolError),
 	);
 
 	const bashExecDescription = [
@@ -551,116 +491,85 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"When true, runs the script in read-only mode: parallel reads are unblocked across calls (no exclusive lock) and any mutating filesystem op is rejected with EREADONLY at the offending command.",
 				),
 		},
-		async (args, extra) => {
+		withWorkerToolContext(async (args, extra) => {
 			const timeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 			const scriptToRun = args.debug ? `set -x\n${args.script}` : args.script;
 			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 
-			try {
-				const result = await runner(sessionManager, tenant, args.id, owner, async (session) => {
-					const controller = new AbortController();
-					let timedOut = false;
-					const startMs = Date.now();
+			const result = await workerRequestContext.run(
+				{
+					bytes: retainedInputBytes(args) + (args.debug ? retainedInputBytes(scriptToRun) : 0),
+					signal: extra?.signal,
+				},
+				() =>
+					runner(sessionManager, tenant, args.id, owner, async (session) => {
+						const controller = new AbortController();
+						const lostSignal = sessionLeaseSignal();
+						let timedOut = false;
+						const startMs = Date.now();
 
-					const timer = setTimeout(() => {
-						timedOut = true;
-						controller.abort();
-					}, timeoutMs);
+						const timer = setTimeout(() => {
+							timedOut = true;
+							controller.abort();
+						}, timeoutMs);
 
-					// Audit L4: abort the in-flight exec on MCP client disconnect rather
-					// than running to the full timeout.
-					const onDisconnect = (): void => controller.abort();
-					extra.signal.addEventListener("abort", onDisconnect, { once: true });
-					if (extra.signal.aborted) controller.abort();
+						// Audit L4: abort the in-flight exec on MCP client disconnect rather
+						// than running to the full timeout.
+						const onDisconnect = (): void => controller.abort();
+						extra.signal.addEventListener("abort", onDisconnect, { once: true });
+						if (extra.signal.aborted) controller.abort();
 
-					try {
-						const execResult = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-							signal: controller.signal,
-						});
-						clearTimeout(timer);
-						extra.signal.removeEventListener("abort", onDisconnect);
-						if (timedOut) {
-							return {
-								stdout: "",
-								stderr: "timeout",
-								exitCode: -1,
-								exitSignal: null as string | null,
-								timedOut: true,
-								durationMs: Date.now() - startMs,
-							};
-						}
-						return {
-							stdout: execResult.stdout,
-							stderr: execResult.stderr,
-							exitCode: execResult.exitCode,
-							exitSignal: null as string | null,
-							timedOut: false,
-							durationMs: Date.now() - startMs,
-						};
-					} catch (e) {
-						clearTimeout(timer);
-						extra.signal.removeEventListener("abort", onDisconnect);
-						if (timedOut) {
-							return {
-								stdout: "",
-								stderr: "timeout",
-								exitCode: -1,
-								exitSignal: null as string | null,
-								timedOut: true,
-								durationMs: Date.now() - startMs,
-							};
-						}
-						throw e;
-					}
-				});
-
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify(result) }],
-				};
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") {
-					return {
-						content: [
-							{ type: "text" as const, text: JSON.stringify({ stdout: "", stderr: "forbidden", exitCode: 1 }) },
-						],
-					};
-				}
-				if (code === "ENOENT") {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({ stdout: "", stderr: "sandbox not found", exitCode: 1 }),
-							},
-						],
-					};
-				}
-				if (code === "EREADONLY_VIOLATION") {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({
+						try {
+							const execResult = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
+								signal: lostSignal ? AbortSignal.any([controller.signal, lostSignal]) : controller.signal,
+							});
+							clearTimeout(timer);
+							extra.signal.removeEventListener("abort", onDisconnect);
+							if (
+								timedOut &&
+								controller.signal.aborted &&
+								execResult.executionAborted === true &&
+								!lostSignal?.aborted
+							) {
+								return {
 									stdout: "",
-									stderr: "EREADONLY_VIOLATION: readOnly script attempted to mutate the filesystem",
-									exitCode: 1,
-									code: "EREADONLY_VIOLATION",
-								}),
-							},
-						],
-					};
-				}
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ stdout: "", stderr: clientSafeErrorMessage(err, "internal error"), exitCode: 1 }),
-						},
-					],
-				};
-			}
-		},
+									stderr: "timeout",
+									exitCode: -1,
+									exitSignal: null as string | null,
+									timedOut: true,
+									durationMs: Date.now() - startMs,
+								};
+							}
+							return {
+								stdout: execResult.stdout,
+								stderr: execResult.stderr,
+								exitCode: execResult.exitCode,
+								exitSignal: null as string | null,
+								timedOut: false,
+								durationMs: Date.now() - startMs,
+							};
+						} catch (e) {
+							clearTimeout(timer);
+							extra.signal.removeEventListener("abort", onDisconnect);
+							if (timedOut && ((e as Error)?.name === "AbortError" || (e as { code?: string })?.code === undefined)) {
+								return {
+									stdout: "",
+									stderr: "timeout",
+									exitCode: -1,
+									exitSignal: null as string | null,
+									timedOut: true,
+									durationMs: Date.now() - startMs,
+								};
+							}
+							throw e;
+						}
+					}),
+			);
+
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify(result) }],
+			};
+		}, executionToolError),
 	);
 
 	server.tool(
@@ -695,64 +604,37 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"When true, runs all scripts in the batch in read-only mode: parallel reads are unblocked across calls and any mutating filesystem op is rejected with EREADONLY at the offending command.",
 				),
 		},
-		async (args, extra) => {
-			const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
-			const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
+		withWorkerToolContext(
+			async (args, extra) => {
+				const totalTimeoutMs = Math.min(args.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+				const runner = args.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
 
-			const disconnectController = new AbortController();
-			const onDisconnect = () => disconnectController.abort();
-			extra.signal.addEventListener("abort", onDisconnect, { once: true });
-			if (extra.signal.aborted) disconnectController.abort();
+				const disconnectController = new AbortController();
+				const onDisconnect = () => disconnectController.abort();
+				extra.signal.addEventListener("abort", onDisconnect, { once: true });
+				if (extra.signal.aborted) disconnectController.abort();
 
-			try {
-				const results = await runner(sessionManager, tenant, args.id, owner, async (session) =>
-					executeBatch(sessionManager, session, args.scripts, totalTimeoutMs, disconnectController.signal),
-				);
+				try {
+					const results = await runner(sessionManager, tenant, args.id, owner, async (session) => {
+						const lostSignal = sessionLeaseSignal();
+						return executeBatch(
+							sessionManager,
+							session,
+							args.scripts,
+							totalTimeoutMs,
+							lostSignal ? AbortSignal.any([disconnectController.signal, lostSignal]) : disconnectController.signal,
+						);
+					});
 
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
-				};
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") {
 					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
+						content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
 					};
+				} finally {
+					extra.signal.removeEventListener("abort", onDisconnect);
 				}
-				if (code === "ENOENT") {
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
-					};
-				}
-				if (code === "EREADONLY_VIOLATION") {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({
-									ok: false,
-									code: "EREADONLY_VIOLATION",
-									error: "readOnly script attempted to mutate the filesystem",
-								}),
-							},
-						],
-					};
-				}
-				console.error(
-					JSON.stringify({
-						event: "bash_exec_batch_failed",
-						sandboxId: args.id,
-						tenant,
-						error: err instanceof Error ? err.message : String(err),
-					}),
-				);
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
-				};
-			} finally {
-				extra.signal.removeEventListener("abort", onDisconnect);
-			}
-		},
+			},
+			(error, args) => batchToolError(error, args.id, tenant),
+		),
 	);
 
 	server.tool(
@@ -768,7 +650,7 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			"   { relativePath: absoluteHostPath }",
 			"   The server reads the bytes directly from the host filesystem.",
 			"   You emit only path strings — no file content ever appears in your output.",
-			"   Use this for every file that exists on disk. There is no size limit.",
+			"   Use this for regular files on disk. Ingest and worker-message byte limits apply.",
 			'   Example: { "src/app.ts": "/Users/me/project/src/app.ts" }',
 			"",
 			"`files` — INLINE BASE64 (small generated content only):",
@@ -806,66 +688,47 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 					"EXCEPTION: small generated content only. Map of relativePath → base64 bytes. Avoid for anything >a few KB — every byte costs output tokens.",
 				),
 		},
-		async (args) => {
-			try {
-				const result = await withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
-					// Authorization has passed — only now is it safe to touch the host
-					// filesystem. `buildBulkIngestPayload` in `paths` mode reads arbitrary
-					// host files off disk, so it MUST run AFTER the ownership check, never
-					// before (audit H3 — pre-authz host-read + readability oracle).
-					const built = await buildBulkIngestPayload({
-						basePath: args.basePath ?? "/home/user",
-						files: args.files,
-						paths: args.paths,
-					});
-					if (!built.ok) {
-						return { ok: false as const, error: built.errors.join("; ") };
-					}
-					const fs = session.fs as ICoherentFs;
-					if (typeof fs.bulkIngest !== "function") {
-						throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
-					}
-					await fs.bulkIngest(built.bulkFiles);
-					return { ok: true as const, count: built.bulkFiles.length };
+		withWorkerToolContext(
+			async (args, extra) => {
+				const metadata =
+					(await sessionManager.getSandboxMeta(tenant, args.id)) ?? sessionManager.getSession(tenant, args.id);
+				if (metadata === undefined) throw Object.assign(new Error("sandbox not found"), { code: "ENOENT" });
+				if (!isOwnedBy(metadata.owner, owner)) throw createForbiddenError();
+				const prepared = await prepareBulkIngestPayload({
+					basePath: args.basePath ?? "/home/user",
+					files: args.files,
+					paths: args.paths,
 				});
+				if (!prepared.ok) return fail(prepared.errors.join("; "));
+				const { payload } = prepared;
+				sessionManager.assertWorkerMessageBudget(
+					{ kind: "bulkIngest", files: payload.bulkFiles },
+					payload.contentBytes,
+				);
+				const result = await workerRequestContext.run(
+					{
+						bytes: retainedInputBytes(args) + retainedInputBytes(payload.bulkFiles) + payload.contentBytes,
+						signal: extra?.signal,
+					},
+					() =>
+						withOwnedSessionOrRehydrate(sessionManager, tenant, args.id, owner, async (session) => {
+							const fs = session.fs as ICoherentFs;
+							if (typeof fs.bulkIngest !== "function") {
+								throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
+							}
+							const built = await payload.materialize(extra?.signal);
+							if (!built.ok) return { ok: false as const, error: built.errors.join("; ") };
+							await fs.bulkIngest(built.bulkFiles);
+							return { ok: true as const, count: built.bulkFiles.length };
+						}),
+				);
 
 				return {
 					content: [{ type: "text" as const, text: JSON.stringify(result) }],
 				};
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") {
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-					};
-				}
-				if (code === "ENOENT") {
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "sandbox not found" }) }],
-					};
-				}
-				if (code === "ENOTSUP") {
-					console.error(
-						JSON.stringify({
-							event: "fs_ingest_backend_unsupported",
-							sandboxId: args.id,
-							tenant,
-						}),
-					);
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "internal error" }) }],
-					};
-				}
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: JSON.stringify({ ok: false, error: clientSafeErrorMessage(err, "internal error") }),
-						},
-					],
-				};
-			}
-		},
+			},
+			(error, args) => ingestToolError(error, args.id, tenant),
+		),
 	);
 
 	server.tool(
@@ -875,102 +738,75 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			id: z.string(),
 			basePath: z.string().optional(),
 		},
-		async (args) => {
+		withWorkerToolContext(async (args) => {
 			const basePath = args.basePath ?? "/home/user";
 			// `ignoreBOM` for the same reason as file_read: an export is re-imported verbatim.
 			const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
-			try {
-				const { files, errors } = await withOwnedSessionOrRehydrate(
-					sessionManager,
-					tenant,
-					args.id,
-					owner,
-					async (session) => {
-						const allPaths = await sessionManager.getSessionPaths(session);
-						const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
-						const result: Record<string, string> = Object.create(null);
-						const readErrors: string[] = [];
+			const { files, errors } = await withOwnedSessionOrRehydrate(
+				sessionManager,
+				tenant,
+				args.id,
+				owner,
+				async (session) => {
+					const allPaths = await sessionManager.getSessionPaths(session);
+					const prefix = basePath.endsWith("/") ? basePath : `${basePath}/`;
+					const result: Record<string, string> = Object.create(null);
+					const readErrors: string[] = [];
 
-						const candidates = allPaths.filter((p) => p.startsWith(prefix));
-						if (candidates.length > MAX_EXPORT_FILES) {
-							throw Object.assign(new Error(`export exceeds file limit (${MAX_EXPORT_FILES})`), {
-								code: "EEXPORT_TOO_LARGE",
-							});
-						}
-						let totalBytes = 0;
-						// Read in bounded-concurrency batches with a running byte cap so a large
-						// sandbox can't open every file at once or blow up memory (audit H11).
-						for (let i = 0; i < candidates.length; i += MAX_EXPORT_CONCURRENCY) {
-							const batch = candidates.slice(i, i + MAX_EXPORT_CONCURRENCY);
-							await Promise.all(
-								batch.map(async (absPath) => {
-									try {
-										const buf = await session.fs.readFileBuffer(absPath);
-										totalBytes += buf.byteLength;
-										if (totalBytes > MAX_EXPORT_BYTES) {
-											throw Object.assign(new Error(`export exceeds byte limit (${MAX_EXPORT_BYTES})`), {
-												code: "EEXPORT_TOO_LARGE",
-											});
-										}
-										const relativePath = absPath.slice(prefix.length);
-										try {
-											result[relativePath] = utf8Decoder.decode(buf);
-										} catch {
-											result[relativePath] =
-												`data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
-										}
-									} catch (e) {
-										const code = (e as Error & { code?: string }).code;
-										if (code === "EEXPORT_TOO_LARGE") throw e;
-										// EISDIR is expected — directories cannot be read as files
-										if (code !== "EISDIR") {
-											readErrors.push(absPath);
-										}
+					const candidates = allPaths.filter((p) => p.startsWith(prefix));
+					if (candidates.length > MAX_EXPORT_FILES) {
+						throw Object.assign(new Error(`export exceeds file limit (${MAX_EXPORT_FILES})`), {
+							code: "EEXPORT_TOO_LARGE",
+						});
+					}
+					let totalBytes = 0;
+					// Read in bounded-concurrency batches with a running byte cap so a large
+					// sandbox can't open every file at once or blow up memory (audit H11).
+					for (let i = 0; i < candidates.length; i += MAX_EXPORT_CONCURRENCY) {
+						const batch = candidates.slice(i, i + MAX_EXPORT_CONCURRENCY);
+						await Promise.all(
+							batch.map(async (absPath) => {
+								try {
+									const buf = await session.fs.readFileBuffer(absPath);
+									totalBytes += buf.byteLength;
+									if (totalBytes > MAX_EXPORT_BYTES) {
+										throw Object.assign(new Error(`export exceeds byte limit (${MAX_EXPORT_BYTES})`), {
+											code: "EEXPORT_TOO_LARGE",
+										});
 									}
-								}),
-							);
-						}
+									const relativePath = absPath.slice(prefix.length);
+									try {
+										result[relativePath] = utf8Decoder.decode(buf);
+									} catch {
+										result[relativePath] =
+											`data:application/octet-stream;base64,${Buffer.from(buf).toString("base64")}`;
+									}
+								} catch (e) {
+									const code = (e as Error & { code?: string }).code;
+									if (code === "EEXPORT_TOO_LARGE") throw e;
+									// EISDIR is expected — directories cannot be read as files
+									if (code !== "EISDIR") {
+										readErrors.push(absPath);
+									}
+								}
+							}),
+						);
+					}
 
-						return { files: result, errors: readErrors };
-					},
-				);
+					return { files: result, errors: readErrors };
+				},
+			);
 
-				if (errors.length > 0) {
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ files, errors }) }],
-					};
-				}
-
+			if (errors.length > 0) {
 				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ files }) }],
-				};
-			} catch (err) {
-				const code = (err as Error & { code?: string }).code;
-				if (code === "FORBIDDEN") {
-					return {
-						content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: "forbidden" }) }],
-					};
-				}
-				if (code === "EEXPORT_TOO_LARGE") {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: JSON.stringify({
-									ok: false,
-									code: "EEXPORT_TOO_LARGE",
-									error: "export too large; narrow with basePath",
-								}),
-							},
-						],
-					};
-				}
-				const message = code === "ENOENT" ? "sandbox not found" : clientSafeErrorMessage(err, "internal error");
-				return {
-					content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: message }) }],
+					content: [{ type: "text" as const, text: JSON.stringify({ files, errors }) }],
 				};
 			}
-		},
+
+			return {
+				content: [{ type: "text" as const, text: JSON.stringify({ files }) }],
+			};
+		}, exportToolError),
 	);
 }

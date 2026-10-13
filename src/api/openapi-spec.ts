@@ -13,7 +13,7 @@ const errorSchema = {
 			type: "boolean",
 			example: false,
 			description:
-				"Durability discriminator for the operation that failed. `true` means the server knows THAT OPERATION applied nothing and the condition is transient, so an automatic retry is safe (`ELOCKTIMEOUT`, `ELOCKLOST`, `ECOHERENCE_UNAPPLIED`, `ESESSIONCLOSING`, `ESHUTTINGDOWN`, `ERUNTIME_BUSY`, and the Postgres capacity refusals). `false` means the effect may already be durable, or a retry would fail identically — retry only if the call is idempotent. Notably `503 ECOHERENCE` is `false` (the write may have committed before cache recovery failed) and so is `503 ELOCKLOST_APPLIED` (the lease lapsed only after the write had committed). SCOPE: the guarantee is per operation, not per request. Routes that run several independent transactions — `POST /v1/sandboxes` (sandbox row, then FS, then initial files) and the ingest routes — can have committed an earlier step before a later one fails with `retryable: true`; retrying those re-creates rather than resumes, so reconcile with `GET /v1/sandboxes` instead of retrying blind. Single-transaction routes (exec, the file routes) are fully covered. Emitted on every error raised through the global handler; when absent, treat it as `false`.",
+				"Retry safety for the operation that failed. `true` means THAT OPERATION applied nothing and the condition is transient. This includes EWORKER_BUSY before execution and EWORKER_UNAVAILABLE for interrupted read-only operations. `false` means effects may already be durable or the same call would fail again. EEXEC_OUTCOME_UNKNOWN means the server cannot determine whether writes committed. Never automatically replay that operation, including with readOnly or retryOn5xx hints. Inspect state before another call. ECOHERENCE means writes may have committed before recovery failed; ELOCKLOST_APPLIED means writes committed. The guarantee covers one operation, not the entire request. POST /v1/sandboxes and ingest can commit an earlier step before a later step returns retryable: true. Reconcile those requests with GET /v1/sandboxes before another attempt. Single-transaction exec and file operations are fully covered. When retryable is absent, treat it as false.",
 		},
 	},
 	required: ["error", "code"],
@@ -75,7 +75,7 @@ const execBodySchema = {
 		retryOn5xx: {
 			type: "boolean",
 			description:
-				"Caller hint that the script is idempotent and safe to retry on transient 5xx (network blip, ERUNTIME_BUSY, ESESSIONCLOSING). Currently accepted and ignored server-side; client SDKs use it to enable client-side retry. Reserved for future server-side retry of worker-crash exceptions. Never causes retry on 503 ECOHERENCE for write execs: the write may have committed before cache recovery failed, so a retry may re-run an already-applied script. Use the `retryable` field on the error body as the machine-readable form of this rule rather than enumerating codes.",
+				"Caller hint that the script is idempotent and safe to retry on transient 5xx. Client SDKs use this hint to enable retry. The server never automatically replays scripts. EEXEC_OUTCOME_UNKNOWN is never automatically retried, including with this hint or readOnly. ECOHERENCE is never retried for write execs because the writes committed. EWORKER_BUSY means execution did not start and supports retry when the caller enables it.",
 		},
 	},
 	required: ["script"],
@@ -89,13 +89,15 @@ const sandboxIdParam = {
 	schema: { type: "string", format: "uuid" },
 } as const;
 
-/**
- * #175: the exec 503 contract. Six codes share this status and they disagree
- * about durability, so the response documents the split explicitly.
- */
 const execUnavailableResponse = {
 	description:
-		"Service unavailable. Check `retryable` before retrying: `true` (ELOCKTIMEOUT, ELOCKLOST, ECOHERENCE_UNAPPLIED, ESESSIONCLOSING, ESHUTTINGDOWN, ERUNTIME_BUSY, EUNAVAILABLE capacity refusals) means nothing was applied and an automatic retry is safe. Two codes are `retryable: false` because the operation may already be durable: `ECOHERENCE` (cache recovery failed after a potentially durable operation) and `ELOCKLOST_APPLIED` (the exec lock lease lapsed, but only after the commit — a heartbeat tick can land during COMMIT). Treat both as applied-but-unacknowledged: re-read state, or retry only if the script is idempotent.",
+		"Service unavailable. EWORKER_BUSY means execution did not start and retryable is true. EWORKER_UNAVAILABLE identifies an interrupted read-only operation and retryable is true. EEXEC_OUTCOME_UNKNOWN has retryable false because writes may have committed. Never automatically replay an unknown outcome, including with readOnly or retryOn5xx hints. Inspect state before another call. ECOHERENCE and ELOCKLOST_APPLIED also have retryable false because writes may already be durable. Other transient errors with retryable true applied nothing in the failed operation.",
+	headers: {
+		"Retry-After": {
+			schema: { type: "integer", minimum: 0 },
+			description: "Seconds to wait before retrying when the response permits retry.",
+		},
+	},
 	content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
 } as const;
 
@@ -888,7 +890,7 @@ export const openapiSpec = {
 									retryOn5xx: {
 										type: "boolean",
 										description:
-											"Caller hint that every script in the batch is idempotent and safe to retry. Currently accepted and ignored server-side; client SDKs use it to enable client-side retry of the whole batch.",
+											"Caller hint that every script in the batch is idempotent and safe to retry. Client SDKs use this hint to retry the whole batch on transient failures. EEXEC_OUTCOME_UNKNOWN is never automatically retried, including with this hint or readOnly. Inspect state before another call.",
 									},
 								},
 								required: ["scripts"],

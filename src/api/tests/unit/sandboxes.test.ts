@@ -3,14 +3,18 @@
  */
 
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { SignJWT } from "jose";
 import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
+import { IngressAdmission } from "../../ingress-admission.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
+import { FairAdmission } from "../../worker-owner/admission.js";
+import { workerRequestContext } from "../../worker-owner/request-context.js";
 
 const AUTH_SECRET = "test-secret-for-sandbox-tests-at-least-32b";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);
@@ -155,6 +159,54 @@ describe("DELETE /v1/sandboxes/:id", () => {
 			headers: { Authorization: `Bearer ${token}` },
 		});
 		expect(delRes.status).toBe(204);
+	});
+
+	it("queued delete is cancelled when the request aborts after ownership validation", async () => {
+		const admission = new FairAdmission({
+			capacity: 1,
+			maxActivePerTenant: 1,
+			maxQueued: 1,
+			maxQueuedPerTenant: 1,
+			maxQueuedBytes: 1024,
+			maxQueuedBytesPerTenant: 1024,
+			waitMs: 1000,
+		});
+		const releaseActive = await admission.acquire("tenant", "active", 1);
+		let destroyed = 0;
+		const manager = {
+			withSessionOrRehydrate: async (_tenant: string, _id: string, fn: (session: { owner: string }) => Promise<void>) =>
+				fn({ owner: "owner-del" }),
+			destroy: async () => {
+				const signal = workerRequestContext.getStore()?.signal;
+				const release = await admission.acquire("tenant", "delete", 1, signal);
+				destroyed++;
+				release();
+				return true;
+			},
+		} as unknown as SessionManager;
+		const app = makeTestApp(manager);
+		app.onError(() => new Response(null, { status: 499 }));
+		const token = await makeToken("owner-del");
+		const controller = new AbortController();
+		const responsePromise = app.fetch(
+			new Request("http://localhost/v1/sandboxes/queued-delete", {
+				method: "DELETE",
+				headers: { Authorization: `Bearer ${token}` },
+				signal: controller.signal,
+			}),
+		);
+
+		try {
+			await vi.waitFor(() => expect(admission.metrics.queued).toBe(1));
+			controller.abort();
+			releaseActive();
+			const response = await responsePromise;
+			expect(destroyed).toBe(0);
+			expect(response.status).toBe(499);
+			expect(admission.metrics.cancelled).toBe(1);
+		} finally {
+			releaseActive();
+		}
 	});
 
 	it("delete non-existent sandbox returns 404", async () => {
@@ -312,5 +364,161 @@ describe("GET /v1/sandboxes/:id", () => {
 
 		// The timestamps must agree — no clock-based drift between POST and GET
 		expect(getCreatedAt).toBe(postCreatedAt);
+	});
+});
+
+describe("sandbox creation body admission", () => {
+	const managers: SessionManager[] = [];
+
+	beforeEach(() => {
+		vi.stubEnv("AUTH_SECRET", AUTH_SECRET);
+	});
+
+	afterEach(async () => {
+		await Promise.all(managers.splice(0).map((manager) => manager.shutdown()));
+		vi.unstubAllEnvs();
+	});
+
+	function setup(stackBodyLimit = false) {
+		const metadata = new Map<string, SandboxMeta>();
+		let filesystems = 0;
+		const manager = new SessionManager({
+			createFs: async () => {
+				filesystems++;
+				return new InMemoryFs();
+			},
+			persistSandboxMetaFn: async (_tenant, id, meta) => {
+				metadata.set(id, meta);
+			},
+		});
+		managers.push(manager);
+		const ingress = new IngressAdmission({
+			maxRequests: 8,
+			maxTenantRequests: 4,
+			maxBytes: 128,
+			maxTenantBytes: 96,
+			maxBodyBytes: 64,
+		});
+		const app = new Hono<{ Variables: AuthVariables }>();
+		app.onError((_error, c) => c.json({ error: "body rejected" }, 500));
+		app.use("*", authMiddleware);
+		app.use("*", ingress.middleware);
+		if (stackBodyLimit) app.use("*", bodyLimit({ maxSize: 64 }));
+		app.post("/hold", async (c) => {
+			await c.req.text();
+			return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+		});
+		app.route("/v1/sandboxes", sandboxRoutes(manager));
+		return { app, ingress, metadata, filesystems: () => filesystems };
+	}
+
+	async function request(
+		app: ReturnType<typeof setup>["app"],
+		body?: ReadableStream<Uint8Array> | string,
+		options: { path?: string; signal?: AbortSignal; declared?: string } = {},
+	) {
+		return app.request(
+			new Request(`http://localhost${options.path ?? "/v1/sandboxes"}`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${await makeToken()}`,
+					...(options.declared === undefined ? {} : { "Content-Length": options.declared }),
+				},
+				body,
+				signal: options.signal,
+				duplex: "half",
+			} as RequestInit),
+		);
+	}
+
+	function chunks(text: string) {
+		return new ReadableStream<Uint8Array>({
+			start(output) {
+				output.enqueue(new TextEncoder().encode(text.slice(0, 8)));
+				output.enqueue(new TextEncoder().encode(text.slice(8)));
+				output.close();
+			},
+		});
+	}
+
+	for (const declared of [undefined, "1"]) {
+		it(`creates no sandbox after a ${declared === undefined ? "chunked" : "underdeclared"} body exceeds its limit`, async () => {
+			const { app, ingress, metadata, filesystems } = setup();
+			const response = await request(app, chunks(JSON.stringify({ name: "x".repeat(64) })), { declared });
+			expect(response.status).toBe(413);
+			expect(await response.json()).toMatchObject({ code: "PAYLOAD_TOO_LARGE", retryable: false });
+			expect(filesystems()).toBe(0);
+			expect(metadata.size).toBe(0);
+			expect(ingress.metrics).toMatchObject({ activeRequests: 0, retainedRawBytes: 0, payloadTooLarge: 1 });
+		});
+
+		it(`creates no sandbox after a ${declared === undefined ? "chunked" : "underdeclared"} body exhausts tenant bytes`, async () => {
+			const { app, ingress, metadata, filesystems } = setup();
+			const held = await request(app, "x".repeat(64), { path: "/hold" });
+			try {
+				const response = await request(app, chunks(JSON.stringify({ name: "x".repeat(40) })), { declared });
+				expect(response.status).toBe(503);
+				expect(await response.json()).toMatchObject({ code: "EWORKER_BUSY", retryable: true });
+				expect(response.headers.get("Retry-After")).toBe("1");
+				expect(filesystems()).toBe(0);
+				expect(metadata.size).toBe(0);
+				expect(ingress.metrics).toMatchObject({ activeRequests: 1, retainedRawBytes: 64, refused: 1 });
+			} finally {
+				await held.body!.cancel();
+			}
+			expect(ingress.metrics).toMatchObject({ activeRequests: 0, retainedRawBytes: 0 });
+		});
+	}
+
+	for (const stackBodyLimit of [false, true]) {
+		it(`creates no sandbox after abort${stackBodyLimit ? " with Hono bodyLimit" : ""}`, async () => {
+			const { app, ingress, metadata, filesystems } = setup(stackBodyLimit);
+			const abort = new AbortController();
+			const body = new ReadableStream<Uint8Array>({
+				start(output) {
+					output.enqueue(new TextEncoder().encode("{}"));
+				},
+			});
+			const pending = request(app, body, { signal: abort.signal });
+			await expect.poll(() => ingress.metrics.retainedRawBytes).toBe(2);
+			abort.abort();
+			const response = await pending;
+			expect(response.status).toBe(499);
+			expect(filesystems()).toBe(0);
+			expect(metadata.size).toBe(0);
+			expect(ingress.metrics).toMatchObject({ activeRequests: 0, retainedRawBytes: 0, aborted: 1 });
+		});
+	}
+
+	for (const error of [new Error("body transport failed"), new SyntaxError("body transport failed")]) {
+		it(`creates no sandbox when the transport throws ${error.name}`, async () => {
+			const { app, metadata, filesystems } = setup();
+			const body = new ReadableStream<Uint8Array>({
+				start(output) {
+					output.error(error);
+				},
+			});
+			expect((await request(app, body)).status).toBe(500);
+			expect(filesystems()).toBe(0);
+			expect(metadata.size).toBe(0);
+		});
+	}
+
+	for (const body of [undefined, "", "{}", '{"name":"valid"}']) {
+		it(`accepts a complete optional body ${JSON.stringify(body)}`, async () => {
+			const { app, metadata, filesystems } = setup();
+			expect((await request(app, body)).status).toBe(201);
+			expect(filesystems()).toBe(1);
+			expect(metadata.size).toBe(1);
+		});
+	}
+
+	it("rejects malformed nonempty JSON before creating a sandbox", async () => {
+		const { app, metadata, filesystems } = setup();
+		const response = await request(app, "{");
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ code: "INVALID_INPUT", details: ["Invalid JSON body"] });
+		expect(filesystems()).toBe(0);
+		expect(metadata.size).toBe(0);
 	});
 });

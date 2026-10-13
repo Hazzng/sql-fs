@@ -11,7 +11,9 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import type { AuthVariables } from "../auth.js";
 import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError } from "../errors.js";
+import { retainIngressWork } from "../ingress-admission.js";
 import { type BatchScriptResult, type ExecuteBatchOptions, executeBatch } from "../lib/batch-exec.js";
+import { retainedInputBytes } from "../lib/request-input.js";
 import {
 	forbiddenResponse,
 	isForbiddenError,
@@ -20,6 +22,7 @@ import {
 } from "../ownership.js";
 import { sessionLeaseSignal } from "../session-lease-context.js";
 import type { SessionManager } from "../session-manager.js";
+import { workerRequestContext } from "../worker-owner/request-context.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -177,60 +180,71 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		let execResult: ExecSyncResult;
 		try {
 			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
-			execResult = await runner<ExecSyncResult>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				const controller = new AbortController();
-				let timedOut = false;
-				const startMs = Date.now();
+			execResult = await workerRequestContext.run(
+				{
+					bytes: retainedInputBytes(body) + (body.debug ? retainedInputBytes(scriptToRun) : 0),
+					signal: c.req.raw.signal,
+				},
+				() =>
+					runner<ExecSyncResult>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+						const controller = new AbortController();
+						let timedOut = false;
+						const startMs = Date.now();
 
-				// #172: a client that gives up must not leave the script running, holding the
-				// sandbox's exclusive exec lock for the rest of its timeout. Same wiring as
-				// /exec and /exec-sync-batch, including the already-aborted pre-check — the
-				// client can disconnect while this handler waits for the lock. Semantics match
-				// the timeout path: abort only, work already committed stays committed.
-				if (c.req.raw.signal.aborted) {
-					controller.abort();
-				} else {
-					c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
-				}
+						// #172: a client that gives up must not leave the script running, holding the
+						// sandbox's exclusive exec lock for the rest of its timeout. Same wiring as
+						// /exec and /exec-sync-batch, including the already-aborted pre-check — the
+						// client can disconnect while this handler waits for the lock. Semantics match
+						// the timeout path: abort only, work already committed stays committed.
+						if (c.req.raw.signal.aborted) {
+							controller.abort();
+						} else {
+							c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
+						}
 
-				const timer = setTimeout(() => {
-					timedOut = true;
-					controller.abort();
-				}, timeoutMs);
+						const timer = setTimeout(() => {
+							timedOut = true;
+							controller.abort();
+						}, timeoutMs);
 
-				// F2-L1: abort the exec — and roll its script-tx back BEFORE any commit —
-				// the instant the distributed exec lock is definitively lost. Compose the
-				// lock-lost signal (if a distributed lock is held) with the timeout signal.
-				const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
+						// F2-L1: abort the exec — and roll its script-tx back BEFORE any commit —
+						// the instant the distributed exec lock is definitively lost. Compose the
+						// lock-lost signal (if a distributed lock is held) with the timeout signal.
+						const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
 
-				try {
-					const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-						signal: execSignal,
-						cwd: body.cwd,
-						env,
-					});
-					clearTimeout(timer);
+						try {
+							const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
+								signal: execSignal,
+								cwd: body.cwd,
+								env,
+							});
+							clearTimeout(timer);
 
-					// Audit L7: a RESOLVED exec means the script ran to completion and any
-					// write committed — return the real result even if the timeout timer
-					// happened to fire in the same tick. Reporting a false 408 here would
-					// make the client retry a write that actually succeeded. The timeout
-					// path applies only when the exec was genuinely aborted (catch below).
-					return {
-						kind: "ok",
-						stdout: result.stdout,
-						stderr: result.stderr,
-						exitCode: result.exitCode,
-						durationMs: Date.now() - startMs,
-					};
-				} catch (e) {
-					clearTimeout(timer);
-					if (timedOut) {
-						return { kind: "timeout", durationMs: Date.now() - startMs };
-					}
-					throw e;
-				}
-			});
+							if (
+								timedOut &&
+								controller.signal.aborted &&
+								result.executionAborted === true &&
+								!sessionLeaseSignal()?.aborted
+							) {
+								return { kind: "timeout", durationMs: Date.now() - startMs };
+							}
+
+							return {
+								kind: "ok",
+								stdout: result.stdout,
+								stderr: result.stderr,
+								exitCode: result.exitCode,
+								durationMs: Date.now() - startMs,
+							};
+						} catch (e) {
+							clearTimeout(timer);
+							if (timedOut && ((e as Error)?.name === "AbortError" || (e as { code?: string })?.code === undefined)) {
+								return { kind: "timeout", durationMs: Date.now() - startMs };
+							}
+							throw e;
+						}
+					}),
+			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
@@ -282,133 +296,159 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		const readOnly = body.readOnly === true;
 		try {
 			const ownerCheck = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
-			await ownerCheck(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined);
+			await workerRequestContext.run(
+				{
+					bytes: retainedInputBytes(body) + (body.debug ? retainedInputBytes(scriptToRun) : 0),
+					signal: c.req.raw.signal,
+				},
+				() => ownerCheck(sessionManager, tenant, sandboxId, c.get("owner"), async () => undefined),
+			);
 		} catch (err) {
 			if (isForbiddenError(err)) return forbiddenResponse();
 			throw err;
 		}
 
-		return streamSSE(c, async (stream) => {
-			const controller = new AbortController();
-			let timedOut = false;
-			const startMs = Date.now();
+		return streamSSE(
+			c,
+			retainIngressWork(async (stream) => {
+				const controller = new AbortController();
+				let timedOut = false;
+				const startMs = Date.now();
 
-			// Cancel on client disconnect ({ once: true }: the listener is never removed).
-			c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
+				// Cancel on client disconnect ({ once: true }: the listener is never removed).
+				c.req.raw.signal.addEventListener("abort", () => controller.abort(), { once: true });
+				if (c.req.raw.signal.aborted) controller.abort();
 
-			const timer = setTimeout(() => {
-				timedOut = true;
-				controller.abort();
-			}, timeoutMs);
+				const timer = setTimeout(() => {
+					timedOut = true;
+					controller.abort();
+				}, timeoutMs);
 
-			// Audit L2: run the streamed exec through the rehydrating, owner-checking
-			// entry point (not withExistingSession). This avoids a spurious ENOENT if
-			// the session is evicted between the pre-check above and here, and re-runs
-			// the ownership check under lock rather than skipping it in this phase.
-			const ownerRunner = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
-			try {
-				await ownerRunner(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-					// F2-L1: compose the distributed lock's definitive-loss signal with the
-					// timeout/client-disconnect signal so a lapsed lease aborts the exec and
-					// rolls its script-tx back BEFORE any commit.
-					const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
-					try {
-						const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
-							signal: execSignal,
-							cwd: body.cwd,
-							env,
+				// Audit L2: run the streamed exec through the rehydrating, owner-checking
+				// entry point (not withExistingSession). This avoids a spurious ENOENT if
+				// the session is evicted between the pre-check above and here, and re-runs
+				// the ownership check under lock rather than skipping it in this phase.
+				const ownerRunner = readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
+				let terminal: { exitCode: number; error?: "timeout" };
+				try {
+					terminal = await workerRequestContext.run(
+						{
+							bytes: retainedInputBytes(body) + (body.debug ? retainedInputBytes(scriptToRun) : 0),
+							signal: c.req.raw.signal,
+						},
+						() =>
+							ownerRunner<{ exitCode: number; error?: "timeout" }>(
+								sessionManager,
+								tenant,
+								sandboxId,
+								c.get("owner"),
+								async (session) => {
+									// F2-L1: compose the distributed lock's definitive-loss signal with the
+									// timeout/client-disconnect signal so a lapsed lease aborts the exec and
+									// rolls its script-tx back BEFORE any commit.
+									const execSignal = composeAbortSignals(controller.signal, sessionLeaseSignal());
+									try {
+										const result = await sessionManager.execWithRuntimeThrottle(session, scriptToRun, {
+											signal: execSignal,
+											cwd: body.cwd,
+											env,
+										});
+										clearTimeout(timer);
+
+										if (
+											timedOut &&
+											controller.signal.aborted &&
+											result.executionAborted === true &&
+											!sessionLeaseSignal()?.aborted
+										) {
+											return { exitCode: -1, error: "timeout" };
+										}
+
+										if (result.stdout) {
+											await stream.writeSSE({
+												event: "stdout",
+												data: JSON.stringify({ t: "stdout", data: result.stdout }),
+											});
+										}
+										if (result.stderr) {
+											await stream.writeSSE({
+												event: "stderr",
+												data: JSON.stringify({ t: "stderr", data: result.stderr }),
+											});
+										}
+										return { exitCode: result.exitCode };
+									} catch (e) {
+										clearTimeout(timer);
+										if (
+											timedOut &&
+											((e as Error)?.name === "AbortError" || (e as { code?: string })?.code === undefined)
+										) {
+											return { exitCode: -1, error: "timeout" };
+										}
+										throw e;
+									}
+								},
+							),
+					);
+				} catch (err) {
+					clearTimeout(timer);
+					if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
+						await stream.writeSSE({
+							event: "error",
+							data: JSON.stringify({
+								t: "error",
+								code: "EREADONLY_VIOLATION",
+								error: "readOnly script attempted to mutate the filesystem",
+							}),
 						});
-						clearTimeout(timer);
-
-						if (timedOut) {
-							await stream.writeSSE({
-								event: "exit",
-								data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
-							});
-							return;
-						}
-
-						if (result.stdout) {
-							await stream.writeSSE({
-								event: "stdout",
-								data: JSON.stringify({ t: "stdout", data: result.stdout }),
-							});
-						}
-						if (result.stderr) {
-							await stream.writeSSE({
-								event: "stderr",
-								data: JSON.stringify({ t: "stderr", data: result.stderr }),
-							});
-						}
 						await stream.writeSSE({
 							event: "exit",
-							data: JSON.stringify({ t: "exit", exitCode: result.exitCode, durationMs: Date.now() - startMs }),
+							data: JSON.stringify({
+								t: "exit",
+								exitCode: -1,
+								durationMs: Date.now() - startMs,
+								error: "read_only_violation",
+							}),
 						});
-					} catch (e) {
-						clearTimeout(timer);
-						if (timedOut) {
-							await stream.writeSSE({
-								event: "exit",
-								data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "timeout" }),
-							});
-							return;
-						}
-						throw e;
+						return;
 					}
-				});
-			} catch (err) {
-				clearTimeout(timer);
-				if ((err as Error & { code?: string }).code === "EREADONLY_VIOLATION") {
-					await stream.writeSSE({
-						event: "error",
-						data: JSON.stringify({
-							t: "error",
-							code: "EREADONLY_VIOLATION",
-							error: "readOnly script attempted to mutate the filesystem",
-						}),
-					});
-					await stream.writeSSE({
-						event: "exit",
-						data: JSON.stringify({
-							t: "exit",
-							exitCode: -1,
-							durationMs: Date.now() - startMs,
-							error: "read_only_violation",
-						}),
-					});
+					// Audit M12: never let the stream close without a terminal event —
+					// otherwise the client cannot distinguish a failed exec from a
+					// truncated success. Emit a sanitized error + exit event. Writing may
+					// itself fail if the client already disconnected; ignore that.
+					// The server-side log keeps the raw driver code/message for diagnosis; the
+					// SSE frame carries only the allowlisted code (#174).
+					const errCode = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
+					console.error(
+						JSON.stringify({ event: "exec_sse_error", sandboxId, code: errCode, error: (err as Error).message }),
+					);
+					try {
+						await stream.writeSSE({
+							event: "error",
+							data: JSON.stringify({
+								t: "error",
+								code: clientSafeErrorCode(err),
+								error: clientSafeErrorMessage(err, "internal error"),
+								// #175: mirror the JSON error body's durability discriminator so an
+								// SSE client can make the same retry decision as a buffered one.
+								retryable: isRetryableError(err),
+							}),
+						});
+						await stream.writeSSE({
+							event: "exit",
+							data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "error" }),
+						});
+					} catch {
+						// stream already closed (client disconnect) — nothing to surface.
+					}
 					return;
 				}
-				// Audit M12: never let the stream close without a terminal event —
-				// otherwise the client cannot distinguish a failed exec from a
-				// truncated success. Emit a sanitized error + exit event. Writing may
-				// itself fail if the client already disconnected; ignore that.
-				// The server-side log keeps the raw driver code/message for diagnosis; the
-				// SSE frame carries only the allowlisted code (#174).
-				const errCode = (err as Error & { code?: string }).code ?? "INTERNAL_ERROR";
-				console.error(
-					JSON.stringify({ event: "exec_sse_error", sandboxId, code: errCode, error: (err as Error).message }),
-				);
-				try {
-					await stream.writeSSE({
-						event: "error",
-						data: JSON.stringify({
-							t: "error",
-							code: clientSafeErrorCode(err),
-							error: clientSafeErrorMessage(err, "internal error"),
-							// #175: mirror the JSON error body's durability discriminator so an
-							// SSE client can make the same retry decision as a buffered one.
-							retryable: isRetryableError(err),
-						}),
-					});
-					await stream.writeSSE({
-						event: "exit",
-						data: JSON.stringify({ t: "exit", exitCode: -1, durationMs: Date.now() - startMs, error: "error" }),
-					});
-				} catch {
-					// stream already closed (client disconnect) — nothing to surface.
-				}
-			}
-		});
+				await stream.writeSSE({
+					event: "exit",
+					data: JSON.stringify({ t: "exit", ...terminal, durationMs: Date.now() - startMs }),
+				});
+			}),
+		);
 	});
 
 	router.post("/:id/exec-sync-batch", async (c) => {
@@ -444,17 +484,19 @@ export function execRoutes(sessionManager: SessionManager): Hono<{ Variables: Au
 		let results: BatchScriptResult[];
 		try {
 			const runner = body.readOnly ? withOwnedSessionRead : withOwnedSessionOrRehydrate;
-			results = await runner<BatchScriptResult[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) =>
-				// F2-L1: compose the distributed lock's definitive-loss signal with the
-				// client-disconnect signal so a lapsed lease aborts the in-flight batch
-				// script and rolls its script-tx back BEFORE any commit.
-				executeBatch(
-					sessionManager,
-					session,
-					body.scripts,
-					totalTimeoutMs,
-					composeAbortSignals(disconnectController.signal, sessionLeaseSignal()),
-					batchOptions,
+			results = await workerRequestContext.run({ bytes: retainedInputBytes(body), signal: c.req.raw.signal }, () =>
+				runner<BatchScriptResult[]>(sessionManager, tenant, sandboxId, c.get("owner"), async (session) =>
+					// F2-L1: compose the distributed lock's definitive-loss signal with the
+					// client-disconnect signal so a lapsed lease aborts the in-flight batch
+					// script and rolls its script-tx back BEFORE any commit.
+					executeBatch(
+						sessionManager,
+						session,
+						body.scripts,
+						totalTimeoutMs,
+						composeAbortSignals(disconnectController.signal, sessionLeaseSignal()),
+						batchOptions,
+					),
 				),
 			);
 		} catch (err) {

@@ -334,11 +334,10 @@ export function apiErrorHandler(err: Error, c: Context): Response {
 			}),
 		);
 	}
+	const code = clientSafeErrorCode(err);
+	if (code === "EWORKER_BUSY") c.header("Retry-After", "1");
 	// #175: six distinct codes share 503, and they disagree about durability.
 	// `retryable` is the discriminator so a client never has to enumerate codes
 	// to learn whether a retry can double-apply a write.
-	return c.json(
-		{ error: clientSafeErrorMessage(err), code: clientSafeErrorCode(err), retryable: isRetryableError(err) },
-		status,
-	);
+	return c.json({ error: clientSafeErrorMessage(err), code, retryable: isRetryableError(err) }, status);
 }

@@ -9,8 +9,10 @@ import { z } from "zod";
 import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import type { AuthVariables } from "../auth.js";
 import { buildBulkIngestPayload } from "../ingest-manifest.js";
+import { retainedInputBytes } from "../lib/request-input.js";
 import { forbiddenResponse, isForbiddenError, withOwnedSessionOrRehydrate } from "../ownership.js";
 import type { SessionManager } from "../session-manager.js";
+import { workerRequestContext } from "../worker-owner/request-context.js";
 
 export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: AuthVariables }> {
 	const router = new Hono<{ Variables: AuthVariables }>();
@@ -55,13 +57,17 @@ export function ingestRoutes(sessionManager: SessionManager): Hono<{ Variables: 
 		const fileCount = bulkFiles.length;
 
 		try {
-			await withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
-				const fs = session.fs as ICoherentFs;
-				if (typeof fs.bulkIngest !== "function") {
-					throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
-				}
-				await fs.bulkIngest(bulkFiles);
-			});
+			await workerRequestContext.run(
+				{ bytes: retainedInputBytes({ basePath, files, bulkFiles }), signal: c.req.raw.signal },
+				() =>
+					withOwnedSessionOrRehydrate(sessionManager, tenant, sandboxId, c.get("owner"), async (session) => {
+						const fs = session.fs as ICoherentFs;
+						if (typeof fs.bulkIngest !== "function") {
+							throw Object.assign(new Error("bulkIngest not supported by this fs backend"), { code: "ENOTSUP" });
+						}
+						await fs.bulkIngest(bulkFiles);
+					}),
+			);
 		} catch (e) {
 			const code = (e as Error & { code?: string }).code;
 			if (isForbiddenError(e)) {
