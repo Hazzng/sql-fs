@@ -71,7 +71,7 @@ interface SqlFsOptions<Tx> {
 	readonly sandboxId: string;
 	/** Max total byte budget for the content cache. Default: 50 MB. */
 	readonly contentCacheMaxBytes?: number;
-	/** Allow symlink() to create symlinks. Default: false (EPERM). */
+	/** Allow symbolic links. Defaults to true. */
 	readonly allowSymlinks?: boolean;
 	/**
 	 * Buffered script-tx (#166). When enabled, mutations inside a script scope are
@@ -168,7 +168,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	constructor(opts: SqlFsOptions<Tx>) {
 		this.#dialect = opts.dialect;
 		this.#sandboxId = opts.sandboxId;
-		this.#allowSymlinks = opts.allowSymlinks ?? false;
+		this.#allowSymlinks = opts.allowSymlinks ?? true;
 		this.#persistence = new ScriptPersistence(
 			opts.dialect,
 			opts.sandboxId,

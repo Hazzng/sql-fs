@@ -21,8 +21,10 @@ describe("cached reads during scope failure", () => {
 				await gate;
 				return [{ inodeId: 4n, data: bytes }];
 			});
-			const blobRead = vi.spyOn(probe.dialect, "getBlobNoTx");
-			const blobWrite = vi.spyOn(probe.dialect, "commitBlob");
+			const blobRead = vi.fn(async () => null);
+			const blobWrite = vi.fn(async () => undefined);
+			probe.dialect.getBlobNoTx = blobRead;
+			probe.dialect.commitBlob = blobWrite;
 			const fs = new SqlFs({ dialect: probe.dialect, sandboxId: "cached-verdict", scriptTxBuffer: BUFFER_ON });
 			await fs.ready();
 			fs.beginScriptScope();

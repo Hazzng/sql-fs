@@ -79,15 +79,16 @@ export class CoherentView<Tx> {
 	}
 
 	#cacheSet(key: string, entry: PathCacheEntry): void {
-		if (!this.#pathCache.has(key)) {
-			this.#pathCacheBytes += key.length + 100;
-		}
+		const prior = this.#pathCache.get(key);
+		this.#pathCacheBytes += prior === undefined ? key.length + 100 : -(prior.symlinkTarget?.length ?? 0) * 2;
+		this.#pathCacheBytes += (entry.symlinkTarget?.length ?? 0) * 2;
 		this.#pathCache.set(key, entry);
 	}
 
 	#cacheDelete(key: string): void {
-		if (this.#pathCache.delete(key)) {
-			this.#pathCacheBytes -= key.length + 100;
+		const prior = this.#pathCache.get(key);
+		if (prior !== undefined && this.#pathCache.delete(key)) {
+			this.#pathCacheBytes -= key.length + 100 + (prior.symlinkTarget?.length ?? 0) * 2;
 		}
 	}
 
@@ -181,7 +182,10 @@ export class CoherentView<Tx> {
 		if (view === undefined) return false;
 		for (const path of view.entries.keys()) assertStoredPath(validatePath(path), "load reserved virtual device");
 		this.#committedView = view;
-		this.#pathCacheBytes = [...view.entries.keys()].reduce((bytes, path) => bytes + path.length + 100, 0);
+		this.#pathCacheBytes = [...view.entries].reduce(
+			(bytes, [path, entry]) => bytes + path.length + 100 + (entry.symlinkTarget?.length ?? 0) * 2,
+			0,
+		);
 
 		this.#dirty = false;
 		this.#cachePoisoned = false;

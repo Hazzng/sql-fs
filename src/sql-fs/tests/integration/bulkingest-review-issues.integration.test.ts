@@ -9,6 +9,7 @@
  * Skipped when DATABASE_URL is not set.
  */
 
+import { Bash } from "just-bash";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import { SqlFs } from "../../sql-fs.js";
@@ -38,6 +39,7 @@ describe.skipIf(!process.env.DATABASE_URL)("bulkIngest review issues — integra
 			try {
 				await dialect.transaction(async (tx) => {
 					await dialect.deleteSandbox(tx, id);
+					await tx`DELETE FROM sandbox_epochs WHERE sandbox_id = ${id}`;
 				});
 			} catch {}
 		}
@@ -59,6 +61,64 @@ describe.skipIf(!process.env.DATABASE_URL)("bulkIngest review issues — integra
 		expect(fs.getAllPaths()).toEqual(before);
 		expect((await fs.stat("/")).isDirectory).toBe(true);
 	});
+
+	it("supports ln -s by default and bounds cyclic resolution", async () => {
+		const { fs } = await makeSandbox();
+		await fs.writeFile("/home/user/target", "linked bytes");
+		const bash = new Bash({ fs, cwd: "/home/user" });
+		const result = await bash.exec("ln -s target alias; cat alias");
+		expect({ exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr }).toEqual({
+			exitCode: 0,
+			stdout: "linked bytes",
+			stderr: "",
+		});
+		expect(await fs.readlink("/home/user/alias")).toBe("target");
+		await fs.symlink("/home/user/cycle", "/home/user/cycle");
+		await expect(fs.readFile("/home/user/cycle")).rejects.toMatchObject({ code: "ELOOP" });
+	});
+
+	it("resolves nested relative targets and clamps parent traversal to the sandbox root", async () => {
+		const { fs } = await makeSandbox();
+		await fs.mkdir("/home/user/sub");
+		await fs.writeFile("/home/user/target", "nested target");
+		await fs.writeFile("/root-target", "sandbox root");
+		await fs.symlink("../target", "/home/user/sub/link");
+		await fs.symlink("sub", "/home/user/directory-alias");
+		expect(await fs.readFile("/home/user/directory-alias/link")).toBe("nested target");
+		await fs.symlink("../../../../root-target", "/home/user/up");
+		expect(await fs.readFile("/home/user/up")).toBe("sandbox root");
+	});
+
+	it("caps total SQL symlink hops across separate path components", async () => {
+		const { fs, id } = await makeSandbox();
+		await fs.writeFile("/home/user/target", "reachable");
+		const names = Array.from({ length: 41 }, (_, index) => `hop${index}`);
+		for (const name of names) await fs.symlink(".", `/home/user/${name}`);
+		await dialect.transaction(async (tx) => {
+			await dialect.setSandboxContext(tx, id);
+			const allowed = `/home/user/${names.slice(0, 40).join("/")}/target`;
+			expect(await dialect.resolvePath(tx, allowed, true)).toBe(fs._getPathCache().get("/home/user/target")?.inodeId);
+		});
+		await expect(
+			dialect.transaction(async (tx) => {
+				await dialect.setSandboxContext(tx, id);
+				return dialect.resolvePath(tx, `/home/user/${names.join("/")}/target`, true);
+			}),
+		).rejects.toMatchObject({ code: "ELOOP" });
+	});
+
+	it.each(["/dev/null", "/dev/null/child", "/dev/./null"])(
+		"rejects direct dialect ingestion of virtual device %s",
+		async (path) => {
+			const { fs, id } = await makeSandbox();
+			const before = fs.getAllPaths();
+			await expect(
+				dialect.transaction((tx) => dialect.bulkIngest(tx, [{ path, content: new Uint8Array(1), mode: 0o644 }], id)),
+			).rejects.toMatchObject({ code: path === "/dev/null/child" ? "ENOTDIR" : "EPERM" });
+			await fs.reload();
+			expect(fs.getAllPaths()).toEqual(before);
+		},
+	);
 
 	// ── Issue 1: overwriting a directory as a file ────────────────────────────
 

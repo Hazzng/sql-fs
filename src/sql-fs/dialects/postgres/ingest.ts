@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { createEisdir, createEnotdir, createEstale } from "../../errors.js";
+import { posix } from "node:path";
+import { createEisdir, createEnotdir, createEperm, createEstale } from "../../errors.js";
 import { type BulkIngestFile, INODE_KIND, type PathCacheEntry } from "../../types.js";
 import type { PostgresBlobs } from "./blobs.js";
 import { fenceAndAdvance } from "./sandbox.js";
@@ -15,7 +16,10 @@ export async function bulkIngest(
 	const result = new Map<string, PathCacheEntry>();
 	if (files.length === 0) return result;
 	for (const file of files) {
-		if (file.path === "/") throw createEisdir(file.path);
+		const path = posix.resolve("/", file.path);
+		if (path === "/") throw createEisdir(file.path);
+		if (path === "/dev/null") throw createEperm(file.path, "bulkIngest");
+		if (path.startsWith("/dev/null/")) throw createEnotdir("/dev/null");
 	}
 
 	const ctxRows = await tx<{ root_inode: string | null; fenced: number }[]>`
