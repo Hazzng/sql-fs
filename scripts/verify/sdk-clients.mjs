@@ -96,12 +96,16 @@ async function runPythonWithCapture(server, owner, mode, extra, captureDir) {
 			SDK_VERIFY_TOKEN: owner.token,
 			SDK_VERIFY_MARKER: run.runId,
 			SDK_VERIFY_CAPTURE_DIR: captureDir,
+			SDK_VERIFY_AUTH_FD: "3",
 			...extra,
 		},
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: ["ignore", "pipe", "pipe", "pipe"],
 	});
 	let stdout = "";
 	let stderr = "";
+	let authMessages = "";
+	child.stdio[3].setEncoding("utf8");
+	child.stdio[3].on("data", (chunk) => { authMessages += chunk; });
 	child.stdout.on("data", (chunk) => {
 		stdout += chunk;
 	});
@@ -110,17 +114,22 @@ async function runPythonWithCapture(server, owner, mode, extra, captureDir) {
 	});
 	const status = await new Promise((resolve, reject) => {
 		child.once("error", reject);
-		child.once("exit", resolve);
+		child.once("close", resolve);
 	});
 	run.record({ phase: "python-sdk", mode, status, stderr });
 	assert.equal(status, 0, run.redact(stderr));
 	const proof = JSON.parse(stdout);
-	for (const request of proof.requests) {
-		const { requestBodyValue, responseBodyValue } = request;
-		delete request.requestBodyValue;
-		delete request.responseBodyValue;
+	const authExchanges = new Map(authMessages.trim().split("\n").filter(Boolean).map((line) => {
+		const exchange = JSON.parse(line);
+		return [exchange.index, exchange];
+	}));
+	for (const [index, request] of proof.requests.entries()) {
+		const authExchange = authExchanges.get(index);
+		const requestBodyValue = authExchange?.requestBody;
+		const responseBodyValue = authExchange?.responseBody;
 		if (request.path.startsWith("/v1/auth/")) {
 			run.equal(request.requestBodyFile, undefined, "Python auth request body is never written to disk");
+			run.equal(Boolean(authExchange), true, "Python auth schema values arrive only through the private pipe");
 			run.equal(request.responseBodyFile, undefined, "Python auth response body is never written to disk");
 		}
 		const requestBody = requestBodyValue ?? (request.requestBodyFile

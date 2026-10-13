@@ -56,10 +56,15 @@ def observe(response):
     if not capture_body:
         response.read()
         entry["responseBodyPresent"] = bool(response.content)
+        auth_exchange = {"index": len(requests)}
         if entry["requestBodyPresent"] and is_json_content_type(request_content_type):
-            entry["requestBodyValue"] = json.loads(response.request.content)
+            auth_exchange["requestBody"] = json.loads(response.request.content)
         if response.content and is_json_content_type(response_content_type):
-            entry["responseBodyValue"] = response.json()
+            auth_exchange["responseBody"] = response.json()
+        with os.fdopen(
+            int(os.environ["SDK_VERIFY_AUTH_FD"]), "w", encoding="utf-8", closefd=False
+        ) as auth_pipe:
+            auth_pipe.write(json.dumps(auth_exchange) + "\n")
     elif (response_content_type or "").split(";", 1)[
         0
     ].strip().lower() == "text/event-stream":
