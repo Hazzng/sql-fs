@@ -37,7 +37,7 @@ export interface ScopeStamp {
 export type PathChange =
 	| { readonly kind: "set"; readonly path: string; readonly entry: PathCacheEntry }
 	| { readonly kind: "delete"; readonly path: string }
-	| { readonly kind: "patchInode"; readonly inodeId: bigint; readonly patch: Partial<PathCacheEntry> };
+	| { readonly kind: "patchInode"; readonly inodeId: bigint; readonly patch: Partial<Omit<PathCacheEntry, "inodeId">> };
 export type ContentChange =
 	| { readonly kind: "evict"; readonly inodeId: bigint }
 	| { readonly kind: "put"; readonly inodeId: bigint; readonly bytes: Uint8Array };

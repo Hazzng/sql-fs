@@ -48,6 +48,18 @@ describe.skipIf(!process.env.DATABASE_URL)("bulkIngest review issues — integra
 		await dialect.disconnect();
 	});
 
+	it("rejects root ingestion with EISDIR and preserves its children", async () => {
+		const { fs, id } = await makeSandbox();
+		const before = fs.getAllPaths();
+		const file = { path: "/", content: new TextEncoder().encode("root overwrite"), mode: 0o644 };
+		await expect(fs.bulkIngest([file])).rejects.toMatchObject({ code: "EISDIR" });
+		await expect(dialect.transaction((tx) => dialect.bulkIngest(tx, [file], id))).rejects.toMatchObject({
+			code: "EISDIR",
+		});
+		expect(fs.getAllPaths()).toEqual(before);
+		expect((await fs.stat("/")).isDirectory).toBe(true);
+	});
+
 	// ── Issue 1: overwriting a directory as a file ────────────────────────────
 
 	it("issue 1: ingesting a file at a path that is currently a directory throws EISDIR", async () => {

@@ -11,6 +11,6 @@
 
 The namespace modules contain complete stateless algorithms: [file writes and append](namespace/file-writes.ts), [directory/tree creation/copy/removal](namespace/directory-tree.ts), [links/moves/metadata](namespace/links-moves.ts), and [ingest](namespace/ingest.ts). Their query/view/persistence/policy ports derive only the operations each group uses. Execution policy remains in the adapter.
 
-Metadata publication follows successful database commit outside a script scope. Buffered scopes publish provisional metadata until finalization; the view applies the returned inode remap to both caches and rejects unbound IDs before publishing the epoch. Failed settlement reloads through the public adapter method; failed reload poisons the view. Execution is never replayed automatically.
+Metadata publication follows successful database commit outside a script scope. Non-buffered scopes publish transaction-local metadata before their held transaction commits. Buffered scopes publish provisional metadata until finalization; the view applies the returned inode remap to both caches and rejects unbound IDs before publishing the epoch. Failed settlement reloads through the public adapter method; failed reload poisons the view. Execution is never replayed automatically.
 
 [`paths.ts`](paths.ts) contains shared pure path rules. [`types.ts`](types.ts) defines mutation, publication, and scope contracts. The existing `_getPathCache()` and `_getContentCache()` adapters remain available for tests; production collaborators use observation and publication methods.

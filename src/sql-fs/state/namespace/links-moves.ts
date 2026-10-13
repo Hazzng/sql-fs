@@ -132,6 +132,10 @@ export async function mv<Tx>(
 	// Reject moving onto the root inode (empty basename) — would clobber "/"
 	// (audit H2 #25).
 	if (destName === "") throw createEisdir(dest);
+	if (destEntry?.inodeId === srcEntry.inodeId) return;
+	if (destEntry?.kind === INODE_KIND.DIRECTORY && srcEntry.kind !== INODE_KIND.DIRECTORY) throw createEisdir(dest);
+	if (destEntry !== undefined && destEntry.kind !== INODE_KIND.DIRECTORY && srcEntry.kind === INODE_KIND.DIRECTORY)
+		throw createEnotdir(dest);
 	// Reject overwriting a non-empty directory: replacing its dirent here would
 	// leave the destination's entire subtree orphaned in the DB and diverge the
 	// cache (audit H2 #8). Mirrors rename(2) ENOTEMPTY.

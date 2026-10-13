@@ -27,7 +27,7 @@ export type FileWriteQueries<Tx> = Pick<
 export type FileWriteView<Tx> = Pick<CoherentView<Tx>, "epoch" | "get" | "requireParent" | "publishMutation">;
 export type FileWritePersistence<Tx> = Pick<
 	ScriptPersistence<Tx>,
-	"buffering" | "captureGeneration" | "assertGeneration" | "guarded" | "mutateOne" | "readForAppend"
+	"buffering" | "captureReservation" | "assertReservation" | "guarded" | "mutateOne" | "readForAppend"
 >;
 
 function blobArgFor<Tx>(
@@ -109,7 +109,7 @@ export async function writeFile<Tx>(
 ): Promise<void> {
 	const paths: PathChange[] = [];
 	const contents: ContentChange[] = [];
-	const scopeGeneration = persistence.captureGeneration();
+	const scopeStamp = persistence.captureReservation();
 	policy.assertWritable(path, "writeFile");
 	// Refuse to clobber an existing directory with a file (audit H2 #13). This
 	// also rejects writing to "/" (the root is a directory), closing #25.
@@ -128,13 +128,13 @@ export async function writeFile<Tx>(
 	// `assertAlive`, so a condemned scope would still put it on the wire — the exact
 	// hazard the sticky scope verdict exists to prevent. Assert first, and route it through `guarded` so a
 	// fault during the blob write is raced (it never settles on its own) and condemns the scope.
-	persistence.assertGeneration(scopeGeneration);
+	persistence.assertReservation(scopeStamp);
 	// An empty file needs no blob row (readers map a missing blob to empty bytes), and
 	// just-bash 3.6 truncates every `>` target with one before writing the output.
 	if (dialect.commitBlob && bytes.byteLength > 0) {
 		await persistence.guarded(() => dialect.commitBlob!(sha256, bytes));
 	}
-	persistence.assertGeneration(scopeGeneration);
+	persistence.assertReservation(scopeStamp);
 
 	// The write replaces the inode; carry the old file's mode onto the new one, as
 	// overwriting a file in place does.
@@ -192,7 +192,7 @@ export async function appendFile<Tx>(
 ): Promise<void> {
 	const paths: PathChange[] = [];
 	const contents: ContentChange[] = [];
-	const scopeGeneration = persistence.captureGeneration();
+	const scopeStamp = persistence.captureReservation();
 	policy.assertWritable(path, "appendFile");
 	// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
 	if (view.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
@@ -233,11 +233,11 @@ export async function appendFile<Tx>(
 
 	// F6: commit the CAS blob in its own short tx FIRST (see writeFile), under the same
 	// liveness assert and the same driver-fault race (#169 M4).
-	persistence.assertGeneration(scopeGeneration);
+	persistence.assertReservation(scopeStamp);
 	if (dialect.commitBlob && fullBytes.byteLength > 0) {
 		await persistence.guarded(() => dialect.commitBlob!(sha256, fullBytes));
 	}
-	persistence.assertGeneration(scopeGeneration);
+	persistence.assertReservation(scopeStamp);
 
 	const mode = existing?.kind === INODE_KIND.FILE ? existing.mode : NEW_FILE_MODE;
 	const receipt = await persistence.mutateOne(

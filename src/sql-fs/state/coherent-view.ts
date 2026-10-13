@@ -72,7 +72,7 @@ export class CoherentView<Tx> {
 		return result;
 	}
 
-	#updateCacheByInode(inodeId: bigint, patch: Partial<PathCacheEntry>): void {
+	#updateCacheByInode(inodeId: bigint, patch: Partial<Omit<PathCacheEntry, "inodeId">>): void {
 		for (const [p, e] of this.#pathCache) {
 			if (e.inodeId === inodeId) this.#cacheSet(p, { ...e, ...patch });
 		}
@@ -302,8 +302,10 @@ export class CoherentView<Tx> {
 		this.#dirty = true;
 	}
 
-	readBytes(path: string, entry: PathCacheEntry): Promise<Uint8Array> {
-		return this.#contents.read(path, entry);
+	async readBytes(path: string, entry: PathCacheEntry): Promise<Uint8Array> {
+		const bytes = await this.#contents.read(path, entry);
+		this.#persistence.assertAlive();
+		return bytes;
 	}
 
 	publishGeneration(certificate: SandboxGeneration): boolean {

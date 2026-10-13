@@ -14,6 +14,9 @@ export async function bulkIngest(
 ): Promise<Map<string, PathCacheEntry>> {
 	const result = new Map<string, PathCacheEntry>();
 	if (files.length === 0) return result;
+	for (const file of files) {
+		if (file.path === "/") throw createEisdir(file.path);
+	}
 
 	const ctxRows = await tx<{ root_inode: string | null; fenced: number }[]>`
 			WITH sandbox AS (

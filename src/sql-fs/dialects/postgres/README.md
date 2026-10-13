@@ -13,6 +13,6 @@ Group contracts in [types.ts](types.ts) derive from SqlDialect. Postgres-specifi
 
 The root blob commit and batch commit remain independent single statements outside the caller's namespace transaction. Ingest invokes its blob commit after directory and overwrite checks, before inserting file inodes. Cache backfill remains asynchronous.
 
-Writer-lock statements precede fenced CTEs so their snapshots follow any lock wait. Each mutation still references and gates on the epoch CTE. Both mvComposite statements and its two version advances remain together. Sandbox bootstrap inserts remain part of sandbox lifecycle rather than ordinary mkdir operations.
+Writer-lock statements precede fenced CTEs so their snapshots follow any lock wait. Fenced CTE mutations reference and gate their writes on the epoch CTE; lower-level mutations run directly in the caller transaction. Both mvComposite statements and its two version advances remain together. Sandbox bootstrap inserts remain part of sandbox lifecycle rather than ordinary mkdir operations.
 
-GC uses the transaction and isolation selected by its caller. It does not create a nested transaction. The same applies to every namespace, sandbox, and ingest operation.
+GC uses the transaction and isolation selected by its caller. It does not create a nested transaction. Namespace and sandbox operations use the caller transaction. Ingest keeps namespace writes there, but commits its blob batch independently through the root pool.
