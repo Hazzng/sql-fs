@@ -38,6 +38,24 @@ const spec = {
 				},
 			},
 		},
+		"/text": {
+			post: {
+				requestBody: {
+					required: true,
+					content: { "text/plain": { schema: { type: "string", minLength: 2 } } },
+				},
+				responses: {
+					200: { content: { "text/plain": { schema: { type: "string", minLength: 2 } } } },
+				},
+			},
+		},
+		"/events": {
+			get: {
+				responses: {
+					200: { content: { "text/event-stream": { schema: { type: "string", minLength: 100 } } } },
+				},
+			},
+		},
 		"/sandboxes/{id}/files/{path}": {
 			get: {
 				responses: { 200: { content: { "*/*": { schema: { type: "string", format: "binary" } } } } },
@@ -228,4 +246,40 @@ test("validates media types with a +json suffix as JSON schemas", () => {
 	assert.equal(isJsonMediaType(value.requestContentType), true);
 	assert.doesNotThrow(() => contract.validateExchange(value));
 	assert.throws(() => contract.validateExchange({ ...value, responseBody: {} }), /response:/);
+});
+
+test("validates UTF-8 text request and response schemas and rejects invalid text content", () => {
+	const contract = new OpenApiContract(spec);
+	const value = {
+		method: "POST",
+		path: "/v1/text",
+		status: 200,
+		requestContentType: "text/plain; charset=utf-8",
+		requestBody: Buffer.from("héllo", "utf8"),
+		responseContentType: "text/plain; charset=utf-8",
+		responseBody: Buffer.from("世界", "utf8"),
+	};
+	assert.deepEqual(contract.validateExchange(value), {
+		exchangeValidated: true,
+		requestSchemaValidated: true,
+		responseSchemaValidated: true,
+	});
+	assert.throws(() => contract.validateExchange({ ...value, requestBody: Buffer.from("x") }), /request:/);
+	assert.throws(() => contract.validateExchange({ ...value, responseBody: Buffer.from("x") }), /response:/);
+	assert.throws(
+		() => contract.validateExchange({ ...value, responseBody: Buffer.from([0xff]) }),
+		/encoded data/,
+	);
+});
+
+test("excludes SSE payloads from text decoding and schema validation", () => {
+	const contract = new OpenApiContract(spec);
+	const result = contract.validateExchange({
+		method: "GET",
+		path: "/v1/events",
+		status: 200,
+		responseContentType: "text/event-stream; charset=utf-8",
+		responseBody: Buffer.from([0xff]),
+	});
+	assert.equal(result.responseSchemaValidated, false);
 });

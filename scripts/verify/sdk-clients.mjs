@@ -31,9 +31,14 @@ function observedFetch(sdk) {
 			: init?.body;
 		const responseContentType = response.headers.get("content-type");
 		const responseSchema = openapiContract?.responseSchema(init?.method ?? "GET", new URL(url).pathname, response.status, responseContentType);
+		const normalizedResponseType = responseContentType?.split(";", 1)[0]?.trim().toLowerCase();
 		const responseBody = isJsonMediaType(responseContentType) && responseSchema?.format !== "binary"
 			? await response.clone().json()
-			: undefined;
+			: normalizedResponseType?.startsWith("text/") &&
+				  normalizedResponseType !== "text/event-stream" &&
+				  responseSchema?.format !== "binary"
+				? Buffer.from(await response.clone().arrayBuffer())
+				: undefined;
 		const validation = openapiContract?.validateExchange({
 			method: init?.method ?? "GET",
 			path: new URL(url).pathname,

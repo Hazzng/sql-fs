@@ -55,6 +55,7 @@ export class LocalApiRun {
 		this.artifacts = [];
 		this.owners = [];
 		this.checks = [];
+		this.schemaValidation = { exchanges: 0, requestSchemas: 0, responseSchemas: 0 };
 		this.cleanup = [];
 		this.clients = [];
 		this.secrets = [
@@ -281,23 +282,11 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 			? JSON.parse(bytes)
 			: bytes;
 		const result = { status: response.status, ms: performance.now() - started, body };
-		this.openapiContract?.validateExchange({
-			method,
-			path,
-			status: response.status,
-			requestContentType: headers["Content-Type"] ?? headers["content-type"] ?? (json !== undefined ? "application/json" : raw !== undefined ? "application/octet-stream" : undefined),
-			requestBody: json !== undefined ? json : raw,
-			requestBodyPresent: json !== undefined || raw !== undefined,
-			validateRequestSchema,
-			responseContentType: response.headers.get("content-type"),
-			responseBody: Buffer.isBuffer(body) ? undefined : body,
-			responseBodyPresent: bytes.length > 0,
-		});
 		const describe = (value) =>
 			Buffer.isBuffer(value)
 				? { bytes: value.length, sha256: sha256(value), ...(value.length < 4096 && { text: value.toString() }) }
 				: value;
-		this.record({
+		const exchange = {
 			server: server.index,
 			owner: owner?.sub,
 			method,
@@ -306,7 +295,31 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 			ms: result.ms,
 			request: describe(json ?? raw ?? null),
 			response: describe(body),
-		});
+		};
+		// Keep the exchange evidence even when contract validation rejects it.
+		this.record(exchange);
+		try {
+			const validation = this.openapiContract?.validateExchange({
+				method,
+				path,
+				status: response.status,
+				requestContentType: headers["Content-Type"] ?? headers["content-type"] ?? (json !== undefined ? "application/json" : raw !== undefined ? "application/octet-stream" : undefined),
+				requestBody: json !== undefined ? json : raw,
+				requestBodyPresent: json !== undefined || raw !== undefined,
+				validateRequestSchema,
+				responseContentType,
+				responseBody: body,
+				responseBodyPresent: bytes.length > 0,
+			});
+			if (validation) {
+				this.schemaValidation.exchanges += Number(validation.exchangeValidated);
+				this.schemaValidation.requestSchemas += Number(validation.requestSchemaValidated);
+				this.schemaValidation.responseSchemas += Number(validation.responseSchemaValidated);
+			}
+		} catch (error) {
+			this.record({ phase: "openapi-validation-failed", method, path, status: response.status, error: error.message });
+			throw error;
+		}
 		if (status !== null) this.equal(response.status, status, `${method} ${path}: HTTP ${status}`);
 		return result;
 	}
@@ -388,6 +401,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 				server.resourceProfile ? [{ server: server.index, ...server.resourceProfile }] : [],
 			),
 			checks: this.checks,
+			schemaValidation: this.schemaValidation,
 			cleanup: this.cleanup,
 			ownedServersStopped: this.servers.every(({ child }) => child.exitCode !== null || child.signalCode !== null),
 			...detail,

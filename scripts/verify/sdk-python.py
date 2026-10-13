@@ -36,24 +36,36 @@ def observe(response):
     response_content_type = response.headers.get("content-type")
     entry["requestContentType"] = request_content_type
     entry["responseContentType"] = response_content_type
-    entry["requestBodyPresent"] = bool(response.request.content) or request_content_type is not None
+    entry["requestBodyPresent"] = (
+        bool(response.request.content) or request_content_type is not None
+    )
+    capture_body = not response.request.url.path.startswith("/v1/auth/")
     capture_dir = Path(os.environ["SDK_VERIFY_CAPTURE_DIR"])
     capture_dir.mkdir(parents=True, exist_ok=True)
     capture_id = os.environ["SDK_VERIFY_MARKER"]
-    if entry["requestBodyPresent"]:
-        capture_path = capture_dir / f"{capture_id}-{mode}-python-request-{len(requests)}.json"
+    if capture_body and entry["requestBodyPresent"]:
+        capture_path = (
+            capture_dir / f"{capture_id}-{mode}-python-request-{len(requests)}.json"
+        )
         if is_json_content_type(request_content_type):
             capture_path.write_bytes(response.request.content)
         else:
             capture_path = capture_path.with_suffix(".bin")
             capture_path.write_bytes(response.request.content)
         entry["requestBodyFile"] = str(capture_path)
-    if (response_content_type or "").split(";", 1)[0].strip().lower() == "text/event-stream":
+    if not capture_body:
+        response.read()
+        entry["responseBodyPresent"] = bool(response.content)
+    elif (response_content_type or "").split(";", 1)[
+        0
+    ].strip().lower() == "text/event-stream":
         entry["responseBodyPresent"] = True
     else:
         response.read()
         response_bytes = response.content
-        response_path = capture_dir / f"{capture_id}-{mode}-python-response-{len(requests)}.bin"
+        response_path = (
+            capture_dir / f"{capture_id}-{mode}-python-response-{len(requests)}.bin"
+        )
         response_path.write_bytes(response_bytes)
         entry["responseBodyFile"] = str(response_path)
         entry["responseBodyPresent"] = bool(response_bytes)
