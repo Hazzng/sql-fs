@@ -167,10 +167,16 @@ describe("SessionScopedFs", () => {
 		const { inner } = makeStatefulInner();
 		const primary = new Error("commit failed");
 		vi.spyOn(inner, "endScriptScope").mockRejectedValue(primary);
-		vi.spyOn(inner, "abortScriptScope").mockRejectedValue(new Error("abort failed"));
+		const abort = vi.mocked(inner.abortScriptScope).getMockImplementation();
+		vi.spyOn(inner, "abortScriptScope").mockImplementation(async () => {
+			await abort?.();
+			throw new Error("abort failed");
+		});
 		const scope = new SessionScopedFs(inner);
 
 		await expect(scope.run(async () => "done")).rejects.toBe(primary);
+		expect(inner.abortScriptScope).toHaveBeenCalledOnce();
+		expect(scope.isActive).toBe(false);
 	});
 
 	it("does not invoke the body or abort when begin throws", async () => {

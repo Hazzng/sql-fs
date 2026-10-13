@@ -60,6 +60,9 @@ describe("worker pool memory pressure", () => {
 				await finish.reached;
 			});
 			await started.reached;
+			let primaryError: unknown;
+			let failed = false;
+			const cleanupErrors: unknown[] = [];
 			try {
 				const rejected = vi.fn(async () => "rejected reader ran");
 				await expect(pool.run("tenant", "sandbox", true, rejected)).rejects.toMatchObject({
@@ -73,13 +76,39 @@ describe("worker pool memory pressure", () => {
 				await expect(pool.run("tenant", "sandbox", true, recovered)).resolves.toBe("healthy reader");
 				expect(recovered).toHaveBeenCalledOnce();
 				expect(pool.metrics).toMatchObject({ active: 1, admitted: 2, queued: 0, completed: 1 });
+			} catch (error) {
+				primaryError = error;
+				failed = true;
 			} finally {
 				rss = memory.rss;
-				await reportExternal(0);
+				try {
+					await reportExternal(0);
+				} catch (error) {
+					cleanupErrors.push(error);
+				}
 				finish.release();
-				await active;
-				await pool.shutdown(0);
+				try {
+					await active;
+				} catch (error) {
+					cleanupErrors.push(error);
+				}
+				try {
+					await pool.shutdown(0);
+				} catch (error) {
+					cleanupErrors.push(error);
+				}
 			}
+			if (failed && cleanupErrors.length > 0) {
+				throw new AggregateError(
+					[primaryError, ...cleanupErrors],
+					"worker pressure test failed and cleanup encountered errors",
+					{
+						cause: primaryError,
+					},
+				);
+			}
+			if (failed) throw primaryError;
+			if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "worker pressure test cleanup failed");
 			expect(pool.metrics).toMatchObject({ active: 0, queued: 0, completed: 2 });
 		},
 	);

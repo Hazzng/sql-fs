@@ -196,6 +196,54 @@ describe("worker request outcomes", () => {
 		},
 	);
 
+	it("promotes ECOHERENCE after dispatched exec and retires the worker without replay", async () => {
+		const { pool, admitted } = fixture();
+		await admitted(async () => {
+			await pool.attach(identity);
+			const worker = latestMockWorker();
+			worker.onPost = (request) => {
+				if (request.command.kind === "exec") {
+					worker.reply(request, {
+						ok: false,
+						error: coded("ECOHERENCE"),
+					});
+					return;
+				}
+				worker.reply(request, { ok: true, value: undefined });
+			};
+			let outcome: unknown;
+			try {
+				await pool.withLease(undefined, () => pool.send({ kind: "exec", script: "echo once", options: {} }));
+			} catch (error) {
+				outcome = error;
+				await pool.recover(error);
+			}
+			expect(outcome).toMatchObject({
+				code: "EEXEC_OUTCOME_UNKNOWN",
+				message: expect.stringContaining("inspect state before retrying"),
+			});
+			expect(worker.requests.filter(({ command }) => command.kind === "exec")).toHaveLength(1);
+			expect(worker.terminationCalls).toBe(1);
+		});
+		expect(retire).toHaveBeenCalledTimes(1);
+		expect(pool.metrics.unknownOutcomes).toBe(1);
+	});
+
+	it("preserves input-budget errors after exec dispatch because execution was refused", async () => {
+		const { pool, admitted } = fixture();
+		await admitted(async () => {
+			await pool.attach(identity);
+			const worker = latestMockWorker();
+			worker.onPost = (request) => worker.reply(request, { ok: false, error: coded("EEXEC_INPUT_LIMIT") });
+			await expect(
+				pool.withLease(undefined, () => pool.send({ kind: "exec", script: "too large", options: {} })),
+			).rejects.toMatchObject({ code: "EEXEC_INPUT_LIMIT" });
+			expect(worker.terminationCalls).toBe(0);
+		});
+		expect(retire).not.toHaveBeenCalled();
+		expect(pool.metrics.unknownOutcomes).toBe(0);
+	});
+
 	it("does not promote runtime refusal for an unacknowledged creating attach alone", async () => {
 		const { pool, admitted } = fixture();
 		await pool.start();
