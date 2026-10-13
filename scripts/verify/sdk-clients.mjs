@@ -116,18 +116,25 @@ async function runPythonWithCapture(server, owner, mode, extra, captureDir) {
 	assert.equal(status, 0, run.redact(stderr));
 	const proof = JSON.parse(stdout);
 	for (const request of proof.requests) {
-		const requestBody = request.requestBodyFile
+		const { requestBodyValue, responseBodyValue } = request;
+		delete request.requestBodyValue;
+		delete request.responseBodyValue;
+		if (request.path.startsWith("/v1/auth/")) {
+			run.equal(request.requestBodyFile, undefined, "Python auth request body is never written to disk");
+			run.equal(request.responseBodyFile, undefined, "Python auth response body is never written to disk");
+		}
+		const requestBody = requestBodyValue ?? (request.requestBodyFile
 			? request.requestBodyFile.endsWith(".json")
 				? request.status < 400
 					? JSON.parse(readFileSync(request.requestBodyFile, "utf8"))
 					: undefined
 				: readFileSync(request.requestBodyFile)
-			: undefined;
+			: undefined);
 		const responseBodyBytes = request.responseBodyFile ? readFileSync(request.responseBodyFile) : Buffer.alloc(0);
 		const responseSchema = openapiContract?.responseSchema(
 			request.method, request.path, request.status, request.responseContentType,
 		);
-		let responseBody;
+		let responseBody = responseBodyValue;
 		if (responseBodyBytes.length && isJsonMediaType(request.responseContentType) && responseSchema?.format !== "binary") {
 			responseBody = JSON.parse(responseBodyBytes.toString("utf8"));
 		} else if (responseBodyBytes.length && request.responseContentType?.toLowerCase().startsWith("text/") && request.responseContentType !== "text/event-stream") {

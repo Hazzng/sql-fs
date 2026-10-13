@@ -145,6 +145,7 @@ describe("runInScriptTx", () => {
 
 		await expect(runInScriptTx(session, async () => "written")).resolves.toBe("written");
 	});
+
 	it("rolls back when the dedicated worker owner lease is lost", async () => {
 		const { session, calls } = makeSession(false);
 		const words = new Int32Array(new SharedArrayBuffer(8));

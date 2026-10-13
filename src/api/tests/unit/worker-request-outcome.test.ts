@@ -220,7 +220,7 @@ describe("worker request outcomes", () => {
 			}
 			expect(outcome).toMatchObject({
 				code: "EEXEC_OUTCOME_UNKNOWN",
-				message: expect.stringContaining("inspect state before retrying"),
+				message: expect.stringContaining("inspect sandbox state before proceeding"),
 			});
 			expect(worker.requests.filter(({ command }) => command.kind === "exec")).toHaveLength(1);
 			expect(worker.terminationCalls).toBe(1);

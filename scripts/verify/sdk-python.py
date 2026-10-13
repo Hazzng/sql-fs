@@ -56,6 +56,10 @@ def observe(response):
     if not capture_body:
         response.read()
         entry["responseBodyPresent"] = bool(response.content)
+        if entry["requestBodyPresent"] and is_json_content_type(request_content_type):
+            entry["requestBodyValue"] = json.loads(response.request.content)
+        if response.content and is_json_content_type(response_content_type):
+            entry["responseBodyValue"] = response.json()
     elif (response_content_type or "").split(";", 1)[
         0
     ].strip().lower() == "text/event-stream":

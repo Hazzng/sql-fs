@@ -15,7 +15,7 @@ The entry point is [AGENTS.md](AGENTS.md). Run `pnpm setup:dev`, `pnpm check`, a
 | Development environment | Disposable Compose project, random loopback ports, separate Redis roles, clean child environment, scoped cleanup | Requires Docker and Compose v2, Bash, Node, Python, pnpm, and uv. |
 | Code quality | Type and lint checks, production ownership boundary checks, bounded test concurrency, explicit test-runner ownership, removed unused drivers and stale schema tooling | Static rules do not replace review or live behavior tests. |
 | Observability | `/healthz`, `/readyz`, authenticated `/metrics`, structured logs, request traces and artifact hashes in verification proof | Production alert routing and dashboards are deployment configuration. |
-| Security and governance | Dependency audit workflow, CodeQL workflow, Dependabot, CODEOWNERS, `SECURITY.md`, isolation tests | Hosted readiness checks passed on PR #238 at `3827a25`. Main now requires 12 Actions checks and an up-to-date branch; existing administrator bypass remains enabled. |
+| Security and governance | Dependency audit workflow, CodeQL workflow, Dependabot, CODEOWNERS, `SECURITY.md`, isolation tests | Hosted readiness checks passed on PR #238 at `eeaf7a6`, including the expanded architecture profile. Main now requires 12 Actions checks and an up-to-date branch; existing administrator bypass remains enabled. |
 
 ## Verification record
 
@@ -39,7 +39,7 @@ The combined architecture and guardrails run passed `pnpm check` with 2,283 core
 
 These facts came from read-only GitHub API checks during the audit. Local files cannot enforce them.
 
-- `main` requires one approving review, an up-to-date branch, and 12 checks from the GitHub Actions app: `Lint & Typecheck`, `Unit Tests`, `TypeScript SDK`, `Build`, `Integration & API`, `Lint & Format`, `Type Check`, `Test (Python 3.9)`, `Test (Python 3.11)`, `Test (Python 3.13)`, `Dependency audit`, and `CodeQL`. These contexts passed on PR #238 at `3827a25` before they were required. Existing administrator bypass is unchanged. The guardrails follow-up read back the exact check names and app binding from GitHub.
+- `main` requires one approving review, an up-to-date branch, and 12 checks from the GitHub Actions app: `Lint & Typecheck`, `Unit Tests`, `TypeScript SDK`, `Build`, `Integration & API`, `Lint & Format`, `Type Check`, `Test (Python 3.9)`, `Test (Python 3.11)`, `Test (Python 3.13)`, `Dependency audit`, and `CodeQL`. These contexts passed on PR #238 at `eeaf7a6` on 2026-10-13. The [Integration & API job](https://github.com/Hazzng/sql-fs/actions/runs/38357531190/job/115163780410) ran `pnpm verify:architecture`, including the worker and architecture follow-up. This is an immutable verification record; require a fresh successful run for every subsequent PR head. Existing administrator bypass is unchanged. The guardrails follow-up read back the exact check names and app binding from GitHub.
 - Secret scanning and secret push protection are enabled.
 - Private vulnerability reporting is disabled. A maintainer can enable it in the repository security settings.
 - The advanced CodeQL workflow passed on PR #238.
