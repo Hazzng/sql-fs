@@ -133,15 +133,15 @@ export async function mv<Tx>(
 	// (audit H2 #25).
 	if (destName === "") throw createEisdir(dest);
 	if (destEntry?.inodeId === srcEntry.inodeId) return;
-	if (destEntry?.kind === INODE_KIND.DIRECTORY && srcEntry.kind !== INODE_KIND.DIRECTORY) throw createEisdir(dest);
-	if (destEntry !== undefined && destEntry.kind !== INODE_KIND.DIRECTORY && srcEntry.kind === INODE_KIND.DIRECTORY)
-		throw createEnotdir(dest);
 	// Reject overwriting a non-empty directory: replacing its dirent here would
 	// leave the destination's entire subtree orphaned in the DB and diverge the
 	// cache (audit H2 #8). Mirrors rename(2) ENOTEMPTY.
 	if (destEntry?.kind === INODE_KIND.DIRECTORY && view.childPaths(dest).length > 0) {
 		throw createEnotempty(dest);
 	}
+	if (destEntry?.kind === INODE_KIND.DIRECTORY && srcEntry.kind !== INODE_KIND.DIRECTORY) throw createEisdir(dest);
+	if (destEntry !== undefined && destEntry.kind !== INODE_KIND.DIRECTORY && srcEntry.kind === INODE_KIND.DIRECTORY)
+		throw createEnotdir(dest);
 
 	const receipt = await persistence.mutate(
 		view,
