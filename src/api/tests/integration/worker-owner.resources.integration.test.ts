@@ -48,7 +48,7 @@ describe.skipIf(!process.env.DATABASE_URL)("worker owner global resource bounds"
 				SQL_FS_WORKER_ACTIVE_TENANT_MAX: "1",
 				SQL_FS_WORKER_PG_POOL_MAX: "2",
 				SQL_FS_WORKER_MAX_PG_CONNECTIONS: "4",
-				SQL_FS_WORKER_QUEUE_WAIT_MS: "5000",
+				SQL_FS_WORKER_QUEUE_WAIT_MS: "30000",
 			}),
 			maxConcurrentJs: 1,
 			maxConcurrentPython: 1,

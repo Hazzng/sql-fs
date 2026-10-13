@@ -2,10 +2,13 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
 	test: {
+		include: ["src/**/*.test.ts"],
 		globals: true,
 		testTimeout: 30_000,
 		hookTimeout: 15_000,
-		passWithNoTests: true,
+		passWithNoTests: false,
+		maxWorkers: 2,
+		minWorkers: 1,
 		setupFiles: ["./vitest.setup.ts"],
 		// Globs must stay path-independent: a git worktree checked out *inside* the
 		// repo (Claude Code puts agent worktrees at .claude/worktrees/<id>/) carries

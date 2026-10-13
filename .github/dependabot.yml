@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: just-bash
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /clients/typescript
+    schedule:
+      interval: weekly
+  - package-ecosystem: uv
+    directory: /clients/python
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

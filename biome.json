@@ -1,5 +1,10 @@
 {
 	"$schema": "https://biomejs.dev/schemas/1.9.0/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
 	"organizeImports": {
 		"enabled": true
 	},
@@ -22,6 +27,6 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python/.venv"]
+		"ignore": ["node_modules", "dist", "*.sql", "scripts", "clients/python"]
 	}
 }

@@ -12,3 +12,4 @@ docs/
 scripts/loadtest/.run/
 
 scripts/verify/.run/
+.audit/

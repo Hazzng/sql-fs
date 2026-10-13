@@ -35,18 +35,21 @@ describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => 
 		const manager = new SessionManager({
 			tenantConfig: loadTenantConfig(),
 			workerEnabled: true,
-			workerOptions: loadWorkerPoolOptions({
-				...process.env,
-				SQL_FS_WORKER_COUNT: String(count),
-				SQL_FS_WORKER_ACTIVE_TENANT_MAX: count === 3 ? "2" : "1",
-				SQL_FS_WORKER_HEAP_MB: "256",
-				SQL_FS_WORKER_MAX_PG_CONNECTIONS: String(count * 2),
-				...(largeFiles && {
-					SQL_FS_WORKER_LARGE_FILES: "true",
-					SQL_FS_WORKER_MAX_RSS_BYTES: "2415919104",
-					SQL_FS_WORKER_MAX_EXTERNAL_BYTES: "1073741824",
-				}),
-			}),
+			workerOptions: loadWorkerPoolOptions(
+				{
+					...process.env,
+					SQL_FS_WORKER_COUNT: String(count),
+					SQL_FS_WORKER_ACTIVE_TENANT_MAX: count === 3 ? "2" : "1",
+					SQL_FS_WORKER_HEAP_MB: "256",
+					SQL_FS_WORKER_MAX_PG_CONNECTIONS: String(count * 2),
+					...(largeFiles && {
+						SQL_FS_WORKER_LARGE_FILES: "true",
+						SQL_FS_WORKER_MAX_RSS_BYTES: "2415919104",
+						SQL_FS_WORKER_MAX_EXTERNAL_BYTES: "1073741824",
+					}),
+				},
+				largeFiles ? { cpus: 2, memoryBytes: 3 * 1024 ** 3 } : undefined,
+			),
 			redis,
 			execLockOptions,
 			defenseInDepth: true,

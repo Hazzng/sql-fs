@@ -1,109 +1,79 @@
-# Contributing
+# Contributing to sql-fs
 
-## Prerequisites
+## Set up the repository
 
-- Node.js 22 or later.
-- pnpm. The `packageManager` field in `package.json` pins the version.
-- Docker, for the local Postgres and Redis. Unit tests need neither.
+Install Node 22, pnpm 10.30.3, Python 3.12, uv 0.9.18, and Docker with Compose v2. The Node version is recorded in `.node-version`; the pnpm version is recorded in `package.json`.
 
-## Set up a local checkout
+```bash
+git clone https://github.com/Hazzng/sql-fs.git
+cd sql-fs
+pnpm setup:dev
+pnpm check
+```
 
-1. Clone the repository: `git clone https://github.com/Hazzng/sql-fs.git && cd sql-fs`.
-2. Install dependencies with `pnpm install`. The install also sets up the lefthook git hooks.
-3. Copy the example environment with `cp .env.example .env`. `pnpm dev` reads `.env`, and the defaults match the compose stack.
-4. Start Postgres and Redis with `docker compose -f docker-compose.local.yml up -d`. [Local database](#local-database) explains what the stack creates.
-5. Start the dev server with `pnpm dev`. It listens on `http://localhost:8080` and applies the migrations on boot.
+`pnpm setup:dev` installs the server, TypeScript SDK, and Python SDK from their lockfiles and installs Lefthook hooks. It does not write `.env`. `pnpm check` runs types, lint, unit tests, builds, and both SDK suites without database credentials. Use `pnpm check:typescript` or `pnpm check:python` for focused SDK work.
 
-To serve the app at a stable `https://sql-fs.localhost` URL on a dynamic port, run `pnpm dev:portless` instead. To mint a bearer token for local requests, run `pnpm token:create -- --sub dev`.
+Python type checking targets the oldest supported interpreter. `pnpm check:python:types` uses uv to provision Python 3.9 in `clients/python/.venv-py39`, separate from the Python 3.12 development environment. This keeps the dependency syntax aligned with the declared target. Mypy stays below version 2 while Python 3.9 is supported.
+
+## Verify against disposable services
+
+```bash
+pnpm verify:local
+```
+
+This command creates a unique Compose project with Postgres 16 and separate Redis 7 control and data instances on random loopback ports. It builds the server, exercises the HTTP and MCP contracts, runs the database integration tests serially, and tests both SDKs against a real API in worker mode. Server startup applies migrations. The data Redis uses `allkeys-lru`; the control Redis keeps `noeviction`.
+
+The command ignores `.env` and inherited deployment settings. It fails if Docker is unavailable or integration tests skip. It removes only its own containers and volumes on exit. Evidence remains under the printed `scripts/verify/.run/<run-id>/` directory. Inspect `proof.json`, request logs, service logs, and `integration.json` there after a failure. Correct the cause before rerunning.
+
+For an interrupted host or a killed shell, list leftover projects with `docker compose ls`. Remove only the `sqlfs-verify-*` project named by your run. Do not reset a shared development database to repair a verification run.
+
+## Start a development server
+
+```bash
+docker compose -f docker-compose.local.yml up -d --wait
+cp .env.example .env
+pnpm dev
+```
+
+The server listens on port 8080. The example environment points at the development Postgres instance and has a local-only authentication secret. Copy the example only when `.env` does not already exist. Set `REDIS_URL=redis://localhost:6379` in `.env` to use the optional development Redis. `pnpm dev:portless` provides a stable `https://sql-fs.localhost` address when Portless is configured.
+
+The persistent development stack and disposable verification stack are separate. The development stack has fixed ports 5432 and 6379. Its `sqlfs_app` role owns the database and schema and has `CREATEDB` for tests, but has neither superuser nor `BYPASSRLS` privileges. `FORCE ROW LEVEL SECURITY` does not constrain a superuser, so testing as `postgres` invalidates isolation checks.
 
 ## Local database
 
-`docker-compose.local.yml` starts Postgres 16 and Redis 7. On the first start, `scripts/initdb/00-create-app-role.sql` creates the role that the app and the tests connect as. Point your shell at it:
+For a separate Postgres 16 instance, create the app role, database, and schema ownership using `scripts/initdb/00-create-app-role.sql`. The app role must own its tables without superuser or `BYPASSRLS` privileges; integration tests also need `CREATEDB`.
+
+## Change SQL safely
+
+Add a numbered SQL file in `src/sql-fs/migrations/postgres/`. The boot-time runner in `src/api/migrations.ts` applies migrations for every configured tenant. Do not edit already applied migrations. There is no Drizzle schema or `db:generate` command.
+
+To use the lower-level integration command, first start the server once to apply migrations, then stop it and run:
 
 ```bash
-export DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs
-export REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs \
+REDIS_URL=redis://localhost:6379 \
+pnpm test:integration
 ```
 
-Do not connect as the image's `postgres` superuser. Migration `0005_enable_rls.sql` turns on `FORCE ROW LEVEL SECURITY`, so the role needs three properties:
+Use disposable services for fault injection and multi-tenant tests. The suite runs files serially to respect the Postgres connection budget. A deadlock is a failure to investigate. Missing service variables can skip tests in this lower-level command, so use `pnpm verify:local` as the completion check.
 
-- **Not a superuser.** A superuser has `BYPASSRLS` and skips the policies. The RLS suite then sees rows from every sandbox and fails with confusing errors.
-- **Owner of the database and the `public` schema.** The migration runner creates tables in `public`, and `ALTER TABLE ... FORCE ROW LEVEL SECURITY` requires ownership. Without it, boot fails with `must be owner of table inodes` or `permission denied for schema public`.
-- **`CREATEDB`.** The multi-tenant and migrations suites create throwaway databases.
+## Submit a change
 
-To use your own Postgres 16, run the same statements as the init script:
+Read [AGENTS.md](AGENTS.md) for coding rules and [DEVELOPER.md](DEVELOPER.md) before changing sessions, transactions, locks, or caches.
 
-```sql
-CREATE ROLE sqlfs_app LOGIN PASSWORD 'sqlfs_app' NOSUPERUSER NOBYPASSRLS CREATEDB;
-CREATE DATABASE sqlfs OWNER sqlfs_app;
-\connect sqlfs
-ALTER SCHEMA public OWNER TO sqlfs_app;
-```
+1. Branch from `main` and implement the change with focused tests.
+2. Run `pnpm check`.
+3. Run `pnpm verify:local` for runtime, database, dependency, or SDK behavior changes.
+4. Run `pnpm security:audit` for dependency changes.
+5. Add a changeset for behavior changes with `pnpm changeset`.
+6. Commit the changeset with the code and open a PR that describes the behavior and verification.
 
-sql-fs has no migrate command. The server applies every file in `src/sql-fs/migrations/postgres/` on boot, from `src/api/migrations.ts`. To migrate a fresh database before you run the integration suites:
+Use a patch changeset for fixes, a minor changeset for compatible features, and a major changeset for breaking API or schema changes. Documentation and tooling-only changes do not need a release entry. Do not manually edit `CHANGELOG.md` or bump versions in a feature PR.
 
-1. Run `pnpm dev`.
-2. Wait for the `server_start` log line.
-3. Stop the server.
+For a release, maintainers run `pnpm changeset:version` in a release branch. That consumes pending changesets, updates `CHANGELOG.md`, synchronizes the OpenAPI version, and refreshes the lockfile. Review that diff before merging the release PR. The release workflow publishes after the version change reaches `main`.
 
-The integration suites check for a migrated schema and fail without one. `pnpm db:generate` only scaffolds a new migration file from `schema.ts`. It applies nothing.
+## Diagnose failures
 
-To wipe the database, run `docker compose -f docker-compose.local.yml down -v`. The next `up` runs the init script again.
+`/healthz` reports liveness. `/readyz` reports dependency readiness. `/metrics` requires a bearer JWT and exposes worker queues, capacity, refusal counts, and timing data. API logs contain structured events. See [CONFIGURATION.md](CONFIGURATION.md) for settings and worker recovery outcomes.
 
-## Run the checks before you push
-
-```bash
-pnpm typecheck              # tsc --noEmit
-pnpm lint:fix               # Biome format and lint
-pnpm test:unit              # every test outside an integration/ directory, no database needed
-pnpm test:integration       # needs DATABASE_URL, and REDIS_URL for the Redis suites
-pnpm test                   # unit and integration tests
-pnpm test -- path/to/file.test.ts
-pnpm test:comparison        # just-bash comparison fixtures, set RECORD_FIXTURES=1 to record
-```
-
-Before you push, run `pnpm typecheck && pnpm lint:fix && pnpm test:unit`. CI runs typecheck, `pnpm lint`, the unit tests and the build. CI does not run the integration suites. If you change SQL, locking or session code, run them yourself.
-
-## Integration tests run one file at a time
-
-The integration tests live in `src/sql-fs/tests/integration/` and `src/api/tests/integration/`. The database-backed suites skip if `DATABASE_URL` is unset. Two files do not use the database. `heartbeat-gap.redis.integration.test.ts` needs only `REDIS_URL`, and `git-network.integration.test.ts` runs on an `InMemoryFs` with no prerequisites. The cross-replica, multi-tenant, worker-owner, and blob cache suites need `REDIS_URL` as well as `DATABASE_URL`.
-
-`pnpm test:integration` passes `--no-file-parallelism`, because the database-backed files share one database and its `max_connections`. Parallel files run out of connection slots unless you raise that limit.
-
-One suite runs migration DDL against the shared database. In `src/sql-fs/tests/integration/postgres.test.ts`, the `fs_resolve` tests apply `0001_rls_and_procs.sql` to `DATABASE_URL` in `beforeAll`. The migration and multi-tenant suites create their own databases and migrate those. A `deadlock detected` error in a run is a real bug, so investigate it instead of re-running.
-
-## Read the standards before you change code
-
-[CLAUDE.md](CLAUDE.md) holds the coding standards, the architecture summary and the caching rules. Read [DEVELOPER.md](DEVELOPER.md) before you change `session-manager.ts`, `sql-fs.ts` or dialect code. [CONFIGURATION.md](CONFIGURATION.md) documents every environment variable.
-
-`just-bash` is an npm dependency, not vendored source. Local fixes to it ship as the pnpm patch `patches/just-bash@3.6.0.patch`, which `pnpm-workspace.yaml` registers. `scripts/build-just-bash-patch.mjs` builds that patch from a published package and a rebuilt one.
-
-## Open a pull request with a changeset
-
-1. Branch from `main`.
-2. Run the checks in [Run the checks before you push](#run-the-checks-before-you-push).
-3. If the change is a feature, a fix or a breaking change, run `pnpm changeset`. Pick the bump and write a one-line summary. The summary becomes the changelog entry.
-4. Commit the generated `.changeset/*.md` file with your code.
-5. Open the PR and say what changed and why.
-
-| Bump | Use it for |
-|---|---|
-| `patch` | Bug fixes, docs, chores and refactors |
-| `minor` | Features that stay backwards-compatible |
-| `major` | Breaking API or schema changes |
-
-Do not edit `CHANGELOG.md` or bump a version in a feature PR.
-
-## Cut a release
-
-A maintainer batches every pending changeset into one release PR:
-
-1. Create a `chore/release` branch from an up-to-date `main`.
-2. Run `pnpm changeset:version`. It bumps `package.json`, writes `CHANGELOG.md`, syncs the version into `src/api/openapi-spec.ts`, updates `pnpm-lock.yaml` and deletes the consumed changesets.
-3. Review `git diff`, commit as `chore: release vX.Y.Z`, push, and open the PR.
-
-Every push to `main` runs the `Release` workflow, which builds and pushes the container image. If the top version in `CHANGELOG.md` has no `v<version>` tag yet, the workflow also creates the tag and publishes a GitHub Release.
-
-## Report an issue
-
-Open a GitHub issue. Include the version from `package.json` or the release tag, the steps to reproduce, the expected and actual behaviour, and the relevant logs with connection strings removed.
+Report defects with the revision, reproduction, expected and actual behavior, and redacted logs. Report security defects through [SECURITY.md](SECURITY.md).
