@@ -51,7 +51,7 @@ Unit tests run with two Vitest workers to bound CPU and WASM memory pressure. Do
 
 Migrations are handwritten numbered SQL files. Add the next migration without editing an applied migration. The boot runner applies them for each configured tenant. There is no Drizzle schema or generation step.
 
-`just-bash@3.6.0` has a substantial checked-in patch. Read `scripts/build-just-bash-patch.mjs` and `patches/` before upgrading it. Regenerate the patch and run the full unit suite and `pnpm verify:local`; do not drop it to make an install pass. Dependabot excludes automatic upgrades to this package.
+`just-bash@3.6.0` has a substantial checked-in patch. Dependabot may open upgrade PRs for this package; maintainers review the upgrade and patch before merging. Read `scripts/build-just-bash-patch.mjs` and `patches/` before upgrading it. Regenerate the patch and run the full unit suite and `pnpm verify:local`; do not drop it to make an install pass.
 
 ## Completion and boundaries
 

@@ -4,8 +4,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    ignore:
-      - dependency-name: just-bash
     open-pull-requests-limit: 5
   - package-ecosystem: npm
     directory: /clients/typescript
