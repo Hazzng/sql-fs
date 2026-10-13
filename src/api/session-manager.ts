@@ -1141,7 +1141,8 @@ export class SessionManager {
 		this.stopReaper();
 
 		const drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
-		await this.workerPool?.shutdown(drainTimeoutMs);
+		const deadline = Date.now() + drainTimeoutMs;
+		await this.workerPool?.shutdown(Math.max(0, deadline - Date.now()));
 
 		// Mark every session closing so new entries reject early.
 		for (const session of this.sessions.values()) {
@@ -1158,7 +1159,6 @@ export class SessionManager {
 			}
 		}
 
-		const deadline = Date.now() + drainTimeoutMs;
 		const sessionsSnapshot = [...this.sessions.entries()];
 		await Promise.allSettled(
 			sessionsSnapshot.map(async ([key, session]) => {
