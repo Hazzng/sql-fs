@@ -1,7 +1,40 @@
 import { InMemoryFs } from "just-bash";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSessionRuntime } from "../../session-runtime/engine.js";
+import { budgetWorkerReply } from "../../worker-owner/message-budget.js";
 import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import type { OwnerReply } from "../../worker-owner/protocol.js";
+
+const cpuProbe = vi.hoisted(() => ({
+	membership: undefined as string | null | undefined,
+	quota: undefined as string | undefined,
+	parallelism: undefined as number | undefined,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		readFileSync: (path: string, options?: unknown) => {
+			if (path === "/proc/self/cgroup" && cpuProbe.membership === null) throw new Error("cgroup unavailable");
+			if (path === "/proc/self/cgroup" && cpuProbe.membership !== undefined) return cpuProbe.membership;
+			if (path === "/sys/fs/cgroup/cpu.max" && cpuProbe.quota !== undefined) return cpuProbe.quota;
+			return (actual.readFileSync as (path: string, options?: unknown) => unknown)(path, options);
+		},
+	};
+});
+
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	return { ...actual, availableParallelism: () => cpuProbe.parallelism ?? actual.availableParallelism() };
+});
+
+afterEach(() => {
+	vi.restoreAllMocks();
+	cpuProbe.membership = undefined;
+	cpuProbe.quota = undefined;
+	cpuProbe.parallelism = undefined;
+});
 
 describe("worker resource policy", () => {
 	it.each([0, 23])("preserves an explicit invalid %i byte Python bridge cap", async (maxPythonBridgeBytes) => {
@@ -60,6 +93,112 @@ describe("worker resource policy", () => {
 		});
 		expect(options.scriptTxBuffer).toEqual({ enabled: true, maxOps: 50_000, maxBytes: 32 * 1024 * 1024 });
 		expect(options).toMatchObject({ maxQueuedBytes: 64 * 1024 * 1024, maxQueuedBytesPerTenant: 32 * 1024 * 1024 });
+	});
+
+	it("fits the default maximum stdout and ordinary reply envelope into the default message budget", () => {
+		const options = loadWorkerPoolOptions({});
+		const outputBytes = options.executionLimits.maxOutputSize ?? 0;
+		const messageBytes = options.executionLimits.maxWorkerMessageBytes ?? 0;
+		expect(outputBytes).toBe(64 * 1024 * 1024);
+		expect(messageBytes).toBe(65 * 1024 * 1024);
+		expect(loadWorkerPoolOptions({ SQL_FS_WORKER_MESSAGE_BYTES: "4096" }).executionLimits.maxWorkerMessageBytes).toBe(
+			4096,
+		);
+		const reply = {
+			id: 1,
+			generation: 1,
+			metadata: {
+				owner: "owner",
+				createdAt: "2026-10-12T00:00:00.000Z",
+				cwd: "/home/user",
+				dirty: false,
+				poisoned: false,
+				pathCacheBytes: 0,
+			},
+			readOnlyViolated: false,
+			memory: { heapUsed: 1, external: 1, rss: 1 },
+			ok: true,
+			value: { stdout: "x".repeat(outputBytes), stderr: "", exitCode: 0, env: { PWD: "/home/user" } },
+		} satisfies OwnerReply;
+		expect(budgetWorkerReply(reply, { kind: "exec", script: "printf", options: {} }, messageBytes)).toBe(reply);
+	});
+
+	const largeFileEnv = {
+		SQL_FS_WORKER_LARGE_FILES: "true",
+		SQL_FS_WORKER_MAX_RSS_BYTES: "2415919104",
+		SQL_FS_WORKER_MAX_EXTERNAL_BYTES: "1073741824",
+	};
+	const largeFileResources = { cpus: 2, memoryBytes: 3 * 1024 ** 3 };
+
+	it.each([
+		{ membership: "0::/\n", quota: "400000 100000", accepted: true },
+		{ membership: "0::/", quota: "400000 100000", accepted: true },
+		{ membership: "0::/\n", quota: "100000 100000", accepted: false },
+		{ membership: "0::/\n", quota: "50000 100000", accepted: false },
+		{ membership: "0::/docker/limited\n", quota: "400000 100000", accepted: false },
+		{ membership: "0::/\n0::/docker/limited\n", quota: "400000 100000", accepted: false },
+		{ membership: "0::/docker/limited\n0::/\n", quota: "400000 100000", accepted: false },
+		{ membership: "0::/\n\n", quota: "400000 100000", accepted: false },
+		{ membership: "", quota: "400000 100000", accepted: false },
+		{ membership: null, quota: "400000 100000", accepted: false },
+		{ membership: "0::/\r\n", quota: "400000 100000", accepted: false },
+		{ membership: "1:cpu:/\n", quota: "400000 100000", accepted: false },
+	])("only trusts the private root cgroup and its quota: $membership / $quota", ({ membership, quota, accepted }) => {
+		cpuProbe.membership = membership;
+		cpuProbe.quota = quota;
+		cpuProbe.parallelism = 4;
+		vi.spyOn(process, "constrainedMemory").mockReturnValue(3 * 1024 ** 3);
+		if (accepted) expect(loadWorkerPoolOptions(largeFileEnv).execFileLimitBytes).toBeNull();
+		else {
+			expect(() => loadWorkerPoolOptions(largeFileEnv)).toThrow("at least 2 CPUs");
+			expect(loadWorkerPoolOptions({ ...largeFileEnv, MAX_EXEC_FILE_BYTES: "1024" }).execFileLimitBytes).toBe(1024);
+			expect(loadWorkerPoolOptions({}).execFileLimitBytes).toBe(8 * 1024 * 1024);
+		}
+	});
+
+	it("removes the file cap only after an explicit large-file profile opt-in", () => {
+		expect(loadWorkerPoolOptions(largeFileEnv, largeFileResources).execFileLimitBytes).toBeNull();
+		expect(
+			loadWorkerPoolOptions({ ...largeFileEnv, SQL_FS_WORKER_LARGE_FILES: "false" }, largeFileResources)
+				.execFileLimitBytes,
+		).toBe(8 * 1024 * 1024);
+	});
+
+	it.each(["", "1", "TRUE", "yes"])("rejects an invalid large-file opt-in %s", (value) => {
+		expect(() => loadWorkerPoolOptions({ SQL_FS_WORKER_LARGE_FILES: value })).toThrow(
+			"SQL_FS_WORKER_LARGE_FILES must be true or false",
+		);
+	});
+
+	it.each([
+		{ cpus: 0.5, memoryBytes: 3 * 1024 ** 3 },
+		{ cpus: 1, memoryBytes: 3 * 1024 ** 3 },
+		{ cpus: 2, memoryBytes: 2 * 1024 ** 3 },
+		{ cpus: 2, memoryBytes: 0 },
+		{ cpus: Number.NaN, memoryBytes: 3 * 1024 ** 3 },
+	])("rejects an uncapped profile with $cpus CPUs and $memoryBytes memory bytes", (resources) => {
+		expect(() => loadWorkerPoolOptions(largeFileEnv, resources)).toThrow("at least 2 CPUs and a 3 GiB memory limit");
+	});
+
+	it.each([
+		{ SQL_FS_WORKER_MAX_RSS_BYTES: "1610612736" },
+		{ SQL_FS_WORKER_MAX_EXTERNAL_BYTES: "536870912" },
+		{ SQL_FS_WORKER_MAX_RSS_BYTES: "3221225472" },
+	])("rejects unmeasured memory thresholds %j", (override) => {
+		expect(() => loadWorkerPoolOptions({ ...largeFileEnv, ...override }, largeFileResources)).toThrow(
+			"large-file memory thresholds",
+		);
+	});
+
+	it("preserves operator caps on an opted-in constrained container", () => {
+		for (const cap of ["1024", "", "0", "NaN"]) {
+			expect(
+				loadWorkerPoolOptions(
+					{ SQL_FS_WORKER_LARGE_FILES: "true", MAX_EXEC_FILE_BYTES: cap },
+					{ cpus: 1, memoryBytes: 2 * 1024 ** 3 },
+				).execFileLimitBytes,
+			).toBe(cap === "1024" ? 1024 : 8 * 1024 * 1024);
+		}
 	});
 
 	it("rejects pool configurations that exceed the database connection allowance", () => {

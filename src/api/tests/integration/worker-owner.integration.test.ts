@@ -26,7 +26,12 @@ describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => 
 		await Promise.all(redisClients.splice(0).map((redis) => redis.quit()));
 	});
 
-	function makeManager(count = 2, redis?: Redis, execLockOptions?: Partial<DistributedRWLockOptions>): SessionManager {
+	function makeManager(
+		count = 2,
+		redis?: Redis,
+		execLockOptions?: Partial<DistributedRWLockOptions>,
+		largeFiles = false,
+	): SessionManager {
 		const manager = new SessionManager({
 			tenantConfig: loadTenantConfig(),
 			workerEnabled: true,
@@ -36,6 +41,11 @@ describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => 
 				SQL_FS_WORKER_ACTIVE_TENANT_MAX: count === 3 ? "2" : "1",
 				SQL_FS_WORKER_HEAP_MB: "256",
 				SQL_FS_WORKER_MAX_PG_CONNECTIONS: String(count * 2),
+				...(largeFiles && {
+					SQL_FS_WORKER_LARGE_FILES: "true",
+					SQL_FS_WORKER_MAX_RSS_BYTES: "2415919104",
+					SQL_FS_WORKER_MAX_EXTERNAL_BYTES: "1073741824",
+				}),
 			}),
 			redis,
 			execLockOptions,
@@ -321,8 +331,13 @@ describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => 
 		});
 	});
 
-	it("retains the stopgap cap until the separately gated cap policy changes", async () => {
-		const manager = makeManager();
+	it("enforces an explicit worker file cap and rolls back the buffered prefix", async () => {
+		const manager = new SessionManager({
+			tenantConfig: loadTenantConfig(),
+			workerEnabled: true,
+			workerOptions: loadWorkerPoolOptions({ MAX_EXEC_FILE_BYTES: "8388608" }),
+		});
+		managers.push(manager);
 		const id = await create(manager);
 		await manager.withSessionOrRehydrate("default", id, async (session) => {
 			await session.fs.writeFile("/home/user/large", new Uint8Array(8 * 1024 * 1024 + 1));
@@ -335,6 +350,28 @@ describe.skipIf(!process.env.DATABASE_URL)("worker filesystem ownership", () => 
 		await manager.withSessionRead("default", id, async (session) =>
 			expect(await session.fs.exists("/home/user/prefix")).toBe(false),
 		);
+	});
+
+	it("reads above the former file cap on an opted-in worker while the inline cap remains enforced", async () => {
+		const manager = makeManager(1, undefined, undefined, true);
+		const id = await create(manager);
+		const size = 8 * 1024 * 1024 + 1;
+		await manager.withSessionOrRehydrate("default", id, (session) =>
+			session.fs.writeFile("/home/user/large", new Uint8Array(size)),
+		);
+		await manager.withSessionRead("default", id, async (session) => {
+			expect((await manager.execWithRuntimeThrottle(session, "wc -c /home/user/large")).stdout).toBe(
+				`${size} /home/user/large\n`,
+			);
+		});
+		const inline = new SessionManager({ tenantConfig: loadTenantConfig(), workerEnabled: false });
+		managers.push(inline);
+		await inline.getOrCreate("default", id, undefined, "worker-test-owner");
+		await expect(
+			inline.withSessionRead("default", id, (session) =>
+				inline.execWithRuntimeThrottle(session, "wc -c /home/user/large"),
+			),
+		).rejects.toMatchObject({ code: "EFBIG" });
 	});
 
 	it.each([

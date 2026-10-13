@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import type { ScriptTxBufferConfig } from "../../sql-fs/script-tx-buffer.js";
 import { positiveIntEnv } from "../lib/env.js";
@@ -80,8 +81,29 @@ function assertQueuedTenantLimit(total: number, limit: number): void {
 	}
 }
 
-export function loadWorkerPoolOptions(env: NodeJS.ProcessEnv = process.env): WorkerPoolOptions {
+function workerHostResources(): { cpus: number; memoryBytes: number } {
+	let quotaCpus = 0;
+	try {
+		const membership = readFileSync("/proc/self/cgroup", "utf8");
+		if (membership === "0::/" || membership === "0::/\n") {
+			const [quota, period] = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/);
+			quotaCpus = quota === "max" ? availableParallelism() : Number(quota) / Number(period);
+		}
+	} catch {
+		quotaCpus = 0;
+	}
+	return { cpus: Math.min(availableParallelism(), quotaCpus), memoryBytes: process.constrainedMemory() };
+}
+
+export function loadWorkerPoolOptions(
+	env: NodeJS.ProcessEnv = process.env,
+	resources?: { cpus: number; memoryBytes: number },
+): WorkerPoolOptions {
 	const mib = 1024 * 1024;
+	const largeFiles = env.SQL_FS_WORKER_LARGE_FILES;
+	if (largeFiles !== undefined && largeFiles !== "true" && largeFiles !== "false") {
+		throw new Error("SQL_FS_WORKER_LARGE_FILES must be true or false");
+	}
 	const count = configuredInteger(env, "SQL_FS_WORKER_COUNT", 2);
 	const maxQueued = configuredInteger(env, "SQL_FS_WORKER_QUEUE_MAX", 32);
 	const maxQueuedBytes = configuredInteger(env, "SQL_FS_WORKER_QUEUE_BYTES", 64 * mib);
@@ -111,14 +133,16 @@ export function loadWorkerPoolOptions(env: NodeJS.ProcessEnv = process.env): Wor
 		pgPoolMax: configuredInteger(env, "SQL_FS_WORKER_PG_POOL_MAX", 2),
 		maxPgConnections: configuredInteger(env, "SQL_FS_WORKER_MAX_PG_CONNECTIONS", 4),
 		execFileLimitBytes:
-			env.MAX_EXEC_FILE_BYTES === undefined ? 8 * mib : positiveIntEnv(env.MAX_EXEC_FILE_BYTES, 8 * mib),
+			largeFiles === "true" && env.MAX_EXEC_FILE_BYTES === undefined
+				? null
+				: positiveIntEnv(env.MAX_EXEC_FILE_BYTES, 8 * mib),
 		executionLimits: {
 			maxSourceBytes: configuredInteger(env, "SQL_FS_WORKER_SOURCE_BYTES", mib),
 			maxStringLength: configuredInteger(env, "SQL_FS_WORKER_STRING_CHARS", 64 * mib),
 			maxInputBytes: configuredInteger(env, "SQL_FS_WORKER_INPUT_BYTES", 128 * mib),
 			maxOutputSize: configuredInteger(env, "SQL_FS_WORKER_OUTPUT_BYTES", 64 * mib),
 			maxLiveBytes: configuredInteger(env, "SQL_FS_WORKER_LIVE_BYTES", 128 * mib),
-			maxWorkerMessageBytes: configuredInteger(env, "SQL_FS_WORKER_MESSAGE_BYTES", 64 * mib),
+			maxWorkerMessageBytes: configuredInteger(env, "SQL_FS_WORKER_MESSAGE_BYTES", 65 * mib),
 			maxPythonBridgeBytes: configuredInteger(env, "SQL_FS_WORKER_PYTHON_BRIDGE_BYTES", 64 * mib),
 			maxExecutionTimeMs: configuredInteger(env, "SQL_FS_WORKER_EXECUTION_MS", 120_000),
 		},
@@ -136,6 +160,19 @@ export function loadWorkerPoolOptions(env: NodeJS.ProcessEnv = process.env): Wor
 	}
 	if (options.count * options.heapMb * mib >= options.maxRssBytes) {
 		throw new Error("Worker heap limits must leave RSS headroom for the parent and external allocations");
+	}
+	if (options.execFileLimitBytes === null) {
+		const host = resources ?? workerHostResources();
+		if (!(host.cpus >= 2) || !(host.memoryBytes >= 3 * 1024 ** 3)) {
+			throw new Error("Worker large-file execution requires at least 2 CPUs and a 3 GiB memory limit");
+		}
+		if (
+			options.maxRssBytes < 2304 * mib ||
+			options.maxRssBytes >= host.memoryBytes ||
+			options.maxExternalBytes < 1024 * mib
+		) {
+			throw new Error("Worker large-file memory thresholds require at least 2.25 GiB RSS and 1 GiB external headroom");
+		}
 	}
 	return options;
 }

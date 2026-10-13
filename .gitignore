@@ -10,3 +10,5 @@ docs/
 # Load-test harness runtime state: logs, pids, generated migration scripts
 # and .run/token, which is a live bearer token.
 scripts/loadtest/.run/
+
+scripts/verify/.run/

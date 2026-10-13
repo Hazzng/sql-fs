@@ -21,7 +21,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 export interface ExecContext {
 	readonly sandboxId?: string;
 	/** Largest file this script may read whole or produce. See MAX_EXEC_FILE_BYTES. */
-	readonly maxFileBytes: number;
+	readonly maxFileBytes: number | null;
 	readonly inputLimitBytes?: number;
 	inputBytes?: number;
 	/**
