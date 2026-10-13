@@ -43,7 +43,9 @@ It is NOT a real Linux shell. The following is the authoritative list of what wo
 
 ---
 
-## Optional runtimes (must be enabled at sandbox creation)
+## Optional runtimes
+
+Each runtime is off by default. Turn it on at sandbox creation, or later with `PATCH /v1/sandboxes/:id` (MCP: `sandbox_update`), which also turns it off again. The next exec runs with the new flags.
 
 ### Python — `python: true`
 
@@ -80,7 +82,7 @@ node script.js    # alias for js-exec
 
 ### Network — `network: true`
 
-Network access is opt-in at sandbox creation. With `network: true`:
+Network access is opt-in. With `network: true`:
 
 - `curl` can reach outbound HTTPS endpoints
 - `git clone`, `git fetch`, and `git push` can reach HTTPS remotes

@@ -35,6 +35,7 @@ export type OwnerCommand =
 	| { readonly kind: "paths" }
 	| { readonly kind: "reload" }
 	| { readonly kind: "fresh" }
+	| { readonly kind: "runtime"; readonly runtimeOptions: RuntimeOptions }
 	| { readonly kind: "bulkIngest"; readonly files: BulkIngestFile[] }
 	| { readonly kind: "beginScope" | "endScope" | "abortScope" | "disconnect" | "clearDirty" | "shutdown" };
 

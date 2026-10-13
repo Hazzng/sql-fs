@@ -670,6 +670,47 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		}
 	}
 
+	/** Advancing `version` is what makes every replica's next freshness check rebuild its shell. */
+	async updateSandboxRuntime(
+		tx: PgTx,
+		sandboxId: string,
+		runtime: Partial<Pick<SandboxMeta, "python" | "javascript" | "network">>,
+	): Promise<SandboxMeta | null> {
+		try {
+			await PostgresDialect.takeWriterLock(tx, sandboxId);
+			const rows = await tx<
+				{
+					owner: string | null;
+					name: string | null;
+					python: boolean;
+					javascript: boolean;
+					network: boolean;
+					created_at: Date;
+				}[]
+			>`
+				UPDATE sandboxes
+				SET python = COALESCE(${runtime.python ?? null}::boolean, python),
+					javascript = COALESCE(${runtime.javascript ?? null}::boolean, javascript),
+					network = COALESCE(${runtime.network ?? null}::boolean, network),
+					version = version + 1
+				WHERE id = ${sandboxId}
+				RETURNING owner, name, python, javascript, network, created_at
+			`;
+			const r = rows[0];
+			if (r === undefined) return null;
+			return {
+				owner: r.owner,
+				name: r.name,
+				python: r.python,
+				javascript: r.javascript,
+				network: r.network,
+				createdAt: r.created_at.toISOString(),
+			};
+		} catch (err) {
+			throw translateSqlError(err, sandboxId);
+		}
+	}
+
 	async listSandboxes(tx: PgTx, owner?: string): Promise<SandboxListEntry[]> {
 		try {
 			const rows =

@@ -106,7 +106,7 @@ export class WorkerFileSystem implements ICoherentFs {
 	reload(): Promise<void> {
 		return this.call({ kind: "reload" });
 	}
-	ensureFresh(): Promise<void> {
+	ensureFresh(): Promise<boolean> {
 		return this.call({ kind: "fresh" });
 	}
 	wasDirty(): boolean {

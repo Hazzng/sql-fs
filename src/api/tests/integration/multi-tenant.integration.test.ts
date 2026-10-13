@@ -14,6 +14,7 @@ import { Redis } from "ioredis";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
+import { apiErrorHandler } from "../../errors.js";
 import { signToken } from "../../lib/jwt.js";
 import { runMigrations } from "../../migrations.js";
 import { execRoutes } from "../../routes/exec.js";
@@ -22,7 +23,6 @@ import { ingestRoutes } from "../../routes/ingest.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
 import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 const AUTH_SECRET = "phase-5-multi-tenant-secret-at-least-32b";
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;
@@ -72,7 +72,7 @@ function makeApp(tenantConfig: TenantConfig, redis: Redis) {
 	app.route("/v1/sandboxes", ingestRoutes(sessionManager));
 	// Shares server.ts's handler so FS error codes (ENOENT etc.) map to the
 	// correct HTTP status instead of bubbling up as 500.
-	app.onError(testErrorHandler);
+	app.onError(apiErrorHandler);
 	return { app, sessionManager };
 }
 

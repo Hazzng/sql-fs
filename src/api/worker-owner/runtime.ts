@@ -108,8 +108,19 @@ async function dispatch(command: OwnerCommand, request: OwnerRequest, signal: Ab
 		case "reload":
 			return coherent.reload();
 		case "fresh": {
-			await coherent.claimGeneration?.();
-			return coherent.ensureFresh();
+			const claimed = (await coherent.claimGeneration?.()) === true;
+			return (await coherent.ensureFresh()) || claimed;
+		}
+		case "runtime": {
+			const { tenantId, sandboxId, cwd } = runtime;
+			const next = createSessionRuntime(
+				fs,
+				{ tenantId, sandboxId, runtimeOptions: command.runtimeOptions },
+				workerData.options,
+			);
+			next.cwd = cwd;
+			resident = { ...resident, runtime: next };
+			return;
 		}
 		case "clearDirty":
 			return coherent.clearDirty();

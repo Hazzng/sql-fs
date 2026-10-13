@@ -4,11 +4,11 @@ import { InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
+import { apiErrorHandler } from "../../errors.js";
 import { executeBatch } from "../../lib/batch-exec.js";
 import { readOnlyContext } from "../../read-only-context.js";
 import { execRoutes } from "../../routes/exec.js";
 import { SessionManager } from "../../session-manager.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 const scripts = [{ id: "write", script: "echo hello" }];
 
@@ -160,7 +160,7 @@ describe("batch terminal outcomes", () => {
 			const app = new Hono<{ Variables: AuthVariables }>();
 			app.use("/v1/*", authMiddleware);
 			app.route("/v1/sandboxes", execRoutes(manager));
-			app.onError(testErrorHandler);
+			app.onError(apiErrorHandler);
 			const token = await new SignJWT({ sub: "owner" })
 				.setProtectedHeader({ alg: "HS256" })
 				.sign(new TextEncoder().encode(secret));

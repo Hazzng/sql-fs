@@ -25,6 +25,12 @@ const createBodySchema = z.object({
 	network: z.boolean().optional(),
 });
 
+const updateBodySchema = z
+	.object({ python: z.boolean(), javascript: z.boolean(), network: z.boolean() })
+	.partial()
+	.strict()
+	.refine((body) => Object.keys(body).length > 0, "Set at least one of python, javascript, network");
+
 // Audit H11 (#2): bound the optional initial-files map so a single create can't
 // buffer an unbounded number of files / bytes.
 //
@@ -223,6 +229,45 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 			createdAt: session.createdAt,
 			lastUsedAt: new Date(session.lastUsed).toISOString(),
 		});
+	});
+
+	router.patch("/:id", async (c) => {
+		const id = c.req.param("id");
+		const tenant = c.get("tenant");
+		let parsed: ReturnType<typeof updateBodySchema.safeParse>;
+		try {
+			parsed = updateBodySchema.safeParse(await c.req.json());
+		} catch {
+			return c.json(
+				{ error: "validation_error", code: "INVALID_INPUT", details: ["Invalid JSON body"] },
+				400 as ContentfulStatusCode,
+			);
+		}
+		if (!parsed.success) {
+			const details = parsed.error.issues.map((i) => i.message);
+			return c.json({ error: "validation_error", code: "INVALID_INPUT", details }, 400 as ContentfulStatusCode);
+		}
+		const runtime = parsed.data;
+		try {
+			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, c.get("owner"), (session) =>
+				sessionManager.updateSandboxRuntime(session, runtime),
+			);
+			return c.json({
+				id,
+				name: meta.name,
+				owner: meta.owner,
+				createdAt: meta.createdAt ?? null,
+				python: meta.python,
+				javascript: meta.javascript,
+				network: meta.network,
+			});
+		} catch (err) {
+			if (isForbiddenError(err)) return forbiddenResponse();
+			if ((err as Error & { code?: string }).code === "ENOENT") {
+				return c.json({ error: "not_found", code: "SANDBOX_NOT_FOUND" }, 404 as ContentfulStatusCode);
+			}
+			throw err;
+		}
 	});
 
 	router.delete("/:id", async (c) => {

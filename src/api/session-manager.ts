@@ -9,7 +9,7 @@ import type { SandboxListEntry, SandboxMeta } from "../sql-fs/types.js";
 import type { GitIdentity } from "./commands/git-command.js";
 import { execLockKey, withDistributedLock } from "./distributed-lock.js";
 import { type DistributedRWLockOptions, rwLockKeys, withDistributedRWLock } from "./distributed-rw-lock.js";
-import { preservesAmbiguousOutcome } from "./errors.js";
+import { execFsError, extractErrCode, preservesAmbiguousOutcome } from "./errors.js";
 import { logAudit } from "./lib/audit.js";
 // NOTE: `py-exec` (warm host Python) is intentionally NOT imported/wired here.
 // It spawned the HOST python3 with full `process.env`, which is a sandbox
@@ -79,6 +79,8 @@ function assertValidSandboxId(sandboxId: string): void {
 }
 
 export interface Session extends SessionRuntime {
+	bash: SessionRuntime["bash"];
+	runtimeOptions: RuntimeOptions;
 	lastUsed: number;
 	inFlight: number;
 	/**
@@ -160,6 +162,12 @@ export interface SessionManagerOptions {
 	 * Called from `persistSandboxMeta` after sandbox creation.
 	 */
 	readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	/** Changes runtime flags in the store and advances the sandbox epoch. Resolves null for a missing sandbox. */
+	readonly updateSandboxRuntimeFn?: (
+		tenantId: string,
+		sandboxId: string,
+		runtime: Partial<RuntimeOptions>,
+	) => Promise<SandboxMeta | null>;
 	/**
 	 * Lists all sandboxes from the persistent store for the given tenant,
 	 * optionally filtered by owner.
@@ -221,6 +229,7 @@ export class SessionManager {
 	private readonly blobCacheFactory: ((tenantId: string) => RedisBlobCache | undefined) | undefined;
 	private readonly getSandboxMetaFn?: (tenantId: string, sandboxId: string) => Promise<SandboxMeta | null>;
 	private readonly persistSandboxMetaFn?: (tenantId: string, sandboxId: string, meta: SandboxMeta) => Promise<void>;
+	private readonly updateSandboxRuntimeFn?: SessionManagerOptions["updateSandboxRuntimeFn"];
 	private readonly listSandboxesFn?: (tenantId: string, owner?: string) => Promise<SandboxListEntry[]>;
 
 	private readonly pythonSem: Semaphore;
@@ -258,6 +267,7 @@ export class SessionManager {
 		blobCacheFactory,
 		getSandboxMetaFn,
 		persistSandboxMetaFn,
+		updateSandboxRuntimeFn,
 		listSandboxesFn,
 		defenseInDepth,
 		defenseAuditMode,
@@ -282,6 +292,7 @@ export class SessionManager {
 		this.blobCacheFactory = blobCacheFactory;
 		this.getSandboxMetaFn = getSandboxMetaFn;
 		this.persistSandboxMetaFn = persistSandboxMetaFn;
+		this.updateSandboxRuntimeFn = updateSandboxRuntimeFn;
 		this.listSandboxesFn = listSandboxesFn;
 		const maxPyWaiters = Number(process.env.MAX_PYTHON_QUEUE ?? "100");
 		const maxJsWaiters = Number(process.env.MAX_JS_QUEUE ?? "100");
@@ -386,6 +397,25 @@ export class SessionManager {
 		return total;
 	}
 
+	private createRuntime(
+		fs: IFileSystem,
+		tenantId: string,
+		sandboxId: string,
+		runtimeOptions: RuntimeOptions,
+	): SessionRuntime {
+		return createSessionRuntime(
+			fs,
+			{ tenantId, sandboxId, runtimeOptions },
+			{
+				defenseInDepth: this.defenseInDepth,
+				defenseAuditMode: this.defenseAuditMode,
+				executionLimits: this.executionLimits,
+				baseEnv: this.sandboxBaseEnv,
+				gitIdentity: this.gitIdentity,
+			},
+		);
+	}
+
 	async getOrCreate(
 		tenantId: string,
 		sandboxId: string,
@@ -436,17 +466,7 @@ export class SessionManager {
 					createdAt: fsCreatedAt,
 				} = await this.buildFs(tenantId, sandboxId, owner, openExisting);
 				createdFs = fs;
-				const runtime = createSessionRuntime(
-					fs,
-					{ tenantId, sandboxId, runtimeOptions: resolvedRuntime },
-					{
-						defenseInDepth: this.defenseInDepth,
-						defenseAuditMode: this.defenseAuditMode,
-						executionLimits: this.executionLimits,
-						baseEnv: this.sandboxBaseEnv,
-						gitIdentity: this.gitIdentity,
-					},
-				);
+				const runtime = this.createRuntime(fs, tenantId, sandboxId, resolvedRuntime);
 				const pathCacheBytes = this.estimatePathCacheBytes(fs);
 
 				// Shutdown may have begun while buildFs() was running. If so, refuse
@@ -922,12 +942,34 @@ export class SessionManager {
 		}
 	}
 
+	private async syncRuntime(tenantId: string, sandboxId: string, session: Session): Promise<void> {
+		const meta = await this.getSandboxMetaFn?.(tenantId, sandboxId);
+		if (!meta) return;
+		const { python, javascript, network } = meta;
+		const current = session.runtimeOptions;
+		if (python === current.python && javascript === current.javascript && network === current.network) return;
+		const runtimeOptions = { python, javascript, network };
+		if (session.fs instanceof WorkerFileSystem) await session.fs.call({ kind: "runtime", runtimeOptions });
+		else session.bash = this.createRuntime(session.fs, tenantId, sandboxId, runtimeOptions).bash;
+		session.runtimeOptions = runtimeOptions;
+	}
+
+	/** Takes the locked session so no script runs across the change. */
+	async updateSandboxRuntime(session: Session, runtime: Partial<RuntimeOptions>): Promise<SandboxMeta> {
+		if (this.updateSandboxRuntimeFn === undefined) {
+			throw Object.assign(new Error("updateSandboxRuntime not configured"), { code: "ENOTSUP" });
+		}
+		const meta = await this.updateSandboxRuntimeFn(session.tenantId, session.sandboxId, runtime);
+		if (meta === null) throw createEnoent(`/${session.sandboxId}`);
+		return meta;
+	}
+
 	private async ensureFreshCache(tenantId: string, sandboxId: string, session: Session): Promise<void> {
 		const coherent = asCoherentFs(session.fs);
 		if (coherent === undefined) return;
 		try {
-			if (!(session.fs instanceof WorkerFileSystem)) await coherent.claimGeneration?.();
-			await coherent.ensureFresh();
+			const claimed = !(session.fs instanceof WorkerFileSystem) && (await coherent.claimGeneration?.()) === true;
+			if ((await coherent.ensureFresh()) || claimed) await this.syncRuntime(tenantId, sandboxId, session);
 			session.pathCacheBytes = this.estimatePathCacheBytes(session.fs);
 			session.overBudget = session.pathCacheBytes > this.pathCacheMaxBytes;
 			if (session.state === "closing")
@@ -1295,6 +1337,25 @@ export class SessionManager {
 	}
 
 	async execWithRuntimeThrottle(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
+		try {
+			return await this.execOnRuntime(session, script, opts);
+		} catch (err) {
+			const escaped = execFsError(err);
+			if (escaped === undefined) throw err;
+			console.error(
+				JSON.stringify({
+					event: "exec_fs_error",
+					tenantId: session.tenantId,
+					sandboxId: session.sandboxId,
+					code: extractErrCode(err),
+					error: (err as Error).message,
+				}),
+			);
+			throw escaped;
+		}
+	}
+
+	private async execOnRuntime(session: Session, script: string, opts?: ExecOptions): Promise<BashExecResult> {
 		if (session.fs instanceof WorkerFileSystem && this.workerPool !== undefined) {
 			const pool = this.workerPool;
 			const fs = session.fs;

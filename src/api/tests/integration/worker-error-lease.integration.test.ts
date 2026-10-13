@@ -12,13 +12,13 @@ import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers
 import { type AuthVariables, createAuthMiddleware } from "../../auth.js";
 import { execLockKey } from "../../distributed-lock.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
+import { apiErrorHandler } from "../../errors.js";
 import { execRoutes } from "../../routes/exec.js";
 import { sessionLeaseSignal } from "../../session-lease-context.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
 import { loadWorkerPoolOptions } from "../../worker-owner/pool.js";
 import type { OwnerEvent, OwnerRequest } from "../../worker-owner/protocol.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 function checkpoint() {
 	let resolve: () => void = () => {};
@@ -174,7 +174,7 @@ describe.skipIf(!process.env.DATABASE_URL || !process.env.REDIS_URL)(
 			const app = new Hono<{ Variables: AuthVariables }>();
 			app.use("/v1/*", createAuthMiddleware(tenantConfig));
 			app.route("/v1/sandboxes", execRoutes(owner));
-			app.onError(testErrorHandler);
+			app.onError(apiErrorHandler);
 			const token = await new SignJWT({ sub: subject })
 				.setProtectedHeader({ alg: "HS256" })
 				.sign(new TextEncoder().encode(authSecret));

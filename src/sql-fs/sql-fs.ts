@@ -8,7 +8,16 @@
  */
 
 import { createHash } from "node:crypto";
-import type { CpOptions, FileContent, FsStat, IFileSystem, MkdirOptions, RmOptions } from "just-bash";
+import {
+	type ByteString,
+	type CpOptions,
+	type FileContent,
+	type FsStat,
+	type IFileSystem,
+	type MkdirOptions,
+	type RmOptions,
+	unsafeBytesFromLatin1,
+} from "just-bash";
 import { LRUCache } from "lru-cache";
 
 import { LockLostError } from "../api/distributed-lock.js";
@@ -98,6 +107,12 @@ type WriteFileOpts = Parameters<IFileSystem["writeFile"]>[2];
 type CreateExclusiveOpts = Parameters<NonNullable<IFileSystem["createExclusive"]>>[1];
 type DirentEntry = Awaited<ReturnType<NonNullable<IFileSystem["readdirWithFileTypes"]>>>[number];
 
+function encodeContent(content: FileContent, options: WriteFileOpts): Uint8Array {
+	if (typeof content !== "string") return content;
+	const encoding = (typeof options === "string" ? options : options?.encoding) ?? "utf8";
+	return new Uint8Array(Buffer.from(content, encoding));
+}
+
 export const DEFAULT_CONTENT_CACHE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
 
 /**
@@ -119,6 +134,7 @@ interface MutationSpec<Tx> {
 	readonly mints?: number;
 	/** Bytes the recorded closure keeps alive; defaults to `PER_MUTATION_BASE_BYTES`. */
 	readonly bytes?: number;
+	readonly supersedes?: string;
 	/**
 	 * Method syntax, not a property: it makes the parameter bivariant, which keeps
 	 * `SqlFs<PgTx>` assignable to `SqlFs<unknown>` the way it was before the journal
@@ -155,10 +171,11 @@ interface SqlFsOptions<Tx> {
  */
 export interface ICoherentFs extends IFileSystem {
 	setOwnerLeaseGuard?(guard: () => void): void;
-	claimGeneration?(): Promise<void>;
+	claimGeneration?(): Promise<boolean>;
 	/** Drops all in-memory caches and repopulates from the source of truth. */
 	reload(): Promise<void>;
-	ensureFresh(): Promise<void>;
+	/** Resolves true when it loaded a new committed view. */
+	ensureFresh(): Promise<boolean>;
 	/** True iff at least one mutation has run since the last clearDirty. */
 	wasDirty(): boolean;
 	/** Resets the dirty flag after session memory accounting. */
@@ -211,7 +228,7 @@ interface CommittedView {
 
 interface FreshnessWaiter {
 	readonly force: boolean;
-	readonly resolve: () => void;
+	readonly resolve: (reloaded: boolean) => void;
 	readonly reject: (error: unknown) => void;
 }
 
@@ -349,11 +366,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#ownerLeaseGuard = guard;
 	}
 
-	async claimGeneration(): Promise<void> {
+	async claimGeneration(): Promise<boolean> {
 		this.#assertOwnerLease();
 		this.#assertScriptTxAlive();
 		const retire = this.#dialect.retireSandboxGeneration;
-		if (retire === undefined) return;
+		if (retire === undefined) return false;
 		if (this.#scriptScope) throw createEstale(this.#sandboxId);
 		const certificate = await this.#db(() =>
 			this.#dialect.transaction(async (tx) => {
@@ -365,9 +382,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#assertScriptTxAlive();
 		if (!this.#cachePoisoned && certificate.priorEpoch === this.#committedView.epoch) {
 			this.#committedView.epoch = certificate.epoch;
-		} else {
-			await this.reload();
+			return false;
 		}
+		await this.reload();
+		return true;
 	}
 
 	// ── Transaction helper ────────────────────────────────────────────────────────
@@ -675,7 +693,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			this.#assertScriptTxAlive();
 			const minted: bigint[] = [];
 			for (let i = 0; i < mints; i++) minted.push(this.#mintInodeId());
-			this.#recordMutation({ kind: op.kind, minted, bytes: op.bytes ?? PER_MUTATION_BASE_BYTES, run: op.run });
+			this.#recordMutation({
+				kind: op.kind,
+				minted,
+				bytes: op.bytes ?? PER_MUTATION_BASE_BYTES,
+				supersedes: op.supersedes,
+				run: op.run,
+			});
 			return minted;
 		}
 		const produced = op.composite ? await this.#withBareTx(op.run) : await this.#withWriteTx(op.run);
@@ -713,14 +737,18 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	 * `endScriptScope` would happily flush the truncated prefix.
 	 */
 	#recordMutation(m: BufferedMutation): void {
-		const ops = this.#mutations.length + 1;
-		const bytes = this.#mutationBytes + m.bytes;
+		// just-bash 3.6 opens every `>` target with an empty writeFile and writes the output in a second one.
+		const last = this.#mutations[this.#mutations.length - 1];
+		const superseding = m.supersedes !== undefined && last?.supersedes === m.supersedes;
+		const ops = this.#mutations.length + (superseding ? 0 : 1);
+		const bytes = this.#mutationBytes + m.bytes - (superseding ? last!.bytes : 0);
 		if (ops > this.#scriptTxBuffer.maxOps || bytes > this.#scriptTxBuffer.maxBytes) {
 			const err = createEscriptbuffer(ops, bytes, this.#scriptTxBuffer.maxOps, this.#scriptTxBuffer.maxBytes);
 			this.#scriptTxLost ??= err;
 			throw err;
 		}
-		this.#mutations.push(m);
+		if (superseding) this.#mutations[this.#mutations.length - 1] = m;
+		else this.#mutations.push(m);
 		this.#mutationBytes = bytes;
 	}
 
@@ -1033,7 +1061,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		for (const path of entries.keys()) this.#assertStoredPath(validatePath(path), "load reserved virtual device");
 	}
 
-	async #loadCommittedView(force: boolean): Promise<void> {
+	async #loadCommittedView(force: boolean): Promise<boolean> {
 		const view = await this.#db(() =>
 			this.#dialect.transaction(
 				async (tx) => {
@@ -1049,7 +1077,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 			),
 		);
 		this.#assertScriptTxAlive();
-		if (view === undefined) return;
+		if (view === undefined) return false;
 		this.#assertPathCacheNamespace(view.entries);
 		this.#committedView = view;
 		this.#pathCacheBytes = [...view.entries.keys()].reduce((bytes, path) => bytes + path.length + 100, 0);
@@ -1058,9 +1086,10 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#dirty = false;
 		this.#cachePoisoned = false;
 		this.#startPrewarm(true);
+		return true;
 	}
 
-	#queueFreshness(force: boolean): Promise<void> {
+	#queueFreshness(force: boolean): Promise<boolean> {
 		return new Promise((resolve, reject) => {
 			this.#freshnessQueue.push({ force, resolve, reject });
 			if (this.#freshnessRunning) return;
@@ -1073,8 +1102,8 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		while (this.#freshnessQueue.length > 0) {
 			const cohort = this.#freshnessQueue.splice(0);
 			try {
-				await this.#loadCommittedView(cohort.some((waiter) => waiter.force));
-				for (const waiter of cohort) waiter.resolve();
+				const reloaded = await this.#loadCommittedView(cohort.some((waiter) => waiter.force));
+				for (const waiter of cohort) waiter.resolve(reloaded);
 			} catch (error) {
 				for (const waiter of cohort) waiter.reject(error);
 			}
@@ -1082,7 +1111,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#freshnessRunning = false;
 	}
 
-	async ensureFresh(): Promise<void> {
+	async ensureFresh(): Promise<boolean> {
 		this.#assertScriptTxAlive();
 		if (this.#scriptScope)
 			throw Object.assign(new Error("Freshness admission during a script scope"), { code: "EBUSY" });
@@ -1472,10 +1501,12 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		sha256: Uint8Array,
 		blobBytes: Uint8Array | undefined,
 	): Omit<MutationSpec<Tx>, "mints"> {
+		const supersedes = `${parentInodeId}:${name}`;
 		if (this.#dialect.writeFileComposite) {
 			return {
 				kind,
 				composite: true,
+				supersedes,
 				run: async (tx) => [
 					await this.#dialect.writeFileComposite!(
 						tx,
@@ -1494,6 +1525,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		return {
 			kind,
 			composite: false,
+			supersedes,
 			// Only reachable on a dialect without `commitBlob`, where `blobBytes` is the
 			// content and the journal must carry it because the insert is part of the replay.
 			bytes: PER_MUTATION_BASE_BYTES + (blobBytes?.byteLength ?? 0),
@@ -1516,10 +1548,11 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 
 	// ── IFileSystem: write operations with pathCache updates ─────────────────────
 
-	async writeFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+	async writeFile(inputPath: string, content: FileContent, options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return;
-		await this.#withNamespaceMutation([path], () => this.#writeFileAt(path, content, undefined));
+		const bytes = encodeContent(content, options);
+		await this.#withNamespaceMutation([path], () => this.#writeFileAt(path, bytes, undefined));
 	}
 
 	/**
@@ -1543,7 +1576,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		});
 	}
 
-	async #writeFileAt(path: string, content: FileContent, createMode: number | undefined): Promise<void> {
+	async #writeFileAt(path: string, bytes: Uint8Array, createMode: number | undefined): Promise<void> {
 		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "writeFile");
 		// Refuse to clobber an existing directory with a file (audit H2 #13). This
@@ -1551,7 +1584,6 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 		const { name, parentEntry } = this.#requireParentDir(path);
 
-		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		this.#assertExecFileSize(path, bytes.byteLength, "write");
 		const sha256 = new Uint8Array(createHash("sha256").update(bytes).digest());
 		const mtime = new Date();
@@ -1601,19 +1633,19 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		this.#dirty = true;
 	}
 
-	async appendFile(inputPath: string, content: FileContent, _options?: WriteFileOpts): Promise<void> {
+	async appendFile(inputPath: string, content: FileContent, options?: WriteFileOpts): Promise<void> {
 		const path = validatePath(inputPath);
 		if (path === DEV_NULL) return;
-		await this.#withNamespaceMutation([path], () => this.#appendFileAt(path, content));
+		const bytes = encodeContent(content, options);
+		await this.#withNamespaceMutation([path], () => this.#appendFileAt(path, bytes));
 	}
 
-	async #appendFileAt(path: string, content: FileContent): Promise<void> {
+	async #appendFileAt(path: string, bytes: Uint8Array): Promise<void> {
 		const scopeGeneration = this.#scriptScope ? this.#scriptScopeGeneration : undefined;
 		this.#assertWritable(path, "appendFile");
 		// Refuse to clobber an existing directory (audit H2 #13); also rejects "/".
 		if (this.#pathCache.get(path)?.kind === INODE_KIND.DIRECTORY) throw createEisdir(path);
 
-		const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
 		const mtime = new Date();
 
 		const existing = this.#pathCache.get(path);
@@ -2048,6 +2080,13 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	async readFileBuffer(inputPath: string): Promise<Uint8Array> {
 		this.#assertScriptTxAlive();
 		return this.#readBytes(inputPath);
+	}
+
+	/** Without it just-bash builds the string one byte at a time, which dominated large reads. */
+	async readFileBytes(inputPath: string): Promise<ByteString> {
+		this.#assertScriptTxAlive();
+		const bytes = await this.#readBytes(inputPath);
+		return unsafeBytesFromLatin1(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1"));
 	}
 
 	async exists(inputPath: string): Promise<boolean> {

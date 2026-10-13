@@ -27,6 +27,8 @@ export interface BufferedMutation {
 	readonly minted: readonly bigint[];
 	/** Estimated bytes this op keeps alive while buffered — charged against the cap. */
 	readonly bytes: number;
+	/** `parentInodeId:name` of a dirent this op overwrites regardless of what it held. */
+	readonly supersedes?: string;
 	/**
 	 * Replays the op on the flush transaction, returning the real inode ids
 	 * positionally matching `minted`. `undefined` in a slot means the database did

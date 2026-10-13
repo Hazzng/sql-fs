@@ -425,6 +425,27 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		}, sandboxDeleteToolError),
 	);
 
+	server.tool(
+		"sandbox_update",
+		"Turn runtime flags on or off for an existing sandbox: python, javascript, network. Omitted flags keep their value. The next bash_exec runs with the new flags; files are untouched.",
+		{
+			id: z.string(),
+			python: z.boolean().optional(),
+			javascript: z.boolean().optional(),
+			network: z.boolean().optional().describe("Grant outbound HTTPS (enables curl + git clone/fetch/push)"),
+		},
+		withWorkerToolContext(async ({ id, ...runtime }) => {
+			if (Object.values(runtime).every((flag) => flag === undefined)) {
+				return fail("Set at least one of python, javascript, network");
+			}
+			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, (session) =>
+				sessionManager.updateSandboxRuntime(session, runtime),
+			);
+			const result = { id, python: meta.python, javascript: meta.javascript, network: meta.network };
+			return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+		}, sandboxDeleteToolError),
+	);
+
 	const bashExecDescription = [
 		"Execute a bash script in a sandbox. Returns stdout, stderr, and exitCode.",
 		"",
@@ -442,20 +463,20 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 		"environment variables, conditionals (if/else), loops (for/while), functions, arithmetic,",
 		"base64, md5sum, sha256sum, tar, gzip, jq, yq, xan, sqlite3.",
 		"",
-		"Network: sandboxes are air-gapped by default. If created with network:true,",
-		"curl and outbound git clone/fetch/push over HTTPS are available. wget is not supported.",
+		"Network: sandboxes are air-gapped by default. With network:true (sandbox_create or",
+		"sandbox_update), curl and outbound git clone/fetch/push over HTTPS are available. wget is not supported.",
 		"",
 		"NOT supported: apt/pip/npm (no package managers),",
 		"vi/vim/nano (no interactive), background jobs (&), kill/ps/top (no process control),",
 		"/proc /sys /dev (no special filesystems), ln -s (symlinks off by default),",
 		"gcc/make/rustc (no compilers).",
 		"",
-		"Optional runtimes (only if sandbox was created with python:true or javascript:true):",
+		"Optional runtimes (only with python:true or javascript:true, set by sandbox_create or sandbox_update):",
 		"- python3 / python — CPython WASM, stdlib only (no pip, no network, no os.system).",
 		"  Concurrent python3 executions across the server are capped to prevent OOM; excess",
 		"  scripts queue until a slot frees.",
 		"- js-exec / node — QuickJS WASM. TypeScript supported. No npm. fetch is available",
-		"  only when the sandbox was created with network:true.",
+		"  only with network:true.",
 	].join("\n");
 
 	server.tool(

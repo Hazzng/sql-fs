@@ -134,3 +134,50 @@ describe("SqlFs.readFileBuffer", () => {
 		await expect(fs.readFileBuffer(dirPath)).rejects.toMatchObject({ code: "EISDIR" });
 	});
 });
+
+describe("SqlFs.readFileBytes", () => {
+	const fileContent = new Uint8Array([0x00, 0x41, 0x7f, 0x80, 0xc3, 0xa9, 0xff]);
+	const filePath = "/data.bin";
+	const inodeId = 10n;
+
+	let fs: SqlFs;
+	let getBlobNoTxMock: ReturnType<typeof vi.fn>;
+
+	beforeEach(async () => {
+		const result = makeFs([fileEntry(filePath, inodeId), dirEntry("/mydir", 11n)], fileContent);
+		fs = result.fs;
+		getBlobNoTxMock = result.getBlobNoTxMock;
+		await fs.ready();
+	});
+
+	it("returns one latin1 char per byte, bytes above 0x7f and NUL included", async () => {
+		const bytes = (await fs.readFileBytes(filePath)) as unknown as string;
+		expect(bytes.length).toBe(fileContent.length);
+		expect(Array.from(bytes, (c) => c.charCodeAt(0))).toEqual(Array.from(fileContent));
+	});
+
+	it("serves the second read from contentCache without calling getBlobNoTx", async () => {
+		await fs.readFileBytes(filePath);
+		getBlobNoTxMock.mockClear();
+
+		await fs.readFileBytes(filePath);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+	});
+
+	it("shares the contentCache entry with readFileBuffer", async () => {
+		await fs.readFileBuffer(filePath);
+		getBlobNoTxMock.mockClear();
+
+		await fs.readFileBytes(filePath);
+		expect(getBlobNoTxMock).not.toHaveBeenCalled();
+		expect(await fs.readFileBuffer(filePath)).toEqual(fileContent);
+	});
+
+	it("throws ENOENT when path is not in pathCache", async () => {
+		await expect(fs.readFileBytes("/nonexistent.bin")).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("throws EISDIR when path resolves to a directory", async () => {
+		await expect(fs.readFileBytes("/mydir")).rejects.toMatchObject({ code: "EISDIR" });
+	});
+});

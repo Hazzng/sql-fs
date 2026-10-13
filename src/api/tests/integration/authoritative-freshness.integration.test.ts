@@ -9,12 +9,12 @@ import type { SqlFs } from "../../../sql-fs/sql-fs.js";
 import { deferred } from "../../../sql-fs/tests/unit/freshness-helpers.js";
 import type { AuthVariables } from "../../auth.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
+import { apiErrorHandler } from "../../errors.js";
 import { registerTools } from "../../mcp/tools.js";
 import { execRoutes } from "../../routes/exec.js";
 import { fileRoutes } from "../../routes/files.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
-import { testErrorHandler } from "../helpers/error-handler.js";
 
 const owner = "issue-215-integration";
 const tenant = "default";
@@ -45,7 +45,7 @@ describe.skipIf(!process.env.DATABASE_URL || !process.env.REDIS_URL)("authoritat
 		});
 		await reader.getOrCreate(tenant, id, undefined, owner);
 		app = new Hono<{ Variables: AuthVariables }>();
-		app.onError(testErrorHandler);
+		app.onError(apiErrorHandler);
 		app.use("*", async (c, next) => {
 			c.set("owner", owner);
 			c.set("tenant", tenant);
