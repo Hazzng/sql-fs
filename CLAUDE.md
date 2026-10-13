@@ -4,14 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-sql-fs-api is a persistent filesystem backend + HTTP/MCP API for [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes. It lets AI agents create isolated bash environments over the network, backed by SQL databases (Postgres, MySQL, Azure SQL) or Azure FileShare. `just-bash` is consumed as an npm dependency. Temporary pnpm patches are allowed for upstream bugs with a tracked removal condition.
+sql-fs-api is a persistent filesystem backend + HTTP/MCP API for [just-bash](https://github.com/nicholasgasior/just-bash) sandboxes. It lets AI agents create isolated bash environments over the network, backed by Postgres. `FS_BACKEND` also accepts `mysql`, `azure-sql` and `azure-fileshare`, but `createSandboxFs` throws `not implemented` for them. Only `postgres` and `memory` work. `just-bash` is consumed as an npm dependency. Temporary pnpm patches are allowed for upstream bugs with a tracked removal condition.
 
 `patches/just-bash@3.6.0.patch` makes ENOENT/ENOTDIR from an output redirect fail the command instead of rejecting the whole exec, pending vercel-labs/just-bash#557. It also backports the environment inheritance fix from vercel-labs/just-bash#439 so per-request env reaches child shells without consuming a command slot. Remove each part when a release includes its upstream fix, and remove `patchedDependencies` when no patch remains. The patch targets the shipped bundle's minified identifiers, so regenerate it and run the redirect and environment regression tests when changing the dependency version. Keep other filesystem errors propagating to the API.
 
 **Architecture:**
 ```
-HTTP/MCP Client → Hono API → Session Manager → Bash (just-bash) → IFileSystem → SqlFs → Postgres/MySQL/Azure SQL
-                                                                              → ReadWriteFs → Azure FileShare
+HTTP/MCP Client → Hono API → Session Manager → Bash (just-bash) → IFileSystem → SqlFs → Postgres
 ```
 
 ## Commands
@@ -57,8 +56,8 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
                                           pathCache    contentCache (LRU)
                                                ↓
                                           SqlDialect
-                                        ↓      ↓      ↓
-                                    Postgres  MySQL  Azure SQL
+                                               ↓
+                                           Postgres
 ```
 
 ### Key Modules
@@ -71,8 +70,6 @@ HTTP Request → Auth Middleware → Route Handler → Session Manager → Bash.
 - `schema.ts` — Drizzle ORM schema (blobs, inodes, dirents, sandboxes tables)
 - `index.ts` — Factory: `createSandboxFs()` and `destroySandbox()`
 - `dialects/postgres.ts` — Postgres/Neon dialect (uses `postgres` driver)
-- `dialects/mysql.ts` — MySQL 8+ dialect (uses `mysql2` driver)
-- `dialects/azure-sql.ts` — Azure SQL dialect (uses `mssql`/tedious driver)
 - `migrations/` — SQL migration files per dialect
 
 **API** (`src/api/`): HTTP + MCP server wrapping just-bash Sandbox.
@@ -142,14 +139,14 @@ blobs (sha256, data, size)  — content-addressable, global dedup
 
 ### Security
 
-- **Sandbox isolation:** RLS on Postgres/Azure SQL, app-level WHERE on MySQL. Every query must be scoped to `sandbox_id`.
+- **Sandbox isolation:** RLS on Postgres. Every query must be scoped to `sandbox_id`.
 - **Symlinks:** Default-deny (`allowSymlinks: false`). Throw EPERM on `symlink()` unless explicitly enabled.
 - **Path validation:** All paths must be normalized via `resolvePath` from just-bash's `path-utils`. Reject null bytes.
 - **Error sanitization:** All errors pass through `sanitizeFsError` before reaching the API layer. No connection strings, host paths, or internal table names in responses.
 - **Auth:** Every `/v1/*` route requires Bearer token. Validate before any DB access.
 - **SQL injection:** Use parameterized queries only. Never interpolate user input into SQL strings. The `postgres` driver's tagged templates and Drizzle's query builder handle this automatically — do not bypass them with raw string concatenation.
 - **Prototype pollution:** Use `Object.create(null)` for objects with user-controlled keys. Use `Map` where possible.
-- **Defense-in-depth:** Opt-in via `JUST_BASH_DEFENSE_IN_DEPTH=true`. When enabled, just-bash monkey-patches host globals (`setTimeout`, `eval`, `Function`, dynamic `import`) during `bash.exec`. All Postgres I/O chokepoints (`#withTx`, `#withReadTx`, `#withBareTx`, `getBlobNoTx`) are wrapped in `DefenseInDepthBox.runTrustedAsync` to bypass the patch. When adding new dialects (MySQL, Azure SQL), this wrapping must be preserved — omitting it will throw `WorkerSecurityViolationError` at runtime.
+- **Defense-in-depth:** Opt-in via `JUST_BASH_DEFENSE_IN_DEPTH=true`. When enabled, just-bash monkey-patches host globals (`setTimeout`, `eval`, `Function`, dynamic `import`) during `bash.exec`. All Postgres I/O chokepoints (`#withTx`, `#withReadTx`, `#withBareTx`, `getBlobNoTx`) are wrapped in `DefenseInDepthBox.runTrustedAsync` to bypass the patch. A new dialect must keep this wrapping — omitting it will throw `WorkerSecurityViolationError` at runtime.
 
 ### Null Prototype Objects
 
@@ -198,7 +195,7 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 ### Dependencies
 
 - `just-bash` is the only runtime dependency that provides the `IFileSystem` interface — import types from `just-bash` directly.
-- SQL drivers (`postgres`, `mysql2`, `mssql`) are direct dependencies but only one is loaded at runtime based on `FS_BACKEND`.
+- `postgres` is the only SQL driver in use. `mysql2` and `mssql` are listed as dependencies, but nothing in `src/` imports them.
 - No WASM dependencies (inherited constraint from just-bash).
 - Prefer standard library over new dependencies. Only add a dependency if it saves significant complexity (e.g., `lru-cache` for a correct LRU, `zod` for validation).
 
@@ -216,7 +213,6 @@ const TABLE = Object.assign(Object.create(null) as Record<string, string>, {
 | `FS_BACKEND` | Yes | `postgres` | `memory` |
 | `DATABASE_URL` | SQL backends | Connection string (use pooler endpoint for Neon) |
 | `DATABASE_DIRECT_URL` | No | Direct (non-pooler) connection used **only** by drizzle-kit (`pnpm db:generate`). The boot-time migration runner uses `DATABASE_URL` and is pooler-safe. Falls back to `DATABASE_URL`. |
-| `FS_MOUNT_PATH` | FileShare backend | Mount path for Azure FileShare |
 | `PORT` | No (default: 8080) | HTTP server port |
 | `AUTH_SECRET` | Yes | Secret for Bearer token validation |
 | `SESSION_IDLE_MS` | No (default: 600000) | Idle timeout before session eviction (ms) |
@@ -290,12 +286,8 @@ src/
     index.ts                     ← Factory + destroy
     dialects/
       postgres.ts                ← Postgres/Neon dialect
-      mysql.ts                   ← MySQL 8+ dialect
-      azure-sql.ts               ← Azure SQL dialect
     migrations/
       postgres/                  ← Postgres DDL + RLS + stored procs
-      mysql/                     ← MySQL DDL + stored procs
-      azure-sql/                 ← T-SQL DDL + RLS + stored procs
     integration/                 ← DB integration tests (skippable)
   redis/                         ← Role-split clients, breaker, boot-time config checks
     client.ts                    ← control/data ioredis clients
