@@ -213,10 +213,17 @@ describe("worker request outcomes", () => {
 			};
 			let outcome: unknown;
 			try {
-				await pool.withLease(undefined, () => pool.send({ kind: "exec", script: "echo once", options: {} }));
+				await pool.withLease(undefined, async () => {
+					try {
+						await pool.send({ kind: "exec", script: "echo once", options: {} });
+					} catch (error) {
+						await pool.recover(error);
+						expect(pool.metrics.unknownOutcomes).toBe(0);
+						throw error;
+					}
+				});
 			} catch (error) {
 				outcome = error;
-				await pool.recover(error);
 			}
 			expect(outcome).toMatchObject({
 				code: "EEXEC_OUTCOME_UNKNOWN",

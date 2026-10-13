@@ -30,7 +30,9 @@ Command removal includes its handler, effect policy, and callers in the same cha
 
 A dispatched buffered write creates transport uncertainty without proving commit. Lease-loss replay risk depends on exec dispatch, committed filesystem prefixes, or creating attach dispatch. Exec can produce external effects even in read-only mode.
 
-Runtime refusal after an exec or committed prefix becomes `EEXEC_OUTCOME_UNKNOWN`. A post-exec `ECOHERENCE` is also promoted: the buffered journal may already be committed even though cache reconciliation failed. SessionManager passes that unknown outcome to `recover(error)`, which terminates the captured worker, retires its captured durable identity, and increments `unknownOutcomes`. Creating attach dispatch alone does not trigger runtime-refusal promotion. Acknowledged creation can already count as a committed prefix.
+Runtime refusal after an exec or committed prefix becomes `EEXEC_OUTCOME_UNKNOWN`. Runtime-refusal promotion alone does not retire the worker or increment recovery metrics. Creating attach dispatch alone does not trigger this promotion. Acknowledged creation can already count as a committed prefix.
+
+A post-exec `ECOHERENCE` is also promoted: writes may already have been applied even though cache reconciliation failed. SessionManager's inner recovery handler sees the raw error before `withLease` promotes it. The pool therefore calls `recover` with the promoted coherence error before propagating it. Recovery terminates the captured worker, retires its captured durable identity, and increments `unknownOutcomes`. Callers must inspect sandbox state before proceeding and must not automatically replay the execution.
 
 Recovery tasks belong to one reservation and one captured slot generation. Repeated recovery shares the task, including a rejected task. A replacement generation gets its own recovery task. Recovery captures the thread and identity before awaits, terminates before durable retirement, and preserves newer residency. Different shared-reader reservations retain independent histories and recovery tasks.
 
