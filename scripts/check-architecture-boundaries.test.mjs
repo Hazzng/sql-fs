@@ -10,6 +10,9 @@ const roots = [];
 function project(files) {
 	const root = mkdtempSync(path.join(os.tmpdir(), "sql-fs-boundaries-"));
 	roots.push(root);
+	if (!("tsconfig.json" in files)) {
+		files["tsconfig.json"] = '{"include":["src/**/*.ts"],"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","target":"ES2022","skipLibCheck":true}}\n';
+	}
 	for (const [name, contents] of Object.entries(files)) {
 		const filename = path.join(root, name);
 		mkdirSync(path.dirname(filename), { recursive: true });
@@ -34,6 +37,20 @@ it("permits named adapter imports and scope cleanup in the runtime shutdown owne
 			"interface Scope { abortScope(): Promise<void> }\nexport async function closeSessionRuntime(scope: Scope) { await scope.abortScope(); }\n",
 	});
 	assert.deepEqual(checkArchitectureBoundaries(root), []);
+});
+
+it("checks production files excluded from tsconfig", () => {
+	const root = project({
+		"tsconfig.json":
+			'{"include":["src/api/included.ts"],"exclude":["src/api/excluded.ts"],"compilerOptions":{"module":"NodeNext","moduleResolution":"NodeNext","target":"ES2022"}}\n',
+		"src/api/included.ts": "export const included = true;\n",
+		"src/api/excluded.ts": "import { WorkerOwnerPool } from './worker-owner/pool.js';\nvoid WorkerOwnerPool;\n",
+		"src/api/worker-owner/pool.ts": "export class WorkerOwnerPool {}\n",
+	});
+	const diagnostics = checkArchitectureBoundaries(root);
+	assert.ok(
+		diagnostics.some(({ file, code }) => file === "src/api/excluded.ts" && code === "WORKER_INTERNAL_IMPORT"),
+	);
 });
 
 it("rejects aliased imports, re-exports, and dynamic imports of worker internals", () => {

@@ -65,7 +65,7 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 		await sm.getOrCreate("default", sbId, undefined, "tester");
 
 		const results = await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/shared.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -86,7 +86,7 @@ describe("N concurrent PUTs to the same path within one sandbox", () => {
 		await sm.getOrCreate("default", sbId, undefined, "tester");
 
 		await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/target.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -122,7 +122,7 @@ describe("N concurrent PUTs to distinct paths within one sandbox", () => {
 		await sm.getOrCreate("default", sbId, undefined, "tester");
 
 		const putResults = await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/dir/file-${i}.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -200,7 +200,7 @@ describe("Write-overwrite-read consistency within one sandbox", () => {
 
 		// N concurrent overwrites
 		await Promise.all(
-			Array.from({ length: N }, (_, i) =>
+			Array.from({ length: N }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/counter.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -253,7 +253,7 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 
 		// N concurrent reads must all return 404, not stale content
 		const readResults = await Promise.all(
-			Array.from({ length: N }, () =>
+			Array.from({ length: N }, async () =>
 				app.request(`/v1/sandboxes/${sbId}/files/to-delete.txt`, {
 					headers: { Authorization: `Bearer ${token}` },
 				}),
@@ -275,7 +275,7 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 
 		// Write 10 files
 		await Promise.all(
-			Array.from({ length: total }, (_, i) =>
+			Array.from({ length: total }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/dir/f-${i}.txt`, {
 					method: "PUT",
 					headers: { Authorization: `Bearer ${token}` },
@@ -286,7 +286,7 @@ describe("Write-delete-read: pathCache cleared after delete", () => {
 
 		// Delete the first 5 concurrently
 		await Promise.all(
-			Array.from({ length: keep }, (_, i) =>
+			Array.from({ length: keep }, async (_, i) =>
 				app.request(`/v1/sandboxes/${sbId}/files/dir/f-${i}.txt`, {
 					method: "DELETE",
 					headers: { Authorization: `Bearer ${token}` },
@@ -334,7 +334,7 @@ describe("N concurrent reads of the same file", () => {
 		});
 
 		const readResults = await Promise.all(
-			Array.from({ length: N }, () =>
+			Array.from({ length: N }, async () =>
 				app.request(`/v1/sandboxes/${sbId}/files/stable.txt`, {
 					headers: { Authorization: `Bearer ${token}` },
 				}),

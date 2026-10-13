@@ -138,7 +138,8 @@ async function runParallel(
 	outerSignal?: AbortSignal,
 	options?: ExecuteBatchOptions,
 ): Promise<BatchScriptResult[]> {
-	const results = new Array<BatchScriptResult>(scripts.length) as BatchScriptResult[];
+	const results: BatchScriptResult[] = [];
+	results.length = scripts.length;
 	const perScript = options?.perScriptTimeoutMs;
 
 	const sharedController = new AbortController();

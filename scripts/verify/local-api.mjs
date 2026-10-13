@@ -69,7 +69,7 @@ export class LocalApiRun {
 		]
 			.map((name) => process.env[name])
 			.filter(Boolean);
-		for (const value of [...this.secrets]) {
+		for (const value of this.secrets.slice()) {
 			try {
 				const password = decodeURIComponent(new URL(value).password);
 				if (password) this.secrets.push(password);
@@ -258,6 +258,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 		{ json, raw, status = 200, timeoutMs = 180000, signal, headers = {}, validateRequestSchema = true } = {},
 	) {
 		const started = performance.now();
+		const requestBody = json !== undefined ? JSON.stringify(json) : raw;
 		const response = await fetch(server.base + path, {
 			method,
 			headers: {
@@ -266,7 +267,7 @@ pythonAssets: pythonAssetIdentity(dirname(dirname(dirname(runtimeEntry))))
 				...(raw !== undefined && { "Content-Type": "application/octet-stream" }),
 				...headers,
 			},
-			body: json !== undefined ? JSON.stringify(json) : raw,
+			...(requestBody !== undefined && { body: requestBody }),
 			signal: AbortSignal.any([
 				AbortSignal.timeout(timeoutMs),
 				...(this.cleaning ? [] : [this.interrupted.signal]),

@@ -1,10 +1,12 @@
 import { readdirSync } from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const require = createRequire(import.meta.url);
-const ts = require("typescript");
+import * as ts from "typescript/unstable/sync";
+import * as ast from "typescript/unstable/ast";
+
+const { API, SymbolFlags } = ts;
+const { SyntaxKind } = ast;
 
 const workerImportAllowlist = new Map([
 	[
@@ -42,6 +44,10 @@ for (const importer of [
 
 const scopeOperations = new Set(["beginScope", "endScope", "abortScope"]);
 
+function relative(root, filename) {
+	return path.relative(root, filename).split(path.sep).join("/");
+}
+
 function listTypeScriptFiles(directory) {
 	const entries = readdirSync(directory, { withFileTypes: true });
 	return entries.flatMap((entry) => {
@@ -51,27 +57,18 @@ function listTypeScriptFiles(directory) {
 	});
 }
 
-function relative(root, filename) {
-	return path.relative(root, filename).split(path.sep).join("/");
-}
-
-function resolveModule(root, sourceFile, specifier) {
-	const result = ts.resolveModuleName(
-		specifier,
-		sourceFile.fileName,
-		{
-			module: ts.ModuleKind.NodeNext,
-			moduleResolution: ts.ModuleResolutionKind.NodeNext,
-			allowImportingTsExtensions: true,
-		},
-		ts.sys,
-	).resolvedModule;
-	if (result === undefined) return undefined;
-	return relative(root, path.resolve(result.resolvedFileName));
+function resolveModule(root, node, checker, project) {
+	const moduleSymbol = checker.getSymbolAtLocation(node);
+	if (moduleSymbol === undefined || (moduleSymbol.flags & SymbolFlags.Module) === 0) return undefined;
+	for (const declaration of moduleSymbol.declarations) {
+		const filename = declarationFile(declaration, project);
+		if (filename !== undefined) return relative(root, path.resolve(filename));
+	}
+	return undefined;
 }
 
 function diagnostic(root, sourceFile, node, code, message) {
-	const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+	const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart());
 	return {
 		file: relative(root, sourceFile.fileName),
 		line: line + 1,
@@ -85,32 +82,37 @@ function workerModule(file) {
 	return file?.startsWith("src/api/worker-owner/") === true;
 }
 
-function symbolOriginatesInWorker(symbol, root, checker, seen = new Set()) {
+function declarationFile(declaration, project) {
+	return declaration.resolve(project)?.getSourceFile().fileName;
+}
+
+function symbolOriginatesInWorker(symbol, root, checker, project, seen = new Set()) {
 	if (symbol === undefined || seen.has(symbol)) return false;
 	seen.add(symbol);
-	if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
-		return symbolOriginatesInWorker(checker.getAliasedSymbol(symbol), root, checker, seen);
+	if ((symbol.flags & SymbolFlags.Alias) !== 0) {
+		return symbolOriginatesInWorker(checker.getAliasedSymbol(symbol), root, checker, project, seen);
 	}
-	return (symbol.declarations ?? []).some((declaration) =>
-		workerModule(relative(root, path.resolve(declaration.getSourceFile().fileName))),
-	);
+	return symbol.declarations.some((declaration) => {
+		const filename = declarationFile(declaration, project);
+		return filename !== undefined && workerModule(relative(root, path.resolve(filename)));
+	});
 }
 
 function moduleExports(node, checker) {
 	const moduleSymbol = checker.getSymbolAtLocation(node.moduleSpecifier);
-	if (moduleSymbol === undefined || (moduleSymbol.flags & ts.SymbolFlags.Module) === 0) return [];
+	if (moduleSymbol === undefined || (moduleSymbol.flags & SymbolFlags.Module) === 0) return [];
 	return checker.getExportsOfModule(moduleSymbol);
 }
 
 function importedSymbols(node, checker) {
-	if (ts.isImportDeclaration(node)) {
+	if (ast.isImportDeclaration(node)) {
 		const clause = node.importClause;
 		if (clause === undefined) return [];
 		const symbols = [];
 		if (clause.name !== undefined) symbols.push({ name: "default", symbol: checker.getSymbolAtLocation(clause.name) });
 		if (clause.namedBindings === undefined) return symbols;
-		if (ts.isNamespaceImport(clause.namedBindings)) {
-			return moduleExports(node, checker).map((symbol) => ({ name: symbol.getName(), symbol }));
+		if (ast.isNamespaceImport(clause.namedBindings)) {
+			return moduleExports(node, checker).map((symbol) => ({ name: symbol.name, symbol }));
 		}
 		for (const item of clause.namedBindings.elements) {
 			symbols.push({
@@ -120,9 +122,9 @@ function importedSymbols(node, checker) {
 		}
 		return symbols;
 	}
-	if (ts.isExportDeclaration(node)) {
-		if (node.exportClause === undefined || ts.isNamespaceExport(node.exportClause)) {
-			return moduleExports(node, checker).map((symbol) => ({ name: symbol.getName(), symbol }));
+	if (ast.isExportDeclaration(node)) {
+		if (node.exportClause === undefined || ast.isNamespaceExport(node.exportClause)) {
+			return moduleExports(node, checker).map((symbol) => ({ name: symbol.name, symbol }));
 		}
 		return node.exportClause.elements.map((item) => ({
 			name: (item.propertyName ?? item.name).text,
@@ -137,19 +139,19 @@ function allowedImport(importer, target, symbol) {
 }
 
 function importedNames(node) {
-	if (ts.isImportDeclaration(node)) {
+	if (ast.isImportDeclaration(node)) {
 		const clause = node.importClause;
 		if (clause === undefined) return ["<side-effect>"];
 		const names = [];
 		if (clause.name !== undefined) names.push("default");
 		if (clause.namedBindings === undefined) return names;
-		if (ts.isNamespaceImport(clause.namedBindings)) return ["*"];
+		if (ast.isNamespaceImport(clause.namedBindings)) return ["*"];
 		for (const item of clause.namedBindings.elements) names.push((item.propertyName ?? item.name).text);
 		return names;
 	}
-	if (ts.isExportDeclaration(node)) {
+	if (ast.isExportDeclaration(node)) {
 		if (node.exportClause === undefined) return ["*"];
-		if (ts.isNamespaceExport(node.exportClause)) return ["*"];
+		if (ast.isNamespaceExport(node.exportClause)) return ["*"];
 		return node.exportClause.elements.map((item) => (item.propertyName ?? item.name).text);
 	}
 	return [];
@@ -157,11 +159,11 @@ function importedNames(node) {
 
 function enclosingFunctionName(node) {
 	for (let current = node.parent; current !== undefined; current = current.parent) {
-		if (ts.isFunctionDeclaration(current) || ts.isMethodDeclaration(current)) return current.name?.getText();
+		if (ast.isFunctionDeclaration(current) || ast.isMethodDeclaration(current)) return current.name?.getText();
 		if (
-			ts.isVariableDeclaration(current) &&
+			ast.isVariableDeclaration(current) &&
 			current.initializer !== undefined &&
-			ts.isArrowFunction(current.initializer)
+			ast.isArrowFunction(current.initializer)
 		)
 			return current.name.getText();
 	}
@@ -182,131 +184,35 @@ function scopeCallAllowed(sourcePath, operation, call) {
 export function checkArchitectureBoundaries(root) {
 	const absoluteRoot = path.resolve(root);
 	const sourceRoot = path.join(absoluteRoot, "src");
-	const files = listTypeScriptFiles(sourceRoot).filter((file) => !file.includes(`${path.sep}tests${path.sep}`));
-	const options = {
-		allowImportingTsExtensions: true,
-		module: ts.ModuleKind.NodeNext,
-		moduleResolution: ts.ModuleResolutionKind.NodeNext,
-		noEmit: true,
-		skipLibCheck: true,
-		target: ts.ScriptTarget.ES2022,
-	};
-	const program = ts.createProgram(files, options);
-	const checker = program.getTypeChecker();
-	const diagnostics = [];
+	const files = listTypeScriptFiles(sourceRoot).filter((filename) => !filename.includes(`${path.sep}tests${path.sep}`));
+	const api = new API({ cwd: absoluteRoot });
+	let snapshot;
+	try {
+		snapshot = api.updateSnapshot({
+			openProjects: [path.join(absoluteRoot, "tsconfig.json")],
+			openFiles: files,
+		});
+		const diagnostics = [];
 
-	for (const sourceFile of program.getSourceFiles()) {
-		if (!path.resolve(sourceFile.fileName).startsWith(`${absoluteRoot}${path.sep}src${path.sep}`)) continue;
-		const sourcePath = relative(absoluteRoot, sourceFile.fileName);
-		if (sourcePath.includes("/tests/")) continue;
+		for (const filename of files) {
+			const project = snapshot.getDefaultProjectForFile(filename);
+			if (project === undefined) throw new Error(`TypeScript 7 did not load ${filename}`);
+			const sourceFile = project.program.getSourceFile(filename);
+			if (sourceFile === undefined) throw new Error(`TypeScript 7 did not parse ${filename}`);
+			const checker = project.checker;
+			if (!path.resolve(sourceFile.fileName).startsWith(`${absoluteRoot}${path.sep}src${path.sep}`)) continue;
+			const sourcePath = relative(absoluteRoot, sourceFile.fileName);
+			if (sourcePath.includes("/tests/")) continue;
 
-		const scopeMethodAliases = new Map();
-		const visit = (node) => {
-			if (
-				(ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-				node.moduleSpecifier !== undefined &&
-				ts.isStringLiteral(node.moduleSpecifier) &&
-				["node:module", "module"].includes(node.moduleSpecifier.text) &&
-				!sourcePath.startsWith("src/api/worker-owner/") &&
-				importedNames(node).some((name) => ["createRequire", "*", "default"].includes(name))
-			) {
-				diagnostics.push(
-					diagnostic(
-						absoluteRoot,
-						sourceFile,
-						node,
-						"WORKER_INTERNAL_DYNAMIC_IMPORT",
-						"import explicit ES modules instead of exposing createRequire outside worker-owner",
-					),
-				);
-			}
-
-			if (
-				(ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-				(node.moduleSpecifier === undefined || ts.isStringLiteral(node.moduleSpecifier))
-			) {
-				const target =
-					node.moduleSpecifier === undefined
-						? undefined
-						: resolveModule(absoluteRoot, sourceFile, node.moduleSpecifier.text);
-				const symbols = importedSymbols(node, checker);
-				const hasWorkerOrigin =
-					workerModule(target) || symbols.some(({ symbol }) => symbolOriginatesInWorker(symbol, absoluteRoot, checker));
-				if (hasWorkerOrigin && !sourcePath.startsWith("src/api/worker-owner/")) {
-					const entries = symbols.length > 0 ? symbols : importedNames(node).map((name) => ({ name }));
-					for (const { name, symbol } of entries) {
-						const resolvedSymbol =
-							symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0
-								? checker.getAliasedSymbol(symbol)
-								: symbol;
-						if (
-							name === "workerReservation" ||
-							resolvedSymbol?.getName() === "workerReservation" ||
-							resolvedSymbol?.declarations?.some(
-								(declaration) =>
-									workerModule(relative(absoluteRoot, path.resolve(declaration.getSourceFile().fileName))) &&
-									declaration.name?.getText() === "workerReservation",
-							)
-						) {
-							diagnostics.push(
-								diagnostic(
-									absoluteRoot,
-									sourceFile,
-									node,
-									"WORKER_RESERVATION_LEAK",
-									"workerReservation is mutable worker-owned state and cannot be imported outside worker-owner",
-								),
-							);
-							continue;
-						}
-						if (target === undefined || !allowedImport(sourcePath, target, name)) {
-							diagnostics.push(
-								diagnostic(
-									absoluteRoot,
-									sourceFile,
-									node,
-									"WORKER_INTERNAL_IMPORT",
-									`import of ${name} from ${target} is outside the worker adapter allowlist`,
-								),
-							);
-						}
-					}
-				}
-			}
-
-			if (
-				ts.isCallExpression(node) &&
-				node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-				!sourcePath.startsWith("src/api/worker-owner/") &&
-				(node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0]))
-			) {
-				diagnostics.push(
-					diagnostic(
-						absoluteRoot,
-						sourceFile,
-						node,
-						"WORKER_INTERNAL_DYNAMIC_IMPORT",
-						"nonliteral dynamic import is outside worker-owner",
-					),
-				);
-			}
-
-			if (
-				ts.isCallExpression(node) &&
-				node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-				node.arguments.length === 1 &&
-				ts.isStringLiteral(node.arguments[0])
-			) {
-				const target = resolveModule(absoluteRoot, sourceFile, node.arguments[0].text);
-				const moduleSymbol = checker.getSymbolAtLocation(node.arguments[0]);
-				const dynamicExports =
-					moduleSymbol === undefined || (moduleSymbol.flags & ts.SymbolFlags.Module) === 0
-						? []
-						: checker.getExportsOfModule(moduleSymbol);
+			const scopeMethodAliases = new Map();
+			const visit = (node) => {
 				if (
-					(workerModule(target) ||
-						dynamicExports.some((symbol) => symbolOriginatesInWorker(symbol, absoluteRoot, checker))) &&
-					!sourcePath.startsWith("src/api/worker-owner/")
+					(ast.isImportDeclaration(node) || ast.isExportDeclaration(node)) &&
+					node.moduleSpecifier !== undefined &&
+					ast.isStringLiteral(node.moduleSpecifier) &&
+					["node:module", "module"].includes(node.moduleSpecifier.text) &&
+					!sourcePath.startsWith("src/api/worker-owner/") &&
+					importedNames(node).some((name) => ["createRequire", "*", "default"].includes(name))
 				) {
 					diagnostics.push(
 						diagnostic(
@@ -314,106 +220,209 @@ export function checkArchitectureBoundaries(root) {
 							sourceFile,
 							node,
 							"WORKER_INTERNAL_DYNAMIC_IMPORT",
-							`dynamic import of ${target} is outside worker-owner`,
+							"import explicit ES modules instead of exposing createRequire outside worker-owner",
 						),
 					);
 				}
-			}
 
-			if (
-				ts.isImportEqualsDeclaration(node) &&
-				ts.isExternalModuleReference(node.moduleReference) &&
-				ts.isStringLiteral(node.moduleReference.expression)
-			) {
-				if (!sourcePath.startsWith("src/api/worker-owner/")) {
+				if (
+					(ast.isImportDeclaration(node) || ast.isExportDeclaration(node)) &&
+					(node.moduleSpecifier === undefined || ast.isStringLiteral(node.moduleSpecifier))
+				) {
+					const target =
+						node.moduleSpecifier === undefined
+							? undefined
+							: resolveModule(absoluteRoot, node.moduleSpecifier, checker, project);
+					const symbols = importedSymbols(node, checker);
+					const hasWorkerOrigin =
+						workerModule(target) || symbols.some(({ symbol }) => symbolOriginatesInWorker(symbol, absoluteRoot, checker, project));
+					if (hasWorkerOrigin && !sourcePath.startsWith("src/api/worker-owner/")) {
+						const entries = symbols.length > 0 ? symbols : importedNames(node).map((name) => ({ name }));
+						for (const { name, symbol } of entries) {
+							const resolvedSymbol =
+								symbol !== undefined && (symbol.flags & SymbolFlags.Alias) !== 0
+									? checker.getAliasedSymbol(symbol)
+									: symbol;
+							if (
+								name === "workerReservation" ||
+								resolvedSymbol?.name === "workerReservation" ||
+								resolvedSymbol?.declarations.some((declaration) => {
+										const filename = declarationFile(declaration, project);
+										return filename !== undefined &&
+											workerModule(relative(absoluteRoot, path.resolve(filename))) &&
+											declaration.resolve(project)?.name?.getText() === "workerReservation";
+									})
+							) {
+								diagnostics.push(
+									diagnostic(
+										absoluteRoot,
+										sourceFile,
+										node,
+										"WORKER_RESERVATION_LEAK",
+										"workerReservation is mutable worker-owned state and cannot be imported outside worker-owner",
+									),
+								);
+								continue;
+							}
+							if (target === undefined || !allowedImport(sourcePath, target, name)) {
+								diagnostics.push(
+									diagnostic(
+										absoluteRoot,
+										sourceFile,
+										node,
+										"WORKER_INTERNAL_IMPORT",
+										`import of ${name} from ${target} is outside the worker adapter allowlist`,
+									),
+								);
+							}
+						}
+					}
+				}
+
+				if (
+					ast.isCallExpression(node) &&
+					node.expression.kind === SyntaxKind.ImportKeyword &&
+					!sourcePath.startsWith("src/api/worker-owner/") &&
+					(node.arguments.length !== 1 || !ast.isStringLiteral(node.arguments[0]))
+				) {
 					diagnostics.push(
 						diagnostic(
 							absoluteRoot,
 							sourceFile,
 							node,
 							"WORKER_INTERNAL_DYNAMIC_IMPORT",
-							"import explicit ES modules instead of import-equals outside worker-owner",
+							"nonliteral dynamic import is outside worker-owner",
 						),
 					);
 				}
-			}
 
-			if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name)) {
-				for (const element of node.name.elements) {
-					const operation = (element.propertyName ?? element.name).getText(sourceFile);
-					if (scopeOperations.has(operation) && ts.isIdentifier(element.name)) {
-						const symbol = checker.getSymbolAtLocation(element.name);
+				if (
+					ast.isCallExpression(node) &&
+					node.expression.kind === SyntaxKind.ImportKeyword &&
+					node.arguments.length === 1 &&
+					ast.isStringLiteral(node.arguments[0])
+				) {
+					const target = resolveModule(absoluteRoot, node.arguments[0], checker, project);
+					const moduleSymbol = checker.getSymbolAtLocation(node.arguments[0]);
+					const dynamicExports =
+						moduleSymbol === undefined || (moduleSymbol.flags & SymbolFlags.Module) === 0
+							? []
+							: checker.getExportsOfModule(moduleSymbol);
+					if (
+						(workerModule(target) ||
+							dynamicExports.some((symbol) => symbolOriginatesInWorker(symbol, absoluteRoot, checker, project))) &&
+						!sourcePath.startsWith("src/api/worker-owner/")
+					) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"WORKER_INTERNAL_DYNAMIC_IMPORT",
+								`dynamic import of ${target} is outside worker-owner`,
+							),
+						);
+					}
+				}
+
+				if (
+					ast.isImportEqualsDeclaration(node) &&
+					ast.isExternalModuleReference(node.moduleReference) &&
+					ast.isStringLiteral(node.moduleReference.expression)
+				) {
+					if (!sourcePath.startsWith("src/api/worker-owner/")) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"WORKER_INTERNAL_DYNAMIC_IMPORT",
+								"import explicit ES modules instead of import-equals outside worker-owner",
+							),
+						);
+					}
+				}
+
+				if (ast.isVariableDeclaration(node) && ast.isObjectBindingPattern(node.name)) {
+					for (const element of node.name.elements) {
+						const operation = (element.propertyName ?? element.name).getText(sourceFile);
+						if (scopeOperations.has(operation) && ast.isIdentifier(element.name)) {
+							const symbol = checker.getSymbolAtLocation(element.name);
+							if (symbol !== undefined) scopeMethodAliases.set(symbol, operation);
+						}
+					}
+				}
+				if (ast.isVariableDeclaration(node) && ast.isIdentifier(node.name) && node.initializer !== undefined) {
+					const initializer = node.initializer;
+					const operation = ast.isPropertyAccessExpression(initializer)
+						? initializer.name.text
+						: ast.isElementAccessExpression(initializer) && ast.isStringLiteral(initializer.argumentExpression)
+							? initializer.argumentExpression.text
+							: undefined;
+					if (operation !== undefined && scopeOperations.has(operation)) {
+						const symbol = checker.getSymbolAtLocation(node.name);
 						if (symbol !== undefined) scopeMethodAliases.set(symbol, operation);
 					}
 				}
-			}
-			if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer !== undefined) {
-				const initializer = node.initializer;
-				const operation = ts.isPropertyAccessExpression(initializer)
-					? initializer.name.text
-					: ts.isElementAccessExpression(initializer) && ts.isStringLiteral(initializer.argumentExpression)
-						? initializer.argumentExpression.text
-						: undefined;
-				if (operation !== undefined && scopeOperations.has(operation)) {
-					const symbol = checker.getSymbolAtLocation(node.name);
-					if (symbol !== undefined) scopeMethodAliases.set(symbol, operation);
-				}
-			}
 
-			if (ts.isCallExpression(node)) {
-				const expression = node.expression;
-				if (
-					!sourcePath.startsWith("src/api/worker-owner/") &&
-					ts.isIdentifier(expression) &&
-					expression.text === "require"
-				) {
-					diagnostics.push(
-						diagnostic(
-							absoluteRoot,
-							sourceFile,
-							node,
-							"WORKER_INTERNAL_DYNAMIC_IMPORT",
-							"import explicit ES modules instead of require outside worker-owner",
-						),
-					);
-				}
+				if (ast.isCallExpression(node)) {
+					const expression = node.expression;
+					if (
+						!sourcePath.startsWith("src/api/worker-owner/") &&
+						ast.isIdentifier(expression) &&
+						expression.text === "require"
+					) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"WORKER_INTERNAL_DYNAMIC_IMPORT",
+								"import explicit ES modules instead of require outside worker-owner",
+							),
+						);
+					}
 
-				let operation;
-				const callTarget =
-					ts.isPropertyAccessExpression(expression) && ["call", "apply", "bind"].includes(expression.name.text)
-						? expression.expression
-						: expression;
-				if (ts.isPropertyAccessExpression(callTarget) && scopeOperations.has(callTarget.name.text)) {
-					operation = callTarget.name.text;
-				} else if (
-					ts.isElementAccessExpression(callTarget) &&
-					callTarget.argumentExpression !== undefined &&
-					ts.isStringLiteral(callTarget.argumentExpression) &&
-					scopeOperations.has(callTarget.argumentExpression.text)
-				) {
-					operation = callTarget.argumentExpression.text;
-				} else if (ts.isIdentifier(callTarget)) {
-					const symbol = checker.getSymbolAtLocation(callTarget);
-					if (symbol !== undefined) operation = scopeMethodAliases.get(symbol);
+					let operation;
+					const callTarget =
+						ast.isPropertyAccessExpression(expression) && ["call", "apply", "bind"].includes(expression.name.text)
+							? expression.expression
+							: expression;
+					if (ast.isPropertyAccessExpression(callTarget) && scopeOperations.has(callTarget.name.text)) {
+						operation = callTarget.name.text;
+					} else if (
+						ast.isElementAccessExpression(callTarget) &&
+						callTarget.argumentExpression !== undefined &&
+						ast.isStringLiteral(callTarget.argumentExpression) &&
+						scopeOperations.has(callTarget.argumentExpression.text)
+					) {
+						operation = callTarget.argumentExpression.text;
+					} else if (ast.isIdentifier(callTarget)) {
+						const symbol = checker.getSymbolAtLocation(callTarget);
+						if (symbol !== undefined) operation = scopeMethodAliases.get(symbol);
+					}
+					if (operation !== undefined && !scopeCallAllowed(sourcePath, operation, node)) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"SCRIPT_SCOPE_COMPLETION_OWNER",
+								`direct ${operation} call must stay in a scope adapter, worker handler, or runtime shutdown cleanup`,
+							),
+						);
+					}
 				}
-				if (operation !== undefined && !scopeCallAllowed(sourcePath, operation, node)) {
-					diagnostics.push(
-						diagnostic(
-							absoluteRoot,
-							sourceFile,
-							node,
-							"SCRIPT_SCOPE_COMPLETION_OWNER",
-							`direct ${operation} call must stay in a scope adapter, worker handler, or runtime shutdown cleanup`,
-						),
-					);
-				}
-			}
-			ts.forEachChild(node, visit);
-		};
-		ts.forEachChild(sourceFile, visit);
+				node.forEachChild(visit);
+			};
+			sourceFile.forEachChild(visit);
+		}
+
+		return diagnostics;
+	} finally {
+		snapshot?.dispose();
+		api.close();
 	}
-
-	return diagnostics;
 }
 
 function main() {

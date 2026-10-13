@@ -128,8 +128,8 @@ export class FairAdmission {
 
 	close(): void {
 		this.closed = true;
-		for (const queue of [...this.queues.values()]) {
-			for (const waiter of [...queue]) {
+		for (const queue of Array.from(this.queues.values())) {
+			for (const waiter of queue.slice()) {
 				this.remove(waiter);
 				this.cancelled++;
 				waiter.reject(Object.assign(new Error("ESHUTTINGDOWN: execution pool is draining"), { code: "ESHUTTINGDOWN" }));

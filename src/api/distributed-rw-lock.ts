@@ -240,7 +240,7 @@ function startSharedHeartbeat(
 		// F8: a stall that delays this tick past the reader lease lets a writer
 		// enter mid-read; measure the gap (readerLeaseMs is the reader's "lease").
 		const expectedFireAt = Date.now() + delayMs;
-		timer = setTimeout(async () => {
+		const renew = async (): Promise<void> => {
 			if (stopped) return;
 			recordHeartbeatGap({ lock: "rw-reader", key: keys.readers, expectedFireAt, renewMs, leaseMs: readerLeaseMs });
 			let outcome: "renewed" | "ownership_lost" | "transient";
@@ -267,6 +267,11 @@ function startSharedHeartbeat(
 			} else {
 				schedule(renewRetryMs);
 			}
+		};
+		timer = setTimeout(() => {
+			void renew().catch(() => {
+				if (!stopped) onLost();
+			});
 		}, delayMs);
 	};
 
@@ -373,7 +378,7 @@ function startExclusiveHeartbeat(
 		// F8: a stall that delays this tick past the writer lease lets a peer
 		// replica acquire the flag while we believe we still hold it; measure it.
 		const expectedFireAt = Date.now() + delayMs;
-		timer = setTimeout(async () => {
+		const renew = async (): Promise<void> => {
 			if (stopped) return;
 			recordHeartbeatGap({ lock: "rw-writer", key: keys.writer, expectedFireAt, renewMs, leaseMs });
 			let outcome: "renewed" | "ownership_lost" | "transient";
@@ -399,6 +404,11 @@ function startExclusiveHeartbeat(
 			} else {
 				schedule(renewRetryMs);
 			}
+		};
+		timer = setTimeout(() => {
+			void renew().catch(() => {
+				if (!stopped) onLost();
+			});
 		}, delayMs);
 	};
 

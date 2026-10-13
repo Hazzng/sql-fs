@@ -1,7 +1,7 @@
 {
 	"$schema": "./node_modules/oxlint/configuration_schema.json",
 	"categories": {
-		"correctness": "off"
+		"correctness": "error"
 	},
 	"ignorePatterns": [
 		"node_modules/**",
@@ -32,7 +32,8 @@
 		"anti-slop/no-widen-then-assert": "error",
 		"anti-slop/no-reduce-accumulator-copy": "error",
 		"anti-slop/no-object-parameters": "error",
-		"oxc/no-accumulating-spread": "error"
+		"oxc/no-accumulating-spread": "error",
+		"eslint/array-callback-return": "error"
 	},
 	"overrides": [
 		{
@@ -42,5 +43,6 @@
 				"anti-slop/no-object-parameters": "off"
 			}
 		}
-	]
+	],
+	"plugins": ["typescript", "unicorn", "oxc"]
 }

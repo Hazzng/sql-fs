@@ -38,7 +38,9 @@
 		"changeset:version": "changeset version && node scripts/sync-openapi-version.mjs && pnpm install --lockfile-only",
 		"prepare": "lefthook install",
 		"lint:biome": "biome check .",
-		"lint:oxlint": "NODE_OPTIONS=--import=tsx oxlint --deny-warnings ."
+		"lint:oxlint": "pnpm lint:oxlint:syntax && pnpm lint:oxlint:types",
+		"lint:oxlint:syntax": "NODE_OPTIONS=--import=tsx oxlint --deny-warnings .",
+		"lint:oxlint:types": "NODE_OPTIONS=--import=tsx oxlint -c .oxlintrc-type-aware.json --deny-warnings src clients/typescript"
 	},
 	"dependencies": {
 		"@hono/node-server": "^1.19.17",
@@ -65,9 +67,10 @@
 		"knip": "^6.4.1",
 		"lefthook": "^1.11.0",
 		"oxlint": "1.87.0",
+		"oxlint-tsgolint": "7.0.2004",
 		"portless": "^0.13.0",
 		"tsx": "^4.19.0",
-		"typescript": "^5.7.0",
+		"typescript": "7.0.2",
 		"vitest": "^3.1.0"
 	},
 	"packageManager": "pnpm@10.30.3+sha512.c961d1e0a2d8e354ecaa5166b822516668b7f44cb5bd95122d590dd81922f606f5473b6d23ec4a5be05e7fcd18e8488d47d978bbe981872f1145d06e9a740017"

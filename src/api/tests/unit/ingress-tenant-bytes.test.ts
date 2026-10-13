@@ -136,7 +136,7 @@ describe("tenant raw byte admission", () => {
 			expect(applied()).toBe(1);
 			expect(ingress.metrics).toMatchObject({ retainedRawBytes: 64, activeRequests: 1 });
 		} finally {
-			await Promise.all(responses.map((response) => (response.bodyUsed ? undefined : response.body?.cancel())));
+			await Promise.all(responses.map(async (response) => (response.bodyUsed ? undefined : response.body?.cancel())));
 		}
 		expect(ingress.metrics).toMatchObject({ retainedRawBytes: 0, activeRequests: 0, queuedRequests: 0 });
 		expect(Reflect.get(ingress, "tenantBytes")).toEqual(new Map());

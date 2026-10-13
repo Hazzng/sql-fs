@@ -2420,7 +2420,7 @@ export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 		// Remove src subtree and any existing dest subtree from cache
 		for (const p of srcPaths) this.#cacheDelete(p);
 		const destPrefix = dest === "/" ? "/" : `${dest}/`;
-		for (const key of [...this.#pathCache.keys()]) {
+		for (const key of Array.from(this.#pathCache.keys())) {
 			if (key === dest || key.startsWith(destPrefix)) this.#cacheDelete(key);
 		}
 

@@ -27,6 +27,7 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir clients/typescript install --ignore-workspace --frozen-lockfile
 
       - run: pnpm typecheck
 
