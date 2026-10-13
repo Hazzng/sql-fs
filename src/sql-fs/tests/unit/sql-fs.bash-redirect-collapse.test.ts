@@ -16,7 +16,7 @@ async function runScript(script: string, maxOps: number = BUFFER_ON.maxOps) {
 		result = await bash.exec(script);
 		await fs.endScriptScope();
 	} catch (err) {
-		scriptError = (err as Error & { code?: string }).code;
+		scriptError = (err as Error & { code?: string }).code ?? "UNCODED";
 		await fs.abortScriptScope();
 	}
 	return {
@@ -54,6 +54,10 @@ describe("bash over SqlFs — `>` flushes one composite per redirect", () => {
 	it("counts a collapsed redirect once against the op cap", async () => {
 		const one = await runScript("echo hi > /home/user/out", 1);
 		const two = await runScript("echo 1 > /home/user/a; echo 2 > /home/user/b", 1);
-		expect({ one: one.scriptError, two: two.scriptError }).toEqual({ one: undefined, two: "ESCRIPTBUFFER" });
+		expect({ one: one.scriptError, oneExit: one.result.exitCode, two: two.scriptError }).toEqual({
+			one: undefined,
+			oneExit: 0,
+			two: "ESCRIPTBUFFER",
+		});
 	});
 });

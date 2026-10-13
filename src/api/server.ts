@@ -121,7 +121,11 @@ async function updateSandboxRuntimeFn(
 ): Promise<SandboxMeta | null> {
 	const backend = getOrInitMetaBackend(tenantId);
 	await ensureMetaConnected(backend);
-	return backend.dialect.transaction((tx) => backend.dialect.updateSandboxRuntime(tx, sandboxId, runtime));
+	try {
+		return await backend.dialect.transaction((tx) => backend.dialect.updateSandboxRuntime(tx, sandboxId, runtime));
+	} catch (err) {
+		throw translateSqlError(err, sandboxId);
+	}
 }
 
 async function listSandboxesFn(tenantId: string, owner?: string): Promise<SandboxListEntry[]> {

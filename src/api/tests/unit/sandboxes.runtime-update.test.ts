@@ -206,6 +206,13 @@ describe("MCP sandbox_update", () => {
 		expect(await curlPath(r.b)).toBe("/usr/bin/curl\n");
 	});
 
+	it("rejects a call that sets no flag", async () => {
+		expect(await callUpdate("agent-1", { id: ID })).toEqual({
+			ok: false,
+			error: "Set at least one of python, javascript, network",
+		});
+	});
+
 	it("refuses a caller who does not own the sandbox", async () => {
 		expect(await callUpdate("agent-2", { id: ID, network: true })).toEqual({ ok: false, error: "forbidden" });
 		expect(r.meta.get(ID)?.network).toBe(false);

@@ -435,6 +435,9 @@ export function registerTools(server: McpServer, sessionManager: SessionManager,
 			network: z.boolean().optional().describe("Grant outbound HTTPS (enables curl + git clone/fetch/push)"),
 		},
 		withWorkerToolContext(async ({ id, ...runtime }) => {
+			if (Object.values(runtime).every((flag) => flag === undefined)) {
+				return fail("Set at least one of python, javascript, network");
+			}
 			const meta = await withOwnedSessionOrRehydrate(sessionManager, tenant, id, owner, (session) =>
 				sessionManager.updateSandboxRuntime(session, runtime),
 			);

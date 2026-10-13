@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type BashOverSqlFs, bashOverSqlFs } from "../fixtures/bash-over-sqlfs.js";
 
 const UTF8_TEXT = new Uint8Array([0x63, 0x61, 0x66, 0xc3, 0xa9, 0x0a]);
@@ -18,9 +18,14 @@ describe("SqlFs honours the write encoding", () => {
 	});
 
 	it("appends a non-ASCII file byte for byte through cat >>", async () => {
+		const prefix = new TextEncoder().encode("pre\n");
+		await env.fs.writeFile("/home/user/dst.txt", prefix);
+		vi.mocked(env.probe.dialect.getBlob).mockResolvedValueOnce(prefix);
 		await env.bash.exec("cat /home/user/src.txt >> /home/user/dst.txt");
 
-		expect(await env.fs.readFileBuffer("/home/user/dst.txt")).toEqual(UTF8_TEXT);
+		expect(await env.fs.readFileBuffer("/home/user/dst.txt")).toEqual(
+			new Uint8Array([0x70, 0x72, 0x65, 0x0a, ...UTF8_TEXT]),
+		);
 	});
 
 	it("stores a binary string as one byte per character", async () => {
