@@ -40,6 +40,14 @@ export class RequestOutcome {
 	}
 
 	runtimeFailure(error: unknown): unknown {
+		// A buffered exec can commit its journal and then fail while reconciling
+		// the worker's cache (for example, ECOHERENCE after endScope). The reply
+		// proves the worker is alive, but not that the script had no effects.
+		if (workerFailureCode(error) === "ECOHERENCE" && this.execDispatched) {
+			return new OutcomeUnknownError(
+				"EEXEC_OUTCOME_UNKNOWN: exec may have committed before coherence recovery failed; inspect state before retrying",
+			);
+		}
 		return workerFailureCode(error) === "ERUNTIME_BUSY" && (this.execDispatched || this.committedFsWrite)
 			? new OutcomeUnknownError(
 					"EEXEC_OUTCOME_UNKNOWN: an earlier operation in this request may have applied; do not replay the request",

@@ -10,10 +10,18 @@ const identity: OwnerIdentity = {
 	cwd: "/home/user",
 };
 
-const effects: Array<{ command: OwnerCommand; applies: boolean }> = [
-	{ command: { kind: "attach", identity }, applies: true },
-	{ command: { kind: "attach", identity: { ...identity, openExisting: false } }, applies: true },
-	{ command: { kind: "attach", identity: { ...identity, openExisting: true } }, applies: false },
+const effects: Array<{ label?: string; command: OwnerCommand; applies: boolean }> = [
+	{ label: "creating attach (unspecified openExisting)", command: { kind: "attach", identity }, applies: true },
+	{
+		label: "creating attach",
+		command: { kind: "attach", identity: { ...identity, openExisting: false } },
+		applies: true,
+	},
+	{
+		label: "existing attach",
+		command: { kind: "attach", identity: { ...identity, openExisting: true } },
+		applies: false,
+	},
 	{ command: { kind: "exec", script: "curl -X POST https://example.com", options: {} }, applies: true },
 	{ command: { kind: "readFile", args: ["/file"] }, applies: false },
 	{ command: { kind: "readFileBuffer", args: ["/file"] }, applies: false },
@@ -50,7 +58,7 @@ const effects: Array<{ command: OwnerCommand; applies: boolean }> = [
 ];
 
 describe("worker command effects", () => {
-	it.each(effects)("classifies $command.kind as applies=$applies", ({ command, applies }) => {
+	it.each(effects)("classifies $command.kind $label as applies=$applies", ({ command, applies }) => {
 		expect(mayApply(command)).toBe(applies);
 	});
 });
