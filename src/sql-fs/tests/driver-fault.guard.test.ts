@@ -59,9 +59,7 @@ async function runFixture(mode: string): Promise<ChildResult> {
 	try {
 		const { stdout, stderr } = await run(process.execPath, [fixture, mode], {
 			timeout: 60_000,
-			// Short enough that the fixture's "stuck" await is declared stuck well inside the test
-			// timeout; the production default is 5s.
-			env: { ...process.env, PG_DRIVER_FAULT_GRACE_MS: "100" },
+			env: { ...process.env, PG_DRIVER_FAULT_GRACE_MS: mode === "startup-unref" ? "60000" : "100" },
 		});
 		return { code: 0, stdout, stderr };
 	} catch (err) {

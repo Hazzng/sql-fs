@@ -389,14 +389,12 @@ export class ScriptPersistence<Tx> {
 	}
 
 	#replay(authority: EpochAuthority): ReplayContext {
-		const owner = this;
+		const expectedEpoch = (): bigint => this.#scriptEpoch ?? authority.epoch;
 		return {
 			get expectedEpoch() {
-				return owner.#scriptEpoch ?? authority.epoch;
+				return expectedEpoch();
 			},
-			resolveInodeId(id) {
-				return owner.#realId(id);
-			},
+			resolveInodeId: (id) => this.#realId(id),
 		};
 	}
 
