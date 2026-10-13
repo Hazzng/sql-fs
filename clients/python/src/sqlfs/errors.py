@@ -19,11 +19,13 @@ class SQLFSError(Exception):
         code: Optional[str] = None,
         status: Optional[int] = None,
         details: Any = None,
+        retryable: Optional[bool] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
         self.details = details
+        self.retryable = retryable
 
 
 class AuthError(SQLFSError):
@@ -39,7 +41,7 @@ class ConflictError(SQLFSError):
 
 
 class ValidationError(SQLFSError):
-    """400 — request body / query parameters failed server-side validation."""
+    """400 / 413 / 422 — invalid input or an exceeded input limit."""
 
 
 class ExecTimeoutError(SQLFSError):

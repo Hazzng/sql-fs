@@ -2,12 +2,14 @@ export interface SQLFSErrorOptions {
 	code?: string;
 	status?: number;
 	details?: unknown;
+	retryable?: boolean;
 }
 
 export class SQLFSError extends Error {
 	readonly code?: string;
 	readonly status?: number;
 	readonly details?: unknown;
+	readonly retryable?: boolean;
 
 	constructor(message: string, options: SQLFSErrorOptions = {}) {
 		super(message);
@@ -15,6 +17,7 @@ export class SQLFSError extends Error {
 		this.code = options.code;
 		this.status = options.status;
 		this.details = options.details;
+		this.retryable = options.retryable;
 	}
 }
 

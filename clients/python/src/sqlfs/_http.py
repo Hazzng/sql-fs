@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from collections.abc import Iterator, Mapping
-from typing import Any, Dict, List, Optional, Union
+from types import MappingProxyType
+from typing import Any, Dict, List, NoReturn, Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -37,6 +39,42 @@ from .errors import (
 DEFAULT_MAX_RETRIES = 3
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 DEFAULT_TIMEOUT_S = 30.0
+UNKNOWN_OUTCOME_CODES = frozenset({"EEXEC_OUTCOME_UNKNOWN", "EDRIVERFAULT"})
+COMMITTED_WRITE_CODES = frozenset({"ECOHERENCE", "ELOCKLOST_APPLIED"})
+CONNECTION_EXCEPTION_SQLSTATE = re.compile(r"08[0-9A-Z]{3}")
+STREAM_ERROR_STATUS_BY_CODE: Mapping[str, int] = MappingProxyType(
+    {
+        "ENOENT": 404,
+        "EEXIST": 409,
+        "ENOTEMPTY": 409,
+        "ESTALE": 409,
+        "EPERM": 403,
+        "FORBIDDEN": 403,
+        "EISDIR": 400,
+        "ENOTDIR": 400,
+        "ELOOP": 400,
+        "EINVAL": 400,
+        "EREADONLY": 500,
+        "ESESSIONCLOSING": 503,
+        "ESHUTTINGDOWN": 503,
+        "ELOCKTIMEOUT": 503,
+        "ELOCKLOST": 503,
+        "ELOCKLOST_APPLIED": 503,
+        "ECOHERENCE": 503,
+        "EDRIVERFAULT": 503,
+        "ECOHERENCE_UNAPPLIED": 503,
+        "EWORKER_BUSY": 503,
+        "EWORKER_UNAVAILABLE": 503,
+        "EEXEC_OUTCOME_UNKNOWN": 503,
+        "ERUNTIME_BUSY": 503,
+        "EUNAVAILABLE": 503,
+        "ESCRIPTBUFFER": 413,
+        "EEXEC_INPUT_LIMIT": 413,
+        "EFBIG": 413,
+        "EREADONLY_VIOLATION": 422,
+        "INTERNAL_ERROR": 500,
+    }
+)
 
 
 JsonType = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
@@ -159,21 +197,9 @@ class Transport:
         expect_json: bool = True,
         idempotent: bool = True,
         read_only: bool = False,
+        retry_transport_errors: bool = True,
+        require_explicit_retryable: bool = False,
     ) -> httpx.Response:
-        """Send a request with retry + error mapping.
-
-        `path` is appended to `base_url + /v1`. Pass either `json_body` (sets
-        Content-Type to application/json) or `content` (raw bytes — caller
-        supplies Content-Type via `headers`).
-
-        Retry policy:
-          - Network errors retry up to `max_retries` regardless of idempotency
-            (no HTTP request was completed → no server-side side effect).
-          - 5xx / 429 responses retry only when `idempotent=True`.
-          - 503 with `code: ECOHERENCE` is never retried unless `read_only=True`,
-            because the write committed to the database and only the Redis
-            publish failed — retrying would double-apply the write.
-        """
         url = f"{self._base_url}/v1{path}"
         merged_headers: Dict[str, str] = self._auth_headers()
         if headers:
@@ -194,7 +220,11 @@ class Transport:
                 )
             except httpx.TransportError as e:
                 last_exc = e
-                if attempt >= self._max_retries:
+                if (
+                    not retry_transport_errors
+                    or attempt >= self._max_retries
+                    or (not idempotent and not read_only)
+                ):
                     raise TransportError(f"network error after {attempt + 1} attempts: {e}") from e
                 self._sleep_backoff(attempt)
                 continue
@@ -202,7 +232,13 @@ class Transport:
             if (
                 resp.status_code in RETRY_STATUS
                 and attempt < self._max_retries
-                and _should_retry_response(resp, idempotent=idempotent, read_only=read_only)
+                and _should_retry_response(
+                    resp,
+                    idempotent=idempotent,
+                    read_only=read_only,
+                    method=method,
+                    require_explicit_retryable=require_explicit_retryable,
+                )
             ):
                 # Honour Retry-After when present, else exponential jitter.
                 retry_after = _parse_retry_after(resp)
@@ -259,35 +295,7 @@ class Transport:
 
     # ── error mapping ────────────────────────────────────────────────────────
     def _raise_for_status(self, resp: httpx.Response) -> None:
-        status = resp.status_code
-        body, code, message, details = _parse_error_body(resp)
-        if status in (401, 403):
-            raise AuthError(message, code=code, status=status, details=details)
-        if status == 404:
-            raise NotFoundError(message, code=code, status=status, details=details)
-        if status == 408:
-            raise ExecTimeoutError(
-                message,
-                code=code,
-                status=status,
-                details=details,
-                duration_ms=body.get("durationMs") if isinstance(body, dict) else None,
-            )
-        if status == 409:
-            raise ConflictError(message, code=code, status=status, details=details)
-        if status in (400, 422):
-            raise ValidationError(message, code=code, status=status, details=details)
-        if status == 429:
-            raise RateLimitError(
-                message,
-                code=code,
-                status=status,
-                details=details,
-                retry_after=_parse_retry_after(resp),
-            )
-        if 500 <= status < 600:
-            raise ServerError(message, code=code, status=status, details=details)
-        raise SQLFSError(message, code=code, status=status, details=details)
+        _raise_api_error(resp.status_code, _parse_error_body(resp), _parse_retry_after(resp))
 
     # ── retry sleep ──────────────────────────────────────────────────────────
     def _sleep_backoff(self, attempt: int) -> None:
@@ -298,7 +306,57 @@ class Transport:
 
 
 # ── module-level helpers ─────────────────────────────────────────────────────
-def _parse_error_body(resp: httpx.Response) -> tuple[Dict[str, Any], Any, str, Any]:
+def _status_for_stream_error(code: str) -> int:
+    return STREAM_ERROR_STATUS_BY_CODE.get(code, 422)
+
+
+def _raise_api_error(
+    status: int,
+    body: Mapping[str, Any],
+    retry_after: Optional[int] = None,
+) -> NoReturn:
+    message = body.get("error")
+    message = message if isinstance(message, str) else f"HTTP {status}"
+    raw_code = body.get("code")
+    code = raw_code if isinstance(raw_code, str) else None
+    raw_retryable = body.get("retryable")
+    retryable = raw_retryable if isinstance(raw_retryable, bool) else None
+    details = body.get("details")
+    if status == 408:
+        raise ExecTimeoutError(
+            message,
+            code=code,
+            status=status,
+            details=details,
+            retryable=retryable,
+            duration_ms=body.get("durationMs"),
+        )
+    if status == 429:
+        raise RateLimitError(
+            message,
+            code=code,
+            status=status,
+            details=details,
+            retryable=retryable,
+            retry_after=retry_after,
+        )
+    error_type: type[SQLFSError]
+    if status in (401, 403):
+        error_type = AuthError
+    elif status == 404:
+        error_type = NotFoundError
+    elif status == 409:
+        error_type = ConflictError
+    elif status in (400, 413, 422):
+        error_type = ValidationError
+    elif 500 <= status < 600:
+        error_type = ServerError
+    else:
+        error_type = SQLFSError
+    raise error_type(message, code=code, status=status, details=details, retryable=retryable)
+
+
+def _parse_error_body(resp: httpx.Response) -> Dict[str, Any]:
     """Best-effort parse of `{ error, code, details }` JSON response body."""
     try:
         body = resp.json()
@@ -306,10 +364,7 @@ def _parse_error_body(resp: httpx.Response) -> tuple[Dict[str, Any], Any, str, A
         body = {}
     if not isinstance(body, dict):
         body = {}
-    code = body.get("code")
-    message = body.get("error") or f"HTTP {resp.status_code}"
-    details = body.get("details")
-    return body, code, message, details
+    return body
 
 
 def _should_retry_response(
@@ -317,22 +372,33 @@ def _should_retry_response(
     *,
     idempotent: bool,
     read_only: bool,
+    method: str,
+    require_explicit_retryable: bool,
 ) -> bool:
-    """Decide whether a retriable status code should actually be retried.
-
-    `ECOHERENCE` (503) means the write committed to Postgres but the Redis
-    publish failed. Retrying re-executes the script against already-mutated
-    state, double-applying side effects. Only retry it when the caller has
-    declared the request idempotent (`read_only=True` for execs, or any
-    other inherently safe GET/HEAD).
-    """
-    if resp.status_code == 503 and not read_only:
-        _body, code, _msg, _details = _parse_error_body(resp)
-        if code == "ECOHERENCE":
-            return False
-    if not idempotent and not read_only:
+    body = _parse_error_body(resp)
+    raw_code = body.get("code")
+    code = raw_code if isinstance(raw_code, str) else None
+    if code == "EEXEC_OUTCOME_UNKNOWN":
         return False
-    return True
+    if code in COMMITTED_WRITE_CODES:
+        return False
+    if require_explicit_retryable and body.get("retryable") is not True:
+        return False
+    safe_read = idempotent and method in ("GET", "HEAD")
+    if (
+        safe_read
+        and resp.status_code == 503
+        and (
+            code in ("EDRIVERFAULT", "EUNAVAILABLE")
+            or (code is not None and CONNECTION_EXCEPTION_SQLSTATE.fullmatch(code) is not None)
+        )
+    ):
+        return True
+    if code in UNKNOWN_OUTCOME_CODES or (
+        code is not None and CONNECTION_EXCEPTION_SQLSTATE.fullmatch(code) is not None
+    ):
+        return False
+    return body.get("retryable") is not False and (idempotent or read_only)
 
 
 def _parse_retry_after(resp: httpx.Response) -> Optional[int]:

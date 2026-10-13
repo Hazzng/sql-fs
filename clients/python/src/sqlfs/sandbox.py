@@ -29,11 +29,20 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from collections.abc import Iterator, Mapping
 from typing import Any, Dict, List, Optional, Union
 
-from ._http import Transport, encode_path, iter_sse_events
-from .errors import ValidationError
+import httpx
+
+from ._http import (
+    Transport,
+    _raise_api_error,
+    _status_for_stream_error,
+    encode_path,
+    iter_sse_events,
+)
+from .errors import TransportError, ValidationError
 from .models import (
     BatchExecResult,
     ExecResult,
@@ -49,55 +58,13 @@ from .models import (
 #: client via ``Client(max_file_size=...)`` or disable with ``max_file_size=0``.
 DEFAULT_MAX_FILE_SIZE = 64 * 1024 * 1024
 
-#: Largest file the ``python3`` runtime (CPython compiled to WASM) can read via
-#: ``open()``. CPython reads sandbox files through an 8 MiB SharedArrayBuffer
-#: IPC bridge; ``open()`` on a larger file fails with an opaque
-#: ``FileNotFoundError`` / ``OSError``. The bytes still ingest fine and stay
-#: readable from bash (``cat``/``grep``/``awk``) and ``js-exec`` — only
-#: ``python3`` cannot read them.
+#: Deprecated historical bridge limit; runtime limits are configured on the server.
 CPYTHON_READ_LIMIT = 8 * 1024 * 1024
 
 
 def _content_size(content: Union[str, bytes]) -> int:
     """Raw byte length of a write payload (``str`` measured as UTF-8)."""
     return len(content.encode("utf-8")) if isinstance(content, str) else len(content)
-
-
-def _enforce_cpython_read_limit(
-    files: Mapping[str, Union[str, bytes]],
-    *,
-    allow_oversized: bool,
-) -> None:
-    """Reject files the ``python3`` runtime could not later ``open()``.
-
-    Raises ``ValidationError`` (code ``EFILE_TOO_LARGE_FOR_CPYTHON``) naming
-    every file above :data:`CPYTHON_READ_LIMIT`. Pass ``allow_oversized=True``
-    to ingest anyway — the file is stored and usable from bash/js-exec, but
-    ``python3`` ``open()`` will fail on it.
-    """
-    if allow_oversized:
-        return
-    too_big = [
-        (path, size)
-        for path, content in files.items()
-        if (size := _content_size(content)) > CPYTHON_READ_LIMIT
-    ]
-    if too_big:
-        details = [
-            f"{path} ({size} bytes > {CPYTHON_READ_LIMIT} python3 open() limit)"
-            for path, size in too_big
-        ]
-        raise ValidationError(
-            "file exceeds the 8 MiB limit that the python3 (CPython WASM) runtime "
-            "can read via open(): "
-            + "; ".join(details)
-            + ". The bytes ingest fine and stay usable from bash (cat/grep/awk) and "
-            "js-exec — only python3 open() will fail on these files. Pass "
-            "allow_oversized=True to ingest anyway, or split the file into <8 MiB "
-            "chunks if you need to read it from python3.",
-            code="EFILE_TOO_LARGE_FOR_CPYTHON",
-            details=details,
-        )
 
 
 def _enforce_max_file_size(
@@ -281,15 +248,18 @@ class Sandbox:
             sb.exec("balance=$(cat balance.txt); echo $((balance - 50)) > balance.txt")
 
         Retry semantics:
-          - `read_only=True` execs are always safe to retry; the SDK retries
-            transient 5xx automatically regardless of `retry_on_5xx`.
+          - HTTP retries require an explicit server `retryable: true` response
+            and either `read_only=True` or `retry_on_5xx=True`.
           - For write execs, the SDK does NOT retry 5xx by default — retrying
             a write that may have committed could double-apply side effects.
             Set `retry_on_5xx=True` to opt in only when the script is
             idempotent (e.g. `mkdir -p`, deterministic `echo > file`).
-          - 503 `ECOHERENCE` is never retried on write execs even when
-            `retry_on_5xx=True`: the write committed to Postgres and only
-            the Redis publish failed.
+          - 503 `ECOHERENCE` is never retried, including read-only calls:
+            script side effects may have occurred before publication failed.
+          - 503 `EEXEC_OUTCOME_UNKNOWN` is never retried, including read-only
+            and explicitly idempotent calls. Inspect state before another call.
+          - Network failures raise `TransportError` without replay. The script
+            outcome is unknown; inspect state before another call.
         """
         body: Dict[str, Any] = {"script": script, "timeoutMs": timeout_ms}
         if cwd is not None:
@@ -313,8 +283,13 @@ class Sandbox:
             timeout=client_timeout,
             idempotent=read_only or retry_on_5xx,
             read_only=read_only,
+            retry_transport_errors=False,
+            require_explicit_retryable=True,
         )
-        return ExecResult.from_api(resp.json())
+        payload = _execution_payload(resp)
+        if not _has_execution_output(payload) or not isinstance(payload.get("timedOut"), bool):
+            raise TransportError("script outcome unknown: invalid execution response")
+        return ExecResult.from_api(payload)
 
     def exec_batch(
         self,
@@ -368,11 +343,13 @@ class Sandbox:
         between a read and a write, that logic must live inside a single
         script string.
 
-        Retry semantics: identical to `exec()`. `read_only=True` batches are
-        retried on transient 5xx automatically. Write batches retry only when
-        `retry_on_5xx=True` is set — and only when EVERY script in the batch
-        is safe to re-run from the start (the whole batch is replayed; there
-        is no partial retry).
+        Retry semantics: identical to `exec()`. HTTP retries require an explicit
+        server `retryable: true` response and either `read_only=True` or
+        `retry_on_5xx=True`. Only opt in when EVERY script is safe to re-run from
+        the start; the whole batch is replayed. `EEXEC_OUTCOME_UNKNOWN` and
+        `ECOHERENCE` are never retried.
+        Network failures raise `TransportError` without replay. The batch
+        outcome is unknown; inspect state before another call.
         """
         body: Dict[str, Any] = {
             "scripts": [dict(s) for s in scripts],
@@ -392,9 +369,20 @@ class Sandbox:
             timeout=client_timeout,
             idempotent=read_only or retry_on_5xx,
             read_only=read_only,
+            retry_transport_errors=False,
+            require_explicit_retryable=True,
         )
-        payload = resp.json()
-        items = payload.get("results", []) if isinstance(payload, dict) else []
+        payload = _execution_payload(resp)
+        items = payload.get("results")
+        if (
+            not isinstance(items, list)
+            or len(items) != len(scripts)
+            or any(
+                not _has_execution_output(item) or item.get("id") != scripts[index].get("id")
+                for index, item in enumerate(items)
+            )
+        ):
+            raise TransportError("script outcome unknown: incomplete batch response")
         return [BatchExecResult.from_api(item) for item in items]
 
     def exec_stream(
@@ -423,30 +411,45 @@ class Sandbox:
             body["readOnly"] = True
 
         client_timeout = max(timeout_ms / 1000.0 + 5.0, 35.0)
-        resp = self._t.stream(
-            "POST",
-            f"/sandboxes/{self._id}/exec",
-            json_body=body,
-            headers={"Accept": "text/event-stream"},
-            timeout=client_timeout,
-        )
+        resp: Optional[httpx.Response] = None
         try:
+            resp = self._t.stream(
+                "POST",
+                f"/sandboxes/{self._id}/exec",
+                json_body=body,
+                headers={"Accept": "text/event-stream"},
+                timeout=client_timeout,
+            )
             for event_name, payload in iter_sse_events(resp):
                 if event_name == "error":
-                    msg = (
-                        payload.get("error", "unknown error")
-                        if isinstance(payload, dict)
-                        else str(payload)
+                    error_body = payload if isinstance(payload, dict) else {}
+                    code = error_body.get("code")
+                    code = code if isinstance(code, str) else ""
+                    message = error_body.get("error")
+                    _raise_api_error(
+                        _status_for_stream_error(code),
+                        {
+                            **error_body,
+                            "error": message if isinstance(message, str) else "unknown error",
+                        },
                     )
-                    code = payload.get("code") if isinstance(payload, dict) else None
-                    raise ValidationError(msg, code=code, status=422)
                 if event_name not in ("stdout", "stderr", "exit"):
                     continue
+                if not isinstance(payload, dict) or (
+                    not _has_exit_result(payload)
+                    if event_name == "exit"
+                    else not isinstance(payload.get("data"), str)
+                ):
+                    raise TransportError("script outcome unknown: invalid execution stream event")
                 yield StreamEvent.from_sse(event_name, payload)
                 if event_name == "exit":
                     return
+            raise TransportError("script outcome unknown: stream ended before exit event")
+        except httpx.TransportError as error:
+            raise TransportError("script outcome unknown: execution stream disconnected") from error
         finally:
-            resp.close()
+            if resp is not None:
+                resp.close()
 
     # ── ingest ──────────────────────────────────────────────────────────────
     def ingest_files(
@@ -461,18 +464,14 @@ class Sandbox:
         Keys are paths relative to `base_path`. Values may be `str` (encoded
         utf-8) or `bytes` (encoded as-is); the SDK base64-encodes them.
 
-        Two client-side checks run before anything is encoded or sent:
+        Each file is checked against the client's ``max_file_size`` before
+        anything is encoded or sent. An oversized file raises
+        ``ValidationError`` (code ``EFILE_TOO_LARGE``).
 
-        1. Each file is checked against the client's ``max_file_size``; an
-           oversized file raises ``ValidationError`` (code ``EFILE_TOO_LARGE``).
-        2. Any file larger than 8 MiB (:data:`CPYTHON_READ_LIMIT`) raises
-           ``ValidationError`` (code ``EFILE_TOO_LARGE_FOR_CPYTHON``) because the
-           ``python3`` runtime cannot ``open()`` it. Pass ``allow_oversized=True``
-           to ingest anyway — the file stays usable from bash/js-exec, but
-           ``python3`` ``open()`` will fail on it.
+        ``allow_oversized`` is accepted for compatibility and has no effect;
+        ``max_file_size`` controls ingestion limits.
         """
         _enforce_max_file_size(files, self._max_file_size)
-        _enforce_cpython_read_limit(files, allow_oversized=allow_oversized)
         encoded: Dict[str, str] = {}
         for path, content in files.items():
             data = content.encode("utf-8") if isinstance(content, str) else content
@@ -493,3 +492,32 @@ class Sandbox:
             f"/sandboxes/{self._id}",
             expect_json=False,
         )
+
+
+def _execution_payload(response: httpx.Response) -> Dict[str, Any]:
+    try:
+        payload = response.json()
+    except (ValueError, httpx.TransportError) as error:
+        raise TransportError("script outcome unknown: invalid execution response") from error
+    if not isinstance(payload, dict):
+        raise TransportError("script outcome unknown: invalid execution response")
+    return payload
+
+
+def _has_exit_result(payload: Mapping[str, Any]) -> bool:
+    duration = payload.get("durationMs")
+    return (
+        type(payload.get("exitCode")) is int
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(duration)
+    )
+
+
+def _has_execution_output(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("stdout"), str)
+        and isinstance(payload.get("stderr"), str)
+        and _has_exit_result(payload)
+    )

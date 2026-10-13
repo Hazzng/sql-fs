@@ -1,5 +1,5 @@
-import { ValidationError } from "./errors.js";
-import { type Transport, encodePath, iterSseEvents } from "./http.js";
+import { SQLFSError, TransportError, ValidationError } from "./errors.js";
+import { type Transport, encodePath, iterSseEvents, raiseApiError, statusForStreamError } from "./http.js";
 import { defaultMaxFileSize, isRecord, readJsonObject } from "./internal.js";
 import {
 	type BatchExecResult,
@@ -152,8 +152,14 @@ export class Sandbox {
 			timeout: clientTimeout(timeoutMs),
 			idempotent: Boolean(options.readOnly || options.retryOn5xx),
 			readOnly: Boolean(options.readOnly),
+			retryTransportErrors: false,
+			requireExplicitRetryable: true,
 		});
-		return execResultFromApi(await readJsonObject(response));
+		const payload = await readExecutionPayload(response);
+		if (!hasExecutionOutput(payload) || typeof payload.timedOut !== "boolean") {
+			throw new TransportError("script outcome unknown: invalid execution response");
+		}
+		return execResultFromApi(payload);
 	}
 
 	async execBatch(scripts: ExecBatchScript[], options: ExecBatchOptions = {}): Promise<BatchExecResult[]> {
@@ -176,51 +182,70 @@ export class Sandbox {
 			timeout: clientTimeout(timeoutMs),
 			idempotent: Boolean(options.readOnly || options.retryOn5xx),
 			readOnly: Boolean(options.readOnly),
+			retryTransportErrors: false,
+			requireExplicitRetryable: true,
 		});
-		const payload = await readJsonObject(response);
-		return Array.isArray(payload.results) ? payload.results.filter(isRecord).map(batchExecResultFromApi) : [];
+		const payload = await readExecutionPayload(response);
+		if (
+			!Array.isArray(payload.results) ||
+			payload.results.length !== scripts.length ||
+			!payload.results.every(
+				(item, index) => isRecord(item) && hasExecutionOutput(item) && item.id === scripts[index]?.id,
+			)
+		) {
+			throw new TransportError("script outcome unknown: incomplete batch response");
+		}
+		return payload.results.map(batchExecResultFromApi);
 	}
 
 	async *execStream(script: string, options: ExecStreamOptions = {}): AsyncGenerator<StreamEvent> {
 		const timeoutMs = options.timeoutMs ?? 30_000;
 		const body = execRequestBody(script, options, timeoutMs);
-		const response = await this.transport.stream("POST", `/sandboxes/${this.sandboxId}/exec`, {
-			jsonBody: body,
-			headers: { Accept: "text/event-stream" },
-			timeout: clientTimeout(timeoutMs),
-		});
+		let response: Response | undefined;
 		try {
+			response = await this.transport.stream("POST", `/sandboxes/${this.sandboxId}/exec`, {
+				jsonBody: body,
+				headers: { Accept: "text/event-stream" },
+				timeout: clientTimeout(timeoutMs),
+			});
 			for await (const [eventName, payload] of iterSseEvents(response)) {
 				if (eventName === "error") {
 					const errorBody = isRecord(payload) ? payload : {};
-					throw new ValidationError(typeof errorBody.error === "string" ? errorBody.error : "unknown error", {
-						code: typeof errorBody.code === "string" ? errorBody.code : undefined,
-						status: 422,
+					const code = typeof errorBody.code === "string" ? errorBody.code : "";
+					raiseApiError(statusForStreamError(code), {
+						...errorBody,
+						error: typeof errorBody.error === "string" ? errorBody.error : "unknown error",
 					});
 				}
 				if (eventName !== "stdout" && eventName !== "stderr" && eventName !== "exit") {
 					continue;
 				}
-				if (!isRecord(payload)) {
-					continue;
+				if (!isRecord(payload) || (eventName === "exit" ? !hasExitResult(payload) : typeof payload.data !== "string")) {
+					throw new TransportError("script outcome unknown: invalid execution stream event");
 				}
 				yield streamEventFromSse(eventName, payload);
 				if (eventName === "exit") {
 					return;
 				}
 			}
+			throw new TransportError("script outcome unknown: stream ended before exit event");
+		} catch (error) {
+			if (error instanceof SQLFSError) throw error;
+			throw new TransportError("script outcome unknown: execution stream disconnected");
 		} finally {
-			await response.body?.cancel();
+			await response?.body?.cancel().catch(() => {});
 		}
 	}
 
 	async ingestFiles(
 		files: Record<string, FileContent>,
-		options: { basePath?: string; allowOversized?: boolean } = {},
+		options: {
+			basePath?: string;
+			/** @deprecated Accepted for compatibility; maxFileSize controls ingestion limits. */
+			allowOversized?: boolean;
+		} = {},
 	): Promise<Record<string, unknown>> {
 		enforceMaxFileSize(files, this.maxFileSize);
-		// Files >8 MiB can't be read by python3's open() (CPython WASM IPC bridge cap).
-		enforceCpythonReadLimit(files, options.allowOversized ?? false);
 		const encoded: Record<string, string> = Object.create(null) as Record<string, string>;
 		for (const [path, content] of Object.entries(files)) {
 			encoded[path] = toBase64(content);
@@ -234,6 +259,26 @@ export class Sandbox {
 	async delete(): Promise<void> {
 		await this.transport.request("DELETE", `/sandboxes/${this.sandboxId}`);
 	}
+}
+
+async function readExecutionPayload(response: Response): Promise<Record<string, unknown>> {
+	try {
+		const payload: unknown = await response.json();
+		if (!isRecord(payload)) throw new TypeError("invalid JSON object");
+		return payload;
+	} catch {
+		throw new TransportError("script outcome unknown: invalid execution response");
+	}
+}
+
+function hasExitResult(payload: Record<string, unknown>): boolean {
+	return (
+		Number.isInteger(payload.exitCode) && typeof payload.durationMs === "number" && Number.isFinite(payload.durationMs)
+	);
+}
+
+function hasExecutionOutput(payload: Record<string, unknown>): boolean {
+	return typeof payload.stdout === "string" && typeof payload.stderr === "string" && hasExitResult(payload);
 }
 
 function execRequestBody(script: string, options: BaseExecOptions, timeoutMs: number): Record<string, unknown> {
@@ -290,38 +335,8 @@ function enforceMaxFileSize(files: Record<string, FileContent>, maxFileSize: num
 	});
 }
 
-/**
- * Largest file the `python3` runtime (CPython compiled to WASM) can read via
- * `open()`. CPython reads sandbox files through an 8 MiB SharedArrayBuffer IPC
- * bridge; `open()` on a larger file fails with an opaque error. The bytes still
- * ingest fine and stay readable from bash and js-exec — only `python3` cannot
- * read them.
- */
+/** @deprecated Historical bridge limit; runtime limits are configured on the server. */
 export const cpythonReadLimit = 8 * 1024 * 1024;
-
-/**
- * Reject files the `python3` runtime could not later `open()`. Throws
- * ValidationError (code `EFILE_TOO_LARGE_FOR_CPYTHON`) unless `allowOversized`
- * is set — in which case the file ingests but `python3` open() fails on it.
- */
-function enforceCpythonReadLimit(files: Record<string, FileContent>, allowOversized: boolean): void {
-	if (allowOversized) {
-		return;
-	}
-	const tooBig = Object.entries(files)
-		.map(([path, content]) => [path, contentSize(content)] as const)
-		.filter(([, size]) => size > cpythonReadLimit);
-	if (tooBig.length === 0) {
-		return;
-	}
-	const details = tooBig.map(([path, size]) => `${path} (${size} bytes > ${cpythonReadLimit} python3 open() limit)`);
-	throw new ValidationError(
-		`file exceeds the 8 MiB limit that the python3 (CPython WASM) runtime can read via open(): ${details.join(
-			"; ",
-		)}. The bytes ingest fine and stay usable from bash (cat/grep/awk) and js-exec — only python3 open() will fail on these files. Pass allowOversized: true to ingest anyway, or split the file into <8 MiB chunks if you need to read it from python3.`,
-		{ code: "EFILE_TOO_LARGE_FOR_CPYTHON", details },
-	);
-}
 
 function toBytes(content: FileContent): Uint8Array<ArrayBuffer> {
 	if (typeof content === "string") {

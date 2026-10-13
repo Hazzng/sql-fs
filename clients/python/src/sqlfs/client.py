@@ -141,7 +141,7 @@ class SandboxesResource:
         if network:
             body["network"] = True
 
-        resp = self._t.request("POST", "/sandboxes", json_body=body or None)
+        resp = self._t.request("POST", "/sandboxes", json_body=body or None, idempotent=False)
         record = SandboxRecord.from_api(resp.json())
         return Sandbox(self._t, record.id, record=record, max_file_size=self._max_file_size)
 
