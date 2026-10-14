@@ -78,7 +78,7 @@ describe.skipIf(SKIP)("git through SessionManager and Postgres SqlFs", () => {
 		const originalFetch = globalThis.fetch;
 		vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-			if (URL.parse(url)?.origin !== BASE_ORIGIN) return originalFetch(input, init);
+			if (!URL.canParse(url) || new URL(url).origin !== BASE_ORIGIN) return originalFetch(input, init);
 			return server.fetch(new Request(input, init));
 		});
 	}
