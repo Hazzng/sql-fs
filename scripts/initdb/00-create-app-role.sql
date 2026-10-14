@@ -1,7 +1,7 @@
 -- Provision the sql-fs application role for local dev / integration tests.
 --
 -- This directory is mounted into /docker-entrypoint-initdb.d by
--- docker-compose.local.yml, so every *.sql here runs ONCE, as the bootstrap
+-- infra/docker-compose.local.yml, so every *.sql here runs ONCE, as the bootstrap
 -- superuser, on first Postgres container start.
 --
 -- WHY A NON-SUPERUSER OWNER ROLE — do NOT "simplify" this to the default
