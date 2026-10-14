@@ -2,7 +2,7 @@
 
 This guide explains how a request moves through sql-fs, how the caches and locks keep it correct, and what sql-fs does not guarantee. Read it before you change `session-manager.ts`, `sql-fs.ts` or dialect code.
 
-Commands and coding standards are in [AGENTS.md](AGENTS.md). Environment variables are in [CONFIGURATION.md](CONFIGURATION.md). The reproductions for the distributed, memory and durability issues #164-#175 are in `thoughts/shared/research/2026-09-18_prod-readiness-harness.md`. Most of those failures are out of reach of a unit test or a single replica.
+Commands and coding standards are in [AGENTS.md](../AGENTS.md). Environment variables are in [CONFIGURATION.md](CONFIGURATION.md). The reproductions for the distributed, memory and durability issues #164-#175 are in `thoughts/shared/research/2026-09-18_prod-readiness-harness.md`. Most of those failures are out of reach of a unit test or a single replica.
 
 ## Postgres is the source of truth
 

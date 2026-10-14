@@ -1,6 +1,6 @@
 # Local backing services for sql-fs development and the integration test suite.
 #
-#   docker compose -f docker-compose.local.yml up -d
+#   docker compose -f infra/docker-compose.local.yml up -d
 #
 #   DATABASE_URL=postgres://sqlfs_app:sqlfs_app@localhost:5432/sqlfs \
 #   REDIS_URL=redis://localhost:6379 \
@@ -15,7 +15,9 @@
 # bootstrap `postgres` superuser. See CONTRIBUTING.md → "Local database".
 #
 # Reset to a clean database (re-runs the initdb script):
-#   docker compose -f docker-compose.local.yml down -v
+#   docker compose -f infra/docker-compose.local.yml down -v
+
+name: sql-fs
 
 services:
   postgres:
@@ -28,7 +30,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+      - ../scripts/initdb:/docker-entrypoint-initdb.d:ro
       - sqlfs-pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
