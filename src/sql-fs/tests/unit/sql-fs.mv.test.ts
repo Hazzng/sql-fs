@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
+import { makeProbeDialect } from "../fixtures/buffered-dialect.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -237,4 +238,35 @@ describe("SqlFs.mv() — move over existing destination", () => {
 		expect(decrementNlinkMock).not.toHaveBeenCalled();
 		expect(deleteInodeMock).not.toHaveBeenCalled();
 	});
+});
+
+describe.each([false, true])("rename inode boundaries, composite=%s", (composite) => {
+	it.each(["same inode", "file onto directory", "directory onto file"])(
+		"preserves both paths for %s",
+		async (scenario) => {
+			const src = scenario === "directory onto file" ? dirEntry("/src", 2n) : fileEntry("/src", 2n, 5);
+			const dest =
+				scenario === "file onto directory"
+					? dirEntry("/dest", 3n)
+					: fileEntry("/dest", scenario === "same inode" ? 2n : 3n, 5);
+			const probe = makeProbeDialect([dirEntry("/", 1n), src, dest]);
+			if (!composite) probe.dialect.mvComposite = undefined;
+			const fs = new SqlFs({ dialect: probe.dialect, sandboxId: "rename-boundaries" });
+			await fs.ready();
+			const before = fs.getAllPaths();
+			const operation = fs.mv("/src", "/dest");
+			if (scenario === "same inode") await expect(operation).resolves.toBeUndefined();
+			else
+				await expect(operation).rejects.toMatchObject({
+					code: scenario === "file onto directory" ? "EISDIR" : "ENOTDIR",
+				});
+			expect(fs.getAllPaths()).toEqual(before);
+			expect(fs._getPathCache().get("/src")).toMatchObject({ inodeId: src.inodeId, kind: src.kind });
+			expect(fs._getPathCache().get("/dest")).toMatchObject({ inodeId: dest.inodeId, kind: dest.kind });
+			expect(probe.dialect.moveDirent).not.toHaveBeenCalled();
+			if (composite) expect(probe.dialect.mvComposite).not.toHaveBeenCalled();
+			expect(probe.dialect.decrementNlink).not.toHaveBeenCalled();
+			expect(fs.wasDirty()).toBe(false);
+		},
+	);
 });

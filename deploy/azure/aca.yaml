@@ -1,5 +1,5 @@
 # Azure Container Apps deployment config
-# Deploy: az containerapp create --name sql-fs-api --resource-group <RG> --yaml aca.yaml
+# Deploy: az containerapp create --name sql-fs-api --resource-group <RG> --yaml deploy/azure/aca.yaml
 properties:
   managedEnvironmentId: /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.App/managedEnvironments/<ENV>
   configuration:
