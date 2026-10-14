@@ -195,7 +195,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ts-sdk-v${{ needs.detect.outputs.VERSION }}
           name: TypeScript SDK v${{ needs.detect.outputs.VERSION }}

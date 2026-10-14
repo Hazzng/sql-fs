@@ -166,7 +166,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.detect.outputs.RELEASE == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: python-sdk-v${{ steps.detect.outputs.VERSION }}
           name: Python SDK v${{ steps.detect.outputs.VERSION }}
