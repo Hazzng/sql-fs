@@ -10,6 +10,7 @@ import { loadTenantConfig, type TenantConfig } from "../../tenants.js";
 const SKIP = !process.env.DATABASE_URL;
 const TENANT_ID = "default";
 const BASE_URL = "https://git.test";
+const BASE_ORIGIN = new URL(BASE_URL).origin;
 const REPO_ID = "project";
 const TOKEN = "server-token";
 const IDENTITY = {
@@ -77,7 +78,7 @@ describe.skipIf(SKIP)("git through SessionManager and Postgres SqlFs", () => {
 		const originalFetch = globalThis.fetch;
 		vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-			if (!url.startsWith(BASE_URL)) return originalFetch(input, init);
+			if (!URL.canParse(url) || new URL(url).origin !== BASE_ORIGIN) return originalFetch(input, init);
 			return server.fetch(new Request(input, init));
 		});
 	}
