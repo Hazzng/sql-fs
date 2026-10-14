@@ -66,6 +66,8 @@ Migrations are handwritten numbered SQL files. Add the next migration without ed
 
 `just-bash@3.6.0` has a substantial checked-in patch. Dependabot may open upgrade PRs for this package; maintainers review the upgrade and patch before merging. Read `scripts/build-just-bash-patch.mjs` and `patches/` before upgrading it. Regenerate the patch and run the full unit suite and `pnpm verify:local`; do not drop it to make an install pass.
 
+`just-git@1.9.1` is patched with the built `dist/index.js` and `dist/repo/index.js` of blindmansion/just-git#14 (`git ls-tree`) and #15 (exec bit on checkout, mode-only changes in status, diff and branch switches), merged onto the `v1.9.1` commit. Drop the patch when a just-git release contains both PRs, and keep `src/api/tests/unit/git-command.just-git-patch.test.ts`.
+
 ## Completion and boundaries
 
 Work autonomously on local implementation and reversible verification. Use a separate checkout for concurrent writers. Do not overwrite another agent's changes. Keep secrets out of commits and evidence. Use the disposable verification stack for tests that create databases or inject faults.
