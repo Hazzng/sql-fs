@@ -1,0 +1,37 @@
+name: Dependency merge validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-proof:
+    if: github.head_ref == 'chore/dependency-proof-20261014'
+    name: Full dependency proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install uv==0.9.18
+      - run: pnpm setup:dev
+      - run: pnpm check
+      - run: pnpm security:audit
+      - run: pnpm verify:architecture
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-proof
+          path: scripts/verify/.run/
+          include-hidden-files: true
+          retention-days: 7
