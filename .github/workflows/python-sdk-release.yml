@@ -28,7 +28,7 @@ jobs:
       contents: write   # git push tag + GitHub Release creation
       id-token: write   # OIDC token for PyPI trusted publisher
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
