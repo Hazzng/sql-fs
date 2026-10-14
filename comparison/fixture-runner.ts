@@ -444,4 +444,4 @@ export async function compareOutputs(
 	return compareOutputsInternal(env, testDir, command, testFiles, testFile, options);
 }
 
-export { path, fs };
+export { fs, path };

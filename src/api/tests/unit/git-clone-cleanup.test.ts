@@ -11,8 +11,8 @@
  * `symlink()`, or just-git refusing a symlink whose target escapes the worktree).
  */
 
-import { Bash, InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { Bash, InMemoryFs } from "just-bash";
 import { type Auth, createServer } from "just-git/server";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createGitCommand } from "../../commands/git-command.js";

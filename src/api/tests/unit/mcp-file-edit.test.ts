@@ -5,8 +5,8 @@
  * envelope, the `ok:false` rejection codes, and that a rejection leaves the file untouched.
  */
 
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerTools } from "../../mcp/tools.js";
 import { SessionManager } from "../../session-manager.js";

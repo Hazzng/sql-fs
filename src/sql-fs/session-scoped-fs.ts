@@ -1,4 +1,4 @@
-import { type ScriptScope, runInScriptScope } from "./script-scope.js";
+import { runInScriptScope, type ScriptScope } from "./script-scope.js";
 import type { IScriptTxFs } from "./sql-fs.js";
 
 export class SessionScopedFs implements ScriptScope {

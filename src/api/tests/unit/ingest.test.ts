@@ -5,8 +5,8 @@
 
 import { Hono } from "hono";
 import { SignJWT } from "jose";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ICoherentFs } from "../../../sql-fs/sql-fs.js";
 import type { BulkIngestFile, SandboxMeta } from "../../../sql-fs/types.js";
@@ -264,16 +264,21 @@ describe("POST /v1/sandboxes/:id/ingest-files", () => {
 				meta.set(sandboxId, sandboxMeta);
 			},
 		});
-		await ownerManager.withSession("default", SANDBOX_ID, async (session) => {
-			session.owner = "agent-1";
-			await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
-				owner: "agent-1",
-				name: null,
-				python: false,
-				javascript: false,
-				network: false,
-			});
-		});
+		await ownerManager.withSession(
+			"default",
+			SANDBOX_ID,
+			async () => {
+				await ownerManager.persistSandboxMeta("default", SANDBOX_ID, {
+					owner: "agent-1",
+					name: null,
+					python: false,
+					javascript: false,
+					network: false,
+				});
+			},
+			undefined,
+			"agent-1",
+		);
 
 		const coldReplica = new SessionManager({
 			createFs: async () => withBulkIngest(new InMemoryFs()),

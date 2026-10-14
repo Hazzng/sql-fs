@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type OwnerCommand, type OwnerIdentity, mayApply } from "../../worker-owner/protocol.js";
+import { mayApply, type OwnerCommand, type OwnerIdentity } from "../../worker-owner/protocol.js";
 
 const identity: OwnerIdentity = {
 	tenantId: "tenant",
@@ -58,7 +58,10 @@ const effects: Array<{ label?: string; command: OwnerCommand; applies: boolean }
 ];
 
 describe("worker command effects", () => {
-	it.each(effects)("classifies $command.kind $label as applies=$applies", ({ command, applies }) => {
-		expect(mayApply(command)).toBe(applies);
-	});
+	it.each(effects.map((effect) => ({ ...effect, label: effect.label ?? effect.command.kind })))(
+		"classifies $label as applies=$applies",
+		({ command, applies }) => {
+			expect(mayApply(command)).toBe(applies);
+		},
+	);
 });

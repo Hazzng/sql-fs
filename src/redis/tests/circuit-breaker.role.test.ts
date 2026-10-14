@@ -6,9 +6,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	getRedisCircuitBreaker,
 	type ProbeTicketHolder,
 	RedisCircuitBreaker,
-	getRedisCircuitBreaker,
 	resetRedisCircuitBreakerForTest,
 } from "../circuit-breaker.js";
 

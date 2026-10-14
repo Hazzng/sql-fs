@@ -14,7 +14,7 @@
  *   BASE_URL=... AUTH_SECRET=... npx tsx ingest-explore.ts /path/to/local/code
  */
 
-import { readFile, readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { Client } from "sql-fs-sdk";
 

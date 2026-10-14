@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Bash, InMemoryFs, defineCommand } from "just-bash";
+import { Bash, defineCommand, InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
 
 const hash = (content: string) => createHash("sha256").update(content).digest("hex");
@@ -29,6 +29,7 @@ describe("installed just-bash text backport", () => {
 
 	it.each([
 		["export PROJECT_VAR=outer; sh -c 'printf %s \"$PROJECT_VAR\"'", "outer"],
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 		["UNEXPORTED=secret; sh -c 'printf %s \"${UNEXPORTED-unset}\"'", "unset"],
 		["sh -c 'printf %s \"$HOST_FLAG\"'", "session"],
 	])("retains nested shell environment behavior for %s", async (script, stdout) => {

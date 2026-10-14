@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
-import { type MockInstance, beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, type MockInstance, vi } from "vitest";
 import { destroyPostgresSandbox } from "../../../sql-fs/index.js";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import type { OwnerIdentity, OwnerRequest } from "../../worker-owner/protocol.js";
 
 function checkpoint() {

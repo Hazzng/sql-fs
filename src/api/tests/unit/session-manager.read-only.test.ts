@@ -11,8 +11,8 @@
  *    GET, one reload).
  */
 
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
 import { readOnlyContext } from "../../read-only-context.js";
 import { SessionManager } from "../../session-manager.js";

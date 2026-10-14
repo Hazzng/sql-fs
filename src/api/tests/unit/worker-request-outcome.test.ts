@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { retirePostgresSandboxGeneration } from "../../../sql-fs/index.js";
 import { readOnlyContext } from "../../read-only-context.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import { OutcomeUnknownError, type OwnerCommand, type OwnerIdentity } from "../../worker-owner/protocol.js";
-import { MockOwnerWorker, latestMockWorker } from "../fixtures/mock-owner-worker.js";
+import { latestMockWorker, MockOwnerWorker } from "../fixtures/mock-owner-worker.js";
 
 vi.mock("node:worker_threads", async () => {
 	const { MockOwnerWorker } = await import("../fixtures/mock-owner-worker.js");

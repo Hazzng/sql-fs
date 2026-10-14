@@ -9,7 +9,7 @@
 import type { Redis } from "ioredis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetRedisCircuitBreakerForTest } from "../../../redis/circuit-breaker.js";
-import { LockAcquireTimeoutError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import { execLockKey, LockAcquireTimeoutError, withDistributedLock } from "../../distributed-lock.js";
 
 /** Redis fake that throws a connection-class error on every command (sustained outage). */
 class DeadRedis {

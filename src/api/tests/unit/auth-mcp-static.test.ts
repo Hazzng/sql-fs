@@ -8,7 +8,7 @@
 import { Hono } from "hono";
 import { SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type AuthVariables, type StaticMcpAuthConfig, createAuthMiddleware } from "../../auth.js";
+import { type AuthVariables, createAuthMiddleware, type StaticMcpAuthConfig } from "../../auth.js";
 import type { TenantConfig } from "../../tenants.js";
 
 const SECRET = "test-secret-at-least-32-bytes-long!!";

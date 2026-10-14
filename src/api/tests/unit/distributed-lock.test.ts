@@ -7,10 +7,10 @@
 import type { Redis } from "ioredis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	execLockKey,
 	LockAcquireTimeoutError,
 	LockLostAfterCommitError,
 	LockLostError,
-	execLockKey,
 	withDistributedLock,
 } from "../../distributed-lock.js";
 

@@ -22,7 +22,7 @@ import { fileRoutes } from "../../routes/files.js";
 import { ingestRoutes } from "../../routes/ingest.js";
 import { sandboxRoutes } from "../../routes/sandboxes.js";
 import { SessionManager } from "../../session-manager.js";
-import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
+import { loadTenantConfig, type TenantConfig } from "../../tenants.js";
 
 const AUTH_SECRET = "phase-5-multi-tenant-secret-at-least-32b";
 const SKIP = !process.env.DATABASE_URL || !process.env.REDIS_URL;

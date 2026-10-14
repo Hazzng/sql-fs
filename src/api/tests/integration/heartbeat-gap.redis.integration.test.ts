@@ -20,7 +20,7 @@
 
 import { Redis } from "ioredis";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { LockLostAfterCommitError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import { execLockKey, LockLostAfterCommitError, withDistributedLock } from "../../distributed-lock.js";
 import { type RWLockKeys, rwLockKeys, withDistributedRWLock } from "../../distributed-rw-lock.js";
 
 const SKIP = !process.env.REDIS_URL;

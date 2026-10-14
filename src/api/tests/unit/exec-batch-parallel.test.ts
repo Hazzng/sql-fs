@@ -1,10 +1,10 @@
-import { InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { executeBatch } from "../../lib/batch-exec.js";
 import { readOnlyContext } from "../../read-only-context.js";
-import { SessionManager } from "../../session-manager.js";
 import type { Session } from "../../session-manager.js";
+import { SessionManager } from "../../session-manager.js";
 
 const SANDBOX_ID = "test-batch-parallel-sandbox";
 

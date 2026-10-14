@@ -1,4 +1,4 @@
-import { type ClientRequest, IncomingMessage, ServerResponse, request as httpRequest } from "node:http";
+import { type ClientRequest, request as httpRequest, IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";

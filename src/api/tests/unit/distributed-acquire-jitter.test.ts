@@ -11,7 +11,7 @@
 import type { Redis } from "ioredis";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetRedisCircuitBreakerForTest } from "../../../redis/circuit-breaker.js";
-import { LockAcquireTimeoutError, execLockKey, jitteredDelayMs, withDistributedLock } from "../../distributed-lock.js";
+import { execLockKey, jitteredDelayMs, LockAcquireTimeoutError, withDistributedLock } from "../../distributed-lock.js";
 
 interface Entry {
 	value: string;

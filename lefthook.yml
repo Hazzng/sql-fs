@@ -2,7 +2,7 @@ pre-commit:
   jobs:
     - name: typescript-style
       glob: "*.{ts,tsx,js,mjs,json}"
-      run: pnpm exec biome check --files-ignore-unknown=true --no-errors-on-unmatched {staged_files}
+      run: pnpm exec biome check --error-on-warnings --files-ignore-unknown=true --no-errors-on-unmatched {staged_files}
 
     - name: typescript-oxlint
       glob: "*.{ts,tsx,js,mjs,cjs,json}"

@@ -13,8 +13,8 @@ import type { Redis } from "ioredis";
 import {
 	AcquireErrorBudget,
 	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
-	type ProbeTicketHolder,
 	getRedisCircuitBreaker,
+	type ProbeTicketHolder,
 } from "../redis/circuit-breaker.js";
 import { preservesAmbiguousOutcome } from "./errors.js";
 import { recordHeartbeatGap } from "./event-loop-monitor.js";

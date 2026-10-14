@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../session-manager.js";
-import { FakeRedis, StubCoherentFs, asRedis, makeFsFactory } from "./helpers/session-manager-fakes.js";
+import { asRedis, FakeRedis, makeFsFactory, StubCoherentFs } from "./helpers/session-manager-fakes.js";
 
 describe("SessionManager recovery contract", () => {
 	it("commits once without touching legacy Redis publication", async () => {

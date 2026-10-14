@@ -2,7 +2,7 @@ import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSessionRuntime } from "../../session-runtime/engine.js";
 import { budgetWorkerReply } from "../../worker-owner/message-budget.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import type { OwnerReply } from "../../worker-owner/protocol.js";
 
 const cpuProbe = vi.hoisted(() => ({

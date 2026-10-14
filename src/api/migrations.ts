@@ -9,7 +9,7 @@
  * Fails closed: the first tenant error aborts the boot with a clear log line.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";

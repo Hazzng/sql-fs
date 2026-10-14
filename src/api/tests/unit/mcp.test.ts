@@ -14,15 +14,15 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
 import type { ICoherentFs } from "../../../sql-fs/sql-fs.js";
 import type { BulkIngestFile, SandboxMeta } from "../../../sql-fs/types.js";
 import { createMcpServer } from "../../mcp/server.js";
 import { registerTools } from "../../mcp/tools.js";
-import { SessionManager } from "../../session-manager.js";
 import type { Session } from "../../session-manager.js";
+import { SessionManager } from "../../session-manager.js";
 
 /**
  * Wraps `InMemoryFs` with a `bulkIngest` shim so MCP fs_ingest tests (which
@@ -97,21 +97,15 @@ describe("MCP server", () => {
 describe("MCP tool — sandbox_create", () => {
 	it("returns a sandbox id when called", async () => {
 		const createdIds: string[] = [];
-		const sessions = new Map<string, Session>();
-
-		const mockSessionManager = {
-			getOrCreate: async (_tenantId: string, id: string): Promise<Session> => {
+		const mockSessionManager = new SessionManager({
+			createFs: async (_tenantId, id) => {
 				createdIds.push(id);
-				const session = { owner: "" } as unknown as Session;
-				sessions.set(id, session);
-				return session;
+				return new InMemoryFs();
 			},
-			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
-			persistSandboxMeta: async () => {},
-		};
+		});
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never, "test-owner", "default");
+		registerTools(server, mockSessionManager, "test-owner", "default");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
@@ -136,37 +130,20 @@ describe("MCP tool — sandbox_create", () => {
 		expect(createdIds[0]).toBe(parsed.id);
 
 		await client.close();
+		await mockSessionManager.shutdown();
 	});
 
 	it("sandbox_create accepts network:true and returns/persists the runtime flag", async () => {
-		const sessions = new Map<string, Session>();
-		let createdRuntime: { python?: boolean; javascript?: boolean; network?: boolean } | undefined;
-		let persistedMeta: { python?: boolean; javascript?: boolean; network?: boolean } | undefined;
-
-		const mockSessionManager = {
-			getOrCreate: async (
-				_tenantId: string,
-				id: string,
-				runtime?: { python?: boolean; javascript?: boolean; network?: boolean },
-				owner = "",
-			): Promise<Session> => {
-				createdRuntime = runtime;
-				const session = { owner } as unknown as Session;
-				sessions.set(id, session);
-				return session;
-			},
-			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
-			persistSandboxMeta: async (
-				_tenantId: string,
-				_id: string,
-				meta: { python?: boolean; javascript?: boolean; network?: boolean },
-			) => {
+		let persistedMeta: SandboxMeta | undefined;
+		const mockSessionManager = new SessionManager({
+			createFs: async () => new InMemoryFs(),
+			persistSandboxMetaFn: async (_tenantId, _id, meta) => {
 				persistedMeta = meta;
 			},
-		};
+		});
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never, "test-owner", "default");
+		registerTools(server, mockSessionManager, "test-owner", "default");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -183,10 +160,15 @@ describe("MCP tool — sandbox_create", () => {
 		expect(typeof parsed.id).toBe("string");
 		expect(parsed.javascript).toBe(true);
 		expect(parsed.network).toBe(true);
-		expect(createdRuntime).toEqual({ python: false, javascript: true, network: true });
+		expect(mockSessionManager.getSession("default", parsed.id)?.runtimeOptions).toEqual({
+			python: false,
+			javascript: true,
+			network: true,
+		});
 		expect(persistedMeta).toMatchObject({ python: false, javascript: true, network: true });
 
 		await client.close();
+		await mockSessionManager.shutdown();
 	});
 
 	it("sandbox_create sets session.owner to the caller", async () => {
@@ -216,38 +198,10 @@ describe("MCP tool — sandbox_create", () => {
 
 describe("MCP tool — sandbox_delete", () => {
 	it("creates then deletes a sandbox via MCP tools", async () => {
-		const sessions = new Map<string, Session>();
-
-		const mockSessionManager = {
-			getOrCreate: async (_tenantId: string, id: string, _runtime?: unknown, owner = ""): Promise<Session> => {
-				const session = { owner } as unknown as Session;
-				sessions.set(id, session);
-				return session;
-			},
-			getSession: (_tenantId: string, id: string): Session | undefined => sessions.get(id),
-			withSessionOrRehydrate: async <T>(
-				_tenantId: string,
-				id: string,
-				fn: (session: Session) => Promise<T>,
-			): Promise<T> => {
-				const session = sessions.get(id);
-				if (session === undefined) {
-					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
-				}
-				return fn(session);
-			},
-			persistSandboxMeta: async () => {},
-			destroy: async (_tenantId: string, id: string): Promise<boolean> => {
-				if (!sessions.has(id)) {
-					throw Object.assign(new Error(`ENOENT: sandbox ${id} not found`), { code: "ENOENT" });
-				}
-				sessions.delete(id);
-				return true;
-			},
-		};
+		const mockSessionManager = new SessionManager({ createFs: async () => new InMemoryFs() });
 
 		const server = createMcpServer();
-		registerTools(server, mockSessionManager as never, "test-owner", "default");
+		registerTools(server, mockSessionManager, "test-owner", "default");
 
 		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 		const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -269,9 +223,10 @@ describe("MCP tool — sandbox_delete", () => {
 		expect(deleted.ok).toBe(true);
 
 		// Verify session is gone
-		expect(sessions.has(created.id)).toBe(false);
+		expect(mockSessionManager.getSession("default", created.id)).toBeUndefined();
 
 		await client.close();
+		await mockSessionManager.shutdown();
 	});
 
 	it("returns error content when sandbox not found", async () => {

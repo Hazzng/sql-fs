@@ -1,4 +1,4 @@
-import { OutcomeUnknownError, type OwnerCommand, type OwnerReply, mayApply } from "./protocol.js";
+import { mayApply, OutcomeUnknownError, type OwnerCommand, type OwnerReply } from "./protocol.js";
 
 export function assertWorkerMessageBudget(value: unknown, maxBytes: number, additionalBytes = 0): void {
 	let bytes = additionalBytes;

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Worker } from "node:worker_threads";
 import { Hono } from "hono";
 import { Redis } from "ioredis";

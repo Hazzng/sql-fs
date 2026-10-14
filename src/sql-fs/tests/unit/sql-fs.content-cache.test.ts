@@ -9,8 +9,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../sql-fs.js";
-import { INODE_KIND } from "../../types.js";
 import type { PathCacheEntry, SqlDialect } from "../../types.js";
+import { INODE_KIND } from "../../types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
-import { MockOwnerWorker, latestMockWorker } from "../fixtures/mock-owner-worker.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
+import { latestMockWorker, MockOwnerWorker } from "../fixtures/mock-owner-worker.js";
 
 vi.mock("node:worker_threads", async () => {
 	const { MockOwnerWorker } = await import("../fixtures/mock-owner-worker.js");

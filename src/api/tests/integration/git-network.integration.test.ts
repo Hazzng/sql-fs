@@ -1,4 +1,4 @@
-import { Bash, InMemoryFs, defineCommand } from "just-bash";
+import { Bash, defineCommand, InMemoryFs } from "just-bash";
 import { createGit } from "just-git";
 import { readCommit, resolveRef } from "just-git/repo";
 import { type Auth, createServer } from "just-git/server";

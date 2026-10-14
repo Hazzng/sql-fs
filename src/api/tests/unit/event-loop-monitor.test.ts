@@ -7,8 +7,8 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	DEFAULT_STALL_THRESHOLD_MS,
 	classifyHeartbeatGap,
+	DEFAULT_STALL_THRESHOLD_MS,
 	eventLoopLagSnapshot,
 	recordHeartbeatGap,
 	resetEventLoopMonitorForTest,

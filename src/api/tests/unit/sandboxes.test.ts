@@ -5,8 +5,8 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { SignJWT } from "jose";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { type AuthVariables, authMiddleware } from "../../auth.js";

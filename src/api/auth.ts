@@ -24,7 +24,7 @@ import { createMiddleware } from "hono/factory";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { jwtVerify } from "jose";
 import { constantTimeEqual } from "./lib/constant-time.js";
-import { DEFAULT_TENANT_ID, type TenantConfig, loadTenantConfig } from "./tenants.js";
+import { DEFAULT_TENANT_ID, loadTenantConfig, type TenantConfig } from "./tenants.js";
 
 export type AuthVariables = {
 	owner: string;

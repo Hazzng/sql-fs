@@ -1,5 +1,5 @@
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
 import { SessionScopedFs } from "../../sql-fs/session-scoped-fs.js";
 import type { IScriptTxFs } from "../../sql-fs/sql-fs.js";

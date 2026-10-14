@@ -4,8 +4,8 @@ import {
 	ExecTimeoutError,
 	NotFoundError,
 	RateLimitError,
-	SQLFSError,
 	ServerError,
+	SQLFSError,
 	TransportError,
 	ValidationError,
 } from "./errors.js";

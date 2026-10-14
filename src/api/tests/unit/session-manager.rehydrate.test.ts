@@ -6,8 +6,9 @@
  * 2. Cold hit: sandbox in PG but not in pool -> rehydrate via getOrCreate
  * 3. Cold miss: sandbox not in PG -> throw ENOENT
  */
-import { InMemoryFs } from "just-bash";
+
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { SessionManager } from "../../session-manager.js";
@@ -122,16 +123,21 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
-		await sm.withSession("default", "sb-meta", async (session) => {
-			session.owner = "creator";
-			await sm.persistSandboxMeta("default", "sb-meta", {
-				owner: "creator",
-				name: null,
-				python: true,
-				javascript: false,
-				network: false,
-			});
-		});
+		await sm.withSession(
+			"default",
+			"sb-meta",
+			async () => {
+				await sm.persistSandboxMeta("default", "sb-meta", {
+					owner: "creator",
+					name: null,
+					python: true,
+					javascript: false,
+					network: false,
+				});
+			},
+			undefined,
+			"creator",
+		);
 
 		// Simulate pool eviction by creating a new manager with same store
 		const sm2 = new SessionManager({

@@ -3,7 +3,7 @@
  * Used by CLI token generator and admin token endpoint.
  */
 
-import { SignJWT, jwtVerify } from "jose";
+import { jwtVerify, SignJWT } from "jose";
 
 export interface SignTokenOptions {
 	sub: string;

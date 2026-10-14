@@ -1,5 +1,5 @@
-import { InMemoryFs, createCommandContext } from "just-bash";
 import type { ExecResult } from "just-bash";
+import { createCommandContext, InMemoryFs } from "just-bash";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createGitCommand } from "../../commands/git-command.js";
 

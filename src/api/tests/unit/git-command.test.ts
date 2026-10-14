@@ -1,7 +1,7 @@
 import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { httpsOnlyGitFetch } from "../../commands/git-command.js";
-import { SessionManager, buildSandboxBaseEnv, deriveExecGitCredentials } from "../../session-manager.js";
+import { buildSandboxBaseEnv, deriveExecGitCredentials, SessionManager } from "../../session-manager.js";
 
 const T = "default";
 

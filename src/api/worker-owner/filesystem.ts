@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { IFileSystem } from "just-bash";
-import { type ScriptScope, runInScriptScope } from "../../sql-fs/script-scope.js";
+import { runInScriptScope, type ScriptScope } from "../../sql-fs/script-scope.js";
 import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import type { BulkIngestFile } from "../../sql-fs/types.js";
 import type { WorkerOwnerPool } from "./pool.js";

@@ -6,12 +6,15 @@
  *  - runtime semaphore waiters are removed on abort
  */
 
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
-import { describe, expect, it, vi } from "vitest";
+import { defineCommand, InMemoryFs } from "just-bash";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RuntimeBackpressureError, SessionManager } from "../../session-manager.js";
+import type { OwnerMetadata } from "../../worker-owner/protocol.js";
 
 const T = "tenantA";
+
+afterEach(() => vi.unstubAllEnvs());
 
 interface FakeFs extends IFileSystem {
 	disconnect: ReturnType<typeof vi.fn>;
@@ -45,6 +48,47 @@ describe("SessionManager.shutdown", () => {
 		expect(fs2.disconnect).toHaveBeenCalledTimes(1);
 		expect(sm.getSession(T, "sbx-1")).toBeUndefined();
 		expect(sm.getSession(T, "sbx-2")).toBeUndefined();
+	});
+
+	it("refuses worker sessions whose attachment completes after shutdown", async () => {
+		let completeAttach!: (metadata: OwnerMetadata) => void;
+		let attached!: () => void;
+		const attaching = new Promise<void>((resolve) => {
+			attached = resolve;
+		});
+		const attachment = new Promise<OwnerMetadata>((resolve) => {
+			completeAttach = resolve;
+		});
+		const pool = {
+			hasReservation: () => true,
+			attach: async () => {
+				attached();
+				return attachment;
+			},
+			shutdown: vi.fn(async () => {}),
+			disconnect: vi.fn(async () => {}),
+		};
+		const sm = new SessionManager({
+			createFs: async () => makeFakeFs(),
+			workerEnabled: false,
+			tenantConfig: { tenantIds: [T], hasTenant: () => true, getConnectionString: () => "unused-in-this-unit-test" },
+		});
+		Object.assign(sm, { workerPool: pool });
+		const creation = sm.getOrCreate(T, "worker-race");
+		await attaching;
+		await sm.shutdown();
+		const assertion = expect(creation).rejects.toMatchObject({ code: "ESHUTTINGDOWN" });
+		completeAttach({
+			owner: "owner",
+			createdAt: "2026-10-13T00:00:00.000Z",
+			cwd: "/home/user",
+			dirty: false,
+			poisoned: false,
+			pathCacheBytes: 0,
+		});
+		await assertion;
+		expect(sm.getSession(T, "worker-race")).toBeUndefined();
+		expect(pool.disconnect).toHaveBeenCalledExactlyOnceWith(`${T}:worker-race`);
 	});
 
 	it("is idempotent", async () => {
@@ -124,51 +168,66 @@ describe("SessionManager.getOrCreate cleanup", () => {
 });
 
 describe("Runtime semaphore abort + queue limits", () => {
-	// Direct internal-API tests: we exercise the semaphore primitives
-	// (acquireSlot/releaseSlot) rather than going through bash.exec, which
-	// would require a runtime that actually blocks. The semaphore semantics
-	// are independent of the runtime that runs after the slot is acquired.
-	type SmInternals = {
-		pythonSem: { inFlight: number; maxWaiters: number; waiters: unknown[] };
-		acquireSlot(sem: unknown, signal?: AbortSignal): Promise<void>;
-		releaseSlot(sem: unknown): void;
-	};
+	async function holdRuntime(sm: SessionManager) {
+		const session = await sm.getOrCreate(T, "held", { python: true, javascript: false, network: false });
+		let release!: () => void;
+		let entered!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const ready = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		session.bash.registerCommand(
+			defineCommand("hold-runtime", async () => {
+				entered();
+				await held;
+				return { stdout: "released", stderr: "", exitCode: 0 };
+			}),
+		);
+		const operation = sm.execWithRuntimeThrottle(session, "hold-runtime");
+		await ready;
+		return { release, operation };
+	}
 
 	it("removes a queued waiter when the AbortSignal fires", async () => {
-		const sm = new SessionManager({
-			createFs: vi.fn(() => Promise.resolve(makeFakeFs() as IFileSystem)),
-			maxConcurrentPython: 1,
-		});
-		const internals = sm as unknown as SmInternals;
-		const sem = internals.pythonSem;
-
-		await internals.acquireSlot(sem); // fill the only slot
-
+		vi.stubEnv("MAX_PYTHON_QUEUE", "1");
+		const sm = new SessionManager({ createFs: async () => makeFakeFs(), maxConcurrentPython: 1 });
+		const { release, operation } = await holdRuntime(sm);
+		const session = await sm.getOrCreate(T, "queued", { python: true, javascript: false, network: false });
 		const ac = new AbortController();
-		const queued = internals.acquireSlot(sem, ac.signal);
-		expect(sem.waiters.length).toBe(1);
-
+		const aborted = sm.execWithRuntimeThrottle(session, "echo aborted", { signal: ac.signal });
 		ac.abort();
-		await expect(queued).rejects.toMatchObject({ name: "AbortError" });
-		// Waiter must be removed from the queue, not retained in memory.
-		expect(sem.waiters.length).toBe(0);
+		await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+		const replacement = sm.execWithRuntimeThrottle(session, "echo replacement");
+		try {
+			release();
+			expect((await operation).stdout).toBe("released");
+			expect((await replacement).stdout).toBe("replacement\n");
+		} finally {
+			release();
+			await Promise.allSettled([operation, replacement]);
+			await sm.shutdown();
+		}
 	});
 
 	it("rejects with ERUNTIME_BUSY when queue is full", async () => {
-		const sm = new SessionManager({
-			createFs: vi.fn(() => Promise.resolve(makeFakeFs() as IFileSystem)),
-			maxConcurrentPython: 1,
-		});
-		const internals = sm as unknown as SmInternals;
-		const sem = internals.pythonSem;
-		sem.maxWaiters = 1;
-
-		await internals.acquireSlot(sem); // fill slot
-		const queued = internals.acquireSlot(sem); // fill queue
-		await expect(internals.acquireSlot(sem)).rejects.toBeInstanceOf(RuntimeBackpressureError);
-
-		// Drain so the test doesn't leak unhandled rejections.
-		internals.releaseSlot(sem);
-		await queued;
+		vi.stubEnv("MAX_PYTHON_QUEUE", "1");
+		const sm = new SessionManager({ createFs: async () => makeFakeFs(), maxConcurrentPython: 1 });
+		const { release, operation } = await holdRuntime(sm);
+		const session = await sm.getOrCreate(T, "queued", { python: true, javascript: false, network: false });
+		const queued = sm.execWithRuntimeThrottle(session, "echo queued");
+		try {
+			await expect(sm.execWithRuntimeThrottle(session, "echo overflow")).rejects.toBeInstanceOf(
+				RuntimeBackpressureError,
+			);
+			release();
+			expect((await operation).stdout).toBe("released");
+			expect((await queued).stdout).toBe("queued\n");
+		} finally {
+			release();
+			await Promise.allSettled([operation, queued]);
+			await sm.shutdown();
+		}
 	});
 });

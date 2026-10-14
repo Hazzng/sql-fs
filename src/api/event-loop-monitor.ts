@@ -9,7 +9,7 @@
  * event-loop stall (a V8 GC pause or a pathological synchronous bash stretch) fires
  * the renewal late; by then Redis has already expired the key / reaped the ZSET
  * entry, another replica can step in, and the next renew returns 0 →
- * `LockLostError`. Lock 3 (PG advisory + per-tx serialization, see DEVELOPER.md)
+ * `LockLostError`. Lock 3 (PG advisory + per-tx serialization, see docs/DEVELOPER.md)
  * prevents any DB corruption, so this is an *observability* gap, not a correctness
  * bug: nothing measured how close the process ran to the lease floor.
  *

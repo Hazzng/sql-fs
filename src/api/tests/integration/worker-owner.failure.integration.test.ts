@@ -12,7 +12,7 @@ import { SqlFs } from "../../../sql-fs/sql-fs.js";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
-import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
+import { loadTenantConfig, type TenantConfig } from "../../tenants.js";
 import { loadWorkerPoolOptions } from "../../worker-owner/pool.js";
 import { workerRequestContext } from "../../worker-owner/request-context.js";
 import { commitReplyGate } from "../fixtures/commit-reply-gate.js";
