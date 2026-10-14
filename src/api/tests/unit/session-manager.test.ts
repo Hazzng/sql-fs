@@ -676,21 +676,32 @@ describe("SessionManager idle eviction (US-075)", () => {
 		sm.stopReaper();
 	});
 
-	it("busy session (inFlight > 0) past idle threshold is NOT evicted", async () => {
+	it("reaper does not evict a session with inFlight > 0", async () => {
 		vi.useFakeTimers();
-		const sm = new SessionManager({ createFs: makeCreateFs(), idleMs: 1000 });
-		sm.startReaper(2000);
-
-		const session = await sm.getOrCreate(T, "sandbox-busy");
-		// Simulate an active in-flight operation
-		session.inFlight = 1;
-
-		// Advance past idle threshold — reaper fires at 2000ms but inFlight=1 so skip
-		vi.advanceTimersByTime(3000);
-
-		expect(sm.getSession(T, "sandbox-busy")).toBeDefined();
-
-		sm.stopReaper();
+		const sm = new SessionManager({ createFs: makeCreateFs(), idleMs: 100 });
+		let release!: () => void;
+		let entered!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const ready = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const operation = sm.withSession(T, "sandbox-busy", async () => {
+			entered();
+			await held;
+		});
+		await ready;
+		sm.startReaper(50);
+		try {
+			await vi.advanceTimersByTimeAsync(500);
+			expect(sm.getSession(T, "sandbox-busy")).toBeDefined();
+		} finally {
+			release();
+			await operation;
+			await sm.shutdown();
+			vi.useRealTimers();
+		}
 	});
 });
 

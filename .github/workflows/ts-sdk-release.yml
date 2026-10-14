@@ -27,7 +27,7 @@ jobs:
     name: Test & typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -36,7 +36,7 @@ jobs:
           node-version: "22"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install dependencies
         run: pnpm install --ignore-workspace --frozen-lockfile
@@ -59,7 +59,7 @@ jobs:
       RELEASE: ${{ steps.detect.outputs.RELEASE }}
       VERSION: ${{ steps.detect.outputs.VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -113,7 +113,7 @@ jobs:
     permissions:
       contents: write # git push tag + GitHub Release creation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -124,7 +124,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Verify version consistency
         run: |
@@ -174,7 +174,7 @@ jobs:
         run: pnpm build
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ts-sdk-dist-${{ needs.detect.outputs.VERSION }}
           path: clients/typescript/dist/
@@ -195,7 +195,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ts-sdk-v${{ needs.detect.outputs.VERSION }}
           name: TypeScript SDK v${{ needs.detect.outputs.VERSION }}

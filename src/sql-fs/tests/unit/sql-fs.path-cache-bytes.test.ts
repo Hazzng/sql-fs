@@ -1,7 +1,7 @@
 /**
  * Unit tests for SqlFs.getPathCacheBytes() — incremental O(1) byte accounting (F9e).
  *
- * The counter MUST equal the previous full-walk `Σ (path.length + 100)` over
+ * The counter MUST equal the previous full-walk `Σ (path.length + 100 + symlink target storage)` over
  * `getAllPaths()` exactly, after every mutation (write / delete / overwrite /
  * mkdir / cp / mv / rm -r / symlink / link) and after reload()/ready().
  */
@@ -32,7 +32,7 @@ function fileEntry(path: string, inodeId: bigint, size: number): { path: string 
 /** The original full-walk formula from SessionManager.estimatePathCacheBytes. */
 function fullWalk(fs: SqlFs): number {
 	let total = 0;
-	for (const p of fs.getAllPaths()) total += p.length + 100;
+	for (const [path, entry] of fs._getPathCache()) total += path.length + 100 + (entry.symlinkTarget?.length ?? 0) * 2;
 	return total;
 }
 
@@ -157,6 +157,16 @@ describe("SqlFs.getPathCacheBytes() — incremental byte accounting (F9e)", () =
 		expectInSync(fs);
 		await fs.link("/a/b/c.txt", "/a/hard.txt");
 		expectInSync(fs);
+	});
+
+	it("charges long symlink targets and releases their estimate on replacement", async () => {
+		const before = fs.getPathCacheBytes();
+		await fs.symlink("x".repeat(100_000), "/a/large-link");
+		expect(fs.getPathCacheBytes() - before).toBe(200_000 + "/a/large-link".length + 100);
+		await fs.writeFile("/a/large-link", "replacement");
+		expect(fs.getPathCacheBytes() - before).toBe("/a/large-link".length + 100);
+		await fs.rm("/a/large-link");
+		expect(fs.getPathCacheBytes()).toBe(before);
 	});
 
 	it("resets and re-syncs after reload() with a different tree", async () => {
