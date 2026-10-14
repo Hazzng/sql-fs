@@ -4,7 +4,7 @@ This audit uses the eight areas in [Factory's Agent Readiness article](https://f
 
 ## Implementation workflow
 
-The entry point is [AGENTS.md](AGENTS.md). Run `pnpm setup:dev`, `pnpm check`, and `pnpm verify:local`. The first command installs locked dependencies. The second covers the server and both SDKs without services. The third exercises real Postgres, Redis, HTTP, MCP, and SDK behavior in a disposable stack. Use `pnpm verify:architecture` for ownership or protocol changes; CI runs that expanded profile, including worker failures, SSE finalization, input budgets, and tenant isolation.
+The entry point is [AGENTS.md](../AGENTS.md). Run `pnpm setup:dev`, `pnpm check`, and `pnpm verify:local`. The first command installs locked dependencies. The second covers the server and both SDKs without services. The third exercises real Postgres, Redis, HTTP, MCP, and SDK behavior in a disposable stack. Use `pnpm verify:architecture` for ownership or protocol changes; CI runs that expanded profile, including worker failures, SSE finalization, input budgets, and tenant isolation.
 
 | Area | Repository evidence | Remaining limit |
 | --- | --- | --- |
@@ -49,4 +49,4 @@ Workflow files alone are not proof of hosted enforcement. The original audit lef
 
 ## Known dependency advisory
 
-The production Node audit retains one moderate `sprintf-js` advisory with no published fixed version. High and critical advisories were removed through dependency updates, removal of unused drivers, and two scoped transitive overrides. The Python lock update removes the advisories for the documented Python 3.12 environment. The Python 3.9 resolution retains two AnyIO advisories because the fixed package requires Python 3.10 or later. The broader development-tool audit still reports high and critical advisories outside the production gate. See [SECURITY.md](SECURITY.md) for these limits and the observed runtime behavior.
+The production Node audit retains one moderate `sprintf-js` advisory with no published fixed version. High and critical advisories were removed through dependency updates, removal of unused drivers, and two scoped transitive overrides. The Python lock update removes the advisories for the documented Python 3.12 environment. The Python 3.9 resolution retains two AnyIO advisories because the fixed package requires Python 3.10 or later. The broader development-tool audit still reports high and critical advisories outside the production gate. See [SECURITY.md](../SECURITY.md) for these limits and the observed runtime behavior.
