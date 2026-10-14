@@ -125,7 +125,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # ── 4. Build sdist + wheel ─────────────────────────────────────────────
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.detect.outputs.RELEASE == 'true'
         with:
           python-version: "3.12"
