@@ -32,7 +32,7 @@ Read [AGENTS.md](AGENTS.md) for implementation instructions and [CONTRIBUTING.md
 1. Start Postgres and Redis:
 
 	```bash
-	docker compose -f docker-compose.local.yml up -d
+	docker compose -f infra/docker-compose.local.yml up -d
 	```
 
 2. Copy the example settings. They already point at the compose Postgres. To use Redis, uncomment `REDIS_URL` in `.env`.
@@ -113,7 +113,7 @@ Each request takes a local lock, and also a Redis lock when Redis is configured.
 
 ## Configure the server
 
-Most deployments need only these settings. [CONFIGURATION.md](CONFIGURATION.md) lists every variable, worker tuning, the Redis eviction policy and MCP static-key auth.
+Most deployments need only these settings. [CONFIGURATION.md](docs/CONFIGURATION.md) lists every variable, worker tuning, the Redis eviction policy and MCP static-key auth.
 
 | Variable | Description |
 |---|---|
@@ -132,7 +132,7 @@ docker run -p 8080:8080 \
 	sql-fs-api
 ```
 
-To run several replicas, point them all at one Postgres database and one control Redis in `REDIS_URL`. Put the blob cache on a separate Redis in `REDIS_DATA_URL` with `allkeys-lru`, and keep the control Redis on `noeviction`. [Redis eviction policy](CONFIGURATION.md#redis-eviction-policy) explains why.
+To run several replicas, point them all at one Postgres database and one control Redis in `REDIS_URL`. Put the blob cache on a separate Redis in `REDIS_DATA_URL` with `allkeys-lru`, and keep the control Redis on `noeviction`. [Redis eviction policy](docs/CONFIGURATION.md#redis-eviction-policy) explains why.
 
 ## Develop
 
@@ -149,7 +149,7 @@ pnpm changeset          # record a change for the next release
 
 `pnpm bench:remote-bash` measures end-to-end latency against a running server. To compare against Daytona, run `scripts/benchmark_remote_bash.py --provider daytona`. The script lists its other flags.
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, coding standards and releases. [DEVELOPER.md](DEVELOPER.md) covers internals.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, coding standards and releases. [DEVELOPER.md](docs/DEVELOPER.md) covers internals.
 
 ## License
 

@@ -32,7 +32,7 @@ For an interrupted host or a killed shell, list leftover projects with `docker c
 ## Start a development server
 
 ```bash
-docker compose -f docker-compose.local.yml up -d --wait
+docker compose -f infra/docker-compose.local.yml up -d --wait
 cp .env.example .env
 pnpm dev
 ```
@@ -61,7 +61,7 @@ Use disposable services for fault injection and multi-tenant tests. The suite ru
 
 ## Submit a change
 
-Read [AGENTS.md](AGENTS.md) for coding rules and [DEVELOPER.md](DEVELOPER.md) before changing sessions, transactions, locks, or caches.
+Read [AGENTS.md](AGENTS.md) for coding rules and [DEVELOPER.md](docs/DEVELOPER.md) before changing sessions, transactions, locks, or caches.
 
 TypeScript 7.0.2 builds and checks both TypeScript packages. Oxlint complements Biome with native correctness, selected type-aware promise checks, and test-integrity rules: `pnpm lint` runs both, and CI runs that command. `pnpm lint:fix` applies Biome fixes and then checks Oxlint. Keep Biome rules until equivalent coverage is verified. See [the anti-slop policy](tools/oxlint/anti-slop/README.md) for enabled rules, test-fixture exceptions, and vendored-source update instructions.
 
@@ -78,6 +78,6 @@ For a release, maintainers run `pnpm changeset:version` in a release branch. Tha
 
 ## Diagnose failures
 
-`/healthz` reports liveness. `/readyz` reports dependency readiness. `/metrics` requires a bearer JWT and exposes worker queues, capacity, refusal counts, and timing data. API logs contain structured events. See [CONFIGURATION.md](CONFIGURATION.md) for settings and worker recovery outcomes.
+`/healthz` reports liveness. `/readyz` reports dependency readiness. `/metrics` requires a bearer JWT and exposes worker queues, capacity, refusal counts, and timing data. API logs contain structured events. See [CONFIGURATION.md](docs/CONFIGURATION.md) for settings and worker recovery outcomes.
 
 Report defects with the revision, reproduction, expected and actual behavior, and redacted logs. Report security defects through [SECURITY.md](SECURITY.md).
