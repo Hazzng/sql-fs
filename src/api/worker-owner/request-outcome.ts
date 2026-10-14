@@ -45,7 +45,7 @@ export class RequestOutcome {
 		// proves the worker is alive, but not that the script had no effects.
 		if (workerFailureCode(error) === "ECOHERENCE" && this.execDispatched) {
 			return new OutcomeUnknownError(
-				"EEXEC_OUTCOME_UNKNOWN: exec may have committed before coherence recovery failed; inspect state before retrying",
+				"EEXEC_OUTCOME_UNKNOWN: exec may have committed before coherence recovery failed; inspect sandbox state before proceeding; do not automatically replay the execution",
 			);
 		}
 		return workerFailureCode(error) === "ERUNTIME_BUSY" && (this.execDispatched || this.committedFsWrite)

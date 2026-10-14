@@ -1,0 +1,48 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"categories": {
+		"correctness": "error"
+	},
+	"ignorePatterns": [
+		"node_modules/**",
+		"dist/**",
+		"clients/python/**",
+		".agent/**",
+		".agents/**",
+		".claude/**",
+		".codex/**",
+		".continue/**",
+		".cursor/**",
+		".gemini/**",
+		".opencode/**",
+		".pi/**",
+		".roo/**",
+		".windsurf/**",
+		".audit/**",
+		"tools/oxlint/anti-slop/**"
+	],
+	"jsPlugins": [
+		{
+			"name": "anti-slop",
+			"specifier": "./tools/oxlint/anti-slop/index.ts"
+		}
+	],
+	"rules": {
+		"anti-slop/no-chained-type-assertions": "error",
+		"anti-slop/no-widen-then-assert": "error",
+		"anti-slop/no-reduce-accumulator-copy": "error",
+		"anti-slop/no-object-parameters": "error",
+		"oxc/no-accumulating-spread": "error",
+		"eslint/array-callback-return": "error"
+	},
+	"overrides": [
+		{
+			"files": ["**/tests/**", "**/*.test.ts"],
+			"rules": {
+				"anti-slop/no-chained-type-assertions": "off",
+				"anti-slop/no-object-parameters": "off"
+			}
+		}
+	],
+	"plugins": ["typescript", "unicorn", "oxc"]
+}

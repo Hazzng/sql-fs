@@ -1,13 +1,25 @@
 pre-commit:
   jobs:
+    - name: typescript-style
+      glob: "*.{ts,tsx,js,mjs,json}"
+      run: pnpm exec biome check --files-ignore-unknown=true --no-errors-on-unmatched {staged_files}
+
+    - name: typescript-oxlint
+      glob: "*.{ts,tsx,js,mjs,cjs,json}"
+      run: pnpm lint:oxlint
+
+    - name: typescript-typecheck
+      glob: "*.{ts,tsx}"
+      run: pnpm typecheck && pnpm --dir clients/typescript typecheck
+
     - name: python-sdk-format
       glob: "clients/python/**"
-      run: cd clients/python && uvx ruff format --check .
+      run: cd clients/python && uv run --locked --extra dev ruff format --check .
 
     - name: python-sdk-lint
       glob: "clients/python/**"
-      run: cd clients/python && uvx ruff check .
+      run: cd clients/python && uv run --locked --extra dev ruff check .
 
     - name: python-sdk-typecheck
       glob: "clients/python/**/*.py"
-      run: cd clients/python && uvx --with httpx mypy src/
+      run: pnpm check:python:types

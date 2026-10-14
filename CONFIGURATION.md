@@ -1,15 +1,13 @@
 # Configuration
 
-The server reads every setting from an environment variable. `FS_BACKEND` and `AUTH_SECRET` are always required. The `postgres` backend also needs `TENANT_DATABASES` or `DATABASE_URL`. Sizes are in bytes and durations are in milliseconds, unless the variable name says otherwise.
+The server reads every setting from an environment variable. The API requires `AUTH_SECRET` and either `TENANT_DATABASES` or `DATABASE_URL` for its Postgres storage. Sizes are in bytes and durations are in milliseconds, unless the variable name says otherwise.
 
 ## Core
 
 | Variable | Default | Description |
 |---|---|---|
-| `FS_BACKEND` | Required | `postgres` or `memory`. |
 | `TENANT_DATABASES` | Unset | JSON object that maps each tenant id to its Postgres connection string, for example `{"acme":"postgres://..."}`. A tenant id can use `A-Z`, `a-z`, `0-9`, `_`, `.` and `-`. The server reads the tenant from the JWT `tenant` claim and runs migrations on every tenant database at boot. If it is set, the server ignores `DATABASE_URL`. |
-| `DATABASE_URL` | Required for `postgres` without `TENANT_DATABASES` | Postgres connection string for one tenant, with the id `default`. The migration runner uses it at boot. On Neon, use the pooler endpoint. |
-| `DATABASE_DIRECT_URL` | `DATABASE_URL` | Direct connection, without a pooler. Only drizzle-kit (`pnpm db:generate`) uses it. |
+| `DATABASE_URL` | Required without `TENANT_DATABASES` | Postgres connection string for one tenant, with the id `default`. The migration runner uses it at boot. On Neon, use the pooler endpoint. |
 | `AUTH_SECRET` | Required | Signs and verifies bearer JWTs. |
 | `ADMIN_SECRET` | Unset | Secret for `POST /v1/auth/admin`. If it is unset, that endpoint returns `500 ADMIN_NOT_CONFIGURED`. |
 | `PORT` | `8080` | HTTP port. |

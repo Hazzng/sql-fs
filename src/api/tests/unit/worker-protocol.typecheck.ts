@@ -16,9 +16,9 @@ export function checkWorkerProtocolTypes(
 	// @ts-expect-error The command determines the reply type.
 	const wrongReply: Promise<number> = pool.send({ kind: "readFile", args: ["/file"] });
 	// @ts-expect-error Callers cannot select a result type.
-	pool.send<BashExecResult>({ kind: "exec", script: "true", options: {} });
+	void pool.send<BashExecResult>({ kind: "exec", script: "true", options: {} });
 	// @ts-expect-error Synchronous filesystem methods are not protocol commands.
-	fs.call({ kind: "getAllPaths" });
+	void fs.call({ kind: "getAllPaths" });
 	// @ts-expect-error A handler must return the declared result for its command.
 	const wrongHandler: OwnerHandlers["readFile"] = async () => 123;
 	const { paths: pathsHandler, ...remainingHandlers } = handlers;

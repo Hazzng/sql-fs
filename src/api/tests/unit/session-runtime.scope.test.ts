@@ -109,7 +109,7 @@ describe("session runtime script completion", () => {
 	it("checks a lost route lease in a borrowed scope without finalizing the owner's scope", async () => {
 		const { fs, runtime, scope } = await fixture();
 		const lease = new AbortController();
-		scope.beginScope();
+		await scope.beginScope();
 		await fs.writeFile("/home/user/route-pending", "pending");
 		lease.abort();
 		try {

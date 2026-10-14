@@ -32,7 +32,7 @@ dev = [
   "pytest>=8",
   "respx>=0.21",
   "ruff>=0.5",
-  "mypy>=1.10",
+  "mypy>=1.10,<2",
 ]
 
 [build-system]

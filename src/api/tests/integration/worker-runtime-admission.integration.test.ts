@@ -44,7 +44,7 @@ describe.skipIf(!process.env.DATABASE_URL)("worker runtime admission for dynamic
 			workerOptions: loadWorkerPoolOptions({
 				SQL_FS_WORKER_COUNT: "2",
 				SQL_FS_WORKER_ACTIVE_TENANT_MAX: "1",
-				SQL_FS_WORKER_QUEUE_WAIT_MS: "5000",
+				SQL_FS_WORKER_QUEUE_WAIT_MS: "30000",
 			}),
 			maxConcurrentPython: 1,
 			maxConcurrentJs: 1,

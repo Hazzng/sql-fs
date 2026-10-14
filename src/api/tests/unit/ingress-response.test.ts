@@ -89,7 +89,7 @@ describe("request and response admission", () => {
 				expect(ingress.metrics).toMatchObject({ activeRequests: 4, retainedRawBytes: method === "POST" ? 20 : 0 });
 				const sameTenant = await fetch(`${url}/large`, {
 					method,
-					body: method === "POST" ? "input" : undefined,
+					...(method === "POST" && { body: "input" }),
 					headers: { "X-Tenant": "a" },
 				});
 				expect(sameTenant.status).toBe(503);

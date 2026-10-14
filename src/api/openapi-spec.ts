@@ -309,6 +309,10 @@ export const openapiSpec = {
 							},
 						},
 					},
+					"401": {
+						description: "Missing or invalid bearer token",
+						content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+					},
 				},
 			},
 			post: {
@@ -469,7 +473,7 @@ export const openapiSpec = {
 								schema: { type: "string" },
 							},
 						},
-						content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } },
+						content: { "*/*": { schema: { type: "string", format: "binary" } } },
 					},
 					"400": {
 						description: "Path is a directory",

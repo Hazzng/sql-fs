@@ -94,15 +94,15 @@ describe("SqlFs.writeFile — contentCache eviction on overwrite (F9a)", () => {
 	it("evicts the displaced inode when overwriting a cached non-empty file with non-empty content", async () => {
 		// First write: existing.txt → inode 11n (seeded in contentCache).
 		await fs.writeFile("/home/user/existing.txt", "version one");
-		const firstInode = mocks.createInodeMock.mock.results[0]!.value as bigint;
-		expect(fs._getContentCache().has(await firstInode)).toBe(true);
+		const firstInode = await mocks.createInodeMock.mock.results[0]!.value;
+		expect(fs._getContentCache().has(firstInode)).toBe(true);
 
 		// Overwrite: existing.txt → inode 12n; old inode 11n must be evicted.
 		await fs.writeFile("/home/user/existing.txt", "version two");
-		const secondInode = mocks.createInodeMock.mock.results[1]!.value as bigint;
+		const secondInode = await mocks.createInodeMock.mock.results[1]!.value;
 
-		expect(fs._getContentCache().has(await firstInode)).toBe(false);
-		expect(fs._getContentCache().has(await secondInode)).toBe(true);
+		expect(fs._getContentCache().has(firstInode)).toBe(false);
+		expect(fs._getContentCache().has(secondInode)).toBe(true);
 		// New content is served from cache (no DB read).
 		expect(await fs.readFile("/home/user/existing.txt")).toBe("version two");
 	});
@@ -110,27 +110,27 @@ describe("SqlFs.writeFile — contentCache eviction on overwrite (F9a)", () => {
 	it("evicts the displaced inode when overwriting a cached non-empty file with an EMPTY file", async () => {
 		// First write: existing.txt → inode 11n (seeded in contentCache).
 		await fs.writeFile("/home/user/existing.txt", "version one");
-		const firstInode = mocks.createInodeMock.mock.results[0]!.value as bigint;
+		const firstInode = await mocks.createInodeMock.mock.results[0]!.value;
 		const byteCountBefore = fs._getContentCache().calculatedSize;
-		expect(fs._getContentCache().has(await firstInode)).toBe(true);
+		expect(fs._getContentCache().has(firstInode)).toBe(true);
 		expect(byteCountBefore).toBeGreaterThan(0);
 
 		// Overwrite with empty content: there is no seeding `set` (guarded by
 		// byteLength > 0), so the old entry must be evicted explicitly.
 		await fs.writeFile("/home/user/existing.txt", "");
-		const secondInode = mocks.createInodeMock.mock.results[1]!.value as bigint;
+		const secondInode = await mocks.createInodeMock.mock.results[1]!.value;
 
-		expect(fs._getContentCache().has(await firstInode)).toBe(false);
-		expect(fs._getContentCache().has(await secondInode)).toBe(false); // empty file not cached
+		expect(fs._getContentCache().has(firstInode)).toBe(false);
+		expect(fs._getContentCache().has(secondInode)).toBe(false); // empty file not cached
 		// LRU byte count drops back to zero — no orphaned weight.
 		expect(fs._getContentCache().calculatedSize).toBe(0);
 	});
 
 	it("does not evict when the path is new (no displaced inode)", async () => {
 		await fs.writeFile("/home/user/brand-new.txt", "fresh");
-		const inode = mocks.createInodeMock.mock.results[0]!.value as bigint;
+		const inode = await mocks.createInodeMock.mock.results[0]!.value;
 
-		expect(fs._getContentCache().has(await inode)).toBe(true);
+		expect(fs._getContentCache().has(inode)).toBe(true);
 		expect(await fs.readFile("/home/user/brand-new.txt")).toBe("fresh");
 	});
 });

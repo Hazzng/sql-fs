@@ -8,3 +8,9 @@ dist
 tasks/
 .dockerignore
 Dockerfile
+.audit
+**/node_modules
+**/.venv
+**/.venv-*
+scripts/verify/.run
+.claude/worktrees

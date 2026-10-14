@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   lint-typecheck:
     name: Lint & Typecheck
@@ -24,10 +27,16 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir clients/typescript install --ignore-workspace --frozen-lockfile
 
       - run: pnpm typecheck
 
       - run: pnpm lint
+
+      - run: pnpm check:architecture
+
+      - name: Check verification scripts
+        run: pnpm check:scripts
 
   unit-tests:
     name: Unit Tests
@@ -63,7 +72,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: clients/typescript/pnpm-lock.yaml
 
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --ignore-workspace --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
@@ -91,4 +100,30 @@ jobs:
         with:
           name: dist
           path: dist/
+          retention-days: 7
+
+  integration:
+    name: Integration & API
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv==0.9.18
+      - run: pnpm setup:dev
+      - run: pnpm verify:architecture
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-evidence
+          path: scripts/verify/.run/
+          include-hidden-files: true
           retention-days: 7

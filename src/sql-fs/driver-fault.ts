@@ -68,7 +68,7 @@ export function onDriverFault(listener: DriverFaultListener): () => void {
  * calls this is the last line of defence and has nowhere to report to.
  */
 export function reportDriverFault(err: Error): void {
-	for (const listener of [...listeners]) {
+	for (const listener of Array.from(listeners)) {
 		try {
 			listener(err);
 		} catch {

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { createServer } from "node:http";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { Worker } from "node:worker_threads";
 import { Hono } from "hono";
 import { Redis } from "ioredis";
@@ -188,11 +188,16 @@ describe.skipIf(!process.env.DATABASE_URL || !process.env.REDIS_URL)(
 			expect(control.status).toBe(413);
 			expect(await control.json()).toMatchObject({ code: "EEXEC_INPUT_LIMIT", retryable: false });
 			const posts: { method?: string; body: string }[] = [];
-			const server = createServer(async (request, response) => {
+			const respond = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
 				let body = "";
 				for await (const chunk of request) body += chunk.toString();
 				posts.push({ method: request.method, body });
 				response.end("applied");
+			};
+			const server = createServer((request, response) => {
+				void respond(request, response).catch((error: unknown) => {
+					response.destroy(error instanceof Error ? error : new Error("HTTP proof handler failed"));
+				});
 			});
 			server.listen(0, "127.0.0.1");
 			await once(server, "listening");

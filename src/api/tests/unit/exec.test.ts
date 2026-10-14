@@ -459,9 +459,9 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		const exitEvent = events.find((e) => e.event === "exit");
 
 		expect(stdoutEvent).toBeDefined();
-		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
+		expect((stdoutEvent!.data as { t: string; data: string }).data).toBe("hello\n");
 		expect(exitEvent).toBeDefined();
-		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+		expect((exitEvent!.data as { t: string; exitCode: number }).exitCode).toBe(0);
 	});
 
 	it.each(["text/x-shellscript", "text/plain"])("accepts %s content type for SSE streaming", async (ct) => {
@@ -487,9 +487,9 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 		const exitEvent = events.find((e) => e.event === "exit");
 
 		expect(stdoutEvent).toBeDefined();
-		expect((stdoutEvent?.data as { t: string; data: string }).data).toBe("hello\n");
+		expect((stdoutEvent!.data as { t: string; data: string }).data).toBe("hello\n");
 		expect(exitEvent).toBeDefined();
-		expect((exitEvent?.data as { t: string; exitCode: number }).exitCode).toBe(0);
+		expect((exitEvent!.data as { t: string; exitCode: number }).exitCode).toBe(0);
 	});
 
 	it("SSE streaming respects timeoutMs query param with plaintext body", async () => {
@@ -528,8 +528,8 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 
 		const exitEvent = events.find((e) => e.event === "exit");
 		expect(exitEvent).toBeDefined();
-		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
-		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
+		expect((exitEvent!.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
+		expect((exitEvent!.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
 
 		vi.restoreAllMocks();
 	});
@@ -574,8 +574,8 @@ describe("POST /v1/sandboxes/:id/exec (SSE streaming)", () => {
 
 		const exitEvent = events.find((e) => e.event === "exit");
 		expect(exitEvent).toBeDefined();
-		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
-		expect((exitEvent?.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
+		expect((exitEvent!.data as { t: string; exitCode: number; error: string }).exitCode).toBe(-1);
+		expect((exitEvent!.data as { t: string; exitCode: number; error: string }).error).toBe("timeout");
 
 		vi.restoreAllMocks();
 	});

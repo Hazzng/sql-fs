@@ -292,6 +292,38 @@ describe("F8 heartbeat-gap smoke: a >lease stall is reproduced and observed", ()
 		expect(critical[0]?.gapMs).toBeGreaterThanOrEqual(LEASE_MS);
 	});
 
+	it.each(["exec", "shared", "exclusive"] as const)("%s rejects when heartbeat logging fails", async (mode) => {
+		const sink = vi.spyOn(console, "error").mockImplementationOnce(() => {
+			throw new Error("heartbeat log sink failed");
+		});
+		const work = async (): Promise<string> => {
+			busyLoopMs(STALL_MS);
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			return "completed";
+		};
+		try {
+			const operation =
+				mode === "exec"
+					? withDistributedLock(asRedis(new SimpleFakeRedis()), execLockKey("default", "sink-failure"), work, {
+							leaseMs: LEASE_MS,
+							renewMs: RENEW_MS,
+							acquireTimeoutMs: 5000,
+							acquireRetryMs: 10,
+						})
+					: withDistributedRWLock(asRedis(new RwFakeRedis()), rwLockKeys("default", "sink-failure"), mode, work, {
+							leaseMs: LEASE_MS,
+							readerLeaseMs: LEASE_MS,
+							renewMs: RENEW_MS,
+							acquireTimeoutMs: 5000,
+							acquireRetryMs: 10,
+						});
+			await expect(operation).rejects.toMatchObject({ code: mode === "shared" ? "ELOCKLOST" : "ELOCKLOST_APPLIED" });
+			expect(sink.mock.calls[0]?.[0]).toContain('"event":"heartbeat_gap"');
+		} finally {
+			sink.mockRestore();
+		}
+	});
+
 	it("control: a healthy run (no stall) emits no heartbeat_gap events", async () => {
 		const r = new SimpleFakeRedis();
 		const key = execLockKey("default", "sbx-healthy");

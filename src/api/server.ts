@@ -380,7 +380,7 @@ if (isMain) {
 				process.exit(1);
 			}, 60_000);
 			if (typeof forceExit.unref === "function") forceExit.unref();
-			server.close(async () => {
+			const closeResources = async (): Promise<void> => {
 				try {
 					await shutdownMcp();
 				} catch (err) {
@@ -403,6 +403,12 @@ if (isMain) {
 				}
 				console.log(JSON.stringify({ event: "shutdown_complete" }));
 				process.exit(0);
+			};
+			server.close(() => {
+				void closeResources().catch(() => {
+					console.error(JSON.stringify({ event: "shutdown_failed" }));
+					process.exit(1);
+				});
 			});
 		};
 		process.once("SIGINT", shutdown);

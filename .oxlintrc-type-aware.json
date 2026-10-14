@@ -1,0 +1,39 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"extends": ["./.oxlintrc.json"],
+	"categories": {
+		"correctness": "off"
+	},
+	"plugins": ["typescript", "unicorn", "oxc", "vitest"],
+	"options": {
+		"typeAware": true
+	},
+	"rules": {
+		"typescript/no-floating-promises": "error",
+		"typescript/no-misused-promises": "error",
+		"typescript/await-thenable": "error",
+		"typescript/no-misused-spread": "error",
+		"vitest/no-focused-tests": "error",
+		"vitest/no-disabled-tests": "error",
+		"vitest/valid-describe-callback": "error",
+		"vitest/require-awaited-expect-poll": "error"
+	},
+	"ignorePatterns": [
+		"node_modules/**",
+		"dist/**",
+		"clients/python/**",
+		".agent/**",
+		".agents/**",
+		".claude/**",
+		".codex/**",
+		".continue/**",
+		".cursor/**",
+		".gemini/**",
+		".opencode/**",
+		".pi/**",
+		".roo/**",
+		".windsurf/**",
+		".audit/**",
+		"tools/oxlint/anti-slop/**"
+	]
+}

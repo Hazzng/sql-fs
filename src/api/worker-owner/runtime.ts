@@ -136,7 +136,7 @@ const handlers: OwnerHandlers = {
 		return coherent.bulkIngest(command.files);
 	},
 	beginScope: async (_command, request) => {
-		residentFor(request).runtime.scriptTx?.beginScope();
+		await residentFor(request).runtime.scriptTx?.beginScope();
 	},
 	endScope: async (_command, request) => {
 		const { runtime } = residentFor(request);

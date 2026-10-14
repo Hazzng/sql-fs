@@ -214,7 +214,9 @@ describe("S2 — concurrent delete and read of the same file", () => {
 			const get = app.request(`/v1/sandboxes/${sbId}/files/a/file.txt`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
-			const [first, second] = await Promise.all(delFirstInArray ? [del, get] : [get, del]);
+			const [first, second] = await Promise.all(
+				delFirstInArray ? [Promise.resolve(del), Promise.resolve(get)] : [Promise.resolve(get), Promise.resolve(del)],
+			);
 
 			if (delFirstInArray) {
 				expect(first.status, "DELETE response status").toBe(204);
