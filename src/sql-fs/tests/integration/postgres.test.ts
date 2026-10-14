@@ -20,8 +20,6 @@
  * Skipped when DATABASE_URL is not set so that CI without a DB still passes.
  */
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDialect } from "../../dialects/postgres.js";
 import type { BulkIngestFile } from "../../types.js";
@@ -1511,15 +1509,6 @@ describe.skipIf(!process.env.DATABASE_URL)("PostgresDialect — resolvePath (fs_
 
 	beforeAll(async () => {
 		await dialect.connect();
-
-		// Apply stored procedure DDL (idempotent via CREATE OR REPLACE)
-		const migrationSql = readFileSync(
-			fileURLToPath(new URL("../../migrations/postgres/0001_rls_and_procs.sql", import.meta.url)),
-			"utf8",
-		);
-		await dialect.transaction(async (tx) => {
-			await tx.unsafe(migrationSql);
-		});
 
 		// Create sandbox and populate test fixtures
 		await dialect.transaction(async (tx) => {

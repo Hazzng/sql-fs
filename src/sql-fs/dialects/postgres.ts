@@ -1,37 +1,13 @@
-/**
- * Postgres dialect for SqlFs.
- * US-004: connection and sandbox context (connect, disconnect, transaction, setSandboxContext)
- * Subsequent stories fill in the stub methods below.
- */
-
-import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { runTrustedDbAsync } from "../defense.js";
-import { createEisdir, createEnoent, createEnotdir, createEstale, translateSqlError } from "../errors.js";
 import type { RedisBlobCache } from "../redis-blob-cache.js";
-import {
-	type BulkIngestFile,
-	type CreateInodeOpts,
-	type DirentRow,
-	INODE_KIND,
-	type InodeKind,
-	type InodeRow,
-	type PathCacheEntry,
-	type SandboxGeneration,
-	type SandboxListEntry,
-	type SandboxMeta,
-	type SqlDialect,
-	type TransactionOptions,
-	type UpdateInodeOpts,
-} from "../types.js";
+import type { SqlDialect, TransactionOptions } from "../types.js";
+import { PostgresBlobs } from "./postgres/blobs.js";
+import { bulkIngest } from "./postgres/ingest.js";
+import { PostgresNamespace } from "./postgres/namespace.js";
+import { PostgresSandbox } from "./postgres/sandbox.js";
+import type { BlobOperations, NamespaceOperations, PgTx, SandboxOperations } from "./postgres/types.js";
 
-/** Transaction handle type used throughout this dialect. */
-type PgTx = postgres.TransactionSql;
-
-/**
- * Reads a positive integer env var, returns the fallback when unset / malformed.
- * Used for pool tuning so deploys can override without code changes.
- */
 function envInt(name: string, fallback: number): number {
 	const raw = process.env[name];
 	if (raw === undefined || raw === "") return fallback;
@@ -42,17 +18,16 @@ function envInt(name: string, fallback: number): number {
 export class PostgresDialect implements SqlDialect<PgTx> {
 	private pool: postgres.Sql | null = null;
 	private readonly connectionString: string;
-	readonly #blobCache: RedisBlobCache | undefined;
 	readonly #poolMax: number | undefined;
-
+	private readonly blobs: PostgresBlobs;
+	private readonly sandbox = new PostgresSandbox();
+	private readonly namespace: PostgresNamespace;
 	constructor(connectionString: string, blobCache?: RedisBlobCache, poolMax?: number) {
 		this.connectionString = connectionString;
-		this.#blobCache = blobCache;
 		this.#poolMax = poolMax;
+		this.blobs = new PostgresBlobs(() => this.db(), blobCache);
+		this.namespace = new PostgresNamespace(this.blobs);
 	}
-
-	// ── Connection ────────────────────────────────────────────────────────────────
-
 	async connect(): Promise<void> {
 		// Bound the pool: each PostgresDialect instance is owned by one warm
 		// session, so a tiny `max` is sufficient. Without these caps a runaway
@@ -80,8 +55,6 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		this.pool = null;
 	}
 
-	// ── Transactions ──────────────────────────────────────────────────────────────
-
 	async transaction<T>(fn: (tx: PgTx) => Promise<T>, opts?: TransactionOptions): Promise<T> {
 		if (opts?.isolationLevel !== undefined) {
 			// `postgres` passes this string after BEGIN, e.g. BEGIN ISOLATION LEVEL REPEATABLE READ.
@@ -90,1452 +63,194 @@ export class PostgresDialect implements SqlDialect<PgTx> {
 		return this.db().begin(fn) as Promise<T>;
 	}
 
-	// ── Sandbox context ───────────────────────────────────────────────────────────
-
-	/** Fence param: null skips the check; `>` accepts this tx's own advances. */
-	private static epochParam(expectedEpoch?: bigint): string | null {
-		return expectedEpoch === undefined ? null : String(expectedEpoch);
-	}
-
-	/**
-	 * Takes the per-sandbox writer lock as its own statement. The fenced CTEs
-	 * below must run after this: their snapshot would otherwise predate the
-	 * lock wait and fence on a stale version.
-	 */
-	private static async takeWriterLock(tx: PgTx, sandboxId: string): Promise<void> {
-		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
-	}
-
-	/**
-	 * Composites' fence-and-advance CTEs for writes that are not one statement.
-	 * Omits `set_config('app.sandbox_id')` and `pg_advisory_xact_lock`: callers
-	 * already locked via `#withWriteTx`. Callers MUST reference the `epoch` CTE
-	 * (unreferenced non-modifying CTEs may not run) and gate the mutation on it.
-	 */
-	private static fenceAndAdvance(tx: PgTx, sandboxId: string, expectedEpoch?: bigint) {
-		const epoch = PostgresDialect.epochParam(expectedEpoch);
-		return tx`
-			ctx AS (
-				SELECT s.version
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epoch}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epoch}::bigint IS NOT NULL
-						AND s.version > ${epoch}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			)
-		`;
-	}
-
-	async setSandboxContext(tx: PgTx, sandboxId: string): Promise<void> {
-		// RLS context only — no advisory lock. Read-only paths (cold-start load,
-		// cache reload) use this to avoid serializing against unrelated writers.
-		await tx`SELECT set_config('app.sandbox_id', ${sandboxId}, true)`;
-	}
-
-	async setSandboxContextWithLock(tx: PgTx, sandboxId: string): Promise<void> {
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ epoch: string }[]>`
-			SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-			       set_config('app.sandbox_epoch', s.version::text, true),
-			       s.version AS epoch
-			FROM sandboxes s
-			WHERE s.id = ${sandboxId}
-		`;
-		// Fake tx handles resolve non-arrays; zero rows on a real conn means gone.
-		if (Array.isArray(rows) && rows.length === 0) throw createEnoent(sandboxId);
-	}
-
-	async getSandboxEpoch(tx: PgTx, sandboxId: string): Promise<bigint> {
-		const rows = await tx<{ version: string }[]>`
-			SELECT version FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		const row = rows[0];
-		if (row === undefined) throw createEnoent(sandboxId);
-		return BigInt(row.version);
-	}
-
-	async retireSandboxGeneration(
-		tx: PgTx,
-		sandboxId: string,
-		assertOwnerLease?: () => void,
-	): Promise<SandboxGeneration> {
-		await this.setSandboxContextWithLock(tx, sandboxId);
-		assertOwnerLease?.();
-		const rows = await tx<{ prior_epoch: string; version: string }[]>`
-			UPDATE sandboxes SET version = version + 1
-			WHERE id = ${sandboxId}
-			RETURNING version - 1 AS prior_epoch, version
-		`;
-		const row = rows[0];
-		if (row === undefined) throw createEnoent(sandboxId);
-		return { priorEpoch: BigInt(row.prior_epoch), epoch: BigInt(row.version) };
-	}
-
-	// ── Composite write operations ────────────────────────────────────────────────
-
-	async mkdirComposite(
-		tx: PgTx,
-		sandboxId: string,
-		parentId: bigint,
-		name: string,
-		mode: number,
-		expectedEpoch?: bigint,
-	): Promise<bigint> {
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ fenced: number; id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
-			new_inode AS (
-				INSERT INTO inodes (sandbox_id, kind, mode, size)
-				SELECT ${sandboxId}, 2, ${mode}, 0 FROM epoch
-				RETURNING id
-			),
-			inserted AS (
-				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-				SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
-				FROM new_inode
-				RETURNING inode_id AS id
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM inserted) AS id
-			FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.id === null) throw new Error("mkdirComposite: INSERT returned no rows");
-		return BigInt(row.id);
-	}
-
-	async rmComposite(
-		tx: PgTx,
-		sandboxId: string,
-		parentId: bigint,
-		name: string,
-		expectedEpoch?: bigint,
-	): Promise<bigint> {
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ fenced: number; removed_inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
-			removed_dirent AS (
-				DELETE FROM dirents
-				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM epoch) IS NOT NULL
-				RETURNING inode_id
-			),
-			-- Delete and decrement are split into two mutually-exclusive CTEs
-			-- (by the snapshot nlink) so each inode row is touched exactly once.
-			-- Postgres applies ONLY the UPDATE when a row is both updated and deleted
-			-- in one statement, which would leave an nlink=0 inode tombstone that
-			-- still references content_sha256 and pins its blob against GC.
-			deleted_inode AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT inode_id FROM removed_dirent)
-					AND nlink <= 1
-			),
-			decremented AS (
-				UPDATE inodes
-				SET nlink = nlink - 1
-				WHERE id IN (SELECT inode_id FROM removed_dirent)
-					AND nlink > 1
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced,
-			       (SELECT inode_id FROM removed_dirent) AS removed_inode_id
-			FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.removed_inode_id === null) throw createEnoent(name);
-		return BigInt(row.removed_inode_id);
-	}
-
-	async writeFileComposite(
-		tx: PgTx,
-		sandboxId: string,
-		parentId: bigint,
-		name: string,
-		mode: number,
-		size: number,
-		sha256: Uint8Array,
-		data?: Uint8Array,
-		expectedEpoch?: bigint,
-	): Promise<bigint> {
-		// F6: the CAS blob is committed by `commitBlob` in its own short tx BEFORE
-		// this composite runs, so there is no `blob_insert` CTE here — the
-		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ fenced: number; new_inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
-			new_inode AS (
-				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
-				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM epoch
-				RETURNING id
-			),
-			old_dirent AS (
-				SELECT inode_id FROM dirents
-				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-				  AND (SELECT 1 FROM ctx) IS NOT NULL
-			),
-			upserted AS (
-				INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-				SELECT ${String(parentId)}, ${name}, new_inode.id, ${sandboxId}
-				FROM new_inode
-				ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id
-				RETURNING inode_id
-			),
-			-- Drop the replaced inode in two mutually-exclusive statements (see
-			-- rmComposite): a combined update+delete of the same row applies only
-			-- the UPDATE, leaving an nlink=0 tombstone that pins the old blob.
-			deleted_old_inode AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT inode_id FROM old_dirent)
-					AND nlink <= 1
-			),
-			decremented AS (
-				UPDATE inodes
-				SET nlink = nlink - 1
-				WHERE id IN (SELECT inode_id FROM old_dirent)
-					AND nlink > 1
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM new_inode) AS new_inode_id
-			FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.new_inode_id === null) throw new Error("writeFileComposite: INSERT returned no rows");
-		// Omitted `data` means the caller already backfilled (see the interface note).
-		if (this.#blobCache !== undefined && data !== undefined) {
-			void this.#blobCache.set(sha256, data);
-		}
-		return BigInt(row.new_inode_id);
-	}
-
-	async mvComposite(
-		tx: PgTx,
-		sandboxId: string,
-		oldParentId: bigint,
-		oldName: string,
-		newParentId: bigint,
-		newName: string,
-		expectedEpoch?: bigint,
-	): Promise<void> {
-		// Audit M10: a single wCTE that both DELETEs the destination dirent and
-		// UPDATEs the source dirent into that same (parent_inode_id, name) slot
-		// raises a spurious unique_violation (→ EEXIST) — Postgres checks the PK
-		// for the UPDATE against a snapshot where the to-be-deleted row still
-		// exists. Split into two statements within the SAME transaction: statement
-		// 1 frees the destination slot (and cleans its inode), statement 2 renames
-		// the source into it. Statement 1's effects are visible to statement 2, so
-		// the rename can no longer collide. Atomicity is preserved by the tx.
-		// Both statements fence and advance the version; the tx-local epoch
-		// refresh in SqlFs absorbs the double bump.
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const destinationRows = await tx<{ fenced: number }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
-			old_dest AS (
-				DELETE FROM dirents
-				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM epoch) IS NOT NULL
-				RETURNING inode_id
-			),
-			-- Split delete/decrement by snapshot nlink so the overwritten
-			-- destination inode is touched exactly once (see rmComposite): a
-			-- combined update+delete applies only the UPDATE, leaving an nlink=0
-			-- tombstone that pins the destination's old blob against GC.
-			deleted_dest_inode AS (
-				DELETE FROM inodes
-				WHERE id IN (SELECT inode_id FROM old_dest)
-					AND nlink <= 1
-			),
-			decremented AS (
-				UPDATE inodes
-				SET nlink = nlink - 1
-				WHERE id IN (SELECT inode_id FROM old_dest)
-					AND nlink > 1
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced
-			FROM sandboxes WHERE id = ${sandboxId}
-			`;
-		if (destinationRows[0]?.fenced === 0) throw createEstale(sandboxId);
-		if (!destinationRows[0]) throw createEnoent(oldName);
-		// Re-take for snapshot ordering; re-entrant within this tx.
-		await PostgresDialect.takeWriterLock(tx, sandboxId);
-		const rows = await tx<{ fenced: number; inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${PostgresDialect.epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${PostgresDialect.epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
-			moved AS (
-				UPDATE dirents
-				SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-				WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-				  AND (SELECT 1 FROM epoch) IS NOT NULL
-				RETURNING inode_id
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT inode_id FROM moved) AS inode_id
-			FROM sandboxes WHERE id = ${sandboxId}
-		`;
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.inode_id === null) throw createEnoent(oldName);
-	}
-
-	// ── Private helpers ───────────────────────────────────────────────────────────
-
 	private db(): postgres.Sql {
 		if (!this.pool) throw new Error("PostgresDialect: not connected");
 		return this.pool;
 	}
 
-	// ── Stubs — implemented in subsequent user stories ────────────────────────────
-
-	// US-005
-	async createSandbox(
-		tx: PgTx,
-		sandboxId: string,
-		owner = "",
-	): Promise<{ rootInodeId: bigint; createdAt: string; epoch: bigint }> {
-		// Serialize lifecycle transitions with all composite writers. The first
-		// incarnation starts at zero; every recreation advances the tombstone.
-		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
-		const epochRows = await tx<{ epoch: string }[]>`
-			INSERT INTO sandbox_epochs (sandbox_id, epoch)
-			VALUES (${sandboxId}, 0)
-			ON CONFLICT (sandbox_id) DO UPDATE
-			SET epoch = sandbox_epochs.epoch + 1, deleted_at = NOW()
-			RETURNING epoch
-		`;
-		const epochRow = epochRows[0];
-		if (!epochRow) throw new Error("createSandbox: failed to allocate epoch");
-		const epoch = BigInt(epochRow.epoch);
-
-		const sandboxRows = await tx<{ created_at: Date }[]>`
-			INSERT INTO sandboxes (id, root_inode, owner, version)
-			VALUES (${sandboxId}, NULL, ${owner}, ${String(epoch)}) RETURNING created_at
-		`;
-		const sandboxRow = sandboxRows[0];
-		if (!sandboxRow) throw new Error("createSandbox: failed to insert sandbox row");
-		const createdAt = sandboxRow.created_at.toISOString();
-
-		const rootRows = await tx<{ id: string }[]>`
-			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
-			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
-			RETURNING id
-		`;
-		const rootRow = rootRows[0];
-		if (!rootRow) throw new Error("createSandbox: failed to create root inode");
-		const rootInodeId = BigInt(rootRow.id);
-
-		await tx`UPDATE sandboxes SET root_inode = ${String(rootInodeId)} WHERE id = ${sandboxId}`;
-
-		const homeInodeId = await this.#createDirInode(tx, sandboxId, rootInodeId, "home");
-		await this.#createDirInode(tx, sandboxId, rootInodeId, "tmp");
-		await this.#createDirInode(tx, sandboxId, rootInodeId, "bin");
-		await this.#createDirInode(tx, sandboxId, homeInodeId, "user");
-
-		return { rootInodeId, createdAt, epoch };
+	upsertBlob(...args: Parameters<BlobOperations["upsertBlob"]>): ReturnType<BlobOperations["upsertBlob"]> {
+		return this.blobs.upsertBlob(...args);
 	}
 
-	async deleteSandbox(tx: PgTx, sandboxId: string): Promise<bigint> {
-		await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
-		const rows = await tx<{ epoch: string }[]>`
-			WITH deleted AS (
-				DELETE FROM sandboxes
-				WHERE id = ${sandboxId}
-				RETURNING id, version
-			), tombstone AS (
-				INSERT INTO sandbox_epochs (sandbox_id, epoch)
-				SELECT id, version + 1 FROM deleted
-				ON CONFLICT (sandbox_id) DO UPDATE
-				SET epoch = GREATEST(sandbox_epochs.epoch, EXCLUDED.epoch), deleted_at = NOW()
-				RETURNING epoch
-			)
-			SELECT epoch FROM tombstone
-			UNION ALL
-			SELECT epoch FROM sandbox_epochs
-			WHERE sandbox_id = ${sandboxId} AND NOT EXISTS (SELECT 1 FROM tombstone)
-		`;
-		return BigInt(rows[0]?.epoch ?? 0);
+	commitBlob(...args: Parameters<BlobOperations["commitBlob"]>): ReturnType<BlobOperations["commitBlob"]> {
+		return this.blobs.commitBlob(...args);
 	}
 
-	async sandboxExists(tx: PgTx, sandboxId: string): Promise<boolean> {
-		try {
-			const rows = await tx<{ exists: boolean }[]>`
-				SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ${sandboxId}) AS exists
-			`;
-			return rows[0]?.exists ?? false;
-		} catch (err) {
-			throw translateSqlError(err, sandboxId);
-		}
+	getBlob(...args: Parameters<BlobOperations["getBlob"]>): ReturnType<BlobOperations["getBlob"]> {
+		return this.blobs.getBlob(...args);
 	}
 
-	async getSandboxMeta(tx: PgTx, sandboxId: string): Promise<SandboxMeta | null> {
-		try {
-			const rows = await tx<
-				{
-					owner: string | null;
-					name: string | null;
-					python: boolean;
-					javascript: boolean;
-					network: boolean;
-					created_at: Date;
-				}[]
-			>`
-				SELECT owner, name, python, javascript, network, created_at FROM sandboxes WHERE id = ${sandboxId}
-			`;
-			if (rows.length === 0) return null;
-			const r = rows[0]!;
-			return {
-				owner: r.owner,
-				name: r.name,
-				python: r.python,
-				javascript: r.javascript,
-				network: r.network,
-				createdAt: r.created_at.toISOString(),
-			};
-		} catch (err) {
-			throw translateSqlError(err, sandboxId);
-		}
+	getBlobNoTx(...args: Parameters<BlobOperations["getBlobNoTx"]>): ReturnType<BlobOperations["getBlobNoTx"]> {
+		return this.blobs.getBlobNoTx(...args);
 	}
 
-	async updateSandboxMeta(tx: PgTx, sandboxId: string, meta: SandboxMeta): Promise<void> {
-		let rows: Array<{ id: string }>;
-		try {
-			rows = await tx<{ id: string }[]>`
-				UPDATE sandboxes
-				SET owner = ${meta.owner}, name = ${meta.name}, python = ${meta.python}, javascript = ${meta.javascript}, network = ${meta.network ?? false}
-				WHERE id = ${sandboxId}
-				RETURNING id
-			`;
-		} catch (err) {
-			throw translateSqlError(err, sandboxId);
-		}
-		if (rows.length === 0) {
-			throw Object.assign(new Error(`ENOENT: sandbox ${sandboxId} not found`), {
-				code: "ENOENT",
-			});
-		}
+	getBlobsForSandbox(
+		...args: Parameters<BlobOperations["getBlobsForSandbox"]>
+	): ReturnType<BlobOperations["getBlobsForSandbox"]> {
+		return this.blobs.getBlobsForSandbox(...args);
 	}
 
-	/** Advancing `version` is what makes every replica's next freshness check rebuild its shell. */
-	async updateSandboxRuntime(
-		tx: PgTx,
-		sandboxId: string,
-		runtime: Partial<Pick<SandboxMeta, "python" | "javascript" | "network">>,
-	): Promise<SandboxMeta | null> {
-		try {
-			await PostgresDialect.takeWriterLock(tx, sandboxId);
-			const rows = await tx<
-				{
-					owner: string | null;
-					name: string | null;
-					python: boolean;
-					javascript: boolean;
-					network: boolean;
-					created_at: Date;
-				}[]
-			>`
-				UPDATE sandboxes
-				SET python = COALESCE(${runtime.python ?? null}::boolean, python),
-					javascript = COALESCE(${runtime.javascript ?? null}::boolean, javascript),
-					network = COALESCE(${runtime.network ?? null}::boolean, network),
-					version = version + 1
-				WHERE id = ${sandboxId}
-				RETURNING owner, name, python, javascript, network, created_at
-			`;
-			const r = rows[0];
-			if (r === undefined) return null;
-			return {
-				owner: r.owner,
-				name: r.name,
-				python: r.python,
-				javascript: r.javascript,
-				network: r.network,
-				createdAt: r.created_at.toISOString(),
-			};
-		} catch (err) {
-			throw translateSqlError(err, sandboxId);
-		}
+	gcOrphanBlobs(...args: Parameters<BlobOperations["gcOrphanBlobs"]>): ReturnType<BlobOperations["gcOrphanBlobs"]> {
+		return this.blobs.gcOrphanBlobs(...args);
 	}
 
-	async listSandboxes(tx: PgTx, owner?: string): Promise<SandboxListEntry[]> {
-		try {
-			const rows =
-				owner !== undefined
-					? await tx<
-							{
-								id: string;
-								name: string | null;
-								owner: string | null;
-								created_at: Date;
-								python: boolean;
-								javascript: boolean;
-								network: boolean;
-							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes WHERE owner = ${owner} ORDER BY created_at DESC`
-					: await tx<
-							{
-								id: string;
-								name: string | null;
-								owner: string | null;
-								created_at: Date;
-								python: boolean;
-								javascript: boolean;
-								network: boolean;
-							}[]
-						>`SELECT id, name, owner, created_at, python, javascript, network FROM sandboxes ORDER BY created_at DESC`;
-			return rows.map((r) => ({
-				id: r.id,
-				name: r.name,
-				owner: r.owner,
-				createdAt: r.created_at,
-				python: r.python,
-				javascript: r.javascript,
-				network: r.network,
-			}));
-		} catch (err) {
-			throw translateSqlError(err, "listSandboxes");
-		}
+	setSandboxContext(
+		...args: Parameters<SandboxOperations["setSandboxContext"]>
+	): ReturnType<SandboxOperations["setSandboxContext"]> {
+		return this.sandbox.setSandboxContext(...args);
 	}
 
-	/** Inserts a kind=2 inode and links it under `parentInodeId` with `name`. Returns new inode id. */
-	async #createDirInode(tx: PgTx, sandboxId: string, parentInodeId: bigint, name: string): Promise<bigint> {
-		const rows = await tx<{ id: string }[]>`
-			INSERT INTO inodes (sandbox_id, kind, mode, size, nlink)
-			VALUES (${sandboxId}, 2, ${0o755}, 0, 1)
-			RETURNING id
-		`;
-		const row = rows[0];
-		if (!row) throw new Error(`createSandbox: failed to create inode for /${name}`);
-		const inodeId = BigInt(row.id);
-		await tx`
-			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-			VALUES (${String(parentInodeId)}, ${name}, ${String(inodeId)}, ${sandboxId})
-		`;
-		return inodeId;
+	setSandboxContextWithLock(
+		...args: Parameters<SandboxOperations["setSandboxContextWithLock"]>
+	): ReturnType<SandboxOperations["setSandboxContextWithLock"]> {
+		return this.sandbox.setSandboxContextWithLock(...args);
 	}
 
-	// US-006
-	/** Fence carrier for inode-creating writes (`mkdir -p`, `cp`, `symlink`, fallbacks). */
-	async createInode(tx: PgTx, opts: CreateInodeOpts, expectedEpoch?: bigint): Promise<bigint> {
-		const rows = await tx<{ fenced: number; id: string | null }[]>`
-			WITH ${PostgresDialect.fenceAndAdvance(tx, opts.sandboxId, expectedEpoch)},
-			inserted AS (
-				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256, symlink_target)
-				SELECT ${opts.sandboxId}, ${opts.kind}, ${opts.mode}, ${opts.size}, ${opts.contentSha256 ?? null}, ${opts.symlinkTarget ?? null}
-				FROM epoch
-				RETURNING id
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM inserted) AS id
-		`;
-		const row = rows[0];
-		if (!row) throw new Error("createInode: INSERT returned no rows");
-		if (row.fenced === 0) throw createEstale(opts.sandboxId);
-		if (row.id === null) throw new Error("createInode: INSERT returned no rows");
-		return BigInt(row.id);
+	getSandboxEpoch(
+		...args: Parameters<SandboxOperations["getSandboxEpoch"]>
+	): ReturnType<SandboxOperations["getSandboxEpoch"]> {
+		return this.sandbox.getSandboxEpoch(...args);
 	}
 
-	async getInode(tx: PgTx, inodeId: bigint): Promise<InodeRow | null> {
-		const rows = await tx<
-			{
-				id: string;
-				sandbox_id: string;
-				kind: number;
-				mode: number;
-				size: string;
-				mtime: Date;
-				nlink: number;
-				content_sha256: Buffer | null;
-				symlink_target: string | null;
-			}[]
-		>`
-			SELECT id, sandbox_id, kind, mode, size, mtime, nlink, content_sha256, symlink_target
-			FROM inodes
-			WHERE id = ${String(inodeId)}
-		`;
-		const row = rows[0];
-		if (!row) return null;
-		return {
-			id: BigInt(row.id),
-			sandboxId: row.sandbox_id,
-			kind: row.kind as InodeKind,
-			mode: row.mode,
-			size: Number(row.size),
-			mtime: row.mtime,
-			nlink: row.nlink,
-			contentSha256: row.content_sha256,
-			symlinkTarget: row.symlink_target,
-		};
+	retireSandboxGeneration(
+		...args: Parameters<SandboxOperations["retireSandboxGeneration"]>
+	): ReturnType<SandboxOperations["retireSandboxGeneration"]> {
+		return this.sandbox.retireSandboxGeneration(...args);
 	}
 
-	/** Fence carrier for `chmod` and `utimes`. */
-	async updateInode(
-		tx: PgTx,
-		inodeId: bigint,
-		updates: UpdateInodeOpts,
-		sandboxId: string,
-		expectedEpoch?: bigint,
-	): Promise<void> {
-		// Build a snake_case patch object for postgres.js dynamic sql(obj) helper
-		const patch: Record<string, string | number | Date | Uint8Array | null> = Object.create(null);
-		if (updates.mode !== undefined) patch.mode = updates.mode;
-		if (updates.size !== undefined) patch.size = updates.size;
-		if (updates.mtime !== undefined) patch.mtime = updates.mtime;
-		if ("contentSha256" in updates) patch.content_sha256 = updates.contentSha256 ?? null;
-
-		// No patch is no mutation: bumping here would advance the epoch for a no-op.
-		if (Object.keys(patch).length === 0) return;
-
-		const rows = await tx<{ fenced: number }[]>`
-			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
-			updated AS (
-				UPDATE inodes SET ${tx(patch)}
-				WHERE id = ${String(inodeId)} AND (SELECT 1 FROM epoch) IS NOT NULL
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced
-		`;
-		// A missing inode stays a silent no-op, as before; only the fence throws.
-		if (rows[0]?.fenced === 0) throw createEstale(sandboxId);
+	createSandbox(
+		...args: Parameters<SandboxOperations["createSandbox"]>
+	): ReturnType<SandboxOperations["createSandbox"]> {
+		return this.sandbox.createSandbox(...args);
 	}
 
-	async deleteInode(tx: PgTx, inodeId: bigint): Promise<void> {
-		await tx`DELETE FROM inodes WHERE id = ${String(inodeId)}`;
+	deleteSandbox(
+		...args: Parameters<SandboxOperations["deleteSandbox"]>
+	): ReturnType<SandboxOperations["deleteSandbox"]> {
+		return this.sandbox.deleteSandbox(...args);
 	}
 
-	// US-007
-	/** Fence carrier for `link`. Must run before `insertDirent` so ESTALE cannot leave a dangling dirent. */
-	async incrementNlink(tx: PgTx, inodeId: bigint, sandboxId: string, expectedEpoch?: bigint): Promise<void> {
-		const rows = await tx<{ fenced: number }[]>`
-			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
-			bumped AS (
-				UPDATE inodes SET nlink = nlink + 1
-				WHERE id = ${String(inodeId)} AND (SELECT 1 FROM epoch) IS NOT NULL
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced
-		`;
-		if (rows[0]?.fenced === 0) throw createEstale(sandboxId);
+	sandboxExists(
+		...args: Parameters<SandboxOperations["sandboxExists"]>
+	): ReturnType<SandboxOperations["sandboxExists"]> {
+		return this.sandbox.sandboxExists(...args);
 	}
 
-	async decrementNlink(tx: PgTx, inodeId: bigint): Promise<number> {
-		const rows = await tx<{ nlink: number }[]>`
-			UPDATE inodes SET nlink = nlink - 1 WHERE id = ${String(inodeId)} RETURNING nlink
-		`;
-		const row = rows[0];
-		if (!row) throw new Error(`decrementNlink: inode ${inodeId} not found`);
-		return row.nlink;
+	getSandboxMeta(
+		...args: Parameters<SandboxOperations["getSandboxMeta"]>
+	): ReturnType<SandboxOperations["getSandboxMeta"]> {
+		return this.sandbox.getSandboxMeta(...args);
 	}
 
-	// US-008
-	async insertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<void> {
-		// Derive sandbox_id from the parent inode to avoid needing it as a parameter.
-		await tx`
-			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-			SELECT ${String(parentId)}, ${name}, ${String(inodeId)}, sandbox_id
-			FROM inodes
-			WHERE id = ${String(parentId)}
-		`;
+	updateSandboxMeta(
+		...args: Parameters<SandboxOperations["updateSandboxMeta"]>
+	): ReturnType<SandboxOperations["updateSandboxMeta"]> {
+		return this.sandbox.updateSandboxMeta(...args);
 	}
 
-	// US-009
-	async upsertDirent(tx: PgTx, parentId: bigint, name: string, inodeId: bigint): Promise<bigint | null> {
-		// Capture the old inode_id (if any) before the upsert, then return it after.
-		const rows = await tx<{ old_inode_id: string | null }[]>`
-			WITH existing AS (
-				SELECT inode_id FROM dirents
-				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-			)
-			INSERT INTO dirents (parent_inode_id, name, inode_id, sandbox_id)
-			SELECT ${String(parentId)}, ${name}, ${String(inodeId)}, sandbox_id
-			FROM inodes WHERE id = ${String(parentId)}
-			ON CONFLICT (parent_inode_id, name) DO UPDATE SET inode_id = EXCLUDED.inode_id
-			RETURNING (SELECT inode_id FROM existing) AS old_inode_id
-		`;
-		const row = rows[0];
-		if (!row) throw new Error("upsertDirent: INSERT returned no rows");
-		return row.old_inode_id !== null ? BigInt(row.old_inode_id) : null;
+	updateSandboxRuntime(
+		...args: Parameters<PostgresSandbox["updateSandboxRuntime"]>
+	): ReturnType<PostgresSandbox["updateSandboxRuntime"]> {
+		return this.sandbox.updateSandboxRuntime(...args);
 	}
 
-	// US-010
-	/** Fence carrier for `rm -r` and the non-composite `rm` fallback. */
-	async deleteDirent(
-		tx: PgTx,
-		parentId: bigint,
-		name: string,
-		sandboxId: string,
-		expectedEpoch?: bigint,
-	): Promise<bigint> {
-		const rows = await tx<{ fenced: number; inode_id: string | null }[]>`
-			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
-			removed AS (
-				DELETE FROM dirents
-				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
-					AND (SELECT 1 FROM epoch) IS NOT NULL
-				RETURNING inode_id
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT inode_id FROM removed) AS inode_id
-		`;
-		const row = rows[0];
-		if (row?.fenced === 0) throw createEstale(sandboxId);
-		if (!row || row.inode_id === null) throw createEnoent(name);
-		return BigInt(row.inode_id);
+	listSandboxes(
+		...args: Parameters<SandboxOperations["listSandboxes"]>
+	): ReturnType<SandboxOperations["listSandboxes"]> {
+		return this.sandbox.listSandboxes(...args);
 	}
 
-	// US-011
-	async listDirents(tx: PgTx, parentId: bigint): Promise<DirentRow[]> {
-		const rows = await tx<{ parent_inode_id: string; name: string; inode_id: string }[]>`
-			SELECT d.parent_inode_id, d.name, d.inode_id
-			FROM dirents d
-			JOIN inodes i ON i.id = d.inode_id
-			WHERE d.parent_inode_id = ${String(parentId)}
-			ORDER BY d.name
-		`;
-		return rows.map((r) => ({
-			parentInodeId: BigInt(r.parent_inode_id),
-			name: r.name,
-			inodeId: BigInt(r.inode_id),
-		}));
+	mkdirComposite(
+		...args: Parameters<NamespaceOperations["mkdirComposite"]>
+	): ReturnType<NamespaceOperations["mkdirComposite"]> {
+		return this.namespace.mkdirComposite(...args);
 	}
 
-	// US-012
-	/** Fence carrier for the non-composite `mv` fallback. Dest delete is gated on the fence. */
-	async moveDirent(
-		tx: PgTx,
-		oldParentId: bigint,
-		oldName: string,
-		newParentId: bigint,
-		newName: string,
-		sandboxId: string,
-		expectedEpoch?: bigint,
-	): Promise<void> {
-		// DELETE and UPDATE cannot share one WITH: data-modifying CTEs see the same
-		// snapshot, so the UPDATE would unique-conflict on a dest that still exists.
-		// Fence the DELETE first; the UPDATE only runs after the pin is accepted.
-		const fenced = await tx<{ fenced: number }[]>`
-			WITH ${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)},
-			cleared AS (
-				DELETE FROM dirents
-				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
-					AND (SELECT 1 FROM epoch) IS NOT NULL
-			)
-			SELECT (SELECT count(*) FROM epoch)::int AS fenced
-		`;
-		if (fenced[0]?.fenced === 0) throw createEstale(sandboxId);
-
-		const moved = await tx<{ inode_id: string }[]>`
-			UPDATE dirents
-			SET parent_inode_id = ${String(newParentId)}, name = ${newName}
-			WHERE parent_inode_id = ${String(oldParentId)} AND name = ${oldName}
-			RETURNING inode_id
-		`;
-		if (!moved[0]) throw createEnoent(oldName);
+	rmComposite(...args: Parameters<NamespaceOperations["rmComposite"]>): ReturnType<NamespaceOperations["rmComposite"]> {
+		return this.namespace.rmComposite(...args);
 	}
 
-	// US-013
-	async upsertBlob(tx: PgTx, sha256: Uint8Array, data: Uint8Array): Promise<void> {
-		await tx`
-			INSERT INTO blobs (sha256, data, size)
-			VALUES (${sha256}, ${data}, ${data.length})
-			ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
-		`;
-		// Fire-and-forget: don't hold the PG transaction (and the per-sandbox
-		// advisory lock acquired in setSandboxContext) open on Redis latency.
-		// RedisBlobCache.set() swallows its own errors so this promise cannot
-		// reject. Safe under races: blobs are content-addressable and the PG
-		// insert is ON CONFLICT DO UPDATE (touch-only — it bumps
-		// last_referenced_at but never rewrites data/size), so a concurrent SET
-		// with identical bytes is a no-op.
-		if (this.#blobCache !== undefined) {
-			void this.#blobCache.set(sha256, data);
-		}
+	writeFileComposite(
+		...args: Parameters<NamespaceOperations["writeFileComposite"]>
+	): ReturnType<NamespaceOperations["writeFileComposite"]> {
+		return this.namespace.writeFileComposite(...args);
 	}
 
-	// F6
-	async commitBlob(sha256: Uint8Array, data: Uint8Array): Promise<void> {
-		// Self-committing single-statement INSERT on its OWN pool connection — no
-		// surrounding BEGIN, no advisory lock, no sandbox context (`blobs` is
-		// unscoped CAS). The `ON CONFLICT DO UPDATE` tuple lock on a hot blob is
-		// thus released at statement COMMIT instead of being pinned to the
-		// long-lived script-tx, which is the F6 fix. The touch is unconditional so
-		// the GC grace window protects this blob until its referencing inode
-		// commits in the following composite tx.
-		await runTrustedDbAsync(
-			() => this.db()`
-				INSERT INTO blobs (sha256, data, size)
-				VALUES (${sha256}, ${data}, ${data.length})
-				ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()
-			`,
-		);
-		// Fire-and-forget Redis backfill — see upsertBlob.
-		if (this.#blobCache !== undefined) {
-			void this.#blobCache.set(sha256, data);
-		}
+	mvComposite(...args: Parameters<NamespaceOperations["mvComposite"]>): ReturnType<NamespaceOperations["mvComposite"]> {
+		return this.namespace.mvComposite(...args);
 	}
 
-	async getBlob(tx: PgTx, sha256: Uint8Array): Promise<Uint8Array | null> {
-		if (this.#blobCache !== undefined) {
-			const cached = await this.#blobCache.get(sha256);
-			if (cached !== null) return cached;
-		}
-		const rows = await tx<{ data: Buffer }[]>`SELECT data FROM blobs WHERE sha256 = ${sha256}`;
-		const data = rows[0]?.data;
-		if (!data) return null;
-		const bytes = new Uint8Array(data);
-		// Fire-and-forget backfill — see upsertBlob. The next reader hits Redis;
-		// if the SET hasn't finished yet they pay one more PG round-trip, which
-		// is strictly better than holding the advisory lock on every writer.
-		if (this.#blobCache !== undefined) {
-			void this.#blobCache.set(sha256, bytes);
-		}
-		return bytes;
+	createInode(...args: Parameters<NamespaceOperations["createInode"]>): ReturnType<NamespaceOperations["createInode"]> {
+		return this.namespace.createInode(...args);
 	}
 
-	async getBlobNoTx(sha256: Uint8Array): Promise<Uint8Array | null> {
-		if (this.#blobCache !== undefined) {
-			const cached = await this.#blobCache.get(sha256);
-			if (cached !== null) return cached;
-		}
-		const rows = await this.db()<{ data: Buffer }[]>`
-			SELECT data FROM blobs WHERE sha256 = ${sha256}
-		`;
-		const data = rows[0]?.data;
-		if (!data) return null;
-		const bytes = new Uint8Array(data);
-		if (this.#blobCache !== undefined) {
-			void this.#blobCache.set(sha256, bytes);
-		}
-		return bytes;
+	getInode(...args: Parameters<NamespaceOperations["getInode"]>): ReturnType<NamespaceOperations["getInode"]> {
+		return this.namespace.getInode(...args);
 	}
 
-	async getBlobsForSandbox(sandboxId: string, maxBytes: number): Promise<Array<{ inodeId: bigint; data: Uint8Array }>> {
-		if (maxBytes <= 0) return [];
-
-		// If RLS is later added to `inodes` requiring app.sandbox_id, this query
-		// will need to set that context first; today the WHERE filter suffices.
-		const metaRows = await this.db()<{ inode_id: string; content_sha256: Buffer; size: string }[]>`
-			WITH ranked AS (
-				SELECT
-					i.id              AS inode_id,
-					i.content_sha256  AS content_sha256,
-					i.size            AS size,
-					SUM(i.size) OVER (ORDER BY i.size ASC, i.id ASC) AS running_total
-				FROM inodes i
-				WHERE i.sandbox_id = ${sandboxId}
-					AND i.kind = ${INODE_KIND.FILE}
-					AND i.content_sha256 IS NOT NULL
-			)
-			SELECT inode_id, content_sha256, size
-			FROM ranked
-			WHERE running_total <= ${maxBytes}
-			ORDER BY size ASC, inode_id ASC
-		`;
-
-		if (metaRows.length === 0) return [];
-
-		const shas = metaRows.map((r) => new Uint8Array(r.content_sha256));
-		const shaHexes = shas.map((s) => Buffer.from(s).toString("hex"));
-
-		const redisHits =
-			this.#blobCache !== undefined
-				? await this.#blobCache.mget(shas)
-				: (shas.map(() => null) as Array<Uint8Array | null>);
-
-		const missByHex = new Map<string, Uint8Array>();
-		for (let i = 0; i < shas.length; i++) {
-			if (redisHits[i] === null) missByHex.set(shaHexes[i]!, shas[i]!);
-		}
-
-		const pgHits = new Map<string, Uint8Array>();
-		if (missByHex.size > 0) {
-			const missHexes = [...missByHex.keys()];
-			const pgRows = await this.db()<{ sha256: Buffer; data: Buffer }[]>`
-				SELECT b.sha256, b.data
-				FROM blobs b
-				JOIN unnest(${missHexes}::text[]) AS v(sha256_hex)
-					ON b.sha256 = decode(v.sha256_hex, 'hex')
-			`;
-			for (const r of pgRows) {
-				const hex = Buffer.from(r.sha256).toString("hex");
-				const bytes = new Uint8Array(r.data);
-				pgHits.set(hex, bytes);
-				// Fire-and-forget Redis backfill — see getBlob.
-				if (this.#blobCache !== undefined) {
-					const sha = missByHex.get(hex);
-					if (sha !== undefined) void this.#blobCache.set(sha, bytes);
-				}
-			}
-		}
-
-		const out: Array<{ inodeId: bigint; data: Uint8Array }> = [];
-		for (let i = 0; i < metaRows.length; i++) {
-			const bytes = redisHits[i] ?? pgHits.get(shaHexes[i]!);
-			if (bytes === undefined) continue; // referential-integrity gap; rare
-			out.push({ inodeId: BigInt(metaRows[i]!.inode_id), data: bytes });
-		}
-		return out;
+	updateInode(...args: Parameters<NamespaceOperations["updateInode"]>): ReturnType<NamespaceOperations["updateInode"]> {
+		return this.namespace.updateInode(...args);
 	}
 
-	// US-014: collect orphan blobs older than the grace window.
-	// Runs with NO sandbox context — the RLS escape (migration 0005) lets a
-	// context-less tx see every inode so the anti-join is correct. NOT EXISTS
-	// (vs NOT IN) is null-safe and lets the planner use idx_inodes_content_sha256.
-	// Dedup re-adoption race: a concurrent writer that touches+locks an existing
-	// orphan blob (ON CONFLICT DO UPDATE) and then inserts its inode can be missed
-	// here under READ COMMITTED — EvalPlanQual re-checks the updated blob row but
-	// the NOT EXISTS subquery keeps the stale snapshot and never sees the new
-	// inode, so a small/zero grace window would delete a freshly-referenced blob.
-	// The CALLER (runBlobGc) must therefore run this at REPEATABLE READ, which
-	// turns that conflict into a serialization failure (retried) instead of
-	// silent content loss. The grace window is defense-in-depth / churn control.
-	// `i.nlink > 0` excludes nlink=0 inode tombstones: the composite write/delete
-	// paths no longer create them, but rows left by older buggy builds would
-	// otherwise pin their blobs forever — this lets GC clear that backlog.
-	async gcOrphanBlobs(tx: PgTx, minAgeMs: number): Promise<Uint8Array[]> {
-		const rows = await tx<{ sha256: Buffer }[]>`
-			DELETE FROM blobs b
-			WHERE NOT EXISTS (
-				SELECT 1 FROM inodes i WHERE i.content_sha256 = b.sha256 AND i.nlink > 0
-			)
-			AND (
-				b.last_referenced_at IS NULL
-				OR b.last_referenced_at < now() - (${minAgeMs} * interval '1 millisecond')
-			)
-			RETURNING b.sha256
-		`;
-		return rows.map((r) => new Uint8Array(r.sha256));
+	deleteInode(...args: Parameters<NamespaceOperations["deleteInode"]>): ReturnType<NamespaceOperations["deleteInode"]> {
+		return this.namespace.deleteInode(...args);
 	}
 
-	// US-015
-	async loadAllPaths(tx: PgTx): Promise<Array<{ path: string } & PathCacheEntry>> {
-		const rows = await tx<
-			{
-				inode_id: string;
-				kind: number;
-				mode: number;
-				size: string;
-				mtime: Date;
-				content_sha256: Buffer | null;
-				symlink_target: string | null;
-				path: string;
-			}[]
-		>`
-			WITH RECURSIVE tree AS (
-				SELECT
-					i.id AS inode_id,
-					i.kind,
-					i.mode,
-					i.size,
-					i.mtime,
-					i.content_sha256,
-					i.symlink_target,
-					'/'::text AS path
-				FROM sandboxes s
-				JOIN inodes i ON i.id = s.root_inode
-				WHERE s.id = current_setting('app.sandbox_id')
-
-				UNION ALL
-
-				SELECT
-					i.id AS inode_id,
-					i.kind,
-					i.mode,
-					i.size,
-					i.mtime,
-					i.content_sha256,
-					i.symlink_target,
-					CASE WHEN t.path = '/' THEN '/' || d.name ELSE t.path || '/' || d.name END AS path
-				FROM tree t
-				JOIN dirents d ON d.parent_inode_id = t.inode_id
-				JOIN inodes i ON i.id = d.inode_id
-			)
-			SELECT inode_id, kind, mode, size, mtime, content_sha256, symlink_target, path
-			FROM tree
-		`;
-		return rows.map((r) => ({
-			path: r.path,
-			inodeId: BigInt(r.inode_id),
-			kind: r.kind as InodeKind,
-			mode: r.mode,
-			size: Number(r.size),
-			mtime: r.mtime,
-			contentSha256: r.content_sha256,
-			symlinkTarget: r.symlink_target,
-		}));
+	incrementNlink(
+		...args: Parameters<NamespaceOperations["incrementNlink"]>
+	): ReturnType<NamespaceOperations["incrementNlink"]> {
+		return this.namespace.incrementNlink(...args);
 	}
 
-	// US-016
-	async loadSubtreeInodes(tx: PgTx, rootInodeId: bigint): Promise<bigint[]> {
-		const rows = await tx<{ id: string }[]>`
-			WITH RECURSIVE subtree AS (
-				SELECT id FROM inodes WHERE id = ${String(rootInodeId)}
-
-				UNION ALL
-
-				SELECT i.id
-				FROM inodes i
-				JOIN dirents d ON d.inode_id = i.id
-				JOIN subtree s ON s.id = d.parent_inode_id
-			)
-			SELECT id FROM subtree
-		`;
-		return rows.map((r) => BigInt(r.id));
+	decrementNlink(
+		...args: Parameters<NamespaceOperations["decrementNlink"]>
+	): ReturnType<NamespaceOperations["decrementNlink"]> {
+		return this.namespace.decrementNlink(...args);
 	}
 
-	// US-017
-	/** Fence carrier: one bump for the whole batch, on the preamble it already ran. */
-	async bulkIngest(
-		tx: PgTx,
-		files: BulkIngestFile[],
-		sandboxId: string,
-		expectedEpoch?: bigint,
-	): Promise<Map<string, PathCacheEntry>> {
-		const result = new Map<string, PathCacheEntry>();
-		if (files.length === 0) return result;
-
-		const ctxRows = await tx<{ root_inode: string | null; fenced: number }[]>`
-			WITH sandbox AS (
-				SELECT id, root_inode FROM sandboxes WHERE id = ${sandboxId}
-			),
-			${PostgresDialect.fenceAndAdvance(tx, sandboxId, expectedEpoch)}
-			SELECT sandbox.root_inode, (SELECT count(*) FROM epoch)::int AS fenced
-			FROM sandbox
-		`;
-		const ctxRow = ctxRows[0];
-		if (ctxRow !== undefined && ctxRow.fenced === 0) throw createEstale(sandboxId);
-		if (!ctxRow?.root_inode) throw new Error("bulkIngest: sandbox not found or has no root inode");
-		const rootInodeId = BigInt(ctxRow.root_inode);
-
-		// ── Phase A: resolve/create ancestor directories by depth level ──────────
-
-		const dirMap = new Map<string, bigint>();
-		dirMap.set("/", rootInodeId);
-
-		const dirsByDepth = new Map<number, Set<string>>();
-		for (const f of files) {
-			const parts = f.path.split("/").filter(Boolean);
-			for (let i = 1; i < parts.length; i++) {
-				const dirPath = `/${parts.slice(0, i).join("/")}`;
-				const depth = i;
-				let set = dirsByDepth.get(depth);
-				if (!set) {
-					set = new Set();
-					dirsByDepth.set(depth, set);
-				}
-				set.add(dirPath);
-			}
-		}
-		const sortedDepths = [...dirsByDepth.keys()].sort((a, b) => a - b);
-
-		for (const depth of sortedDepths) {
-			const dirsAtDepth = dirsByDepth.get(depth)!;
-
-			const candidates: Array<{
-				dirPath: string;
-				name: string;
-				parentInodeId: bigint;
-			}> = [];
-			for (const dirPath of dirsAtDepth) {
-				if (dirMap.has(dirPath)) continue;
-				const parts = dirPath.split("/").filter(Boolean);
-				const name = parts[parts.length - 1]!;
-				const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-				const parentInodeId = dirMap.get(parentPath);
-				if (!parentInodeId) throw new Error(`bulkIngest: parent dir ${parentPath} not found`);
-				candidates.push({ dirPath, name, parentInodeId });
-			}
-
-			if (candidates.length === 0) continue;
-
-			const checkValues = candidates.map((c) => [String(c.parentInodeId), c.name]);
-			const existingRows = await tx<
-				{
-					parent_inode_id: string;
-					name: string;
-					inode_id: string;
-					kind: number;
-				}[]
-			>`
-				SELECT d.parent_inode_id, d.name, d.inode_id, i.kind
-				FROM dirents d
-				JOIN inodes i ON i.id = d.inode_id
-				JOIN (VALUES ${tx(checkValues)}) AS v(pid, nm)
-					ON d.parent_inode_id = v.pid::bigint AND d.name = v.nm
-			`;
-
-			const candidateByKey = new Map<string, (typeof candidates)[0]>();
-			for (const c of candidates) candidateByKey.set(`${String(c.parentInodeId)}:${c.name}`, c);
-
-			for (const row of existingRows) {
-				const match = candidateByKey.get(`${row.parent_inode_id}:${row.name}`);
-				if (row.kind !== INODE_KIND.DIRECTORY) {
-					throw createEnotdir(match?.dirPath ?? row.name);
-				}
-				if (match) dirMap.set(match.dirPath, BigInt(row.inode_id));
-			}
-
-			const toCreate = candidates.filter((c) => !dirMap.has(c.dirPath));
-			if (toCreate.length === 0) continue;
-
-			const dirInodeInserts = toCreate.map((_c) => ({
-				sandbox_id: sandboxId,
-				kind: INODE_KIND.DIRECTORY,
-				mode: 0o755,
-				size: 0,
-			}));
-			const createdDirInodes = await tx<{ id: string; mtime: string }[]>`
-				INSERT INTO inodes ${tx(dirInodeInserts)} RETURNING id, mtime
-			`;
-
-			const dirDirentInserts = toCreate.map((c, i) => ({
-				parent_inode_id: String(c.parentInodeId),
-				name: c.name,
-				inode_id: createdDirInodes[i]!.id,
-				sandbox_id: sandboxId,
-			}));
-			await tx`INSERT INTO dirents ${tx(dirDirentInserts)}`;
-
-			for (let i = 0; i < toCreate.length; i++) {
-				const c = toCreate[i]!;
-				const row = createdDirInodes[i]!;
-				const inodeId = BigInt(row.id);
-				dirMap.set(c.dirPath, inodeId);
-				result.set(c.dirPath, {
-					inodeId,
-					kind: INODE_KIND.DIRECTORY,
-					mode: 0o755,
-					size: 0,
-					mtime: new Date(row.mtime),
-					contentSha256: null,
-					symlinkTarget: null,
-				});
-			}
-		}
-
-		// ── Phase B: detect existing file dirents for overwrite handling ──────────
-
-		const filesWithHash = files.map((f) => {
-			const parts = f.path.split("/").filter(Boolean);
-			const name = parts[parts.length - 1]!;
-			const parentPath = parts.length === 1 ? "/" : `/${parts.slice(0, -1).join("/")}`;
-			return {
-				path: f.path,
-				content: f.content,
-				mode: f.mode,
-				sha256: Buffer.from(createHash("sha256").update(f.content).digest()),
-				name,
-				parentPath,
-				parentInodeId: dirMap.get(parentPath)!,
-			};
-		});
-
-		const fileCheckValues = filesWithHash.map((f) => [String(f.parentInodeId), f.name]);
-		const existingFileDirents = await tx<
-			{
-				parent_inode_id: string;
-				name: string;
-				inode_id: string;
-				kind: number;
-			}[]
-		>`
-			SELECT d.parent_inode_id, d.name, d.inode_id, i.kind
-			FROM dirents d
-			JOIN inodes i ON i.id = d.inode_id
-			JOIN (VALUES ${tx(fileCheckValues)}) AS v(pid, nm)
-				ON d.parent_inode_id = v.pid::bigint AND d.name = v.nm
-		`;
-
-		const existingFileMap = new Map<string, bigint>();
-		for (const row of existingFileDirents) {
-			if (row.kind === INODE_KIND.DIRECTORY) {
-				const match = filesWithHash.find((f) => String(f.parentInodeId) === row.parent_inode_id && f.name === row.name);
-				throw createEisdir(match?.path ?? row.name);
-			}
-			existingFileMap.set(`${row.parent_inode_id}:${row.name}`, BigInt(row.inode_id));
-		}
-
-		// ── Phase C: bulk insert blobs ────────────────────────────────────────────
-		// F6: commit the CAS blobs in their OWN short tx (own pool connection, no
-		// advisory lock — `blobs` is unscoped CAS) BEFORE the inode/dirent work in
-		// the script-tx, so the hot-blob `ON CONFLICT DO UPDATE` tuple lock is
-		// released at this statement's COMMIT instead of being pinned to the
-		// long-lived script-tx. The touch is unconditional so the GC grace window
-		// protects these blobs until their referencing inodes commit below.
-
-		const uniqueBlobs = new Map<string, { sha256: Buffer; data: Uint8Array; size: number }>();
-		for (const f of filesWithHash) {
-			const key = f.sha256.toString("hex");
-			if (!uniqueBlobs.has(key)) {
-				uniqueBlobs.set(key, {
-					sha256: f.sha256,
-					data: f.content,
-					size: f.content.length,
-				});
-			}
-		}
-		if (uniqueBlobs.size > 0) {
-			const blobRows = [...uniqueBlobs.values()];
-			const db = this.db();
-			await runTrustedDbAsync(
-				() => db`INSERT INTO blobs ${db(blobRows)} ON CONFLICT (sha256) DO UPDATE SET last_referenced_at = now()`,
-			);
-			if (this.#blobCache !== undefined) {
-				for (const b of blobRows) void this.#blobCache.set(new Uint8Array(b.sha256), b.data);
-			}
-		}
-
-		// ── Phase D: bulk insert file inodes ─────────────────────────────────────
-
-		const inodeInserts = filesWithHash.map((f) => ({
-			sandbox_id: sandboxId,
-			kind: INODE_KIND.FILE,
-			mode: f.mode,
-			size: f.content.length,
-			content_sha256: f.sha256,
-		}));
-		const insertedInodes = await tx<{ id: string; mtime: string }[]>`
-			INSERT INTO inodes ${tx(inodeInserts)} RETURNING id, mtime
-		`;
-
-		// ── Phase E: link dirents — upsert for overwrites, clean up old inodes ───
-
-		const toUpdate: Array<[string, string, string]> = [];
-		const oldInodeIds: bigint[] = [];
-		const toInsert: Array<{
-			parent_inode_id: string;
-			name: string;
-			inode_id: string;
-			sandbox_id: string;
-		}> = [];
-
-		for (let i = 0; i < filesWithHash.length; i++) {
-			const f = filesWithHash[i]!;
-			const newInodeId = insertedInodes[i]!.id;
-			const key = `${String(f.parentInodeId)}:${f.name}`;
-			const oldInodeId = existingFileMap.get(key);
-
-			if (oldInodeId !== undefined) {
-				toUpdate.push([String(f.parentInodeId), f.name, newInodeId]);
-				oldInodeIds.push(oldInodeId);
-			} else {
-				toInsert.push({
-					parent_inode_id: String(f.parentInodeId),
-					name: f.name,
-					inode_id: newInodeId,
-					sandbox_id: sandboxId,
-				});
-			}
-		}
-
-		if (toUpdate.length > 0) {
-			await tx`
-				UPDATE dirents d
-				SET inode_id = v.new_id::bigint
-				FROM (VALUES ${tx(toUpdate)}) AS v(pid, nm, new_id)
-				WHERE d.parent_inode_id = v.pid::bigint AND d.name = v.nm
-			`;
-			// Count occurrences of each old inode — hardlinks may cause duplicates
-			const nlinkDecrements = new Map<string, number>();
-			for (const id of oldInodeIds) {
-				const key = String(id);
-				nlinkDecrements.set(key, (nlinkDecrements.get(key) ?? 0) + 1);
-			}
-			const decrementValues = [...nlinkDecrements.entries()].map(([id, cnt]) => [id, String(cnt)]);
-			await tx`
-				UPDATE inodes i
-				SET nlink = i.nlink - v.cnt::int
-				FROM (VALUES ${tx(decrementValues)}) AS v(inode_id, cnt)
-				WHERE i.id = v.inode_id::bigint
-			`;
-			const oldIdStrings = [...nlinkDecrements.keys()];
-			await tx`DELETE FROM inodes WHERE id IN ${tx(oldIdStrings)} AND nlink <= 0`;
-		}
-
-		if (toInsert.length > 0) {
-			await tx`INSERT INTO dirents ${tx(toInsert)}`;
-		}
-
-		// ── Phase F: build result cache entries from INSERT RETURNING data ────────
-
-		for (let i = 0; i < filesWithHash.length; i++) {
-			const f = filesWithHash[i]!;
-			const row = insertedInodes[i]!;
-			result.set(f.path, {
-				inodeId: BigInt(row.id),
-				kind: INODE_KIND.FILE,
-				mode: f.mode,
-				size: f.content.length,
-				mtime: new Date(row.mtime),
-				contentSha256: f.sha256,
-				symlinkTarget: null,
-			});
-		}
-
-		return result;
+	insertDirent(
+		...args: Parameters<NamespaceOperations["insertDirent"]>
+	): ReturnType<NamespaceOperations["insertDirent"]> {
+		return this.namespace.insertDirent(...args);
 	}
 
-	// US-018
-	async resolvePath(tx: PgTx, path: string, followLast: boolean): Promise<bigint> {
-		try {
-			const rows = await tx<{ inode_id: string }[]>`
-				SELECT fs_resolve(${path}, ${followLast}) AS inode_id
-			`;
-			const row = rows[0];
-			if (!row) throw createEnoent(path);
-			return BigInt(row.inode_id);
-		} catch (err) {
-			throw translateSqlError(err, path);
-		}
+	upsertDirent(
+		...args: Parameters<NamespaceOperations["upsertDirent"]>
+	): ReturnType<NamespaceOperations["upsertDirent"]> {
+		return this.namespace.upsertDirent(...args);
+	}
+
+	deleteDirent(
+		...args: Parameters<NamespaceOperations["deleteDirent"]>
+	): ReturnType<NamespaceOperations["deleteDirent"]> {
+		return this.namespace.deleteDirent(...args);
+	}
+
+	listDirents(...args: Parameters<NamespaceOperations["listDirents"]>): ReturnType<NamespaceOperations["listDirents"]> {
+		return this.namespace.listDirents(...args);
+	}
+
+	moveDirent(...args: Parameters<NamespaceOperations["moveDirent"]>): ReturnType<NamespaceOperations["moveDirent"]> {
+		return this.namespace.moveDirent(...args);
+	}
+
+	loadAllPaths(
+		...args: Parameters<NamespaceOperations["loadAllPaths"]>
+	): ReturnType<NamespaceOperations["loadAllPaths"]> {
+		return this.namespace.loadAllPaths(...args);
+	}
+
+	loadSubtreeInodes(
+		...args: Parameters<NamespaceOperations["loadSubtreeInodes"]>
+	): ReturnType<NamespaceOperations["loadSubtreeInodes"]> {
+		return this.namespace.loadSubtreeInodes(...args);
+	}
+
+	resolvePath(...args: Parameters<NamespaceOperations["resolvePath"]>): ReturnType<NamespaceOperations["resolvePath"]> {
+		return this.namespace.resolvePath(...args);
+	}
+
+	bulkIngest(...args: Parameters<SqlDialect<PgTx>["bulkIngest"]>): ReturnType<SqlDialect<PgTx>["bulkIngest"]> {
+		return bulkIngest(args[0], args[1], args[2], args[3], this.blobs);
 	}
 }

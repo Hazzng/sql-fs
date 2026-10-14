@@ -122,16 +122,21 @@ describe("SessionManager.withSessionOrRehydrate()", () => {
 	});
 
 	it("persistSandboxMeta writes to store and is readable on rehydration", async () => {
-		await sm.withSession("default", "sb-meta", async (session) => {
-			session.owner = "creator";
-			await sm.persistSandboxMeta("default", "sb-meta", {
-				owner: "creator",
-				name: null,
-				python: true,
-				javascript: false,
-				network: false,
-			});
-		});
+		await sm.withSession(
+			"default",
+			"sb-meta",
+			async () => {
+				await sm.persistSandboxMeta("default", "sb-meta", {
+					owner: "creator",
+					name: null,
+					python: true,
+					javascript: false,
+					network: false,
+				});
+			},
+			undefined,
+			"creator",
+		);
 
 		// Simulate pool eviction by creating a new manager with same store
 		const sm2 = new SessionManager({

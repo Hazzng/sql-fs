@@ -1,9 +1,8 @@
 import type { Redis } from "ioredis";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PostgresDialect } from "../../../sql-fs/dialects/postgres.js";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";
 import { makeProbeDialect } from "../../../sql-fs/tests/fixtures/buffered-dialect.js";
-import { deferred } from "../../../sql-fs/tests/unit/freshness-helpers.js";
+import { makePausedPostgresRetirement } from "../../../sql-fs/tests/fixtures/postgres-retirement.js";
 import * as distributedLock from "../../distributed-rw-lock.js";
 import { SessionManager } from "../../session-manager.js";
 
@@ -15,18 +14,8 @@ afterEach(async () => {
 
 async function fixture() {
 	const probe = makeProbeDialect();
-	const postgres = new PostgresDialect("postgres://unused");
-	const blocked = deferred();
-	const resume = deferred();
-	let pause = true;
-	vi.spyOn(postgres, "setSandboxContextWithLock").mockImplementation(async () => {
-		if (!pause) return;
-		pause = false;
-		blocked.resolve();
-		await resume.promise;
-	});
-	const tx = async () => [{ prior_epoch: String(probe.version), version: String(++probe.version) }];
-	probe.dialect.retireSandboxGeneration = (_tx, id, guard) => postgres.retireSandboxGeneration(tx as never, id, guard);
+	const { blocked, resume, retire } = makePausedPostgresRetirement(probe);
+	probe.dialect.retireSandboxGeneration = retire;
 	const leases: AbortController[] = [];
 	vi.spyOn(distributedLock, "withDistributedRWLock").mockImplementation(async (_redis, _keys, _mode, fn) => {
 		const lease = new AbortController();

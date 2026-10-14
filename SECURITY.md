@@ -19,4 +19,4 @@ Python 3.9 resolves `anyio==4.12.1`, which retains [GHSA-82r6-8w77-94w6](https:/
 
 The Postgres application role must not be a superuser or have `BYPASSRLS`.
 Use separate Redis instances for control locks and blob data when cache pressure must not evict locks.
-See [the runtime settings](README.md#environment-variables) and [the concurrency model](DEVELOPER.md).
+See [the runtime settings](README.md#environment-variables) and [the concurrency model](docs/DEVELOPER.md).

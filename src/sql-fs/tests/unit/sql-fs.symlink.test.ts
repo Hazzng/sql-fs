@@ -1,6 +1,6 @@
 /**
- * Unit tests for SqlFs.symlink (default-deny).
- * US-040: SqlFs.symlink (default-deny)
+ * Unit tests for SqlFs.symlink defaults and explicit denial.
+ * US-040: SqlFs.symlink defaults and explicit denial
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -48,25 +48,18 @@ function makeDialect(overrides: Partial<SqlDialect<unknown>> = {}): SqlDialect<u
 	} as unknown as SqlDialect<unknown>;
 }
 
-// ── Tests: allowSymlinks=false (default) ─────────────────────────────────────
+// ── Tests: symlinks enabled by default ─────────────────────────────────────
 
-describe("SqlFs.symlink() — allowSymlinks=false (default)", () => {
+describe("SqlFs.symlink() — symlinks enabled by default", () => {
 	const sandboxId = "test-sandbox";
-	let fs: SqlFs;
-
-	beforeEach(async () => {
-		fs = new SqlFs({ dialect: makeDialect(), sandboxId });
-		await fs.ready();
-	});
-
-	it("throws EPERM immediately without any DB call", async () => {
+	it("creates a readable link when the option is omitted", async () => {
 		const dialect = makeDialect();
-		const strictFs = new SqlFs({ dialect, sandboxId });
-		await strictFs.ready();
+		const defaultFs = new SqlFs({ dialect, sandboxId });
+		await defaultFs.ready();
 
-		await expect(strictFs.symlink("/home", "/home/link")).rejects.toMatchObject({ code: "EPERM" });
-		expect(dialect.createInode).not.toHaveBeenCalled();
-		expect(dialect.insertDirent).not.toHaveBeenCalled();
+		await defaultFs.symlink("/home", "/home/link");
+		expect(await defaultFs.readlink("/home/link")).toBe("/home");
+		expect((await defaultFs.lstat("/home/link")).isSymbolicLink).toBe(true);
 	});
 
 	it("throws EPERM when allowSymlinks is explicitly false", async () => {
@@ -75,6 +68,8 @@ describe("SqlFs.symlink() — allowSymlinks=false (default)", () => {
 		await strictFs.ready();
 
 		await expect(strictFs.symlink("/home", "/home/link")).rejects.toMatchObject({ code: "EPERM" });
+		expect(dialect.createInode).not.toHaveBeenCalled();
+		expect(dialect.insertDirent).not.toHaveBeenCalled();
 	});
 });
 

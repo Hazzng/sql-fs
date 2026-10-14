@@ -21,7 +21,7 @@ test -x clients/python/.venv/bin/python || { echo 'Run pnpm setup:dev first.' >&
 run_id="verify-$(date +%s)-$$"
 evidence="$PWD/scripts/verify/.run/$run_id"
 mkdir -p "$evidence"
-compose=("${compose_command[@]}" --env-file /dev/null -p "sqlfs-$run_id" -f docker-compose.verify.yml)
+compose=("${compose_command[@]}" --env-file /dev/null -p "sqlfs-$run_id" -f infra/docker-compose.verify.yml)
 cleanup() {
 	result=$?
 	trap - EXIT
