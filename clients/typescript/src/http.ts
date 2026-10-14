@@ -115,7 +115,7 @@ export class Transport {
 			throw new Error("authSecret and adminSecret are mutually exclusive");
 		}
 
-		this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+		this.baseUrl = trimTrailingSlashes(options.baseUrl);
 		this.currentToken = options.adminSecret ? undefined : options.token;
 		this.authSecret = options.authSecret;
 		this.adminSecret = options.adminSecret;
@@ -449,4 +449,11 @@ export async function* iterSseEvents(response: Response): AsyncGenerator<[string
 	if (dataLines.length > 0) {
 		yield [eventName, parseSsePayload(dataLines)];
 	}
+}
+
+// A scan from the end, not `/\/+$/`, which backtracks quadratically on long runs of interior slashes (CodeQL js/polynomial-redos).
+function trimTrailingSlashes(value: string): string {
+	let end = value.length;
+	while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+	return value.slice(0, end);
 }
