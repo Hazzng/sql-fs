@@ -114,7 +114,7 @@ jobs:
         with:
           node-version-file: .node-version
           cache: pnpm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install uv==0.9.18
