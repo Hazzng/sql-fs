@@ -13,10 +13,11 @@
  * is the path just-git actually resolved. A script may background several clones, so each
  * invocation gets its own scope via AsyncLocalStorage.
  *
- * just-git's checkout never set the executable bit (blindmansion/just-git#10). The fix in
- * blindmansion/just-git#15 is carried in `patches/just-git@1.9.1.patch` until it is released. Every
- * file git writes is still given the mode its index entry records, because just-git's merge leaves
- * a conflicted file with its old mode.
+ * just-git 1.9.1 never sets the executable bit on checkout (blindmansion/just-git#10) and drops a
+ * one-sided mode change in a merge (blindmansion/just-git#18). `patches/just-git@1.9.1.patch`
+ * carries the fixes, blindmansion/just-git#15 and blindmansion/just-git#20, so just-git now writes
+ * every mode itself. The repair below, which gives each file git wrote its index mode, stays as a
+ * fallback until a just-git release includes both PRs; remove it then.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";

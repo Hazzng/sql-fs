@@ -4,8 +4,10 @@
  * - blindmansion/just-git#15 (fixes #10): status and diff report a chmod-only change, and a branch
  *   switch where a file differs only in mode rewrites the mode.
  * - blindmansion/just-git#14 (fixes #12): `git ls-tree`.
+ * - blindmansion/just-git#20 (fixes #18): a merge keeps a mode change made on either side.
+ * - blindmansion/just-git#21 (fixes #19): `--summary` in `show`, `log` and `diff`.
  *
- * When a just-git release includes both PRs, drop the patch and keep these tests.
+ * When a just-git release includes all four PRs, drop the patch and keep these tests.
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
@@ -67,6 +69,48 @@ describe("git wrapper — patched just-git behaviour", () => {
 	it("lists a tree with git ls-tree", async () => {
 		expect(await sh("cd repo && git ls-tree --name-only plain && git ls-tree HEAD | cut -d' ' -f1-2")).toEqual({
 			stdout: "run.sh\n100755 blob\n",
+			stderr: "",
+			exitCode: 0,
+		});
+	});
+
+	it("recurses, filters by path and resolves <rev>:<path> in git ls-tree", async () => {
+		await sh(
+			"cd repo && mkdir -p src/lib && echo a > src/a && echo b > src/lib/b && git add src && git commit -q -m src",
+		);
+		const r = await sh(
+			"cd repo && git ls-tree --name-only HEAD && git ls-tree -r --name-only HEAD && " +
+				"git ls-tree --name-only HEAD src/lib && git ls-tree -r --name-only HEAD:src",
+		);
+		expect(r).toEqual({
+			stdout: "run.sh\nsrc\n" + "run.sh\nsrc/a\nsrc/lib/b\n" + "src/lib\n" + "a\nlib/b\n",
+			stderr: "",
+			exitCode: 0,
+		});
+	});
+
+	it("keeps a mode-only change from the merged branch", async () => {
+		await sh("cd repo && git checkout -q -b side plain && chmod 755 run.sh && git commit -q -am exec");
+		await sh("cd repo && git checkout -q plain && echo n > n && git add n && git commit -q -m n");
+		const r = await sh("cd repo && git merge -q -m mg side && git ls-files -s run.sh | cut -c1-6 && stat -c %a run.sh");
+		expect(r).toEqual({ stdout: "100755\n755\n", stderr: "", exitCode: 0 });
+	});
+
+	it("gives a conflicted file the merged mode", async () => {
+		await sh(
+			"cd repo && git checkout -q -b side plain && echo theirs > run.sh && chmod 755 run.sh && git commit -q -am t",
+		);
+		await sh("cd repo && git checkout -q plain && echo ours > run.sh && git commit -q -am o");
+		const r = await sh(
+			"cd repo && git merge -q side; echo rc=$?; git ls-files -s run.sh | cut -c1-6 && stat -c %a run.sh",
+		);
+		expect(r.stdout.split("\n").slice(-6)).toEqual(["rc=1", "100644", "100644", "100755", "755", ""]);
+	});
+
+	it("prints git show --summary", async () => {
+		await sh("cd repo && git mv run.sh go.sh && echo n > n && git add n && git commit -q -m sum");
+		expect(await sh("cd repo && git show --summary --format=%s HEAD")).toEqual({
+			stdout: "sum\n\n rename run.sh => go.sh (100%)\n create mode 100644 n\n",
 			stderr: "",
 			exitCode: 0,
 		});

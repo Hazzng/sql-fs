@@ -13,7 +13,7 @@ patchedDependencies:
     hash: 7767ed5b1605abaf5ae15082347fa925b0dfecc7fe870fbcf2c30726c8cbb6b5
     path: patches/just-bash@3.6.0.patch
   just-git@1.9.1:
-    hash: 4b570d2b718ad13902e8392c88921ff339aec9df003956609c3cd2ae18f6bfa2
+    hash: 978c0c3e343a697099e5a9f43b8e74940506cc822e12a129570e425cc589858d
     path: patches/just-git@1.9.1.patch
 
 importers:
@@ -46,7 +46,7 @@ importers:
         version: 3.6.0(patch_hash=7767ed5b1605abaf5ae15082347fa925b0dfecc7fe870fbcf2c30726c8cbb6b5)
       just-git:
         specifier: ^1.9.1
-        version: 1.9.1(patch_hash=4b570d2b718ad13902e8392c88921ff339aec9df003956609c3cd2ae18f6bfa2)
+        version: 1.9.1(patch_hash=978c0c3e343a697099e5a9f43b8e74940506cc822e12a129570e425cc589858d)
       lru-cache:
         specifier: ^11.0.0
         version: 11.3.5
@@ -3783,7 +3783,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  just-git@1.9.1(patch_hash=4b570d2b718ad13902e8392c88921ff339aec9df003956609c3cd2ae18f6bfa2): {}
+  just-git@1.9.1(patch_hash=978c0c3e343a697099e5a9f43b8e74940506cc822e12a129570e425cc589858d): {}
 
   knip@6.4.1(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0):
     dependencies:
