@@ -6,7 +6,7 @@ services:
     ports:
       - "127.0.0.1::5432"
     volumes:
-      - ./scripts/initdb/00-create-app-role.sql:/docker-entrypoint-initdb.d/00-create-app-role.sql:ro
+      - ../scripts/initdb/00-create-app-role.sql:/docker-entrypoint-initdb.d/00-create-app-role.sql:ro
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:

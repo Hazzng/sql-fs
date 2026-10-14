@@ -128,8 +128,7 @@ export function sandboxRoutes(sessionManager: SessionManager): Hono<{ Variables:
 				tenant,
 				sandboxId,
 				async (session) => {
-					if (!session.owner) session.owner = owner;
-					session.name = name;
+					sessionManager.initializeSessionMetadata(session, owner, name);
 					// session.createdAt is set by getOrCreate from the DB RETURNING clause.
 					createdAt = session.createdAt;
 					// Forward createdAt so KV/Redis-backed metadata stores (whose getSandboxMetaFn

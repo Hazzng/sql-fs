@@ -142,7 +142,12 @@ describe.each([false, true])("buffered metadata before cache publication, direct
 });
 
 describe.each([false, true])("pending outside-scope blob writes, buffering=%s", (buffered) => {
-	it.each(["writeFile", "appendFile"] as const)("rejects %s before it enters a newly opened scope", async (method) => {
+	it.each([
+		["writeFile", false],
+		["appendFile", false],
+		["writeFile", true],
+		["appendFile", true],
+	] as const)("rejects %s after a scope transition, ended=%s", async (method, ended) => {
 		const probe = makeProbeDialect();
 		const fs = new SqlFs({
 			dialect: probe.dialect,
@@ -166,6 +171,7 @@ describe.each([false, true])("pending outside-scope blob writes, buffering=%s", 
 		const results = Promise.allSettled([pending]);
 		await waiting;
 		fs.beginScriptScope();
+		if (ended) await fs.endScriptScope();
 		release();
 		expect(await results).toMatchObject([{ status: "rejected", reason: { code: "ESTALE" } }]);
 		expect(probe.dialect.writeFileComposite).not.toHaveBeenCalled();

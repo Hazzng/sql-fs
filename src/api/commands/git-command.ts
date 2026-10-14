@@ -1,9 +1,9 @@
 /**
  * Custom `git` command — wraps just-git so a `clone` that fails partway cleans up after itself.
  *
- * just-git writes the index in full while the checkout is still running, and both just-git
- * (symlink targets escaping the worktree) and SqlFs (`allowSymlinks` defaults to false) abort
- * mid-checkout on a symlink. A non-zero exit is an ordinary exec result, so `SessionManager`
+ * just-git writes the index in full while the checkout is still running, and just-git rejects symlink
+ * targets escaping the worktree. SqlFs can also reject links when `allowSymlinks` is explicitly
+ * disabled. Both can abort mid-checkout. A non-zero exit is an ordinary exec result, so `SessionManager`
  * commits the half-built tree — and because the index is complete, `git status` then reports
  * every un-checked-out file as a staged deletion. `git add -A && git commit` turns those into a
  * real commit that wipes the tree. Real `git` removes a destination it created when a clone
