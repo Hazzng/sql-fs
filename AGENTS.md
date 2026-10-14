@@ -15,7 +15,7 @@ pnpm verify:architecture # also worker failure, stream finalization, input budge
 
 `pnpm verify:local` uses random loopback ports and a unique Compose project, applies migrations through server startup, and removes only its own containers and volumes. It ignores `.env` and inherited deployment settings. It writes logs and JSON proof to `scripts/verify/.run/`. A missing Docker daemon or skipped integration test fails the command.
 
-`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI uses this expanded profile. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
+`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI runs this expanded profile on pushes to `main`; PR checks keep the faster static, unit, build, and SDK gates. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
