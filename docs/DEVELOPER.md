@@ -200,7 +200,7 @@ echo $((balance - 50)) > balance.txt
 
 ## Key source files
 
-[Source ownership maps](src/README.md) describe module responsibilities and verification entry points.
+[Source ownership maps](../src/README.md) describe module responsibilities and verification entry points.
 
 | File | Contents |
 |---|---|
