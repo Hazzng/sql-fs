@@ -96,7 +96,7 @@ jobs:
       - run: pnpm build
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -122,7 +122,7 @@ jobs:
       - run: pnpm verify:architecture
       - name: Upload verification evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-evidence
           path: scripts/verify/.run/
