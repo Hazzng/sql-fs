@@ -9,6 +9,7 @@ import { readOnlyContext } from "../read-only-context.js";
 import { FairAdmission } from "./admission.js";
 import { assertWorkerMessageBudget } from "./message-budget.js";
 import {
+	mayApply,
 	OutcomeUnknownError,
 	type OwnerCommand,
 	type OwnerCommandKind,
@@ -19,7 +20,6 @@ import {
 	type OwnerRequest,
 	type OwnerResult,
 	type ShellExecutionLimits,
-	mayApply,
 } from "./protocol.js";
 import { workerRequestContext } from "./request-context.js";
 import { RequestOutcome, workerFailureCode } from "./request-outcome.js";

@@ -2,9 +2,10 @@ import type { LRUCache } from "lru-cache";
 import { createEloop, createEnoent, createEnotdir, createEsandboxgone } from "../errors.js";
 import { INODE_KIND, type PathCacheEntry, type SandboxGeneration, type SqlDialect } from "../types.js";
 import { FileContents } from "./file-contents.js";
-import { DEV_NULL, assertStoredPath, nameOf, parentOf, resolvePath, validatePath } from "./paths.js";
+import { assertStoredPath, DEV_NULL, nameOf, parentOf, resolvePath, validatePath } from "./paths.js";
 import type { ScriptPersistence } from "./script-persistence.js";
 import type { ContentChange, PathChange, Publication, ScopeSettlement } from "./types.js";
+
 interface CommittedView {
 	epoch: bigint;
 	readonly entries: Map<string, PathCacheEntry>;

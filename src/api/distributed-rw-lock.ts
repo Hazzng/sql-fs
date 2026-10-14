@@ -14,16 +14,18 @@ import type { Redis } from "ioredis";
 import {
 	AcquireErrorBudget,
 	DEFAULT_ACQUIRE_ERROR_BUDGET_MS,
+	getRedisCircuitBreaker,
 	type ProbeTicketHolder,
 	type RedisCircuitBreaker,
-	getRedisCircuitBreaker,
 } from "../redis/circuit-breaker.js";
+
 export { LockAcquireTimeoutError, LockLostAfterCommitError, LockLostError } from "./distributed-lock.js";
+
 import {
+	jitteredDelayMs,
 	LockAcquireTimeoutError,
 	LockLostAfterCommitError,
 	LockLostError,
-	jitteredDelayMs,
 	logLockLostAfterCommit,
 } from "./distributed-lock.js";
 import { preservesAmbiguousOutcome } from "./errors.js";

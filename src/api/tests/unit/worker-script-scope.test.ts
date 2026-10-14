@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkerFileSystem, WorkerScriptScope } from "../../worker-owner/filesystem.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 
 const pools: WorkerOwnerPool[] = [];
 

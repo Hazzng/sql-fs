@@ -5,8 +5,8 @@
  * envelope, paging bounds, and that non-text files are refused rather than mangled.
  */
 
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerTools } from "../../mcp/tools.js";
 import { SessionManager } from "../../session-manager.js";

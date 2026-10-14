@@ -11,7 +11,7 @@ import { INODE_KIND, type PathCacheEntry, type SqlDialect } from "../../types.js
 import type { CoherentView } from "../coherent-view.js";
 import { assertStoredPath, nameOf, parentOf, validatePath } from "../paths.js";
 import type { ScriptPersistence } from "../script-persistence.js";
-import { type ContentChange, type NamespacePolicy, PER_MUTATION_BASE_BYTES, type PathChange } from "../types.js";
+import { type ContentChange, type NamespacePolicy, type PathChange, PER_MUTATION_BASE_BYTES } from "../types.js";
 
 export type LinkMoveQueries<Tx> = Pick<
 	SqlDialect<Tx>,

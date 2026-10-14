@@ -13,7 +13,7 @@
 
 import type { Redis } from "ioredis";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LockLostAfterCommitError, LockLostError, execLockKey, withDistributedLock } from "../../distributed-lock.js";
+import { execLockKey, LockLostAfterCommitError, LockLostError, withDistributedLock } from "../../distributed-lock.js";
 import { type RWLockKeys, rwLockKeys, withDistributedRWLock } from "../../distributed-rw-lock.js";
 import { isRetryableError } from "../../errors.js";
 

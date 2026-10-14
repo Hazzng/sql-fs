@@ -3,7 +3,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import type { OwnerCommand, OwnerCommandKind, OwnerResult } from "../../worker-owner/protocol.js";
 
 const TENANTS = ["worker-runtime-a", "worker-runtime-b"] as const;

@@ -28,8 +28,8 @@ import {
 } from "./event-loop-monitor.js";
 import { loadExecLockOptions } from "./exec-lock-config.js";
 import { IngressAdmission, loadIngressOptions } from "./ingress-admission.js";
-import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
+import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
 import { authRoutes } from "./routes/auth.js";

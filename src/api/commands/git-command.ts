@@ -19,8 +19,8 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { posix } from "node:path";
-import { defineCommand } from "just-bash";
 import type { Command, ExecResult, IFileSystem } from "just-bash";
+import { defineCommand } from "just-bash";
 import { createGit } from "just-git";
 import { flattenTree, readCommit, revParse } from "just-git/repo";
 

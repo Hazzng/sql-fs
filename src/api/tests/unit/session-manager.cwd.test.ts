@@ -8,8 +8,8 @@
  * `session.cwd`, then passing it as `opts.cwd` before the next exec.
  */
 
-import { Bash, InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
+import { Bash, InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../session-manager.js";
 

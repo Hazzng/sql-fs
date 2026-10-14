@@ -2,8 +2,8 @@
  * Unit tests for SessionManager — US-074, US-075, US-076
  */
 
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../session-manager.js";
 
@@ -386,8 +386,11 @@ describe("SessionManager runtime options + Python semaphore (US-080a)", () => {
 		});
 
 		await Promise.all([
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(1)'"),
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(2)'"),
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=py; command=${command}thon3; $command -c 'print(3)'"),
 		]);
 		expect(peak).toBe(1);
@@ -489,8 +492,11 @@ describe("SessionManager JavaScript semaphore (MAX_CONCURRENT_JS)", () => {
 		});
 
 		await Promise.all([
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(1)'"),
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(2)'"),
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Bash expands this literal.
 			sm.execWithRuntimeThrottle(session, "command=no; command=${command}de; $command -e 'console.log(3)'"),
 		]);
 		expect(peak).toBe(1);

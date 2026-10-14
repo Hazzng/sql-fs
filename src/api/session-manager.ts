@@ -15,15 +15,16 @@ import { logAudit } from "./lib/audit.js";
 import { type ReadOnlyContext, readOnlyContext } from "./read-only-context.js";
 import { sessionLeaseContext } from "./session-lease-context.js";
 import {
-	type RuntimeOptions,
-	type SessionRuntime,
 	buildGitIdentity,
 	buildSandboxBaseEnv,
 	createSessionRuntime,
 	executeSessionRuntime,
+	type RuntimeOptions,
+	type SessionRuntime,
 } from "./session-runtime/engine.js";
-export { buildGitIdentity, buildSandboxBaseEnv, deriveExecGitCredentials } from "./session-runtime/engine.js";
+
 export type { RuntimeOptions, SessionScriptScope } from "./session-runtime/engine.js";
+export { buildGitIdentity, buildSandboxBaseEnv, deriveExecGitCredentials } from "./session-runtime/engine.js";
 
 import { RuntimeAdmission, type RuntimeAdmissionOptions } from "./session-manager/runtime-admission.js";
 import {
@@ -34,12 +35,13 @@ import {
 	sessionKey,
 } from "./session-manager/session-catalog.js";
 import { TenantBackends, type TenantBackendsOptions } from "./session-manager/tenant-backends.js";
+
 export { RuntimeBackpressureError } from "./session-manager/runtime-admission.js";
 export type { Session } from "./session-manager/session-catalog.js";
 
 import { WorkerFileSystem, WorkerScriptScope } from "./worker-owner/filesystem.js";
 import { assertWorkerMessageBudget } from "./worker-owner/message-budget.js";
-import { WorkerOwnerPool, type WorkerPoolOptions, loadWorkerPoolOptions } from "./worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool, type WorkerPoolOptions } from "./worker-owner/pool.js";
 import type { ShellExecutionLimits } from "./worker-owner/protocol.js";
 
 function asCoherentFs(fs: IFileSystem): ICoherentFs | undefined {

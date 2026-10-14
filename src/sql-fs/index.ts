@@ -21,7 +21,7 @@ import { PostgresDialect } from "./dialects/postgres.js";
 import { raceDriverFault } from "./driver-fault.js";
 import { createEnoent } from "./errors.js";
 import { RedisBlobCache } from "./redis-blob-cache.js";
-import { type ScriptTxBufferConfig, loadScriptTxBufferConfig } from "./script-tx-buffer.js";
+import { loadScriptTxBufferConfig, type ScriptTxBufferConfig } from "./script-tx-buffer.js";
 import { SqlFs } from "./sql-fs.js";
 import type { StorageBackend } from "./types.js";
 

@@ -13,8 +13,8 @@
  */
 
 import type { Redis } from "ioredis";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";
 import type { PathCacheEntry, SqlDialect } from "../../../sql-fs/types.js";

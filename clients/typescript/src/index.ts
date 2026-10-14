@@ -1,4 +1,4 @@
-export { Client, SandboxesResource, type ClientOptions, type CreateSandboxOptions } from "./client.js";
+export { Client, type ClientOptions, type CreateSandboxOptions, SandboxesResource } from "./client.js";
 export {
 	AuthError,
 	ConflictError,
@@ -23,15 +23,15 @@ export {
 	type TreeEntry,
 } from "./models.js";
 export {
-	FilesAPI,
-	Sandbox,
 	type DeleteOptions,
 	type ExecBatchOptions,
 	type ExecBatchScript,
 	type ExecOptions,
 	type ExecStreamOptions,
 	type FileContent,
+	FilesAPI,
 	type MkdirOptions,
+	Sandbox,
 	type TreeOptions,
 } from "./sandbox.js";
 export { version } from "./version.js";

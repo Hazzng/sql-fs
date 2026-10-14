@@ -5,7 +5,7 @@ import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
-import { type TenantConfig, loadTenantConfig } from "../../tenants.js";
+import { loadTenantConfig, type TenantConfig } from "../../tenants.js";
 
 const SKIP = !process.env.DATABASE_URL;
 const TENANT_ID = "default";

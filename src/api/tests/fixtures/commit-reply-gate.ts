@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { type Socket, createConnection, createServer } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 
 export async function commitReplyGate(connectionString: string, committed: () => Promise<boolean>) {
 	const upstream = new URL(connectionString);

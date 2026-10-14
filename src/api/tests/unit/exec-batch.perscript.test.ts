@@ -14,16 +14,16 @@
 
 import { Hono } from "hono";
 import { SignJWT } from "jose";
-import { InMemoryFs } from "just-bash";
 import type { BashExecResult, IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { apiErrorHandler } from "../../errors.js";
 import { executeBatch } from "../../lib/batch-exec.js";
 import { readOnlyContext } from "../../read-only-context.js";
 import { execRoutes } from "../../routes/exec.js";
-import { SessionManager } from "../../session-manager.js";
 import type { Session } from "../../session-manager.js";
+import { SessionManager } from "../../session-manager.js";
 
 const AUTH_SECRET = "test-secret-for-exec-batch-perscript-at-least-32bytes!";
 const secretBytes = new TextEncoder().encode(AUTH_SECRET);

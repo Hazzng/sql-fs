@@ -3,8 +3,8 @@ import { MessageChannel, Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionScriptScope } from "../../session-runtime/engine.js";
 import { assertWorkerMessageBudget } from "../../worker-owner/message-budget.js";
-import { mayApply } from "../../worker-owner/protocol.js";
 import type { OwnerCommand, OwnerReply, OwnerRequest } from "../../worker-owner/protocol.js";
+import { mayApply } from "../../worker-owner/protocol.js";
 
 const channels: MessageChannel[] = [];
 afterEach(() => {

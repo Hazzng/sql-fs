@@ -146,7 +146,7 @@ export interface IReadOnlyScopeFs extends IFileSystem {
 
 import { CoherentView } from "./state/coherent-view.js";
 import { NamespaceOperations } from "./state/namespace-operations.js";
-import { DEV_NULL, assertStoredPath, nameOf, normalizeFsPath, validatePath } from "./state/paths.js";
+import { assertStoredPath, DEV_NULL, nameOf, normalizeFsPath, validatePath } from "./state/paths.js";
 import { ScriptPersistence } from "./state/script-persistence.js";
 export class SqlFs<Tx = unknown> implements ICoherentFs, IReadOnlyScopeFs {
 	readonly #dialect: SqlDialect<Tx>;

@@ -1,7 +1,6 @@
 import { preservesAmbiguousOutcome } from "../errors.js";
 import { readOnlyContext } from "../read-only-context.js";
-import type { SessionManager } from "../session-manager.js";
-import type { Session } from "../session-manager.js";
+import type { Session, SessionManager } from "../session-manager.js";
 
 export interface BatchScriptEntry {
 	readonly id: string;

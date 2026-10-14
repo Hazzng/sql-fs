@@ -4,7 +4,7 @@
 
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { InMemoryRateLimitStore, clientIp, rateLimit } from "../../rate-limit.js";
+import { clientIp, InMemoryRateLimitStore, rateLimit } from "../../rate-limit.js";
 
 describe("InMemoryRateLimitStore", () => {
 	it("allows up to max in window then denies", () => {

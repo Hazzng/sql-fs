@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { path, cleanupTestDir, createTestDir, runRealBash, setupFiles } from "./fixture-runner.js";
+import { cleanupTestDir, createTestDir, path, runRealBash, setupFiles } from "./fixture-runner.js";
 
 describe("mkdir command - Real Bash Comparison", () => {
 	let testDir: string;

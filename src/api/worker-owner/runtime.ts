@@ -9,10 +9,10 @@ import type { ICoherentFs } from "../../sql-fs/sql-fs.js";
 import { LockLostError } from "../distributed-lock.js";
 import { readOnlyContext } from "../read-only-context.js";
 import {
-	type SessionRuntime,
 	closeSessionRuntime,
 	createSessionRuntime,
 	executeSessionRuntime,
+	type SessionRuntime,
 } from "../session-runtime/engine.js";
 import { budgetWorkerReply } from "./message-budget.js";
 import type { WorkerPoolOptions } from "./pool.js";

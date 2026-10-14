@@ -2,9 +2,9 @@ import type { CpOptions, MkdirOptions, RmOptions } from "just-bash";
 import { createEexist, createEisdir, createEnoent, createEnotdir, createEnotempty } from "../../errors.js";
 import { INODE_KIND, type SqlDialect } from "../../types.js";
 import type { CoherentView } from "../coherent-view.js";
-import { DEV_NULL, assertStoredPath, nameOf, parentOf, validatePath } from "../paths.js";
+import { assertStoredPath, DEV_NULL, nameOf, parentOf, validatePath } from "../paths.js";
 import type { ScriptPersistence } from "../script-persistence.js";
-import { type ContentChange, type NamespacePolicy, PER_MUTATION_BASE_BYTES, type PathChange } from "../types.js";
+import { type ContentChange, type NamespacePolicy, type PathChange, PER_MUTATION_BASE_BYTES } from "../types.js";
 
 const DEV_NULL_STAT = { mode: 0o666 };
 export type TreeQueries<Tx> = Pick<

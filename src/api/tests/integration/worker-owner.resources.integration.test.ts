@@ -6,7 +6,7 @@ import { destroyPostgresSandbox } from "../../../sql-fs/index.js";
 import { requireMigratedSchema } from "../../../sql-fs/tests/integration/helpers/schema-preconditions.js";
 import { type RuntimeOptions, SessionManager } from "../../session-manager.js";
 import { loadTenantConfig } from "../../tenants.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import type { OwnerCommand, OwnerCommandKind, OwnerResult } from "../../worker-owner/protocol.js";
 import { workerRequestContext } from "../../worker-owner/request-context.js";
 

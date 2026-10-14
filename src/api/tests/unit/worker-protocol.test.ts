@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type OwnerCommand, type OwnerIdentity, mayApply } from "../../worker-owner/protocol.js";
+import { mayApply, type OwnerCommand, type OwnerIdentity } from "../../worker-owner/protocol.js";
 
 const identity: OwnerIdentity = {
 	tenantId: "tenant",

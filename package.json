@@ -26,7 +26,7 @@
 		"bench:remote-bash": "python3 scripts/benchmark_remote_bash.py",
 		"typecheck": "tsc --noEmit",
 		"lint": "pnpm lint:biome && pnpm lint:oxlint",
-		"lint:fix": "biome check --write . && pnpm lint:oxlint",
+		"lint:fix": "biome check --write --error-on-warnings . && pnpm lint:oxlint",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:unit": "vitest run --exclude 'src/**/integration/**'",
@@ -37,7 +37,7 @@
 		"changeset": "changeset",
 		"changeset:version": "changeset version && node scripts/sync-openapi-version.mjs && pnpm install --lockfile-only",
 		"prepare": "lefthook install",
-		"lint:biome": "biome check .",
+		"lint:biome": "biome check --error-on-warnings .",
 		"lint:oxlint": "pnpm lint:oxlint:syntax && pnpm lint:oxlint:types",
 		"lint:oxlint:syntax": "NODE_OPTIONS=--import=tsx oxlint --deny-warnings .",
 		"lint:oxlint:types": "NODE_OPTIONS=--import=tsx oxlint -c .oxlintrc-type-aware.json --deny-warnings src clients/typescript"
@@ -57,7 +57,7 @@
 		"zod": "^3.24.0"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "^1.9.0",
+		"@biomejs/biome": "^2.5.15",
 		"@changesets/changelog-github": "^1.0.1",
 		"@changesets/cli": "^3.0.3",
 		"@oxlint/plugins": "1.87.0",

@@ -8,8 +8,8 @@ import {
 	type ContentChange,
 	type MutationSpec,
 	type NamespacePolicy,
-	PER_MUTATION_BASE_BYTES,
 	type PathChange,
+	PER_MUTATION_BASE_BYTES,
 } from "../types.js";
 
 const NEW_FILE_MODE = 0o644;

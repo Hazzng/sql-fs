@@ -1,4 +1,4 @@
-import { type ScriptScope, runInScriptScope } from "../../sql-fs/script-scope.js";
+import { runInScriptScope, type ScriptScope } from "../../sql-fs/script-scope.js";
 import { assertScriptLeaseHeld } from "./script-lease.js";
 
 export async function runInScriptTx<T>(

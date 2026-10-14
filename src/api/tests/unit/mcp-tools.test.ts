@@ -4,8 +4,8 @@
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerTools } from "../../mcp/tools.js";
 import { SessionManager } from "../../session-manager.js";

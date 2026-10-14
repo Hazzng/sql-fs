@@ -1,5 +1,5 @@
 import { preservesAmbiguousOutcome } from "../errors.js";
-import { OutcomeUnknownError, type OwnerCommand, type OwnerCommandKind, mayApply } from "./protocol.js";
+import { mayApply, OutcomeUnknownError, type OwnerCommand, type OwnerCommandKind } from "./protocol.js";
 
 export function workerFailureCode(error: unknown): string | undefined {
 	return error !== null && typeof error === "object" && "code" in error && typeof error.code === "string"

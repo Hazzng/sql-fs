@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";
 import type { SqlDialect } from "../../../sql-fs/types.js";
 import { clientSafeErrorCode, clientSafeErrorMessage, isRetryableError, mapFsErrorToStatus } from "../../errors.js";
-import { type ExecContext, consumeExecInput, execContext } from "../../exec-context.js";
+import { consumeExecInput, type ExecContext, execContext } from "../../exec-context.js";
 
 function context(inputLimitBytes: number): ExecContext {
 	return { maxFileBytes: 1024, inputLimitBytes, inputBytes: 0 };

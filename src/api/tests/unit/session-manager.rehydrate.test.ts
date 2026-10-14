@@ -6,8 +6,9 @@
  * 2. Cold hit: sandbox in PG but not in pool -> rehydrate via getOrCreate
  * 3. Cold miss: sandbox not in PG -> throw ENOENT
  */
-import { InMemoryFs } from "just-bash";
+
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SandboxMeta } from "../../../sql-fs/types.js";
 import { SessionManager } from "../../session-manager.js";

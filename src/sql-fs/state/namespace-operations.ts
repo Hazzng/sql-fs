@@ -9,6 +9,7 @@ import * as links from "./namespace/links-moves.js";
 import { DEV_NULL, parentOf } from "./paths.js";
 import type { ScriptPersistence } from "./script-persistence.js";
 import type { NamespacePolicy } from "./types.js";
+
 type CreateExclusiveOpts = Parameters<NonNullable<import("just-bash").IFileSystem["createExclusive"]>>[1];
 type NamespaceDialect<Tx> = fileWrites.FileWriteQueries<Tx> &
 	tree.TreeQueries<Tx> &

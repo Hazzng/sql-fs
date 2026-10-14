@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AuthVariables, authMiddleware } from "../../auth.js";
 import { execRoutes } from "../../routes/exec.js";
 import { SessionManager } from "../../session-manager.js";
-import { FakeRedis, asRedis } from "./helpers/session-manager-fakes.js";
+import { asRedis, FakeRedis } from "./helpers/session-manager-fakes.js";
 
 class CoherentMemoryFs extends InMemoryFs {
 	dirty = false;

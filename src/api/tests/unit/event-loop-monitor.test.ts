@@ -1,14 +1,14 @@
 /**
  * Unit tests for the F8 event-loop lag monitor (purely observational).
  * Covers the pure gap classifier, the structured `heartbeat_gap` emitter, and
- * the `monitorEventLoopDelay`-backed boot histogram (real busy-loop, no timers
- * faked — perf_hooks measures wall-clock).
+ * the `monitorEventLoopDelay`-backed boot histogram with a real busy-loop and native
+ * perf_hooks sampling.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	DEFAULT_STALL_THRESHOLD_MS,
 	classifyHeartbeatGap,
+	DEFAULT_STALL_THRESHOLD_MS,
 	eventLoopLagSnapshot,
 	recordHeartbeatGap,
 	resetEventLoopMonitorForTest,
@@ -102,7 +102,10 @@ describe("recordHeartbeatGap", () => {
 });
 
 describe("event-loop monitor lifecycle", () => {
-	afterEach(() => resetEventLoopMonitorForTest());
+	afterEach(() => {
+		resetEventLoopMonitorForTest();
+		vi.useRealTimers();
+	});
 
 	it("snapshot is undefined before start and defined after", () => {
 		expect(eventLoopLagSnapshot()).toBeUndefined();
@@ -203,6 +206,8 @@ describe("event-loop monitor lifecycle", () => {
 	// 150 ms stall that would trip a 100 ms threshold must stay silent under a high one, or the
 	// signal is a per-window chorus and worthless as an alert.
 	it("stays silent when a real stall stays under the threshold", async () => {
+		// Flush the logging window only after native perf_hooks sampling records the real stall.
+		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
 		const lines: string[] = [];
 		startEventLoopMonitor({
 			sampleIntervalMs: 60,
@@ -211,9 +216,10 @@ describe("event-loop monitor lifecycle", () => {
 			log: (l) => lines.push(l),
 		});
 		try {
-			await new Promise((res) => setTimeout(res, 40));
+			await expect.poll(() => eventLoopLagSnapshot()?.maxMs).toBeGreaterThan(0);
 			busyLoopMs(150);
-			await new Promise((res) => setTimeout(res, 140));
+			await expect.poll(() => eventLoopLagSnapshot()?.maxMs).toBeGreaterThanOrEqual(100);
+			vi.advanceTimersByTime(60);
 		} finally {
 			stopEventLoopMonitor();
 		}

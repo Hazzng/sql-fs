@@ -1,5 +1,5 @@
-import { InMemoryFs } from "just-bash";
 import type { BashExecResult } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ownerCancellation } from "../../../execution/owner-cancellation.js";
 import { SqlFs } from "../../../sql-fs/sql-fs.js";

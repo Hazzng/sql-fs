@@ -6,8 +6,8 @@
  *  - runtime semaphore waiters are removed on abort
  */
 
-import { InMemoryFs, defineCommand } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { defineCommand, InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RuntimeBackpressureError, SessionManager } from "../../session-manager.js";
 import type { OwnerMetadata } from "../../worker-owner/protocol.js";

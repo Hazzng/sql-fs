@@ -3,7 +3,7 @@
  */
 
 import { Hono } from "hono";
-import { SignJWT, jwtVerify } from "jose";
+import { jwtVerify, SignJWT } from "jose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultRateLimitStore } from "../../rate-limit.js";
 import { authRoutes } from "../../routes/auth.js";

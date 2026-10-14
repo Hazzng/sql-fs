@@ -1,6 +1,6 @@
 import type { Redis } from "ioredis";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
 import { rwLockKeys } from "../../distributed-rw-lock.js";
 import { sessionLeaseSignal } from "../../session-lease-context.js";

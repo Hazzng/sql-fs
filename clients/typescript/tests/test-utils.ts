@@ -11,7 +11,9 @@ export interface CapturedRequest {
 
 export function jsonResponse(status: number, body: unknown, headers?: HeadersInit): Response {
 	const responseHeaders = new Headers({ "Content-Type": "application/json" });
-	new Headers(headers).forEach((value, name) => responseHeaders.set(name, value));
+	new Headers(headers).forEach((value, name) => {
+		responseHeaders.set(name, value);
+	});
 	return new Response(JSON.stringify(body), { status, headers: responseHeaders });
 }
 

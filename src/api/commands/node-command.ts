@@ -21,8 +21,8 @@
  * Fixes: https://github.com/Hazzng/sql-fs/issues/76
  */
 
-import { defineCommand } from "just-bash";
 import type { CommandContext, ExecResult } from "just-bash";
+import { defineCommand } from "just-bash";
 
 const HINT = `\
 'node' is not available in this sandbox. Use 'js-exec' instead:

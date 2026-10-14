@@ -5,9 +5,9 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	assertAcquireTimeoutAboveLeases,
 	DEFAULT_ACQUIRE_TIMEOUT_MS,
 	type ExecLockOptions,
-	assertAcquireTimeoutAboveLeases,
 	loadExecLockOptions,
 } from "../../exec-lock-config.js";
 

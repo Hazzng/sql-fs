@@ -14,15 +14,15 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { InMemoryFs } from "just-bash";
 import type { IFileSystem } from "just-bash";
+import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
 import type { ICoherentFs } from "../../../sql-fs/sql-fs.js";
 import type { BulkIngestFile, SandboxMeta } from "../../../sql-fs/types.js";
 import { createMcpServer } from "../../mcp/server.js";
 import { registerTools } from "../../mcp/tools.js";
-import { SessionManager } from "../../session-manager.js";
 import type { Session } from "../../session-manager.js";
+import { SessionManager } from "../../session-manager.js";
 
 /**
  * Wraps `InMemoryFs` with a `bulkIngest` shim so MCP fs_ingest tests (which

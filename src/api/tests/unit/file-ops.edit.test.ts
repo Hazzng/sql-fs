@@ -6,7 +6,7 @@
 
 import { InMemoryFs } from "just-bash";
 import { describe, expect, it } from "vitest";
-import { REPLACE_FLUSH_PIECES, editFile } from "../../lib/file-ops.js";
+import { editFile, REPLACE_FLUSH_PIECES } from "../../lib/file-ops.js";
 import type { Session } from "../../session-manager.js";
 
 const MAX = 1024;

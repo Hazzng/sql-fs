@@ -2,7 +2,7 @@ import { InMemoryFs } from "just-bash";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../session-manager.js";
 import { FairAdmission } from "../../worker-owner/admission.js";
-import { WorkerOwnerPool, loadWorkerPoolOptions } from "../../worker-owner/pool.js";
+import { loadWorkerPoolOptions, WorkerOwnerPool } from "../../worker-owner/pool.js";
 import { workerRequestContext } from "../../worker-owner/request-context.js";
 
 function checkpoint() {

@@ -1,18 +1,19 @@
-import { Bash } from "just-bash";
 import type { BashExecResult, ExecOptions, IFileSystem, SecurityViolation } from "just-bash";
-import { type ScriptScope, runInScriptScope } from "../../sql-fs/script-scope.js";
+import { Bash } from "just-bash";
+import { runInScriptScope, type ScriptScope } from "../../sql-fs/script-scope.js";
 import { SessionScopedFs } from "../../sql-fs/session-scoped-fs.js";
 import type { ICoherentFs, IScriptTxFs } from "../../sql-fs/sql-fs.js";
-import { type GitIdentity, createGitCommand, httpsOnlyGitFetch } from "../commands/git-command.js";
+import { createGitCommand, type GitIdentity, httpsOnlyGitFetch } from "../commands/git-command.js";
 import { nodeCommand } from "../commands/node-command.js";
 import { LockLostError } from "../distributed-lock.js";
-import { type ExecContext, consumeExecInput, execContext } from "../exec-context.js";
+import { consumeExecInput, type ExecContext, execContext } from "../exec-context.js";
 import { logAudit } from "../lib/audit.js";
 import { MAX_EXEC_FILE_BYTES } from "../lib/env.js";
 import { posixNormalizePath } from "../lib/paths.js";
 import { assertScriptLeaseHeld } from "../lib/script-lease.js";
 import { readOnlyContext } from "../read-only-context.js";
 import { sessionLeaseSignal } from "../session-lease-context.js";
+
 export type { ScriptScope as SessionScriptScope } from "../../sql-fs/script-scope.js";
 
 export interface RuntimeOptions {

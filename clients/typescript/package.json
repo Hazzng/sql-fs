@@ -13,7 +13,11 @@
 			"import": "./dist/index.js"
 		}
 	},
-	"files": ["dist", "README.md", "LICENSE"],
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
 	"scripts": {
 		"build": "tsc -p tsconfig.json",
 		"check:version": "node scripts/check-version.mjs",
@@ -25,8 +29,8 @@
 	},
 	"packageManager": "pnpm@10.30.3",
 	"devDependencies": {
-		"@types/node": "^22.0.0",
+		"@types/node": "^22.20.5",
 		"typescript": "7.0.2",
-		"vitest": "^3.1.0"
+		"vitest": "^5.0.3"
 	}
 }
