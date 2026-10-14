@@ -137,7 +137,7 @@ sql-fs measures freshness when it admits a request. After a lost lease, a script
 
 A write exec runs its script inside a script scope. If the script creates five files and then fails, none of the five persist. `SCRIPT_TX_BUFFERED` picks one of two implementations:
 
-- **Buffered** is the default (`SCRIPT_TX_BUFFERED=true`, #166). Each mutation updates the caches and appends to an in-memory journal. `endScriptScope` replays the journal in one short transaction that holds the advisory lock. `commitBlob` still writes file bytes immediately. The cache can lead the database until scope finalization. `src/sql-fs/script-tx-buffer.ts` implements the journal and buffer limits; failed flushes must reload committed state or poison the cache.
+- **Buffered** is the default (`SCRIPT_TX_BUFFERED=true`, #166). Each mutation updates the caches and appends to an in-memory journal. `endScriptScope` replays the journal in one short transaction that holds the advisory lock. `commitBlob` still writes file bytes immediately. The cache can lead the database until scope finalization. `src/sql-fs/state/script-persistence.ts` owns the journal and applies the buffer limits from `src/sql-fs/script-tx-buffer.ts`; failed flushes must reload committed state or poison the cache.
 - **Legacy** is `SCRIPT_TX_BUFFERED=false`. The first write opens a transaction that stays open until the script ends. That transaction holds a pooled connection for the whole script, and long scripts can exhaust a transaction pooler. That cost is why legacy is no longer the default.
 
 On error, `abortScriptScope` discards the journal or rolls back the transaction, and then reloads committed state. If the reload fails, `SqlFs` marks the cache poisoned, and the next `ensureFresh()` reloads it.
@@ -200,9 +200,12 @@ echo $((balance - 50)) > balance.txt
 
 ## Key source files
 
+[Source ownership maps](../src/README.md) describe module responsibilities and verification entry points.
+
 | File | Contents |
 |---|---|
-| `src/api/session-manager.ts` | Session pool, lock acquisition, the entries `withSession`, `withSessionRead` and `withSessionOrRehydrate`, admission, the reaper, the semaphores, and the `EREADONLY_VIOLATION` remap |
+| `src/api/session-manager.ts` | Session entry points, distributed locks, worker coordination, and read-only error mapping |
+| `src/api/session-manager/` | SessionCatalog owns resident lifetimes; RuntimeAdmission owns language queues; TenantBackends owns storage factories |
 | `src/api/session-runtime/engine.ts` | Builds the `Bash` runtime for a session and wraps each exec in a script scope |
 | `src/api/rw-lock.ts` | `RWLock`, lock 1 |
 | `src/api/distributed-rw-lock.ts` | The distributed lock, lock 2 |
@@ -211,10 +214,12 @@ echo $((balance - 50)) > balance.txt
 | `src/api/ownership.ts` | `withOwnedSessionOrRehydrate` and `withOwnedSessionRead`, which check the owner inside the lock |
 | `src/api/worker-owner/` | Worker pool, message protocol and worker runtime |
 | `src/api/event-loop-monitor.ts` | Event-loop lag sampler and `heartbeat_gap` logging |
-| `src/sql-fs/sql-fs.ts` | `SqlFs`, the `ICoherentFs` and `IScriptTxFs` interfaces, the caches, `ensureFresh`, the read-only scope and the script scope |
+| `src/sql-fs/sql-fs.ts` | Public filesystem adapter, path/input validation, read-only policy, and scope settlement |
+| `src/sql-fs/state/` | CoherentView owns paths/epochs and FileContents; ScriptPersistence owns transactions/journal; NamespaceOperations owns path reservations |
 | `src/sql-fs/script-tx-buffer.ts` | The buffered script journal and its limits |
 | `src/sql-fs/session-scoped-fs.ts` | `SessionScopedFs`, the script scope wrapper that the runtime uses |
-| `src/sql-fs/dialects/postgres.ts` | All SQL, the RLS context, the advisory lock, and blob cache reads and writes |
+| `src/sql-fs/dialects/postgres.ts` | PostgreSQL pool and transaction facade |
+| `src/sql-fs/dialects/postgres/` | Blob, sandbox lifecycle/fencing, namespace SQL, and ingest operations |
 | `src/sql-fs/redis-blob-cache.ts` | Redis blob cache |
 | `src/api/routes/exec.ts`, `src/api/mcp/tools.ts` | HTTP and MCP exec, which pick the read or write entry from `readOnly` |
 

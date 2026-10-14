@@ -15,7 +15,7 @@ pnpm verify:architecture # also worker failure, stream finalization, input budge
 
 `pnpm verify:local` uses random loopback ports and a unique Compose project, applies migrations through server startup, and removes only its own containers and volumes. It ignores `.env` and inherited deployment settings. It writes logs and JSON proof to `scripts/verify/.run/`. A missing Docker daemon or skipped integration test fails the command.
 
-`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI uses this expanded profile. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
+`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI runs this expanded profile on pushes to `main`; PR checks keep the faster static, unit, build, and SDK gates. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
@@ -51,7 +51,7 @@ Live contract and SDK verification validates observed `/v1` operations, status c
 - A worker may complete a write before its reply is lost. Preserve typed unknown-outcome errors and never automatically replay that execution. Worker routing and recovery live in `src/api/worker-owner/`.
 - Preserve cancellation, deadlines, body limits, read-only enforcement, and worker budgets when adding entry points. Run integration verification after changes to those boundaries.
 - Sanitize database and filesystem errors before exposing them. HTTP errors use `{ error, code }`. Do not log tokens or connection strings.
-- Keep symlinks default-denied. Normalize paths and reject null bytes. Use `Map` or null-prototype objects for user-controlled keys.
+- Symlinks are enabled by default; callers can explicitly disable creation with `allowSymlinks: false`. Preserve bounded resolution and account for target strings in cache estimates. Normalize paths and reject null bytes. Use `Map` or null-prototype objects for user-controlled keys.
 - Static MCP keys belong to trusted proxies that authenticate users and overwrite the identity header. A shared key holder can choose the owner header.
 
 ## Code and tests

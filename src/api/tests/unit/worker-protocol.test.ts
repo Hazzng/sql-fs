@@ -58,7 +58,10 @@ const effects: Array<{ label?: string; command: OwnerCommand; applies: boolean }
 ];
 
 describe("worker command effects", () => {
-	it.each(effects)("classifies $command.kind $label as applies=$applies", ({ command, applies }) => {
-		expect(mayApply(command)).toBe(applies);
-	});
+	it.each(effects.map((effect) => ({ ...effect, label: effect.label ?? effect.command.kind })))(
+		"classifies $label as applies=$applies",
+		({ command, applies }) => {
+			expect(mayApply(command)).toBe(applies);
+		},
+	);
 });

@@ -1,6 +1,6 @@
 # Worker ownership
 
-Worker-owner owns the resident filesystem, command outcomes, worker replacement, and durable generation retirement. [SessionManager](../session-manager.ts) owns session lifetime, local and distributed locks, request lease context, runtime admission, read-only error mapping, and metadata accounting.
+Worker-owner owns the resident filesystem, command outcomes, worker replacement, and durable generation retirement. [SessionManager](../session-manager.ts) coordinates distributed leases, runtime execution, read-only error mapping, and worker requests. [Session owners](../session-manager/README.md) hold the session lifetime, local locks, runtime admission, backend factories, and metadata accounting.
 
 | Source | Responsibility |
 | --- | --- |
@@ -36,7 +36,7 @@ A post-exec `ECOHERENCE` is also promoted: writes may already have been applied 
 
 Recovery tasks belong to one reservation and one captured slot generation. Repeated recovery shares the task, including a rejected task. A replacement generation gets its own recovery task. Recovery captures the thread and identity before awaits, terminates before durable retirement, and preserves newer residency. Different shared-reader reservations retain independent histories and recovery tasks.
 
-A worker may commit or send an external request before its reply is lost. Unknown outcomes never trigger automatic replay.
+A worker may commit or send an external request before its reply is lost. Unknown outcomes never trigger automatic replay. For `exec` and `execBatch`, `EDRIVERFAULT`, `ECOHERENCE`, and transport failures after dispatch can mean a write or external request already applied. Inspect sandbox state and reconcile external effects before retrying.
 
 ## Verification entry points
 
@@ -47,4 +47,4 @@ pnpm exec vitest run src/api/tests/unit/worker-protocol.test.ts src/api/tests/un
 pnpm typecheck
 ```
 
-[Worker failure integration tests](../tests/integration/worker-owner.failure.integration.test.ts) cover lost creation, buffered writes, blocked flushes, and committed writes. [Lease error tests](../tests/integration/worker-error-lease.integration.test.ts) cover external effects and nested replacement recovery. [Runtime prefix tests](../tests/integration/worker-runtime-prefix.integration.test.ts) cover refusal after applied work. [Replacement tests](../tests/integration/worker-replacement.integration.test.ts) cover residency and actual worker cleanup. Run `pnpm check`, then `pnpm verify:local`, for completion evidence with disposable Postgres and Redis.
+[Worker failure integration tests](../tests/integration/worker-owner.failure.integration.test.ts) cover lost creation, buffered writes, blocked flushes, and committed writes. [Lease error tests](../tests/integration/worker-error-lease.integration.test.ts) cover external effects and nested replacement recovery. [Runtime prefix tests](../tests/integration/worker-runtime-prefix.integration.test.ts) cover refusal after applied work. [Replacement tests](../tests/integration/worker-replacement.integration.test.ts) cover residency and actual worker cleanup. Run `pnpm typecheck`, `pnpm lint`, `pnpm test:unit`, and `pnpm build`, then `pnpm test:integration` with disposable Postgres and Redis configured through the test environment.
