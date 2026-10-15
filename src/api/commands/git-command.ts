@@ -13,8 +13,8 @@
  * is the path just-git actually resolved. A script may background several clones, so each
  * invocation gets its own scope via AsyncLocalStorage.
  *
- * just-git's checkout also never sets the executable bit (blindmansion/just-git#10), so every
- * file git writes is given the mode its index entry records until upstream fixes that.
+ * just-git 1.10 handles mode-only changes. The wrapper also reapplies index modes for files
+ * written by checkout and merge, including explicitly selected unmerged stages.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -217,8 +217,7 @@ async function indexModes(
 /**
  * Give each regular file git wrote its index mode, merging unmerged stages as Git does.
  * Only those files change, as with real git, so a caller's own uncommitted chmod on any other file
- * stays. A branch switch where a file differs only in mode is not covered: just-git neither
- * rewrites that file nor updates its index entry, so there is no correct mode to read.
+ * stays. just-git handles branch switches where a file differs only in mode.
  */
 async function applyIndexModes(
 	fs: IFileSystem,
