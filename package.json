@@ -51,7 +51,7 @@
 		"ioredis": "^5.4.0",
 		"jose": "^6.2.12",
 		"just-bash": "^3.6.0",
-		"just-git": "^1.9.1",
+		"just-git": "^1.10.0",
 		"lru-cache": "^11.0.0",
 		"postgres": "^3.4.0",
 		"zod": "^3.24.0"
