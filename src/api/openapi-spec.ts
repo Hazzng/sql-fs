@@ -107,7 +107,7 @@ export const openapiSpec = {
 	openapi: "3.0.0",
 	info: {
 		title: "SQL-FS API",
-		version: "1.1.0",
+		version: "1.1.1",
 		description: "Persistent filesystem backend + HTTP/MCP API for just-bash sandboxes. Backed by Postgres.",
 	},
 	servers: [{ url: "/v1", description: "API v1" }],
