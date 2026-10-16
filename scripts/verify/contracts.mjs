@@ -19,7 +19,7 @@ try {
 	run.equal((await run.request(server, null, "GET", "/healthz")).body.status, "ok", "Health is ok");
 	run.equal((await run.request(server, null, "GET", "/readyz")).body.status, "ok", "Redis-aware readiness is ok");
 	const metrics = (await run.request(server, owner, "GET", "/metrics")).body.toString();
-	const workersEnabled = process.env.SQL_FS_WORKERS_ENABLED === "true";
+	const workersEnabled = process.env.SQL_FS_WORKERS_ENABLED !== "false";
 	run.equal(metrics.includes(`sql_fs_workers_enabled ${workersEnabled ? 1 : 0}\n`), true, "Worker feature metric");
 	run.equal(metrics.includes(`sql_fs_ingress_enabled ${workersEnabled ? 1 : 0}\n`), true, "Ingress feature metric");
 	if (workersEnabled) {

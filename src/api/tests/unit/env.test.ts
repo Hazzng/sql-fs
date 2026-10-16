@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { positiveIntEnv } from "../../lib/env.js";
+import { configuredBoolean, positiveIntEnv } from "../../lib/env.js";
 
 describe("positiveIntEnv", () => {
 	it("returns the parsed value for a positive integer string", () => {
@@ -32,5 +32,20 @@ describe("positiveIntEnv", () => {
 
 	it("falls back on Infinity", () => {
 		expect(positiveIntEnv("Infinity", 16)).toBe(16);
+	});
+});
+
+describe("configuredBoolean", () => {
+	it.each([
+		[undefined, true, true],
+		[undefined, false, false],
+		["true", false, true],
+		["false", true, false],
+	])("reads %j with fallback %s as %s", (value, fallback, expected) => {
+		expect(configuredBoolean({ FLAG: value }, "FLAG", fallback)).toBe(expected);
+	});
+
+	it.each(["", "1", "yes", "TRUE"])("rejects %j", (value) => {
+		expect(() => configuredBoolean({ FLAG: value }, "FLAG", true)).toThrow("FLAG must be true or false");
 	});
 });

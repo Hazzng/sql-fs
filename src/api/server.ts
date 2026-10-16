@@ -28,6 +28,7 @@ import {
 } from "./event-loop-monitor.js";
 import { loadExecLockOptions } from "./exec-lock-config.js";
 import { IngressAdmission, loadIngressOptions } from "./ingress-admission.js";
+import { configuredBoolean, loadExecOutputBytes } from "./lib/env.js";
 import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { runMigrations } from "./migrations.js";
@@ -148,7 +149,11 @@ async function closeMetaFns(): Promise<void> {
 	metaBackends.clear();
 }
 
+const workerEnabled = configuredBoolean(process.env, "SQL_FS_WORKERS_ENABLED", true);
+
 const sessionManager = new SessionManager({
+	workerEnabled,
+	executionLimits: { maxOutputSize: loadExecOutputBytes() },
 	tenantConfig,
 	redis: redisClient,
 	execLockOptions,
@@ -182,8 +187,7 @@ app.use("*", async (c, next) => {
 
 // ── Global request body-size backstop (audit H11) ─────────────────────────────
 const MAX_REQUEST_BODY_BYTES = Number(process.env.MAX_REQUEST_BODY_BYTES ?? `${256 * 1024 * 1024}`);
-export const ingressAdmission =
-	process.env.SQL_FS_WORKERS_ENABLED === "true" ? new IngressAdmission(loadIngressOptions()) : undefined;
+export const ingressAdmission = workerEnabled ? new IngressAdmission(loadIngressOptions()) : undefined;
 const bodyLimitMiddleware = bodyLimit({
 	maxSize: MAX_REQUEST_BODY_BYTES,
 	onError: (c) =>

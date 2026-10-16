@@ -107,7 +107,7 @@ export class SessionManager {
 	private readonly executionLimits: ShellExecutionLimits | undefined;
 
 	constructor({
-		workerEnabled,
+		workerEnabled = false,
 		workerOptions,
 		executionLimits,
 		scriptTxBuffer,
@@ -140,7 +140,6 @@ export class SessionManager {
 		this.defenseAuditMode = defenseAuditMode ?? process.env.JUST_BASH_DEFENSE_AUDIT_MODE !== "false";
 		this.sandboxBaseEnv = buildSandboxBaseEnv();
 		this.gitIdentity = buildGitIdentity();
-		const workers = workerEnabled ?? process.env.SQL_FS_WORKERS_ENABLED === "true";
 		this.backends = new TenantBackends(
 			{
 				tenantConfig,
@@ -154,12 +153,12 @@ export class SessionManager {
 				postgresPoolMax,
 				scriptTxBuffer,
 			},
-			workers,
+			workerEnabled,
 		);
-		if (workers && (createFs !== undefined || tenantConfig === undefined)) {
+		if (workerEnabled && (createFs !== undefined || tenantConfig === undefined)) {
 			throw new Error("Worker sessions require tenantConfig and the Postgres filesystem factory");
 		}
-		this.workerPool = workers
+		this.workerPool = workerEnabled
 			? new WorkerOwnerPool({
 					...(workerOptions ?? loadWorkerPoolOptions()),
 					defenseInDepth: this.defenseInDepth,

@@ -4,7 +4,7 @@ import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { retirePostgresSandboxGeneration } from "../../sql-fs/index.js";
 import type { ScriptTxBufferConfig } from "../../sql-fs/script-tx-buffer.js";
-import { positiveIntEnv } from "../lib/env.js";
+import { configuredBoolean, configuredInteger, loadExecOutputBytes, positiveIntEnv } from "../lib/env.js";
 import { readOnlyContext } from "../read-only-context.js";
 import { FairAdmission } from "./admission.js";
 import { assertWorkerMessageBudget } from "./message-budget.js";
@@ -44,14 +44,6 @@ export interface WorkerPoolOptions {
 	readonly scriptTxBuffer: ScriptTxBufferConfig;
 	readonly pgPoolMax: number;
 	readonly maxPgConnections: number;
-}
-
-function configuredInteger(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
-	const value = env[name];
-	if (value === undefined) return fallback;
-	const parsed = Number(value);
-	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
-	return parsed;
 }
 
 function assertActiveTenantLimit(count: number, limit: number): void {
@@ -104,13 +96,11 @@ export function loadWorkerPoolOptions(
 	resources?: { cpus: number; memoryBytes: number },
 ): WorkerPoolOptions {
 	const mib = 1024 * 1024;
-	const largeFiles = env.SQL_FS_WORKER_LARGE_FILES;
-	if (largeFiles !== undefined && largeFiles !== "true" && largeFiles !== "false") {
-		throw new Error("SQL_FS_WORKER_LARGE_FILES must be true or false");
-	}
+	const largeFiles = configuredBoolean(env, "SQL_FS_WORKER_LARGE_FILES", false);
 	const count = configuredInteger(env, "SQL_FS_WORKER_COUNT", 2);
 	const maxQueued = configuredInteger(env, "SQL_FS_WORKER_QUEUE_MAX", 32);
 	const maxQueuedBytes = configuredInteger(env, "SQL_FS_WORKER_QUEUE_BYTES", 64 * mib);
+	const maxOutputSize = loadExecOutputBytes(env);
 	const options = {
 		count,
 		maxActivePerTenant: configuredInteger(env, "SQL_FS_WORKER_ACTIVE_TENANT_MAX", Math.max(1, Math.floor(count / 2))),
@@ -137,16 +127,14 @@ export function loadWorkerPoolOptions(
 		pgPoolMax: configuredInteger(env, "SQL_FS_WORKER_PG_POOL_MAX", 2),
 		maxPgConnections: configuredInteger(env, "SQL_FS_WORKER_MAX_PG_CONNECTIONS", 4),
 		execFileLimitBytes:
-			largeFiles === "true" && env.MAX_EXEC_FILE_BYTES === undefined
-				? null
-				: positiveIntEnv(env.MAX_EXEC_FILE_BYTES, 8 * mib),
+			largeFiles && env.MAX_EXEC_FILE_BYTES === undefined ? null : positiveIntEnv(env.MAX_EXEC_FILE_BYTES, 8 * mib),
 		executionLimits: {
 			maxSourceBytes: configuredInteger(env, "SQL_FS_WORKER_SOURCE_BYTES", mib),
 			maxStringLength: configuredInteger(env, "SQL_FS_WORKER_STRING_CHARS", 64 * mib),
 			maxInputBytes: configuredInteger(env, "SQL_FS_WORKER_INPUT_BYTES", 128 * mib),
-			maxOutputSize: configuredInteger(env, "SQL_FS_WORKER_OUTPUT_BYTES", 64 * mib),
+			maxOutputSize,
 			maxLiveBytes: configuredInteger(env, "SQL_FS_WORKER_LIVE_BYTES", 128 * mib),
-			maxWorkerMessageBytes: configuredInteger(env, "SQL_FS_WORKER_MESSAGE_BYTES", 65 * mib),
+			maxWorkerMessageBytes: configuredInteger(env, "SQL_FS_WORKER_MESSAGE_BYTES", maxOutputSize + mib),
 			maxPythonBridgeBytes: configuredInteger(env, "SQL_FS_WORKER_PYTHON_BRIDGE_BYTES", 64 * mib),
 			maxExecutionTimeMs: configuredInteger(env, "SQL_FS_WORKER_EXECUTION_MS", 120_000),
 		},
