@@ -11,7 +11,7 @@ The entry point is [AGENTS.md](../AGENTS.md). Run `pnpm setup:dev`, `pnpm check`
 | Style and validation | Strict TypeScript, Biome, Python Ruff and mypy, Lefthook checks, `pnpm check` | Hooks require the development dependencies installed by setup. |
 | Build system | Node version file, pinned pnpm, three lockfiles, server and SDK builds | Dependencies and container images need network access on first use. |
 | Testing | Unit suites, serial database integration suite, live HTTP/MCP and SDK verification, JSON proof artifacts | Specialized resource profiles and deployment load tests remain separate from the default verification run. |
-| Documentation | Shared `AGENTS.md`, Claude pointer, setup guide, current architecture paths, explicit migration instructions | Historical records under `thoughts/shared/` can describe older designs. |
+| Documentation | Shared `AGENTS.md`, Claude pointer, setup guide, current architecture paths, explicit migration instructions | None. |
 | Development environment | Disposable Compose project, random loopback ports, separate Redis roles, clean child environment, scoped cleanup | Requires Docker and Compose v2, Bash, Node, Python, pnpm, and uv. |
 | Code quality | Type and lint checks, production ownership boundary checks, bounded test concurrency, explicit test-runner ownership, removed unused drivers and stale schema tooling | Static rules do not replace review or live behavior tests. |
 | Observability | `/healthz`, `/readyz`, authenticated `/metrics`, structured logs, request traces and artifact hashes in verification proof | Production alert routing and dashboards are deployment configuration. |
