@@ -166,6 +166,11 @@ Before you turn workers on, or upgrade from a version where they were off by def
 - Set a hard container memory limit. Heap limits do not cover native memory, and the RSS checks run only between operations.
 - Plan to drain a replica before you replace or stop it. A script that is cut off mid-run has an unknown outcome.
 
+To upgrade replicas that run with workers off, roll out in two stages. A rolling upgrade otherwise starts workers on the first new replica while older replicas still serve the same sandboxes.
+
+1. Deploy the new version with `SQL_FS_WORKERS_ENABLED=false` on every replica.
+2. When no replica of the older version remains, remove the setting and roll out again.
+
 **Admission.** Each tenant has a queue, and the server takes requests from the queues in turn. On one sandbox, a waiting writer goes before new readers. With the defaults, one tenant can hold one of the two workers and four of the eight ingress permits. Long-lived `GET /mcp` streams count against a separate listener quota. If a request waits more than 250 ms, it fails with `EWORKER_BUSY` (503) and `Retry-After: 1`.
 
 **Unknown outcomes.** If a script loses its worker, lease or response after it starts, the request fails with `EEXEC_OUTCOME_UNKNOWN` (503, `retryable: false`). The server and the SDKs do not replay it. That includes read-only scripts, because they can still have network side effects. Read the sandbox state before the next action. Earlier items in a batch can already be committed.
@@ -200,7 +205,7 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_WORKER_INPUT_BYTES` | 128 MiB |
 | `SQL_FS_WORKER_STRING_CHARS` | 64 Mi UTF-16 characters |
 | `SQL_FS_WORKER_OUTPUT_BYTES` | 64 MiB. Also caps stdout plus stderr when workers are off. |
-| `SQL_FS_WORKER_MESSAGE_BYTES` | `SQL_FS_WORKER_OUTPUT_BYTES` plus 1 MiB |
+| `SQL_FS_WORKER_MESSAGE_BYTES` | 65 MiB, or `SQL_FS_WORKER_OUTPUT_BYTES` plus 1 MiB if that is larger |
 | `SQL_FS_WORKER_LIVE_BYTES` | 128 MiB |
 | `SQL_FS_WORKER_PYTHON_BRIDGE_BYTES` | 64 MiB |
 | `SQL_FS_WORKER_EXECUTION_MS` | 120000 ms |
