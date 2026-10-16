@@ -33,7 +33,10 @@ try {
 	}
 	run.equal(results.true, results.false, "Over-cap exec fails the same way with and without workers");
 
-	const inline = await run.start({ SQL_FS_WORKERS_ENABLED: "false" });
+	const inline = await run.start({
+		SQL_FS_WORKERS_ENABLED: "false",
+		SQL_FS_WORKER_OUTPUT_BYTES: String(64 * 1024 * 1024),
+	});
 	const owner = await run.owner();
 	const sandbox = await run.create(inline, owner);
 	const twentyMiB = 20 * 1024 * 1024;
@@ -45,7 +48,7 @@ try {
 	run.equal(
 		[large.exitCode, large.stdout.length, large.stdout === "0".repeat(twentyMiB)],
 		[0, twentyMiB, true],
-		"workers=false: 20 MiB of output returns in full under the default cap",
+		"workers=false: 20 MiB of output returns in full under the 64 MiB default cap",
 	);
 } catch (error) {
 	failure = error;
