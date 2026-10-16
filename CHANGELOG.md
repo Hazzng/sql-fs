@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.1
+
+### Patch Changes
+
+- [#238](https://github.com/Hazzng/sql-fs/pull/238) Thanks [@Hazzng](https://github.com/Hazzng)! - Update HTTP and MCP dependencies, override vulnerable transitive pins, and remove unused SQL drivers and Drizzle tooling. Add isolated database/API verification and document unauthorized sandbox-list and file-media responses in OpenAPI.
+  
+  Preserve primary execution and commit errors when rollback fails. Share script-scope completion across local execution, worker adapters, and file writes, retaining nested scope ownership and lease checks before commit. Observe asynchronous scope initialization and callback rejections; unexpected renewal failures mark the lease lost while preserving transient Redis retries.
+  
+  Keep reservations within each worker pool and retain captured worker identities and generations during recovery so cleanup preserves replacement workers. Never automatically replay an execution with an unknown outcome.
+  
+  After exec dispatch, coherence failures that previously returned `ECOHERENCE` now return `EEXEC_OUTCOME_UNKNOWN`. Writes may already have been applied. Inspect sandbox state before proceeding and do not automatically replay the execution. Clients matching `ECOHERENCE` must handle the new code. Recover the promoted coherence error before returning it so the affected worker is terminated and its durable identity is retired.
+
+- [#251](https://github.com/Hazzng/sql-fs/pull/251) Thanks [@dependabot](https://github.com/apps/dependabot)! - Update jose to 6.2.12 for JWT, JWS, JWE, and remote JWKS validation fixes.
+
+- [#239](https://github.com/Hazzng/sql-fs/pull/239) Thanks [@Hazzng](https://github.com/Hazzng)! - Modularize filesystem, PostgreSQL, session, and worker behavior around state owners. Preserve primary execution and commit errors when rollback fails, and reject worker sessions attached after shutdown begins.
+  
+  Keep reservations and recovery tied to their worker pool and captured generation, preserving replacement residency. Treat post-exec coherence failures as unknown outcomes because writes may already have applied. Retire the affected worker without replaying execution; callers must inspect sandbox state and reconcile external effects before retrying.
+  
+  Reject pending blob writes across script-scope transitions and cache reads from condemned scopes. Preserve both aliases when renaming between hard links to the same inode, reject file/directory rename mismatches, and report EISDIR when ingest targets the root directory.
+  
+  Enable symbolic links by default, retaining `allowSymlinks: false` for callers that explicitly disable them and bounded cycle resolution. Resolve relative link targets from their containing directory in PostgreSQL, cap total traversal at 40 links, and include target strings in session metadata-cache estimates.
+
+- [#265](https://github.com/Hazzng/sql-fs/pull/265) Thanks [@Hazzng](https://github.com/Hazzng)! - Upgrade just-git to 1.10.0 for mode-only status, diff, checkout, and merge fixes, ls-tree support, and summary output.
+
 ## 1.1.0
 
 ### Minor Changes
