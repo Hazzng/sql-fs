@@ -150,7 +150,7 @@ The session runtime opens a script scope only if the filesystem implements `IScr
 
 ## Worker owners run scripts off the main thread
 
-Worker owners are off by default. If `SQL_FS_WORKERS_ENABLED=true`, Bash and `SqlFs` run in a fixed pool of worker threads from `src/api/worker-owner/`, two by default. Each worker builds its own Postgres filesystem and Redis client in `runtime.ts`. The main thread keeps a `WorkerFileSystem` proxy in the session and sends commands to the pool. The same flag turns on ingress admission in `src/api/ingress-admission.ts`, which limits in-flight requests and bytes for each replica and each tenant. Admission rules, rollout prerequisites and tuning variables are in [Worker owners](CONFIGURATION.md#worker-owners).
+Worker owners are on by default. Unless `SQL_FS_WORKERS_ENABLED=false`, Bash and `SqlFs` run in a fixed pool of worker threads from `src/api/worker-owner/`, two by default. Each worker builds its own Postgres filesystem and Redis client in `runtime.ts`. The main thread keeps a `WorkerFileSystem` proxy in the session and sends commands to the pool. The same flag turns on ingress admission in `src/api/ingress-admission.ts`, which limits in-flight requests and bytes for each replica and each tenant. Admission rules, rollout prerequisites and tuning variables are in [Worker owners](CONFIGURATION.md#worker-owners).
 
 ## Semaphores cap Python and JavaScript runs
 
