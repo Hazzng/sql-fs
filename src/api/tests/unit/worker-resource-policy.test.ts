@@ -123,6 +123,13 @@ describe("worker resource policy", () => {
 		expect(budgetWorkerReply(reply, { kind: "exec", script: "printf", options: {} }, messageBytes)).toBe(reply);
 	});
 
+	it("keeps the 65 MiB command budget when the output cap is lowered", () => {
+		expect(
+			loadWorkerPoolOptions({ SQL_FS_WORKER_OUTPUT_BYTES: String(8 * 1024 * 1024) }).executionLimits
+				.maxWorkerMessageBytes,
+		).toBe(65 * 1024 * 1024);
+	});
+
 	it("keeps an explicit SQL_FS_WORKER_MESSAGE_BYTES over the output-derived default", () => {
 		expect(loadWorkerPoolOptions({ SQL_FS_WORKER_MESSAGE_BYTES: "4096" }).executionLimits.maxWorkerMessageBytes).toBe(
 			4096,

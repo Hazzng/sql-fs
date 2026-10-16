@@ -32,6 +32,21 @@ try {
 		run.record({ case: "over-cap", workers: mode, ...results[mode] });
 	}
 	run.equal(results.true, results.false, "Over-cap exec fails the same way with and without workers");
+
+	const inline = await run.start({ SQL_FS_WORKERS_ENABLED: "false" });
+	const owner = await run.owner();
+	const sandbox = await run.create(inline, owner);
+	const twentyMiB = 20 * 1024 * 1024;
+	const large = (
+		await run.request(inline, owner, "POST", `${sandbox.path}/exec-sync`, {
+			json: { script: `printf "%0${twentyMiB}d" 0` },
+		})
+	).body;
+	run.equal(
+		[large.exitCode, large.stdout.length, large.stdout === "0".repeat(twentyMiB)],
+		[0, twentyMiB, true],
+		"workers=false: 20 MiB of output returns in full under the default cap",
+	);
 } catch (error) {
 	failure = error;
 } finally {

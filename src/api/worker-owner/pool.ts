@@ -134,7 +134,12 @@ export function loadWorkerPoolOptions(
 			maxInputBytes: configuredInteger(env, "SQL_FS_WORKER_INPUT_BYTES", 128 * mib),
 			maxOutputSize,
 			maxLiveBytes: configuredInteger(env, "SQL_FS_WORKER_LIVE_BYTES", 128 * mib),
-			maxWorkerMessageBytes: configuredInteger(env, "SQL_FS_WORKER_MESSAGE_BYTES", maxOutputSize + mib),
+			// Commands share this budget, and a writeFile command carries a whole file body.
+			maxWorkerMessageBytes: configuredInteger(
+				env,
+				"SQL_FS_WORKER_MESSAGE_BYTES",
+				Math.max(65 * mib, maxOutputSize + mib),
+			),
 			maxPythonBridgeBytes: configuredInteger(env, "SQL_FS_WORKER_PYTHON_BRIDGE_BYTES", 64 * mib),
 			maxExecutionTimeMs: configuredInteger(env, "SQL_FS_WORKER_EXECUTION_MS", 120_000),
 		},
