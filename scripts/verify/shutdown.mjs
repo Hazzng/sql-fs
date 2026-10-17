@@ -51,7 +51,9 @@ try {
 	server.child.kill("SIGTERM");
 	const [code] = await exited;
 	const seconds = (performance.now() - started) / 1000;
-	run.record({ case: "sigterm-with-mcp-listener", exitCode: code, seconds, listener: await drained });
+	const listenerEnd = await drained;
+	run.record({ case: "sigterm-with-mcp-listener", exitCode: code, seconds, listener: listenerEnd });
+	run.equal(listenerEnd, "ended", "Shutdown ends the MCP listener stream cleanly");
 	run.equal(code, 0, "SIGTERM with an open MCP listener exits cleanly");
 	run.equal(seconds < 10, true, "SIGTERM with an open MCP listener does not wait for the force-exit timer");
 	run.equal(server.log.includes('"event":"shutdown_complete"'), true, "Shutdown logs shutdown_complete");

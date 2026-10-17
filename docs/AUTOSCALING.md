@@ -157,7 +157,7 @@ max(sql_fs_worker_runnable_queued)
 max(sql_fs_ingress_queued_requests)
 ```
 
-The p95 cannot pass `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. A p95 at the limit means the histogram is saturated, not that the wait is bounded. The top finite bucket is 1000 ms. If you raise `SQL_FS_WORKER_QUEUE_WAIT_MS` above 1000 ms, quantiles above 1000 ms report 1000.
+The p95 normally stays below `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. An event-loop stall can delay the refusal and let a slightly later admission through. A p95 at the limit means the histogram is saturated, not that the wait is bounded. The top finite bucket is 1000 ms. If you raise `SQL_FS_WORKER_QUEUE_WAIT_MS` above 1000 ms, quantiles above 1000 ms report 1000.
 
 Scale on `sql_fs_worker_runnable_queued`, not `sql_fs_worker_queued`. The difference is `sql_fs_worker_sandbox_waiting`, which more replicas do not reduce.
 
