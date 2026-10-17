@@ -158,13 +158,18 @@ The server trusts the identity header. Your proxy or LibreChat must set it, and 
 
 ## Worker owners
 
-If `SQL_FS_WORKERS_ENABLED` is `true` (default `false`), a fixed pool of worker threads owns each sandbox's filesystem and shell. Scripts then run off the HTTP event loop.
+If `SQL_FS_WORKERS_ENABLED` is `true` (the default), a fixed pool of worker threads owns each sandbox's filesystem and shell. Scripts then run off the HTTP event loop. If it is `false`, scripts run on the event loop. Any other value stops startup.
 
-Before you turn workers on:
+Before you turn workers on, or upgrade from a version where they were off by default:
 
 - Run a version with PostgreSQL generation fencing on every replica. A replica without it cannot share sandboxes with worker replicas.
 - Set a hard container memory limit. Heap limits do not cover native memory, and the RSS checks run only between operations.
 - Plan to drain a replica before you replace or stop it. A script that is cut off mid-run has an unknown outcome.
+
+To upgrade replicas that run with workers off, roll out in two stages. A rolling upgrade otherwise starts workers on the first new replica while older replicas still serve the same sandboxes.
+
+1. Deploy the new version with `SQL_FS_WORKERS_ENABLED=false` on every replica.
+2. When no replica of the older version remains, remove the setting and roll out again.
 
 **Admission.** Each tenant has a queue, and the server takes requests from the queues in turn. On one sandbox, a waiting writer goes before new readers. With the defaults, one tenant can hold one of the two workers and four of the eight ingress permits. Long-lived `GET /mcp` streams count against a separate listener quota. If a request waits more than 250 ms, it fails with `EWORKER_BUSY` (503) and `Retry-After: 1`.
 
@@ -199,8 +204,8 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_WORKER_SOURCE_BYTES` | 1 MiB |
 | `SQL_FS_WORKER_INPUT_BYTES` | 128 MiB |
 | `SQL_FS_WORKER_STRING_CHARS` | 64 Mi UTF-16 characters |
-| `SQL_FS_WORKER_OUTPUT_BYTES` | 64 MiB |
-| `SQL_FS_WORKER_MESSAGE_BYTES` | 65 MiB |
+| `SQL_FS_WORKER_OUTPUT_BYTES` | 64 MiB. Also caps stdout plus stderr when workers are off. |
+| `SQL_FS_WORKER_MESSAGE_BYTES` | 65 MiB, or `SQL_FS_WORKER_OUTPUT_BYTES` plus 1 MiB if that is larger |
 | `SQL_FS_WORKER_LIVE_BYTES` | 128 MiB |
 | `SQL_FS_WORKER_PYTHON_BRIDGE_BYTES` | 64 MiB |
 | `SQL_FS_WORKER_EXECUTION_MS` | 120000 ms |
@@ -208,6 +213,32 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_WORKER_SCRIPT_BUFFER_BYTES` | 32 MiB |
 
 A replica does not add workers by itself. Scale the number of replicas on CPU and RSS, together with the worker queue, admission delay and refusal metrics from `GET /metrics`. Waits on one sandbox, on distributed locks and on recovery have their own gauges. More replicas do not shorten those waits.
+
+### Sizing
+
+These peaks come from a 2 GiB container with 2 CPUs, no swap and the default 2 workers with 512 MiB heaps. Two tenants each ran one `exec-sync` at the same time. Each cell is the peak cgroup memory for output of that content at the cap.
+
+| Output cap | `printf` zeros | `\x01` bytes | Newlines |
+|---|---|---|---|
+| 64 MiB | 747 MiB | 1078 MiB | 1446 MiB (3 runs, 1439 to 1450) |
+| 80 MiB | Not measured | Not measured | 1789 MiB |
+| 96 MiB | Not measured | 1528 MiB | OOM-killed |
+| 128 MiB | 1326 MiB | 1693 MiB | OOM-killed |
+| 320 MiB | OOM-killed | Not measured | Not measured |
+
+Peak memory grows with the worker count, the output cap and how much the content expands in the JSON reply. Output that is mostly newlines costs about 11 times its size for each exec. The kernel OOM kill stops the whole replica. `SQL_FS_WORKER_MAX_RSS_BYTES` retires only idle workers, and it did not prevent the kill. For 2 GiB, 64 MiB with 2 workers is the measured safe default.
+
+Ten concurrent 64 MiB `PUT` uploads, with `MAX_FILE_WRITE_BYTES` raised to 64 MiB, peaked at 1444 to 1582 MiB. Ingress admits two 64 MiB bodies at a time. A client can see a rejected upload as a socket error (`UND_ERR_SOCKET`) instead of the 503, so clients must retry both.
+
+One replica served 100 agents with separate sandboxes and 5 s think time, about 20 execs per second, with 0 errors and p99 latency under 50 ms. At about 100 execs per second, one tenant saturated at about 71 per second, because its active limit is half the worker count, 1 per replica. Ten tenants reached 97 per second with 0 errors.
+
+Add replicas instead of raising caps, and keep the caps fixed for each box size. Autoscale on these signals:
+
+- Queue wait, from the `sql_fs_worker_queue_wait_milliseconds` histogram.
+- Queue depth, from `sql_fs_worker_queued` and `sql_fs_ingress_queued_requests`.
+- Refusals and timeouts, from `sql_fs_worker_refused_total`, `sql_fs_worker_queue_timeouts_total`, `sql_fs_ingress_refused_total` and `sql_fs_ingress_queue_timeouts_total`.
+- Memory, from `sql_fs_worker_process_rss_bytes`.
+- CPU.
 
 ### Large files
 

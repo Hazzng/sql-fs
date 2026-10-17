@@ -1,5 +1,5 @@
 /**
- * Small helpers for reading numeric environment configuration safely.
+ * Small helpers for reading environment configuration safely.
  */
 
 import { DEFAULT_CONTENT_CACHE_MAX_BYTES } from "../../sql-fs/sql-fs.js";
@@ -19,6 +19,28 @@ export function positiveIntEnv(value: string | undefined, fallback: number): num
 	if (value === undefined || value === "") return fallback;
 	const n = Number(value);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Strict counterpart of {@link positiveIntEnv}: an invalid value stops startup instead of falling back. */
+export function configuredInteger(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+	const value = env[name];
+	if (value === undefined) return fallback;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+	return parsed;
+}
+
+export function configuredBoolean(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+	const value = env[name];
+	if (value === undefined) return fallback;
+	if (value === "true") return true;
+	if (value === "false") return false;
+	throw new Error(`${name} must be true or false`);
+}
+
+/** Stdout plus stderr cap for one exec, shared by inline and worker execution. */
+export function loadExecOutputBytes(env: NodeJS.ProcessEnv = process.env): number {
+	return configuredInteger(env, "SQL_FS_WORKER_OUTPUT_BYTES", 64 * 1024 * 1024);
 }
 
 /**

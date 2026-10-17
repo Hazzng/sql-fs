@@ -109,7 +109,7 @@ Before a request touches the cache, the server checks the sandbox's epoch in Pos
 
 While a script runs, its changes stay in memory. They commit in one short transaction when the script ends.
 
-Each request takes a local lock, and also a Redis lock when Redis is configured. With `SQL_FS_WORKERS_ENABLED=true`, scripts run in a pool of worker threads instead of on the HTTP event loop.
+Each request takes a local lock, and also a Redis lock when Redis is configured. Scripts run in a pool of worker threads instead of on the HTTP event loop. Set `SQL_FS_WORKERS_ENABLED=false` to run them on the event loop.
 
 ## Configure the server
 
@@ -121,7 +121,8 @@ Most deployments need only these settings. [CONFIGURATION.md](docs/CONFIGURATION
 | `AUTH_SECRET` | Signs and verifies bearer JWTs. Required. |
 | `REDIS_URL` | Redis for distributed locks. Required for more than one replica. |
 | `REDIS_DATA_URL` | Redis for the blob cache, on its own connection. Defaults to `REDIS_URL`. Needs `maxmemory-policy allkeys-lru` or `allkeys-lfu`. |
-| `SQL_FS_WORKERS_ENABLED` | Run scripts in worker threads. Default `false`. |
+| `SQL_FS_WORKERS_ENABLED` | Run scripts in worker threads. Default `true`. Any value other than `true` or `false` stops startup. |
+| `SQL_FS_WORKER_OUTPUT_BYTES` | Largest stdout plus stderr of one exec, with or without workers. Default 64 MiB. |
 
 ## Deploy with Docker
 

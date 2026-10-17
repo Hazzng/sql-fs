@@ -430,7 +430,6 @@ describe("HTTP body admission", () => {
 	it("bounds real MCP SSE listeners separately from authenticated tool requests", async () => {
 		const secret = "mcp-listener-admission-test-secret-32-bytes";
 		vi.stubEnv("AUTH_SECRET", secret);
-		vi.stubEnv("SQL_FS_WORKERS_ENABLED", "false");
 		const ingress = new IngressAdmission(loadIngressOptions({}));
 		const manager = new SessionManager({ createFs: async () => new InMemoryFs() });
 		await manager.getOrCreate("default", "mcp-ingress", undefined, "owner");
@@ -514,7 +513,6 @@ describe("HTTP body admission", () => {
 	it("shows retained MCP requests can exhaust the shared ordinary request quota", async () => {
 		const secret = "mcp-listener-admission-test-secret-32-bytes";
 		vi.stubEnv("AUTH_SECRET", secret);
-		vi.stubEnv("SQL_FS_WORKERS_ENABLED", "false");
 		const ingress = new IngressAdmission(loadIngressOptions({}));
 		const manager = new SessionManager({ createFs: async () => new InMemoryFs() });
 		const tenantConfig = {

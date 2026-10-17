@@ -95,15 +95,15 @@ describe("worker resource policy", () => {
 		expect(options).toMatchObject({ maxQueuedBytes: 64 * 1024 * 1024, maxQueuedBytesPerTenant: 32 * 1024 * 1024 });
 	});
 
-	it("fits the default maximum stdout and ordinary reply envelope into the default message budget", () => {
-		const options = loadWorkerPoolOptions({});
+	it.each([
+		[{}, 64],
+		[{ SQL_FS_WORKER_OUTPUT_BYTES: String(96 * 1024 * 1024) }, 96],
+	])("fits maximum stdout and an ordinary reply envelope into the default message budget (%j)", (env, outputMib) => {
+		const options = loadWorkerPoolOptions(env);
 		const outputBytes = options.executionLimits.maxOutputSize ?? 0;
 		const messageBytes = options.executionLimits.maxWorkerMessageBytes ?? 0;
-		expect(outputBytes).toBe(64 * 1024 * 1024);
-		expect(messageBytes).toBe(65 * 1024 * 1024);
-		expect(loadWorkerPoolOptions({ SQL_FS_WORKER_MESSAGE_BYTES: "4096" }).executionLimits.maxWorkerMessageBytes).toBe(
-			4096,
-		);
+		expect(outputBytes).toBe(outputMib * 1024 * 1024);
+		expect(messageBytes).toBe((outputMib + 1) * 1024 * 1024);
 		const reply = {
 			id: 1,
 			generation: 1,
@@ -121,6 +121,19 @@ describe("worker resource policy", () => {
 			value: { stdout: "x".repeat(outputBytes), stderr: "", exitCode: 0, env: { PWD: "/home/user" } },
 		} satisfies OwnerReply;
 		expect(budgetWorkerReply(reply, { kind: "exec", script: "printf", options: {} }, messageBytes)).toBe(reply);
+	});
+
+	it("keeps the 65 MiB command budget when the output cap is lowered", () => {
+		expect(
+			loadWorkerPoolOptions({ SQL_FS_WORKER_OUTPUT_BYTES: String(8 * 1024 * 1024) }).executionLimits
+				.maxWorkerMessageBytes,
+		).toBe(65 * 1024 * 1024);
+	});
+
+	it("keeps an explicit SQL_FS_WORKER_MESSAGE_BYTES over the output-derived default", () => {
+		expect(loadWorkerPoolOptions({ SQL_FS_WORKER_MESSAGE_BYTES: "4096" }).executionLimits.maxWorkerMessageBytes).toBe(
+			4096,
+		);
 	});
 
 	const largeFileEnv = {

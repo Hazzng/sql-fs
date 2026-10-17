@@ -19,7 +19,7 @@ pnpm verify:architecture # also worker failure, stream finalization, input budge
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
-See [READINESS.md](docs/READINESS.md) for verified scope and hosted follow-up. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution steps, [DEVELOPER.md](docs/DEVELOPER.md) before changing consistency or session ownership, and [README.md](README.md) for API behavior, and [CONFIGURATION.md](docs/CONFIGURATION.md) for runtime settings. Current source and tests take precedence over historical records in `thoughts/shared/`.
+See [READINESS.md](docs/READINESS.md) for verified scope and hosted follow-up. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution steps, [DEVELOPER.md](docs/DEVELOPER.md) before changing consistency or session ownership, and [README.md](README.md) for API behavior, and [CONFIGURATION.md](docs/CONFIGURATION.md) for runtime settings.
 
 Python type checking targets the oldest supported interpreter. `pnpm check:python:types` uses uv to provision Python 3.9 in `clients/python/.venv-py39`, separate from the Python 3.12 development environment. This keeps the dependency syntax aligned with the declared target. Mypy stays below version 2 while Python 3.9 is supported.
 
