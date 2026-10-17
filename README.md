@@ -133,7 +133,7 @@ docker run -p 8080:8080 \
 	sql-fs-api
 ```
 
-To run several replicas, point them all at one Postgres database and one control Redis in `REDIS_URL`. Put the blob cache on a separate Redis in `REDIS_DATA_URL` with `allkeys-lru`, and keep the control Redis on `noeviction`. [Redis eviction policy](docs/CONFIGURATION.md#redis-eviction-policy) explains why.
+To run several replicas, point them all at one Postgres database and one control Redis in `REDIS_URL`. Put the blob cache on a separate Redis in `REDIS_DATA_URL` with `allkeys-lru`, and keep the control Redis on `noeviction`. [Redis eviction policy](docs/CONFIGURATION.md#redis-eviction-policy) explains why. [AUTOSCALING.md](docs/AUTOSCALING.md) covers health probes, metrics and scaling the replica count.
 
 ## Develop
 

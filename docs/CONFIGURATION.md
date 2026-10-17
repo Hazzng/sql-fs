@@ -171,7 +171,9 @@ To upgrade replicas that run with workers off, roll out in two stages. A rolling
 1. Deploy the new version with `SQL_FS_WORKERS_ENABLED=false` on every replica.
 2. When no replica of the older version remains, remove the setting and roll out again.
 
-**Admission.** Each tenant has a queue, and the server takes requests from the queues in turn. On one sandbox, a waiting writer goes before new readers. With the defaults, one tenant can hold one of the two workers and four of the eight ingress permits. Long-lived `GET /mcp` streams count against a separate listener quota. If a request waits more than 250 ms, it fails with `EWORKER_BUSY` (503) and `Retry-After: 1`.
+**Admission.** Each tenant has a queue, and the server takes requests from the queues in turn. On one sandbox, a waiting writer goes before new readers. With the defaults, one tenant can hold one of the two workers and four of the eight ingress permits. Long-lived `GET /mcp` streams count against a separate listener quota. A request that waits longer than `SQL_FS_MAX_INGRESS_WAIT_MS` for an ingress permit, or an exec that waits longer than `SQL_FS_WORKER_QUEUE_WAIT_MS` for a worker, fails with `EWORKER_BUSY` (503) and `Retry-After: 1`. With the defaults, an exec can queue for up to 0.5 s before it fails.
+
+A longer ingress wait does not absorb bursts, because the ingress queue holds no more requests than ingress admits at once. [Wait limits](AUTOSCALING.md#wait-limits) has the measurements.
 
 **Unknown outcomes.** If a script loses its worker, lease or response after it starts, the request fails with `EEXEC_OUTCOME_UNKNOWN` (503, `retryable: false`). The server and the SDKs do not replay it. That includes read-only scripts, because they can still have network side effects. Read the sandbox state before the next action. Earlier items in a batch can already be committed.
 
@@ -199,6 +201,7 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_MAX_INGRESS_TENANT_BYTES` | Three quarters of `SQL_FS_MAX_INGRESS_BYTES`, at least 1 |
 | `SQL_FS_MAX_INGRESS_MCP_LISTENERS` | 8 listeners |
 | `SQL_FS_MAX_INGRESS_TENANT_MCP_LISTENERS` | 4 listeners |
+| `SQL_FS_MAX_INGRESS_WAIT_MS` | 250 ms |
 | `SQL_FS_WORKER_MAX_RSS_BYTES` | 1.5 GiB |
 | `SQL_FS_WORKER_MAX_EXTERNAL_BYTES` | 512 MiB |
 | `SQL_FS_WORKER_SOURCE_BYTES` | 1 MiB |
@@ -212,7 +215,7 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_WORKER_SCRIPT_BUFFER_OPS` | 50000 changes |
 | `SQL_FS_WORKER_SCRIPT_BUFFER_BYTES` | 32 MiB |
 
-A replica does not add workers by itself. Scale the number of replicas on CPU and RSS, together with the worker queue, admission delay and refusal metrics from `GET /metrics`. Waits on one sandbox, on distributed locks and on recovery have their own gauges. More replicas do not shorten those waits.
+A replica does not add workers by itself. To handle more load, add replicas. [AUTOSCALING.md](AUTOSCALING.md) describes the metrics to scale on and the waits that more replicas do not shorten.
 
 ### Sizing
 
@@ -232,13 +235,7 @@ Ten concurrent 64 MiB `PUT` uploads, with `MAX_FILE_WRITE_BYTES` raised to 64 Mi
 
 One replica served 100 agents with separate sandboxes and 5 s think time, about 20 execs per second, with 0 errors and p99 latency under 50 ms. At about 100 execs per second, one tenant saturated at about 71 per second, because its active limit is half the worker count, 1 per replica. Ten tenants reached 97 per second with 0 errors.
 
-Add replicas instead of raising caps, and keep the caps fixed for each box size. Autoscale on these signals:
-
-- Queue wait, from the `sql_fs_worker_queue_wait_milliseconds` histogram.
-- Queue depth, from `sql_fs_worker_queued` and `sql_fs_ingress_queued_requests`.
-- Refusals and timeouts, from `sql_fs_worker_refused_total`, `sql_fs_worker_queue_timeouts_total`, `sql_fs_ingress_refused_total` and `sql_fs_ingress_queue_timeouts_total`.
-- Memory, from `sql_fs_worker_process_rss_bytes`.
-- CPU.
+Add replicas instead of raising caps, and keep the caps fixed for each box size. [AUTOSCALING.md](AUTOSCALING.md) lists the metrics to scale on, a replica-count estimate and an example scale rule.
 
 ### Large files
 
