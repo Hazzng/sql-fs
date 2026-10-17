@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+### Minor Changes
+
+- [#268](https://github.com/Hazzng/sql-fs/pull/268) Thanks [@Hazzng](https://github.com/Hazzng)! - Run scripts in worker threads by default. Set `SQL_FS_WORKERS_ENABLED=false` to keep inline mode. Any value other than `true` or `false` now stops startup.
+  
+  Inline mode now caps exec output at `SQL_FS_WORKER_OUTPUT_BYTES` (default 64 MiB), down from 256 MiB, so both modes share one limit. The default `SQL_FS_WORKER_MESSAGE_BYTES` grows with the output cap: 65 MiB, or the output cap plus 1 MiB if that is larger. An explicit value still wins.
+  
+  To upgrade replicas that run with workers off, deploy with `SQL_FS_WORKERS_ENABLED=false` first, then remove the setting once no older replica remains. docs/CONFIGURATION.md describes the two-stage rollout.
+
+### Patch Changes
+
+- [#270](https://github.com/Hazzng/sql-fs/pull/270) Thanks [@Hazzng](https://github.com/Hazzng)! - Add `SQL_FS_MAX_INGRESS_WAIT_MS`, the time a request or MCP listener waits for ingress capacity before it gets a 503 `EWORKER_BUSY`. The default stays 250 ms, the previous fixed value. Like the other ingress settings, an empty value uses the default. With workers on, any other invalid value, including a wait above 2147483647 ms, stops startup. `SQL_FS_WORKER_QUEUE_WAIT_MS` now rejects values above 2147483647 ms too, because Node would run such a timer after 1 ms.
+
+- [#270](https://github.com/Hazzng/sql-fs/pull/270) Thanks [@Hazzng](https://github.com/Hazzng)! - Shut down promptly when MCP clients hold a `GET /mcp` listener stream open. The server waited for those streams before it drained workers, so every such shutdown ran into the 60 s force exit and exited with code 1. It now ends listener streams first and lets in-flight MCP tool calls finish.
+
 ## 1.1.1
 
 ### Patch Changes
