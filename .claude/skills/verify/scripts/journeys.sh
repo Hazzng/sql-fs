@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Runs every journey in ../features/ against the current stack and asserts the documented results.
-# Usage: journeys.sh [auth|sandboxes|exec|files|ingest|mcp ...]   (default: all)
 set -euo pipefail
 repo=$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)
 cd "$repo"

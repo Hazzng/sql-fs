@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Appends one redacted event to a stack transcript. CLI form is used by stack.sh `api`; mcp.mjs imports record().
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -8,7 +7,7 @@ const SENSITIVE_KEY = /token|secret|password|authorization/i;
 
 function redact(value, secret) {
 	if (typeof value === "string") {
-		const masked = secret ? value.replaceAll(secret, "[REDACTED]") : value;
+		const masked = value.replaceAll(secret, "[REDACTED]");
 		return masked.replace(JWT, "[REDACTED JWT]");
 	}
 	if (Array.isArray(value)) return value.map((item) => redact(item, secret));

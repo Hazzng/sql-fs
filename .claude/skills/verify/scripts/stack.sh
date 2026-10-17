@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Persistent disposable sql-fs stack for driving the API by hand. See ../SKILL.md.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)
@@ -38,15 +37,15 @@ server_alive() {
 	[[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null && ps -p "$PID" -o command= | grep -q "dist/api/server.js"
 }
 
-# EXEC=1 replaces the calling (sub)shell, so a backgrounded call's $! is the server's own PID.
-run_env() {
-	${EXEC:+exec} env -i "PATH=$PATH" "HOME=$HOME" "DATABASE_URL=$DATABASE_URL" "REDIS_URL=$REDIS_URL" \
+exec_in_stack_env() {
+	exec env -i "PATH=$PATH" "HOME=$HOME" "DATABASE_URL=$DATABASE_URL" "REDIS_URL=$REDIS_URL" \
 		"REDIS_DATA_URL=$REDIS_DATA_URL" "AUTH_SECRET=$AUTH_SECRET" "$@"
 }
 
 start_server() {
-	# shellcheck disable=SC2086
-	EXEC=1 run_env "PORT=$PORT" ${SERVER_ENV:-} node dist/api/server.js >>"$DIR/server.log" 2>&1 &
+	local -a overrides=()
+	read -r -a overrides <<<"${SERVER_ENV:-}"
+	(exec_in_stack_env "PORT=$PORT" ${overrides[@]+"${overrides[@]}"} node dist/api/server.js >>"$DIR/server.log" 2>&1) &
 	PID=$!
 	local deadline=$((SECONDS + 60))
 	until ready; do
@@ -74,6 +73,12 @@ STARTED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
 EOF
 }
 
+register_for_teardown() {
+	DATABASE_URL="" REDIS_URL="" REDIS_DATA_URL="" AUTH_SECRET=$secret PORT="" BASE="" PID=""
+	write_state
+	echo "$DIR" >"$pointer"
+}
+
 stop_server() {
 	server_alive || return 0
 	kill -TERM "$PID"
@@ -96,10 +101,7 @@ cmd_up() {
 	if docker compose version >/dev/null 2>&1; then COMPOSE="docker compose"; else COMPOSE="docker-compose"; fi
 	mkdir -p "$DIR"
 	set_compose
-	# Record state before anything can fail so `down` can always clean up.
-	DATABASE_URL="" REDIS_URL="" REDIS_DATA_URL="" AUTH_SECRET=$secret PORT="" BASE="" PID=""
-	write_state
-	echo "$DIR" >"$pointer"
+	register_for_teardown
 	"${compose[@]}" up -d --wait --wait-timeout 120 >&2
 	DATABASE_URL="postgres://sqlfs_app:sqlfs_app@$("${compose[@]}" port postgres 5432)/sqlfs"
 	REDIS_URL="redis://$("${compose[@]}" port redis 6379)"
@@ -210,8 +212,7 @@ cmd_suite() {
 	if [[ "$name" == integration ]]; then
 		local report
 		report="$DIR/suites/integration-$(date +%s).json"
-		run_env "${suite_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$report" "$@"
-		# Same gate as verify-local.sh: a run that skips or executes nothing is not proof.
+		(exec_in_stack_env "${suite_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$report" "$@")
 		node -e '
 			const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 			if (!(r.numPassedTests > 0) || r.numFailedTests || r.numPendingTests) {
@@ -220,7 +221,7 @@ cmd_suite() {
 			}' "$report"
 	else
 		[[ -f "scripts/verify/$name.mjs" ]] || die "no scripts/verify/$name.mjs"
-		run_env "${suite_env[@]}" node "scripts/verify/$name.mjs" "$@"
+		(exec_in_stack_env "${suite_env[@]}" node "scripts/verify/$name.mjs" "$@")
 	fi
 }
 

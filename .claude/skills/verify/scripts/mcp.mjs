@@ -1,8 +1,16 @@
 #!/usr/bin/env node
-// Calls one MCP tool on the stack started by stack.sh. Invoked via `stack.sh mcp`.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { record } from "./record.mjs";
+
+function isToolFailure(part) {
+	if (part.type !== "text") return false;
+	try {
+		return JSON.parse(part.text)?.ok === false;
+	} catch {
+		return false;
+	}
+}
 
 const { STACK_BASE, STACK_TOKEN, STACK_TRANSCRIPT, STACK_SECRET } = process.env;
 const [tool, rawArgs = "{}"] = process.argv.slice(2);
@@ -15,19 +23,14 @@ await client.connect(
 try {
 	if (tool === "list") {
 		const { tools } = await client.listTools();
-		for (const t of tools) console.log(`${t.name}\t${Object.keys(t.inputSchema?.properties ?? {}).join(",")}`);
+		for (const t of tools) console.log(`${t.name}\t${Object.keys(t.inputSchema.properties ?? {}).join(",")}`);
 	} else {
 		const args = JSON.parse(rawArgs);
 		const response = await client.callTool({ name: tool, arguments: args });
 		record(STACK_TRANSCRIPT, STACK_SECRET, { transport: "mcp", tool, args, response });
-		let failed = response.isError === true;
-		for (const part of response.content ?? []) {
-			console.log(part.type === "text" ? part.text : JSON.stringify(part));
-			// File and sandbox tools report failures as isError:false with {"ok":false} (src/api/mcp/tool-errors.ts).
-			try {
-				if (part.type === "text" && JSON.parse(part.text)?.ok === false) failed = true;
-			} catch {}
-		}
+		const parts = response.content;
+		for (const part of parts) console.log(part.type === "text" ? part.text : JSON.stringify(part));
+		const failed = response.isError === true || parts.some(isToolFailure);
 		console.error(`MCP ${tool}: ${failed ? "error" : "ok"}`);
 		const expectError = process.env.EXPECT === "error";
 		if (failed !== expectError) process.exitCode = 1;
