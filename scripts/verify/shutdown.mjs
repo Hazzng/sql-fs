@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 import { once } from "node:events";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { LocalApiRun } from "./local-api.mjs";
+import { LocalApiRun, repo } from "./local-api.mjs";
 
 const run = new LocalApiRun("shutdown");
 let failure;
 try {
 	const server = await run.start({ SQL_FS_WORKERS_ENABLED: "true" });
-	await run.start({ SQL_FS_WORKERS_ENABLED: "true" });
-	const owner = await run.owner();
+	// This check creates no sandboxes, so it signs its own token rather than registering an owner for cleanup,
+	// which would need a second live server after the first one exits.
+	const { signToken } = await import(join(repo, "dist/api/lib/jwt.js"));
+	const token = await signToken({ sub: `${run.runId}-mcp`, expiresIn: "1h", secret: process.env.AUTH_SECRET });
 	const headers = {
-		Authorization: `Bearer ${owner.token}`,
+		Authorization: `Bearer ${token}`,
 		Accept: "application/json, text/event-stream",
 		"Content-Type": "application/json",
 	};
