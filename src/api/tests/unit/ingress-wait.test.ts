@@ -11,11 +11,12 @@ function deferred() {
 	return { promise, resolve };
 }
 
-function setup(maxRequests = 8, maxTenantRequests = 4) {
+function setup(maxRequests = 8, maxTenantRequests = 4, env: NodeJS.ProcessEnv = {}) {
 	const ingress = new IngressAdmission(
 		loadIngressOptions({
 			SQL_FS_MAX_INGRESS_REQUESTS: String(maxRequests),
 			SQL_FS_MAX_INGRESS_TENANT_REQUESTS: String(maxTenantRequests),
+			...env,
 		}),
 	);
 	const app = new Hono<{ Variables: AuthVariables }>();
@@ -23,7 +24,7 @@ function setup(maxRequests = 8, maxTenantRequests = 4) {
 	app.use("*", (c, next) => {
 		if (c.req.path.startsWith("/bootstrap/")) return ingress.bootstrapMiddleware(c, next);
 		c.set("tenant", c.req.header("X-Tenant") ?? "observer");
-		return ingress.middleware(c, next);
+		return c.req.path.startsWith("/mcp") ? ingress.mcpMiddleware(c, next) : ingress.middleware(c, next);
 	});
 	app.post("/work", async (c) => c.text(await c.req.text()));
 	return { ingress, app };
@@ -190,6 +191,40 @@ describe("bounded ingress wait", () => {
 			});
 			expect(input.observed).toEqual({ reads: 0, cancelled: true });
 			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 0, queueTimeouts: 1, refused: 1 });
+		} finally {
+			hold.resolve();
+			await Promise.allSettled([active, ...(waiting ? [waiting] : [])].map(consume));
+		}
+	});
+
+	it.each([
+		{ gate: "request", method: "POST", path: "/hold" },
+		{ gate: "MCP listener", method: "GET", path: "/mcp/listen" },
+	])("refuses a queued $gate only after SQL_FS_MAX_INGRESS_WAIT_MS", async ({ method, path }) => {
+		const { app, ingress } = setup(2, 1, { SQL_FS_MAX_INGRESS_WAIT_MS: "40" });
+		const hold = deferred();
+		app.on(["GET", "POST"], path, async (c) => {
+			await hold.promise;
+			return c.text("held");
+		});
+		const active = app.request(path, { method });
+		let waiting: Promise<Response> | undefined;
+		try {
+			await flush();
+			waiting = Promise.resolve(app.request(path, { method }));
+			await flush();
+			await vi.advanceTimersByTimeAsync(39);
+			const gate = () =>
+				method === "GET"
+					? { queued: ingress.metrics.queuedMcpListeners, timeouts: ingress.metrics.mcpListenerQueueTimeouts }
+					: { queued: ingress.metrics.queuedRequests, timeouts: ingress.metrics.queueTimeouts };
+			expect(gate()).toEqual({ queued: 1, timeouts: 0 });
+			await vi.advanceTimersByTimeAsync(1);
+			expect(gate()).toEqual({ queued: 0, timeouts: 1 });
+			const response = await waiting;
+			expect(response.status).toBe(503);
+			expect(response.headers.get("Retry-After")).toBe("1");
+			expect(await response.json()).toMatchObject({ code: "EWORKER_BUSY", retryable: true });
 		} finally {
 			hold.resolve();
 			await Promise.allSettled([active, ...(waiting ? [waiting] : [])].map(consume));

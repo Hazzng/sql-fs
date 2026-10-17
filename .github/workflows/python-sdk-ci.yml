@@ -2,7 +2,7 @@ name: Python SDK CI
 
 on:
   push:
-    branches: [main, "ci/**", "feat/**", "fix/**", "feature/**", "ralph/**"]
+    branches: [main]
   pull_request:
 
 permissions:

@@ -78,6 +78,20 @@ export function startMcpSessionSweeper(intervalMs: number = MCP_SWEEP_INTERVAL_M
 	if (typeof sweeperTimer.unref === "function") sweeperTimer.unref();
 }
 
+/**
+ * End every session's standalone `GET /mcp` stream, leaving in-flight tool calls to finish. Shutdown calls this
+ * before `server.close()`, which otherwise waits on those long-lived connections until the force-exit timer.
+ */
+export function closeMcpListeners(): void {
+	for (const entry of sessions.values()) {
+		try {
+			entry.transport.closeStandaloneSSEStream();
+		} catch {
+			// best-effort
+		}
+	}
+}
+
 /** Stop the sweeper and close every active MCP transport. Used during shutdown. */
 export async function shutdownMcp(): Promise<void> {
 	if (sweeperTimer !== undefined) {

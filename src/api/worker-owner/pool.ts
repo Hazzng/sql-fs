@@ -4,7 +4,13 @@ import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { retirePostgresSandboxGeneration } from "../../sql-fs/index.js";
 import type { ScriptTxBufferConfig } from "../../sql-fs/script-tx-buffer.js";
-import { configuredBoolean, configuredInteger, loadExecOutputBytes, positiveIntEnv } from "../lib/env.js";
+import {
+	assertTimerMs,
+	configuredBoolean,
+	configuredInteger,
+	loadExecOutputBytes,
+	positiveIntEnv,
+} from "../lib/env.js";
 import { readOnlyContext } from "../read-only-context.js";
 import { FairAdmission } from "./admission.js";
 import { assertWorkerMessageBudget } from "./message-budget.js";
@@ -117,7 +123,7 @@ export function loadWorkerPoolOptions(
 			"SQL_FS_WORKER_QUEUE_TENANT_BYTES",
 			Math.max(1, Math.floor(maxQueuedBytes / 2)),
 		),
-		waitMs: configuredInteger(env, "SQL_FS_WORKER_QUEUE_WAIT_MS", 250),
+		waitMs: assertTimerMs("SQL_FS_WORKER_QUEUE_WAIT_MS", configuredInteger(env, "SQL_FS_WORKER_QUEUE_WAIT_MS", 250)),
 		cancelGraceMs: configuredInteger(env, "SQL_FS_WORKER_CANCEL_GRACE_MS", 500),
 		startupMs: configuredInteger(env, "SQL_FS_WORKER_STARTUP_MS", 10_000),
 		maxRssBytes: configuredInteger(env, "SQL_FS_WORKER_MAX_RSS_BYTES", 1536 * 1024 * 1024),

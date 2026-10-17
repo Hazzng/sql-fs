@@ -50,6 +50,7 @@ pnpm build
 pnpm --dir clients/typescript build
 "${verify_env[@]}" node scripts/verify/contracts.mjs
 "${verify_env[@]}" node scripts/verify/output-cap.mjs
+"${verify_env[@]}" node scripts/verify/shutdown.mjs
 "${verify_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$evidence/integration.json"
 node --input-type=module - "$evidence/integration.json" <<'JS'
 import assert from "node:assert/strict";

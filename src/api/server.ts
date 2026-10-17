@@ -29,7 +29,7 @@ import {
 import { loadExecLockOptions } from "./exec-lock-config.js";
 import { IngressAdmission, loadIngressOptions } from "./ingress-admission.js";
 import { configuredBoolean, loadExecOutputBytes } from "./lib/env.js";
-import { handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
+import { closeMcpListeners, handleMcpRequest, shutdownMcp, startMcpSessionSweeper } from "./mcp/server.js";
 import { mcpOptionsResponse, withMcpCors } from "./mcp-cors.js";
 import { runMigrations } from "./migrations.js";
 import { openapiSpec } from "./openapi-spec.js";
@@ -376,6 +376,7 @@ if (isMain) {
 			shuttingDown = true;
 			console.log(JSON.stringify({ event: "shutdown_begin" }));
 			ingressAdmission?.close();
+			closeMcpListeners();
 			stopEventLoopMonitor();
 			// Force-exit guard so a hung Postgres or Redis cleanup cannot keep
 			// the process alive past the orchestrator's grace period.

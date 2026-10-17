@@ -130,6 +130,12 @@ describe("worker resource policy", () => {
 		).toBe(65 * 1024 * 1024);
 	});
 
+	it("rejects a worker queue wait that Node's timer would cut to 1 ms", () => {
+		expect(() => loadWorkerPoolOptions({ SQL_FS_WORKER_QUEUE_WAIT_MS: "2147483648" })).toThrow(
+			"SQL_FS_WORKER_QUEUE_WAIT_MS must be at most 2147483647",
+		);
+	});
+
 	it("keeps an explicit SQL_FS_WORKER_MESSAGE_BYTES over the output-derived default", () => {
 		expect(loadWorkerPoolOptions({ SQL_FS_WORKER_MESSAGE_BYTES: "4096" }).executionLimits.maxWorkerMessageBytes).toBe(
 			4096,

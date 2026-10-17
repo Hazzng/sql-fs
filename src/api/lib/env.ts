@@ -30,6 +30,14 @@ export function configuredInteger(env: NodeJS.ProcessEnv, name: string, fallback
 	return parsed;
 }
 
+/** Node runs any longer `setTimeout` delay after 1 ms, so a larger wait would refuse requests at once. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+export function assertTimerMs(name: string, value: number): number {
+	if (value > MAX_TIMER_MS) throw new Error(`${name} must be at most ${MAX_TIMER_MS}`);
+	return value;
+}
+
 export function configuredBoolean(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
 	const value = env[name];
 	if (value === undefined) return fallback;
