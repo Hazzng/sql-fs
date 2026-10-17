@@ -8,8 +8,7 @@ const run = new LocalApiRun("shutdown");
 let failure;
 try {
 	const server = await run.start({ SQL_FS_WORKERS_ENABLED: "true" });
-	// This check creates no sandboxes, so it signs its own token rather than registering an owner for cleanup,
-	// which would need a second live server after the first one exits.
+	// No run.owner(): its cleanup needs a live server after this one exits.
 	const { signToken } = await import(join(repo, "dist/api/lib/jwt.js"));
 	const token = await signToken({ sub: `${run.runId}-mcp`, expiresIn: "1h", secret: process.env.AUTH_SECRET });
 	const headers = {
