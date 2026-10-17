@@ -65,6 +65,13 @@ describe("ingress configuration", () => {
 		expect(loadIngressOptions({ SQL_FS_MAX_INGRESS_WAIT_MS: "40" }).waitMs).toBe(40);
 	});
 
+	it("rejects an ingress wait that Node's timer would cut to 1 ms", () => {
+		expect(loadIngressOptions({ SQL_FS_MAX_INGRESS_WAIT_MS: "2147483647" }).waitMs).toBe(2147483647);
+		expect(() => loadIngressOptions({ SQL_FS_MAX_INGRESS_WAIT_MS: "2147483648" })).toThrow(
+			"SQL_FS_MAX_INGRESS_WAIT_MS must be at most 2147483647",
+		);
+	});
+
 	it("reserves explicit raw-body headroom with bounded concurrent requests", () => {
 		expect(loadIngressOptions({})).toEqual({
 			maxRequests: 8,

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { ServerResponse } from "node:http";
 import { Http2ServerResponse } from "node:http2";
 import type { Context, MiddlewareHandler, Next } from "hono";
+import { assertTimerMs } from "./lib/env.js";
 import { FairAdmission } from "./worker-owner/admission.js";
 import { WorkerBusyError } from "./worker-owner/protocol.js";
 
@@ -68,7 +69,7 @@ export function loadIngressOptions(env: NodeJS.ProcessEnv = process.env): Ingres
 		maxBytes,
 		maxTenantBytes,
 		maxBodyBytes: read("MAX_REQUEST_BODY_BYTES", 256 * 1024 * 1024),
-		waitMs: read("SQL_FS_MAX_INGRESS_WAIT_MS", 250),
+		waitMs: assertTimerMs("SQL_FS_MAX_INGRESS_WAIT_MS", read("SQL_FS_MAX_INGRESS_WAIT_MS", 250)),
 	};
 }
 
