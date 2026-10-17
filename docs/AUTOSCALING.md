@@ -12,7 +12,7 @@ Each replica has fixed capacity. By default it runs 2 worker threads and admits 
 | `GET /readyz` | None | `200 {"status":"ok"}` with an `eventLoop` lag summary. If Redis is configured and does not answer `PING` within 2 s, it returns `503 {"status":"degraded"}`. | Readiness and startup. It does not check Postgres. |
 | `GET /metrics` | Bearer JWT | Prometheus text format 0.0.4. | Scraping. |
 
-`/readyz` keeps returning 200 while the server shuts down. The platform must stop routing to a terminating replica by itself. Kubernetes and Azure Container Apps both do so.
+`/readyz` does not report shutdown. A terminating replica refuses new connections, so probes on new connections fail to connect. The platform must stop routing to a terminating replica by itself. Kubernetes and Azure Container Apps both do so.
 
 `/metrics` accepts the same bearer JWT as the REST API: an HS256 token signed with `AUTH_SECRET`, with a `sub` claim and an optional `tenant` claim that names a configured tenant. Without a valid token it returns 401. The metrics have no tenant labels, so a token for any tenant returns the same numbers. Give the scraper a token with a dedicated `sub`, minted through `POST /v1/auth/admin` or signed with `AUTH_SECRET` directly. In Prometheus, put the token in a file and point the scrape job at it:
 
@@ -220,13 +220,13 @@ For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 
 
 On `SIGTERM` or `SIGINT`, the server does the following:
 
-1. It closes ingress admission. Queued and new `/v1` and `/mcp` requests get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue. `/healthz`, `/readyz` and `/metrics` bypass ingress and keep answering.
+1. It closes ingress admission. Queued `/v1` and `/mcp` requests, and new ones on already-open connections, get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue.
 2. It ends every MCP session's `GET /mcp` listener stream. In-flight MCP tool calls continue.
-3. It stops accepting connections and waits for open requests to finish.
+3. It stops accepting connections, so new requests fail to connect, and waits for open requests to finish.
 4. It closes MCP sessions, then lets running worker operations finish for up to 30 s, then closes Postgres and Redis. It exits with code 0.
 5. If shutdown has not finished 60 s after the signal, it logs `shutdown_force_exit` and exits with code 1.
 
-Neither the 30 s nor the 60 s limit is configurable. A script can run for up to `SQL_FS_WORKER_EXECUTION_MS`, 120 s by default, so a long script can still be cut off. Set the platform's termination grace period above 60 s so that the platform does not kill the process before the server's own limit. To avoid cut-off scripts, keep `SQL_FS_WORKER_EXECUTION_MS` below about 60 s.
+The 30 s drain starts only after open requests finish, so an in-flight request effectively has until the 60 s force exit. Neither limit is configurable. A script can run for up to `SQL_FS_WORKER_EXECUTION_MS`, 120 s by default, so a long script can still be cut off. Set the platform's termination grace period above 60 s so that the platform does not kill the process before the server's own limit. To avoid cut-off scripts, keep `SQL_FS_WORKER_EXECUTION_MS` below about 60 s.
 
 ### Wait limits
 
