@@ -52,14 +52,7 @@ pnpm --dir clients/typescript build
 "${verify_env[@]}" node scripts/verify/output-cap.mjs
 "${verify_env[@]}" node scripts/verify/shutdown.mjs
 "${verify_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$evidence/integration.json"
-node --input-type=module - "$evidence/integration.json" <<'JS'
-import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-const report = JSON.parse(readFileSync(process.argv[2], "utf8"));
-assert.ok(report.numPassedTests > 0, "Integration tests must execute");
-assert.equal(report.numFailedTests, 0, "Integration tests must pass");
-assert.equal(report.numPendingTests, 0, "Integration tests must not silently skip");
-JS
+node scripts/verify/assert-integration-report.mjs "$evidence/integration.json"
 "${verify_env[@]}" node scripts/verify/sdk-clients.mjs
 
 if [[ "$profile" == architecture ]]; then

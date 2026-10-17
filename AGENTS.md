@@ -49,7 +49,7 @@ Evidence lands in `scripts/verify/.run/stack-<id>/` (`transcript.jsonl`, `server
 | `worker-failures`, `sse-finalization`, `input-budgets`, `tenants` | worker loss, stream finalization, input budgets, tenant isolation | `verify:architecture` |
 | `ingest-admission`, `large-files` | ingest budgets, large-file profiling | manual; large files need cgroup v2 |
 
-`local-api.mjs` is the shared harness: owned servers, tokens, schema validation, `proof.json`. `*-faults.mjs` files are fault injectors loaded by the suites, not entry points. When you add an endpoint or client-visible behavior, add or extend a suite here, add its journey to `features/` and `journeys.sh`, and update `openapi-spec.ts`.
+`local-api.mjs` is the shared harness: owned servers, tokens, schema validation, `proof.json`. `assert-integration-report.mjs` is the shared check that an integration run executed tests with none failed or skipped. `*-faults.mjs` files are fault injectors loaded by the suites, not entry points. When you add an endpoint or client-visible behavior, add or extend a suite here, add its journey to `features/` and `journeys.sh`, and update `openapi-spec.ts`.
 
 See [READINESS.md](docs/READINESS.md) for verified scope and hosted follow-up. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution steps, [DEVELOPER.md](docs/DEVELOPER.md) before changing consistency or session ownership, [README.md](README.md) for API behavior, [CONFIGURATION.md](docs/CONFIGURATION.md) for runtime settings, and [AUTOSCALING.md](docs/AUTOSCALING.md) for probes, metrics and replica scaling.
 

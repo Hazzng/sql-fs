@@ -213,12 +213,7 @@ cmd_suite() {
 		local report
 		report="$DIR/suites/integration-$(date +%s).json"
 		(exec_in_stack_env "${suite_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$report" "$@")
-		node -e '
-			const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-			if (!(r.numPassedTests > 0) || r.numFailedTests || r.numPendingTests) {
-				console.error(`integration: passed=${r.numPassedTests} failed=${r.numFailedTests} skipped=${r.numPendingTests}`);
-				process.exit(1);
-			}' "$report"
+		node scripts/verify/assert-integration-report.mjs "$report"
 	else
 		[[ -f "scripts/verify/$name.mjs" ]] || die "no scripts/verify/$name.mjs"
 		(exec_in_stack_env "${suite_env[@]}" node "scripts/verify/$name.mjs" "$@")
