@@ -398,6 +398,7 @@ describe("sandbox creation body admission", () => {
 			maxBytes: 128,
 			maxTenantBytes: 96,
 			maxBodyBytes: 64,
+			waitMs: 250,
 		});
 		const app = new Hono<{ Variables: AuthVariables }>();
 		app.onError((_error, c) => c.json({ error: "body rejected" }, 500));

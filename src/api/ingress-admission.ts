@@ -32,6 +32,7 @@ export interface IngressOptions {
 	readonly maxBytes: number;
 	readonly maxTenantBytes: number;
 	readonly maxBodyBytes: number;
+	readonly waitMs: number;
 }
 
 export function loadIngressOptions(env: NodeJS.ProcessEnv = process.env): IngressOptions {
@@ -67,6 +68,7 @@ export function loadIngressOptions(env: NodeJS.ProcessEnv = process.env): Ingres
 		maxBytes,
 		maxTenantBytes,
 		maxBodyBytes: read("MAX_REQUEST_BODY_BYTES", 256 * 1024 * 1024),
+		waitMs: read("SQL_FS_MAX_INGRESS_WAIT_MS", 250),
 	};
 }
 
@@ -89,7 +91,7 @@ export class IngressAdmission {
 			maxQueuedPerTenant: options.maxTenantRequests,
 			maxQueuedBytes: 0,
 			maxQueuedBytesPerTenant: 0,
-			waitMs: 250,
+			waitMs: options.waitMs,
 		});
 		this.mcpListenerAdmission = new FairAdmission({
 			capacity: options.maxMcpListeners ?? options.maxRequests,
@@ -98,7 +100,7 @@ export class IngressAdmission {
 			maxQueuedPerTenant: options.maxTenantMcpListeners ?? options.maxTenantRequests,
 			maxQueuedBytes: 0,
 			maxQueuedBytesPerTenant: 0,
-			waitMs: 250,
+			waitMs: options.waitMs,
 		});
 	}
 

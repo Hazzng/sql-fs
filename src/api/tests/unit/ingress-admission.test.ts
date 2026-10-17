@@ -30,6 +30,7 @@ function setup(maxRequests = 8, maxBytes = 128, maxBodyBytes = 256) {
 		maxBytes,
 		maxTenantBytes: Math.max(1, maxBytes - 1),
 		maxBodyBytes,
+		waitMs: 250,
 	});
 	const app = new Hono<{ Variables: AuthVariables }>();
 	let tenantSequence = 0;
@@ -59,6 +60,11 @@ afterEach(() => {
 });
 
 describe("ingress configuration", () => {
+	it("waits 250 ms at ingress by default, independent of the worker queue wait", () => {
+		expect(loadIngressOptions({ SQL_FS_WORKER_QUEUE_WAIT_MS: "900" }).waitMs).toBe(250);
+		expect(loadIngressOptions({ SQL_FS_MAX_INGRESS_WAIT_MS: "40" }).waitMs).toBe(40);
+	});
+
 	it("reserves explicit raw-body headroom with bounded concurrent requests", () => {
 		expect(loadIngressOptions({})).toEqual({
 			maxRequests: 8,
@@ -68,6 +74,7 @@ describe("ingress configuration", () => {
 			maxBytes: 128 * 1024 * 1024,
 			maxTenantBytes: 96 * 1024 * 1024,
 			maxBodyBytes: 256 * 1024 * 1024,
+			waitMs: 250,
 		});
 	});
 
@@ -79,6 +86,7 @@ describe("ingress configuration", () => {
 		"SQL_FS_MAX_INGRESS_BYTES",
 		"SQL_FS_MAX_INGRESS_TENANT_BYTES",
 		"MAX_REQUEST_BODY_BYTES",
+		"SQL_FS_MAX_INGRESS_WAIT_MS",
 	])("rejects invalid %s instead of disabling its budget", (name) => {
 		for (const value of ["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992"]) {
 			expect(() => loadIngressOptions({ [name]: value })).toThrow(name);
@@ -264,6 +272,7 @@ describe("HTTP body admission", () => {
 			maxBytes: 100,
 			maxTenantBytes: 99,
 			maxBodyBytes: 256,
+			waitMs: 250,
 		});
 		const app = new Hono<{ Variables: AuthVariables }>();
 		app.onError((_error, c) => c.text("body rejected", 400));
@@ -575,6 +584,7 @@ describe("HTTP body admission", () => {
 			maxBytes: 150,
 			maxTenantBytes: 149,
 			maxBodyBytes: 256,
+			waitMs: 250,
 		});
 		const app = new Hono<{ Variables: AuthVariables }>();
 		app.use("/v1/*", authMiddleware);
