@@ -222,7 +222,7 @@ On `SIGTERM` or `SIGINT`, the server does the following:
 
 1. It closes ingress admission. Queued `/v1` and `/mcp` requests, and new ones on already-open connections, get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue.
 2. It ends every MCP session's `GET /mcp` listener stream. In-flight MCP tool calls continue.
-3. It stops accepting connections, so new requests fail to connect, and waits for open requests to finish.
+3. It stops accepting connections, so new connections fail, and waits for open requests to finish.
 4. It closes MCP sessions, then lets running worker operations finish for up to 30 s, then closes Postgres and Redis. It exits with code 0.
 5. If shutdown has not finished 60 s after the signal, it logs `shutdown_force_exit` and exits with code 1.
 
