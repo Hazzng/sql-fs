@@ -205,7 +205,7 @@ To estimate the replica count:
 2. Add about 50% headroom and round up.
 3. Check the per-tenant limit. The busiest tenant's concurrent execs must be at or below `replicas * SQL_FS_WORKER_ACTIVE_TENANT_MAX`.
 
-For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 3 replicas, and 5 with headroom. If one tenant runs 6 execs at a time, 5 replicas with the default limit of 1 is too few. That tenant needs 6 replicas, or 3 or more replicas that each run 4 workers with a limit of 2. A replica with 4 workers needs its memory sized again.
+For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 3 replicas, and 5 with headroom. If one tenant runs 6 execs at a time, 5 replicas with the default limit of 1 is too few. That tenant needs 6 replicas, or 3 or more replicas that each run 4 workers with a limit of 2. Startup rejects 4 workers with the default settings. Also set `SQL_FS_WORKER_MAX_PG_CONNECTIONS=8`, and either lower `SQL_FS_WORKER_HEAP_MB` (for example to 256) or raise `SQL_FS_WORKER_MAX_RSS_BYTES`, then size the replica's memory again.
 
 ## Doing it well
 
