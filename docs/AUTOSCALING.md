@@ -16,15 +16,26 @@ Each replica has fixed capacity. By default it runs 2 worker threads and admits 
 
 `/metrics` accepts the same bearer JWT as the REST API: an HS256 token signed with `AUTH_SECRET`, with a `sub` claim and an optional `tenant` claim that names a configured tenant. Without a valid token it returns 401. The metrics have no tenant labels, so a token for any tenant returns the same numbers. Give the scraper a token with a dedicated `sub`, minted through `POST /v1/auth/admin` or signed with `AUTH_SECRET` directly. In Prometheus, put the token in a file and point the scrape job at it:
 
+Scrape every replica. A load-balanced service address reaches one replica per scrape, so fleet sums and per-replica queries would describe a random replica. On Kubernetes, discover the pods:
+
 ```yaml
 scrape_configs:
   - job_name: sql-fs
     metrics_path: /metrics
     authorization:
       credentials_file: /etc/prometheus/sql-fs-token
-    static_configs:
-      - targets: ["sql-fs-api:8080"]
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        regex: sql-fs-api
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: "$1:8080"
 ```
+
+Change the `app` label to match your deployment. On a platform that does not expose each replica's address, use its own per-replica metrics collection instead of one scrape target.
 
 The server also serves `GET /openapi.json` and `GET /docs` for the API schema. They are not operational endpoints.
 
@@ -210,9 +221,10 @@ For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 
 On `SIGTERM` or `SIGINT`, the server does the following:
 
 1. It closes ingress admission. Queued requests, and new requests on open connections, get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue.
-2. It stops accepting connections and waits for open requests to finish.
-3. It closes MCP sessions, then lets running worker operations finish for up to 30 s, then closes Postgres and Redis. It exits with code 0.
-4. If shutdown has not finished 60 s after the signal, it logs `shutdown_force_exit` and exits with code 1.
+2. It ends every MCP session's `GET /mcp` listener stream. In-flight MCP tool calls continue.
+3. It stops accepting connections and waits for open requests to finish.
+4. It closes MCP sessions, then lets running worker operations finish for up to 30 s, then closes Postgres and Redis. It exits with code 0.
+5. If shutdown has not finished 60 s after the signal, it logs `shutdown_force_exit` and exits with code 1.
 
 Neither the 30 s nor the 60 s limit is configurable. A script can run for up to `SQL_FS_WORKER_EXECUTION_MS`, 120 s by default, so a long script can still be cut off. Set the platform's termination grace period above 60 s so that the platform does not kill the process before the server's own limit. To avoid cut-off scripts, keep `SQL_FS_WORKER_EXECUTION_MS` below about 60 s.
 
@@ -220,7 +232,7 @@ Neither the 30 s nor the 60 s limit is configurable. A script can run for up to 
 
 A request can wait twice before it gets a 503. It first waits for an ingress permit, up to `SQL_FS_MAX_INGRESS_WAIT_MS`. An exec then waits for a worker, up to `SQL_FS_WORKER_QUEUE_WAIT_MS`. Both default to 250 ms, so an exec can queue for up to 0.5 s before it fails.
 
-A longer ingress wait does not absorb bursts. The ingress queue holds at most as many requests as ingress admits at once: `SQL_FS_MAX_INGRESS_REQUESTS` for the replica and `SQL_FS_MAX_INGRESS_TENANT_REQUESTS` for each tenant, 8 and 4 by default. In a burst of 100 requests, 8 run, 8 wait and the rest are refused at once, whatever the wait. The wait only decides how long those few queued requests hold their places. [#269](https://github.com/Hazzng/sql-fs/issues/269) tracks a deeper ingress queue.
+A longer ingress wait does not absorb bursts. The ingress queue holds at most as many requests as ingress admits at once: `SQL_FS_MAX_INGRESS_REQUESTS` for the replica and `SQL_FS_MAX_INGRESS_TENANT_REQUESTS` for each tenant, 8 and 4 by default. In a burst of 100 requests spread across tenants, 8 run, 8 wait and the rest are refused at once, whatever the wait. One tenant on its own gets 4 running and 4 waiting. The wait only decides how long those few queued requests hold their places. [#269](https://github.com/Hazzng/sql-fs/issues/269) tracks a deeper ingress queue.
 
 These runs used the same 2 GiB replica as [Measured capacity](#measured-capacity), with clients that waited 1 s after each 503, as `Retry-After: 1` asks. They ran on 2026-10-17.
 
