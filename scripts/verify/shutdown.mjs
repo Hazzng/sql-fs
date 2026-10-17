@@ -47,7 +47,7 @@ try {
 		.catch(() => "aborted");
 
 	const started = performance.now();
-	const exited = once(server.child, "exit");
+	const exited = once(server.child, "close");
 	server.child.kill("SIGTERM");
 	const [code] = await exited;
 	const seconds = (performance.now() - started) / 1000;

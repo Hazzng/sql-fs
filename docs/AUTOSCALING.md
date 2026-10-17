@@ -58,7 +58,7 @@ The names below come from `src/api/worker-owner/metrics.ts` and from a scrape of
 |---|---|---|
 | `sql_fs_worker_capacity` | gauge | Configured worker count, `SQL_FS_WORKER_COUNT`. |
 | `sql_fs_worker_ready` | gauge | Workers that are started and able to take work. |
-| `sql_fs_worker_busy` | gauge | Workers that run an operation now. |
+| `sql_fs_worker_busy` | gauge | Worker slots held by an admitted operation, including operations that wait for a lock or recovery. For work that executes now, use `sql_fs_worker_running_operations`. |
 | `sql_fs_worker_resident_sessions` | gauge | Workers that hold a sandbox loaded. A worker keeps the last sandbox it served until another sandbox needs it. |
 | `sql_fs_worker_running_operations` | gauge | Admitted operations that run now. |
 | `sql_fs_worker_lock_waiting` | gauge | Admitted operations that wait for the sandbox's distributed lock. |
@@ -220,7 +220,7 @@ For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 
 
 On `SIGTERM` or `SIGINT`, the server does the following:
 
-1. It closes ingress admission. Queued requests, and new requests on open connections, get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue.
+1. It closes ingress admission. Queued and new `/v1` and `/mcp` requests get 503 `ESHUTTINGDOWN` with `Retry-After: 1`. Admitted requests continue. `/healthz`, `/readyz` and `/metrics` bypass ingress and keep answering.
 2. It ends every MCP session's `GET /mcp` listener stream. In-flight MCP tool calls continue.
 3. It stops accepting connections and waits for open requests to finish.
 4. It closes MCP sessions, then lets running worker operations finish for up to 30 s, then closes Postgres and Redis. It exits with code 0.
