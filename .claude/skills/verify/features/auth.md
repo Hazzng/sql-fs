@@ -1,10 +1,10 @@
 # Auth
 
-Every `/v1/*` and `/mcp` call carries a bearer JWT signed with `AUTH_SECRET`. A caller with the secret can mint a token through `POST /v1/auth/bootstrap`. Requests without a valid token are rejected before they touch any sandbox.
+Every `/v1/*` and `/mcp` call carries a bearer JWT signed with `AUTH_SECRET`, with two exceptions. `POST /v1/auth/bootstrap` takes no bearer token: a caller proves it holds the secret with `X-Auth-Secret` and gets a token back. When `MCP_API_KEY` is set, `/mcp` also accepts that static key as the bearer value and takes the owner from an identity header. Requests without a valid token are rejected before they touch any sandbox.
 
 ## Sub-features
 
-- `auth-required` rejects unauthenticated `/v1` requests with `401 AUTH_REQUIRED`.
+- `auth-required` rejects `/v1` requests without a bearer token with `401 AUTH_REQUIRED`. `POST /v1/auth/bootstrap` is exempt.
 - `auth-bootstrap` issues a token for a `sub` when `X-Auth-Secret` matches.
 - `auth-bootstrap-denied` rejects a wrong secret with `403 FORBIDDEN` before parsing the body.
 - `auth-token-cli` mints tokens offline with `pnpm token:create`.
@@ -28,6 +28,6 @@ Preconditions:
 
 ## Gotchas
 
-- Bootstrap is rate-limited per IP. A burst of bad attempts returns `429` for a while.
+- Every `POST /v1/auth/bootstrap` counts toward a per-IP limit, successful mints included: 5 per 60 seconds by default (`BOOTSTRAP_RATE_LIMIT_MAX`, `BOOTSTRAP_RATE_LIMIT_WINDOW_MS`). The `auth` journey makes two calls, so a third run within a minute gets `429`.
 - `POST /v1/auth/admin` needs `ADMIN_SECRET`, which the stack does not set. It returns `500 ADMIN_NOT_CONFIGURED` unless you pass `SERVER_ENV="ADMIN_SECRET=..." $S restart`.
 - A token without a `tenant` claim resolves to the `default` tenant.

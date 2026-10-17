@@ -42,11 +42,19 @@ exec_in_stack_env() {
 		"REDIS_DATA_URL=$REDIS_DATA_URL" "AUTH_SECRET=$AUTH_SECRET" "$@"
 }
 
+override_names() {
+	local -a overrides=()
+	read -r -a overrides <<<"${SERVER_ENV:-}"
+	local kv
+	for kv in ${overrides[@]+"${overrides[@]}"}; do printf '%s ' "${kv%%=*}"; done
+}
+
 start_server() {
 	local -a overrides=()
 	read -r -a overrides <<<"${SERVER_ENV:-}"
 	(exec_in_stack_env "PORT=$PORT" ${overrides[@]+"${overrides[@]}"} node dist/api/server.js >>"$DIR/server.log" 2>&1) &
 	PID=$!
+	write_state
 	local deadline=$((SECONDS + 60))
 	until ready; do
 		if ! kill -0 "$PID" 2>/dev/null; then tail -40 "$DIR/server.log" >&2; die "server exited before ready"; fi
@@ -56,21 +64,15 @@ start_server() {
 }
 
 write_state() {
-	cat >"$DIR/state.env" <<EOF
-DIR='$DIR'
-PROJECT='$PROJECT'
-COMPOSE='$COMPOSE'
-DATABASE_URL='$DATABASE_URL'
-REDIS_URL='$REDIS_URL'
-REDIS_DATA_URL='$REDIS_DATA_URL'
-AUTH_SECRET='$AUTH_SECRET'
-PORT='$PORT'
-BASE='$BASE'
-PID='$PID'
-SERVER_ENV='${SERVER_ENV:-}'
-BUILT_HEAD='$(git rev-parse --short HEAD)'
-STARTED_AT='$(date -u +%Y-%m-%dT%H:%M:%SZ)'
-EOF
+	local built_head started_at
+	built_head=$(git rev-parse --short HEAD)
+	started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	(
+		umask 077
+		printf '%s=%q\n' DIR "$DIR" PROJECT "$PROJECT" COMPOSE "$COMPOSE" DATABASE_URL "$DATABASE_URL" \
+			REDIS_URL "$REDIS_URL" REDIS_DATA_URL "$REDIS_DATA_URL" AUTH_SECRET "$AUTH_SECRET" PORT "$PORT" BASE "$BASE" \
+			PID "$PID" SERVER_ENV "${SERVER_ENV:-}" BUILT_HEAD "$built_head" STARTED_AT "$started_at" >"$DIR/state.env"
+	)
 }
 
 register_for_teardown() {
@@ -99,7 +101,8 @@ cmd_up() {
 	DIR="$runs/$id"
 	PROJECT="sqlfs-$id"
 	if docker compose version >/dev/null 2>&1; then COMPOSE="docker compose"; else COMPOSE="docker-compose"; fi
-	mkdir -p "$DIR"
+	mkdir -p "$runs"
+	mkdir -m 700 "$DIR"
 	set_compose
 	register_for_teardown
 	"${compose[@]}" up -d --wait --wait-timeout 120 >&2
@@ -109,9 +112,7 @@ cmd_up() {
 	maybe_build "${1:-}"
 	PORT=$(node -e 'const s=require("net").createServer().listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
 	BASE="http://127.0.0.1:$PORT"
-	write_state
 	start_server
-	write_state
 	echo "stack up: $BASE (pid $PID)"
 	echo "evidence: $DIR"
 }
@@ -122,9 +123,8 @@ cmd_restart() {
 	[[ "$requested" == __keep__ ]] || SERVER_ENV=$requested
 	maybe_build "${1:-}"
 	stop_server
-	echo "--- restart $(date -u +%Y-%m-%dT%H:%M:%SZ) SERVER_ENV=${SERVER_ENV:-}" >>"$DIR/server.log"
+	echo "--- restart $(date -u +%Y-%m-%dT%H:%M:%SZ) overrides: $(override_names)" >>"$DIR/server.log"
 	start_server
-	write_state
 	echo "restarted: $BASE (pid $PID)"
 }
 
@@ -140,12 +140,12 @@ cmd_doctor() {
 	server_alive && ok "server pid $PID runs dist/api/server.js" || fail "server pid ${PID:-?} not running (see $DIR/server.log)"
 	if command -v lsof >/dev/null; then
 		local owner
-		owner=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
+		owner=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
 		[[ "$owner" == "$PID" ]] && ok "port $PORT owned by pid $PID" || fail "port $PORT listener is '${owner:-none}', expected $PID"
 	fi
 	ready && ok "GET /readyz ok" || fail "GET /readyz not ok"
 	local code
-	code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(mint doctor)" "$BASE/v1/sandboxes")
+	code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(mint doctor)" "$BASE/v1/sandboxes") || true
 	[[ "$code" == 200 ]] && ok "minted token accepted (GET /v1/sandboxes 200)" || fail "GET /v1/sandboxes returned $code"
 	deps_current && ok "node_modules matches pnpm-lock.yaml" ||
 		fail "node_modules does not match pnpm-lock.yaml -> run: pnpm install --frozen-lockfile && $0 restart"
@@ -158,7 +158,7 @@ cmd_doctor() {
 	else
 		ok "dist is current for src (server started $STARTED_AT, HEAD $BUILT_HEAD, now $(git rev-parse --short HEAD))"
 	fi
-	[[ -n "${SERVER_ENV:-}" ]] && echo "info  server env overrides: $SERVER_ENV"
+	[[ -n "${SERVER_ENV:-}" ]] && echo "info  server env overrides (values hidden): $(override_names)"
 	echo "base  $BASE"
 	echo "dir   $DIR"
 	return "$bad"
@@ -192,7 +192,7 @@ cmd_api() {
 cmd_mcp() {
 	load_state
 	(($# >= 1)) || die "usage: $0 mcp list | $0 mcp TOOL '{json args}'   (env: AS=sub, EXPECT=error)"
-	STACK_BASE=$BASE STACK_TOKEN=$(mint "${AS:-verify-agent}" "${TENANT:-}") STACK_TRANSCRIPT=$DIR/transcript.jsonl \
+	STACK_BASE=$BASE STACK_TOKEN=$(mint "${AS:-verify-agent}" "${TENANT:-}") STACK_AS=${AS:-verify-agent} STACK_TRANSCRIPT=$DIR/transcript.jsonl \
 		STACK_SECRET=$AUTH_SECRET node "$here/mcp.mjs" "$@"
 }
 
@@ -202,11 +202,17 @@ cmd_psql() {
 	"${compose[@]}" exec -T postgres psql -U postgres -d sqlfs -v ON_ERROR_STOP=1 -c "$1"
 }
 
+suite_names() {
+	echo integration
+	grep -l "new LocalApiRun(" scripts/verify/*.mjs | grep -v '\.test\.mjs$' | xargs -n1 basename | sed 's/\.mjs$//'
+}
+
 cmd_suite() {
 	load_state
-	(($# >= 1)) || die "usage: $0 suite NAME [args]   (NAME: integration or a scripts/verify/*.mjs basename)"
+	(($# >= 1)) || die "usage: $0 suite NAME [args]   (NAME: integration or a suite entry point in scripts/verify/)"
 	local name=$1
 	shift
+	suite_names | grep -qx "$name" || die "$name is not a suite entry point (have: $(suite_names | tr '\n' ' '))"
 	local -a suite_env=("VERIFY_ENV_FILE=none" "VERIFY_EVIDENCE_DIR=$DIR/suites" "VERIFY_PYTHON=$repo/clients/python/.venv/bin/python")
 	mkdir -p "$DIR/suites"
 	if [[ "$name" == integration ]]; then
@@ -215,7 +221,6 @@ cmd_suite() {
 		(exec_in_stack_env "${suite_env[@]}" pnpm test:integration --reporter=default --reporter=json --outputFile="$report" "$@")
 		node scripts/verify/assert-integration-report.mjs "$report"
 	else
-		[[ -f "scripts/verify/$name.mjs" ]] || die "no scripts/verify/$name.mjs"
 		(exec_in_stack_env "${suite_env[@]}" node "scripts/verify/$name.mjs" "$@")
 	fi
 }

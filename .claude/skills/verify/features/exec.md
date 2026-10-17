@@ -33,4 +33,4 @@ Preconditions:
 - A non-zero script exit is still HTTP `200`. Assert `exitCode`, not just the status.
 - Python and JavaScript commands need the runtime enabled (`PATCH {"python":true}`). The first `python3` call can take tens of seconds.
 - Output above `SQL_FS_WORKER_OUTPUT_BYTES` fails with exit `126`. `$S suite output-cap` covers both worker modes.
-- Never auto-retry an execution whose reply was lost. Unknown-outcome errors are typed on purpose; see `worker-failures`.
+- The outcome of an `exec` or `execBatch` is unknown after `503` with code `EEXEC_OUTCOME_UNKNOWN`, `EDRIVERFAULT`, or `ECOHERENCE` (writes may have been applied), or after an SDK `TransportError` starting with `network error after` or `script outcome unknown`. Never retry those automatically. Read the sandbox state before running anything else. `worker-failures` covers them.

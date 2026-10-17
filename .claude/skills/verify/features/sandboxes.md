@@ -7,7 +7,7 @@ A sandbox is a persistent, owner-scoped filesystem with optional Python and Java
 - `sandbox-create` creates a sandbox, optionally with seed `files`, and returns `201` with `id`.
 - `sandbox-get` returns metadata including `owner`.
 - `sandbox-list` lists only the caller's sandboxes.
-- `sandbox-update` toggles `python`, `javascript`, and `network`.
+- `sandbox-update` sets `python`, `javascript`, and `network` to `true` or `false`. An omitted flag keeps its current value.
 - `sandbox-isolation` denies other owners with `403 FORBIDDEN`.
 - `sandbox-delete` removes the sandbox and its files.
 
@@ -15,7 +15,7 @@ A sandbox is a persistent, owner-scoped filesystem with optional Python and Java
 
 - REST: `POST /v1/sandboxes`, `GET /v1/sandboxes`, `GET|PATCH|DELETE /v1/sandboxes/:id`.
 - MCP: `sandbox_create`, `sandbox_list`, `sandbox_update`, `sandbox_delete`.
-- SDKs: `SqlFsClient` in `clients/typescript` and `sqlfs` in `clients/python`.
+- SDKs: `Client` from `sql-fs-sdk` (`clients/typescript`) and `Client` from `sqlfs` (`clients/python`).
 
 ## Driving it with stack.sh
 

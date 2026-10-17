@@ -3,6 +3,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)
 cd "$repo"
 S=.claude/skills/verify/scripts/stack.sh
+command -v jq >/dev/null || { echo "journeys.sh needs jq on PATH" >&2; exit 2; }
 doctor=$($S doctor) || { echo "$doctor"; exit 1; }
 eval "$($S env)"
 
@@ -59,9 +60,11 @@ journey_exec() {
 	eq "$(EXPECT=408 api POST "/v1/sandboxes/$id/exec-sync" --json '{"script":"echo p > /home/user/p.txt; sleep 2; echo s > /home/user/s.txt","timeoutMs":100}' | jq -r .code)" EXEC_TIMEOUT "timeout -> 408"
 	eq "$(api GET "/v1/sandboxes/$id/files/home/user/p.txt")" p "timeout kept prefix"
 	eq "$(absent "/v1/sandboxes/$id/files/home/user/s.txt")" absent "timeout dropped suffix"
+	trap 'SERVER_ENV= $S restart --no-build >/dev/null' EXIT
 	SERVER_ENV="SQL_FS_WORKERS_ENABLED=false" $S restart --no-build >/dev/null
 	eq "$(api POST "/v1/sandboxes/$id/exec-sync" --json '{"script":"cat /home/user/a.txt"}' | jq -c '{exitCode,stdout}')" '{"exitCode":0,"stdout":"hi\n"}' "workers disabled: same result"
 	SERVER_ENV= $S restart --no-build >/dev/null
+	trap - EXIT
 	drop "$id"
 }
 

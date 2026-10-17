@@ -28,17 +28,18 @@ S=.claude/skills/verify/scripts/stack.sh
 $S up                      # disposable Postgres/Redis + built API server; keeps running
 $S doctor                  # read-only health check; FAILs when dist/ is older than src/
 $S restart                 # rebuild and restart after each source edit (data kept)
-$S api POST /v1/sandboxes --json '{"name":"x"}'    # authed request; EXPECT=403 AS=intruder to assert denial
+$S api POST /v1/sandboxes --json '{"name":"x"}'    # authed request as verify-agent; EXPECT=<status> asserts the status
+EXPECT=403 AS=intruder $S api GET /v1/sandboxes/$ID # another subject is denied a sandbox it does not own
 $S mcp list                # MCP over Streamable HTTP; $S mcp TOOL '<json>'
 $S psql 'select ...'       # inspect side effects (superuser, bypasses RLS: never proof of isolation)
-$S suite contracts         # any scripts/verify/<name>.mjs, or `integration [filter]`, against the stack
-.claude/skills/verify/scripts/journeys.sh           # every mapped journey, ~40 assertions in ~10s
+$S suite contracts         # a suite from the table below, or `integration [filter]`, on the stack's databases
+.claude/skills/verify/scripts/journeys.sh           # every mapped journey, ~40 assertions in ~10s; needs jq
 $S down                    # remove only this run's server, containers, and volumes; evidence stays
 ```
 
 Evidence lands in `scripts/verify/.run/stack-<id>/` (`transcript.jsonl`, `server.log`, `suites/`). The stack can run alongside `pnpm verify:local`, which starts its own.
 
-`scripts/verify/` holds the live suites. Every suite except `large-files` runs against the stack through `$S suite <name>`; the full gates run them as listed:
+`scripts/verify/` holds the live suites. Every suite except `large-files` runs through `$S suite <name>`. It reuses the stack's Postgres and Redis but starts its own API server from `dist/`, so a passing suite does not prove the `$S up` server. The full gates run them as listed:
 
 | Suite | Proves | Run by |
 | --- | --- | --- |

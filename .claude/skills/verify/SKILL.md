@@ -34,7 +34,7 @@ Also, from CLAUDE.md: add `.changeset/*.md` for behavior changes, update `src/ap
 
 ## Launch
 
-Preconditions: Docker daemon running, `pnpm setup:dev` done (needs `node_modules` and `clients/python/.venv`). `jq` makes JSON assertions easier but is optional.
+Preconditions: Docker daemon running, `pnpm setup:dev` done (needs `node_modules` and `clients/python/.venv`), and `jq` on `PATH`. `journeys.sh` and the feature recipes need `jq`.
 
 ```bash
 $S up            # compose stack + pnpm build + API server; ~10s
@@ -45,7 +45,7 @@ $S up --no-build # reuse the current dist/
 
 `up` refuses while a stack is recorded for this checkout. Reuse it (`$S doctor`) or `$S down` first. After a failed `up`, run `$S down` too, because the containers may be running.
 
-Server environment overrides: `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false SQL_FS_WORKER_OUTPUT_BYTES=1048576" $S restart`. Overrides persist across later restarts until you pass `SERVER_ENV= $S restart`. Values are split on spaces, so use compact JSON with no spaces.
+Server environment overrides: `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false SQL_FS_WORKER_OUTPUT_BYTES=1048576" $S restart`. Overrides persist across later restarts until you pass `SERVER_ENV= $S restart`. Values are split on spaces, so use compact JSON with no spaces. `server.log` and `doctor` show only the override names; the values stay in the owner-only `state.env`.
 
 ## Doctor
 
@@ -56,7 +56,7 @@ Run `$S doctor` first, and again whenever anything looks off. It is read-only an
 - that PID owns the recorded port (via `lsof`)
 - `/readyz` ok and a freshly minted token gets `200` on `GET /v1/sandboxes`
 - `node_modules` matches `pnpm-lock.yaml`, compared byte-for-byte with `node_modules/.pnpm/lock.yaml`. After a pull that changed the lockfile, the old install keeps running and unit tests fail for reasons unrelated to your diff. Fix it with `pnpm install --frozen-lockfile && $S restart`. `up` refuses to start on drift.
-- `dist/` is not older than any non-test `src/**/*.ts`. **A stale build is the most common false result**: you edited source, but the server and every suite still run the old `dist/`. Fix it with `$S restart`.
+- `dist/` is not older than any non-test `src/**/*.ts` or `src/**/*.sql`, so a migration edit also fails until you restart. **A stale build is the most common false result**: you edited source, but the server and every suite still run the old `dist/`. Fix it with `$S restart`.
 
 ## Drive
 
@@ -70,7 +70,7 @@ After every source edit: `$S restart` (rebuild + restart, same port, data kept),
 | `$S mcp list` / `$S mcp TOOL '<json>'` | MCP over Streamable HTTP with the same `AS`/`TENANT`. Exits non-zero on `isError` or a `{"ok":false}` payload. Use `EXPECT=error` to assert one of those. `bash_exec` denials are neither; assert their `exitCode`/`stderr`. |
 | `$S token [sub] [tenant]` | Print a 24h JWT signed with the stack's `AUTH_SECRET`. |
 | `$S psql 'SQL'` | Run SQL as the `postgres` superuser on the stack DB. This **bypasses RLS** and is only for inspecting side effects; never use it to prove isolation. Tables: `sandboxes`, `inodes`, `dirents`, `blobs`, `sandbox_epochs`. |
-| `$S suite NAME [args]` | Run `scripts/verify/NAME.mjs` with the stack's DB/Redis. Suites start their own servers from `dist/`, so restart (build) first. `NAME=integration [file filters]` runs vitest integration and writes a JSON report. |
+| `$S suite NAME [args]` | Run the suite entry point `scripts/verify/NAME.mjs` against the stack's Postgres and Redis. Suites start their own API servers from `dist/`, so a passing suite does not prove the `$S up` server; restart (build) first. An entry point is a non-test file that creates a `LocalApiRun`; helper modules such as `local-api.mjs` or `measurements.mjs` are rejected with the list of entry points. `NAME=integration [file filters]` runs vitest integration and writes a JSON report. |
 | `$S env` | Print the recorded state (URLs, port, PID, run dir). |
 
 Use `curl --json '<body>'` for JSON (sets both headers). Use `--data-binary @file -H 'Content-Type: application/octet-stream'` for raw file bytes.
@@ -81,11 +81,11 @@ The feature map in [features/](features/README.md) has the exact journeys. Alway
 
 Everything lands in `scripts/verify/.run/stack-<id>/` (gitignored) and survives `down`:
 
-- `transcript.jsonl`: every `api`/`mcp` call with caller, status, and body (≤4 KiB). The stack secret, JWTs (in curl args or bodies), and token/secret/password/authorization keys are redacted.
+- `transcript.jsonl`: every `api` call with caller, method, path, curl args, and HTTP status, and every `mcp` call (including `list`) with caller, tool, args, and whether it failed. Each record keeps the response body up to 4 KiB; a longer body is cut, marked `truncated: true`, and `bytes` keeps the full size. The stack secret, JWTs, values of token/secret/password/authorization keys (also inside JSON strings such as `--json` args and MCP text parts), and sensitive header values are redacted.
 - `server.log`: server stdout/stderr across restarts, with a `--- restart` line at each one.
 - `services.log`: Postgres/Redis logs, written at `down`.
 - `suites/<suite>-<id>/proof.json` and `requests.jsonl`, plus `suites/integration-*.json`.
-- `state.env`: the stack's coordinates. It contains the local-only verification secret.
+- `state.env`: the stack's coordinates. It contains the local-only verification secret and any `SERVER_ENV` values, so the run directory is owner-only.
 
 `pnpm verify:local` writes its own `scripts/verify/.run/verify-*/` directory with `proof.json` per suite and `integration.json`.
 
