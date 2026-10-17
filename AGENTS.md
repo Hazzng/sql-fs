@@ -19,6 +19,39 @@ pnpm verify:architecture # also worker failure, stream finalization, input budge
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
+## Verify while you work
+
+Prove every runtime change against a real server before handing back. The full gates above are completion evidence. While iterating, use the verification skill in [`.claude/skills/verify/`](.claude/skills/verify/SKILL.md). In Claude Code, invoke it as `verify`. Other agents read `SKILL.md` and run its scripts directly. The skill maps each kind of change to its required gates, and [`features/`](.claude/skills/verify/features/README.md) holds the client journeys for auth, sandboxes, exec, files, ingest, and MCP.
+
+```bash
+S=.claude/skills/verify/scripts/stack.sh
+$S up                      # disposable Postgres/Redis + built API server; keeps running
+$S doctor                  # read-only health check; FAILs when dist/ is older than src/
+$S restart                 # rebuild and restart after each source edit (data kept)
+$S api POST /v1/sandboxes --json '{"name":"x"}'    # authed request as verify-agent; EXPECT=<status> asserts the status
+EXPECT=403 AS=intruder $S api GET /v1/sandboxes/$ID # another subject is denied a sandbox it does not own
+$S mcp list                # MCP over Streamable HTTP; $S mcp TOOL '<json>'
+$S psql 'select ...'       # inspect side effects (superuser, bypasses RLS: never proof of isolation)
+$S suite contracts         # a suite from the table below, or `integration [filter]`, on the stack's databases
+.claude/skills/verify/scripts/journeys.sh           # every mapped journey, ~40 assertions in ~10s; needs jq
+$S down                    # remove only this run's server, containers, and volumes; evidence stays
+```
+
+Evidence lands in `scripts/verify/.run/stack-<id>/` (`transcript.jsonl`, `server.log`, `suites/`). The stack can run alongside `pnpm verify:local`, which starts its own.
+
+`scripts/verify/` holds the live suites. Every suite except `large-files` runs through `$S suite <name>`. It reuses the stack's Postgres and Redis but starts its own API server from `dist/`, so a passing suite does not prove the `$S up` server. The full gates run them as listed:
+
+| Suite | Proves | Run by |
+| --- | --- | --- |
+| `contracts` | HTTP and MCP behavior across replicas, validated against `/openapi.json` | `verify:local` |
+| `output-cap` | worker output limits in both worker modes | `verify:local` |
+| `shutdown` | graceful shutdown ends MCP listener streams and refuses new connections | `verify:local` |
+| `sdk-clients` (+ `sdk-python.py`) | live TypeScript and Python SDKs | `verify:local` |
+| `worker-failures`, `sse-finalization`, `input-budgets`, `tenants` | worker loss, stream finalization, input budgets, tenant isolation | `verify:architecture` |
+| `ingest-admission`, `large-files` | ingest budgets, large-file profiling | manual; large files need cgroup v2 |
+
+`local-api.mjs` is the shared harness: owned servers, tokens, schema validation, `proof.json`. `assert-integration-report.mjs` is the shared check that an integration run executed tests with none failed or skipped. `*-faults.mjs` files are fault injectors loaded by the suites, not entry points. When you add an endpoint or client-visible behavior, add or extend a suite here, add its journey to `features/` and `journeys.sh`, and update `openapi-spec.ts`.
+
 See [READINESS.md](docs/READINESS.md) for verified scope and hosted follow-up. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution steps, [DEVELOPER.md](docs/DEVELOPER.md) before changing consistency or session ownership, [README.md](README.md) for API behavior, [CONFIGURATION.md](docs/CONFIGURATION.md) for runtime settings, and [AUTOSCALING.md](docs/AUTOSCALING.md) for probes, metrics and replica scaling.
 
 Python type checking targets the oldest supported interpreter. `pnpm check:python:types` uses uv to provision Python 3.9 in `clients/python/.venv-py39`, separate from the Python 3.12 development environment. This keeps the dependency syntax aligned with the declared target. Mypy stays below version 2 while Python 3.9 is supported.
@@ -70,6 +103,6 @@ Migrations are handwritten numbered SQL files. Add the next migration without ed
 
 Work autonomously on local implementation and reversible verification. Use a separate checkout for concurrent writers. Do not overwrite another agent's changes. Keep secrets out of commits and evidence. Use the disposable verification stack for tests that create databases or inject faults.
 
-Before handing back, run `pnpm check`, then `pnpm verify:local` for runtime, database, dependency, or SDK behavior changes. Run `pnpm security:audit` after dependency changes. Report the commands, results, and any unverified claims. A skipped test is not proof.
+Before handing back, run `pnpm check`, then `pnpm verify:local` for runtime, database, dependency, or SDK behavior changes. For runtime changes, also drive the changed behavior on the verify stack and run `journeys.sh` (see [Verify while you work](#verify-while-you-work)). Cite the evidence paths. Run `pnpm security:audit` after dependency changes. Report the commands, results, and any unverified claims. A skipped test is not proof.
 
 Add a `.changeset/*.md` entry for behavior changes. Do not bump versions or edit `CHANGELOG.md` in feature work. Deployment, release, merging, production data changes, and shared-branch force pushes need explicit task authorization. Repository changes do not prove that hosted CI or branch protection is active.
