@@ -287,6 +287,12 @@ The queue waits apply at both gates, so an execution can wait up to ten seconds 
 
 Budget shared connections for old and new replicas during a rollout. With blob caching off, each replica holds a control Redis connection. Twenty old plus twenty new replicas already need forty connections before observation and restart headroom. A thirty-connection test instance cannot support that rollout safely. Keep control Redis on `noeviction`; use a separate data Redis when enabling blob caching. Postgres capacity must cover worker pools and metadata pools for configured tenants, including rollout overlap.
 
+### Startup work
+
+Unchanged replicas check `public.sql_fs_migrations` and skip already applied filesystem DDL. This avoids taking filesystem table locks just because capacity is scaling out. Each tenant database records filenames, SHA-256 checksums and application timestamps under the existing transaction advisory lock. Pending DDL and its history commit together; an applied checksum mismatch stops startup.
+
+The first boot of this version against a legacy database establishes that history by applying the existing idempotent files once. Keep traffic idle for that adoption. Deployments with genuinely new migrations still need to account for their DDL locks. See [startup migration configuration](CONFIGURATION.md).
+
 ### Hosted measurements, 2026-10-18
 
 These bounded tests ran on the candidate in `virtualfs-api`, ACA Consumption in Australia East. Each replica had 1 CPU and 2 GiB. Two workers retained the default limit of one active execution per tenant. One tenant used distinct sandboxes with durable marker appends. Sandbox setup warmed the app before each thirty-second offer window. No retries were enabled for these fixed-replica points.
@@ -304,6 +310,18 @@ Every point had zero generator drops, refusals, unknown outcomes, duplicate mark
 
 A separate fifteen-second overload run offered 200 writes/s to twenty replicas. It completed 81.2 successful writes/s during the offer window. Including drain, 1613 writes succeeded and 1387 received explicit busy refusals. All 3000 operations reconciled correctly: each successful marker appeared once, each refused marker was absent, and no unknown outcome occurred. The load generator sent every arrival; maximum send delay was 21.3 ms and peak in-flight requests were 405 of the allowed 500. Queueing raised successful-request p99 to 6.05 seconds.
 
-The same AMD64 source and base images produced 179905757 compressed layer bytes with development dependencies and 106470873 after pruning, a 40.82% reduction. Runtime parity covered Git, JavaScript, TypeScript, Python, SQLite, tar, MCP and cross-replica persistence. Smaller transfer size is not proof of a faster ACA startup.
+The dependency-pruning experiment used source `4b0a721` with the same AMD64 base images. It produced 179905757 compressed layer bytes with development dependencies and 106470873 after pruning, a 40.82% reduction. Runtime parity covered Git, JavaScript, TypeScript, Python, SQLite, tar, MCP and cross-replica persistence. The later migration-history candidate retains that pruning. Smaller transfer size is not proof of a faster ACA startup.
 
 The throwaway Redis accepted only thirty concurrent connections and refused `noeviction`. Twenty replicas therefore remain a test configuration. Production use requires suitable control Redis, rollout headroom and workload-specific confirmation. The load driver preserves raw summaries and durable reconciliation in its evidence directory.
+
+### Final cold and sustained confirmation
+
+The final candidate, source `e0bf5f3`, adds migration history to the same admission and worker code used for the fixed-replica points above. It ran as immutable image `ghcr.io/hazzng/sql-fs@sha256:fa390528895c1996b6ad0f3ccbc044b6d005c2d8125e9db51faeec506834f330`.
+
+A cold burst began with exactly one ready replica and allowed ACA to grow to ten. It offered twelve operations/s for three minutes, each including 250 ms of waiting work. All 2160 operations succeeded and reconciled once, with no generator drops or unknown outcomes. The reference client sent 3533 attempts, including 1373 explicit safe busy refusals. It retried those refusals within a 120-second operation deadline. Client p99 including queueing and backoff was 47.49 seconds; the maximum was 59.72 seconds.
+
+The scaler's rescale event appeared 9.79 seconds after demand. The earliest retained durable write on a new replica appeared at 28.36 seconds. Ten replicas were first observed ready at 46.40 seconds; that ARM read spanned 10.40 seconds. These are observations from one episode, not startup percentiles or a demonstrated speedup. Queues alone did not hold every request throughout that gap. The existing SDK write-execution defaults retain their conservative retry policy; callers need an explicit safe-overload retry policy to reproduce this result. Unknown outcomes and transport failures require reconciliation.
+
+The earlier cold candidate produced one nonretryable internal error and a container restart while the database deadlock counter rose by two. Repeated startup DDL was independently reproduced blocking behind live filesystem table locks. The final runner skips that DDL on unchanged boots. During the corrected episode the sampled deadlock counter stayed unchanged, with no observed lock waiters or container restarts. The retained earlier logs do not establish the exact cause of that particular internal error or restart.
+
+A separate five-minute confirmation fixed ten final-image replicas and offered thirty short writes/s with no retries. All 9000 operations succeeded and reconciled once, with zero refusals, unknown outcomes, generator drops or marker errors. Successful completions during the offer window were 29.96/s; client p50 was 318 ms, p95 932 ms and p99 1615 ms. Peak in-flight work was 25 of the allowed 200 and maximum initial send delay was 3.31 ms. All 200 fixtures were deleted. This confirms that workload for five minutes; CPU-heavy commands, large files, shared-sandbox contention and longer soaks need their own capacity evidence.
