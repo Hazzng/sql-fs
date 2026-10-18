@@ -6,13 +6,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, validateOperation, visitConcurrent } from './aca-load-workload.mjs';
+import { waitForStartBarrier } from './aca-load-barrier.mjs';
 
 const defaults = { app: 'virtualfs-api', group: 'rg-harry-dev', duration: '30', rate: '2', pool: '20',
 	'max-inflight': '20', 'setup-concurrency': '1', 'timeout-ms': '120000', 'command-timeout-ms': '30000', 'hold-ms': '250',
-	'cpu-iterations': '0', interval: '5', 'max-start-delay-ms': '250', retries: '0' };
+	'cpu-iterations': '0', 'start-barrier-timeout-ms': '300000', interval: '5', 'max-start-delay-ms': '250', retries: '0' };
 const { positionals: [command], values: flags } = parseArgs({ allowPositionals: true, options: {
 	...Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, { type: 'string', default: v }])),
-	out: { type: 'string' }, manifest: { type: 'string' }, tenant: { type: 'string' },
+	'start-barrier': { type: 'string' }, out: { type: 'string' }, manifest: { type: 'string' }, tenant: { type: 'string' },
 	resource: { type: 'string', multiple: true, default: [] }, 'app-metrics': { type: 'boolean', default: false },
 	help: { type: 'boolean', default: false },
 } });
@@ -22,7 +23,9 @@ if (flags.help || !['inspect', 'observe', 'load', 'cleanup'].includes(command)) 
 		'Observe: --duration SECONDS --interval SECONDS [--app-metrics]\n' +
 		'Load: --duration SECONDS --rate OPS_PER_SECOND --pool N --max-inflight N --hold-ms N\n' +
 		'      --cpu-iterations N --retries N --timeout-ms N --command-timeout-ms N --tenant ID\n' +
-		'      --max-start-delay-ms N --interval SECONDS --setup-concurrency N (1..8, default 1)\nCleanup: --manifest PATH');
+		'      --max-start-delay-ms N --interval SECONDS --setup-concurrency N (1..8, default 1)\n' +
+		'      --start-barrier PATH [--start-barrier-timeout-ms N (1000..900000, default 300000)]\n' +
+		'      Creates PATH.prepared.json after setup; atomically write {runId,release:true} to PATH to start.\nCleanup: --manifest PATH');
 	process.exit(flags.help ? 0 : 2);
 }
 function number(key, min, max, integer = false) {
@@ -34,7 +37,10 @@ const cfg = { duration: number('duration', 1, 7200), rate: number('rate', 0.01, 
 	pool: number('pool', 1, 500, true), setupConcurrency: number('setup-concurrency', 1, 8, true), maxInflight: number('max-inflight', 1, 500, true),
 	timeout: number('timeout-ms', 5000, 120000, true), commandTimeout: number('command-timeout-ms', 1000, 90000, true),
 	hold: number('hold-ms', 0, 60000), cpu: number('cpu-iterations', 0, 100000, true),
+	startBarrierTimeoutMs: number('start-barrier-timeout-ms', 1000, 900000, true),
 	interval: number('interval', 1, 300), maxDelay: number('max-start-delay-ms', 1, 10000), retries: number('retries', 0, 20, true) };
+if (flags['start-barrier'] !== undefined && !flags['start-barrier'].trim()) throw new Error('--start-barrier must name a local release file');
+if (flags['start-barrier'] && command !== 'load') throw new Error('--start-barrier is only valid for load');
 if (cfg.timeout <= cfg.commandTimeout + 5000 || cfg.hold >= cfg.commandTimeout || Math.ceil(cfg.duration * cfg.rate) * (cfg.retries + 1) > 500000)
 	throw new Error('Require timeout > command timeout + 5000ms, hold < command timeout, and <= 500000 possible attempts');
 if (flags.resource.length > 8 || flags.resource.some(x => !/^\/subscriptions\/[\w-]+\/resourceGroups\/[\w.-]+\/providers\/Microsoft\.(App\/containerApps|DBforPostgreSQL\/flexibleServers|Cache\/Redis)\/[\w.-]+$/i.test(x)))
@@ -258,6 +264,10 @@ async function load() {
 			if (r.status !== 201 || r.json?.owner !== manifest.owner || !/^[0-9a-f-]{36}$/i.test(r.json?.id || '') || r.transportFailure) throw new Error('Sandbox creation failed; cleanup discovers any owned orphan');
 			manifest.sandboxes.push({ id: r.json.id, name }); await saveManifest();
 		});
+		if (flags['start-barrier']) {
+			await waitForStartBarrier(resolve(flags['start-barrier']), runId, { timeoutMs: cfg.startBarrierTimeoutMs, isStopped: () => stopped });
+			await record({ kind: 'startBarrierReleased', runId });
+		}
 		await sample(true);
 		const available = [...manifest.sandboxes];
 		loop.enable(); began = performance.now(); loadStart = began; loadDeadline = began + cfg.duration * 1000; measurement = now();

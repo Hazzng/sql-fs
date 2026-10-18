@@ -14,6 +14,10 @@ The server reads every setting from an environment variable. The API requires `A
 | `SESSION_IDLE_MS` | `600000` | Idle time before the server evicts a warm sandbox session. |
 | `SKIP_STARTUP_MIGRATIONS` | `false` | If `true`, the server does not apply migrations at boot. |
 
+Startup records each applied migration's filename, SHA-256 checksum, and timestamp in `public.sql_fs_migrations` in each tenant database. Later boots check the recorded checksums and execute only pending files. Changed applied files fail startup; add a new numbered migration instead. The advisory lock, pending DDL, and ledger writes share one transaction, including through a transaction pooler.
+
+The first boot against an existing database without this ledger applies the idempotent SQL files once to establish history. Roll out that first boot while traffic is idle because those files take locks on filesystem tables. Subsequent unchanged replica boots skip that table DDL. `migrations_committed` logs the total `files` and separate `applied` and `skipped` counts.
+
 ## Postgres
 
 | Variable | Default | Description |

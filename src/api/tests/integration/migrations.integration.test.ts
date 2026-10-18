@@ -5,13 +5,26 @@
  * does not drop tables on a shared dev database. Skips when DATABASE_URL is unset.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../../migrations.js";
 import { loadTenantConfig } from "../../tenants.js";
 
 const SKIP = !process.env.DATABASE_URL;
+const MIGRATION_DIR = fileURLToPath(new URL("../../../sql-fs/migrations/postgres/", import.meta.url));
+const MIGRATION_FILES = readdirSync(MIGRATION_DIR)
+	.filter((file) => file.endsWith(".sql"))
+	.sort();
+
+async function migrationLedger(sql: postgres.Sql): Promise<{ filename: string; sha256: string; applied_at: string }[]> {
+	return sql<{ filename: string; sha256: string; applied_at: string }[]>`
+		SELECT filename, sha256, applied_at::text FROM public.sql_fs_migrations ORDER BY filename
+	`;
+}
 
 function withDatabase(connectionString: string, database: string): string {
 	const u = new URL(connectionString);
@@ -164,6 +177,167 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 			await afterRerun.end({ timeout: 5 });
 		}
 	}, 60_000);
+
+	it("records each file checksum and preserves history for each tenant on later boots", async () => {
+		const urls = [await createScratchDb(), await createScratchDb()];
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ first: urls[0], second: urls[1] }) });
+		await runMigrations(cfg);
+		for (const url of urls) {
+			const sql = postgres(url, { prepare: false, max: 1 });
+			try {
+				const before = await migrationLedger(sql);
+				expect(before.map(({ filename, sha256 }) => ({ filename, sha256 }))).toEqual(
+					MIGRATION_FILES.map((filename) => ({
+						filename,
+						sha256: createHash("sha256")
+							.update(readFileSync(join(MIGRATION_DIR, filename)))
+							.digest("hex"),
+					})),
+				);
+				expect(before.every(({ applied_at }) => Number.isFinite(Date.parse(applied_at)))).toBe(true);
+				await runMigrations(cfg);
+				expect(await migrationLedger(sql)).toEqual(before);
+			} finally {
+				await sql.end({ timeout: 5 });
+			}
+		}
+	});
+
+	it("bootstraps migration history for a legacy database", async () => {
+		const url = await createScratchDb();
+		const sql = postgres(url, { prepare: false, max: 1 });
+		try {
+			await sql.begin(async (tx) => {
+				for (const file of MIGRATION_FILES) {
+					await tx.unsafe(readFileSync(join(MIGRATION_DIR, file), "utf8"));
+				}
+			});
+			const before = await sql<{ ledger: string | null }[]>`
+				SELECT to_regclass('public.sql_fs_migrations')::text AS ledger
+			`;
+			expect(before).toEqual([{ ledger: null }]);
+			const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+			await runMigrations(cfg);
+			expect((await migrationLedger(sql)).map(({ filename }) => filename)).toEqual(MIGRATION_FILES);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
+
+	it("rejects changed applied checksums before executing pending migrations", async () => {
+		const url = await createScratchDb();
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await runMigrations(cfg);
+		const sql = postgres(url, { prepare: false, max: 1 });
+		try {
+			await sql`UPDATE public.sql_fs_migrations SET sha256 = ${"0".repeat(64)} WHERE filename = '0000_create_tables.sql'`;
+			await sql`DELETE FROM public.sql_fs_migrations WHERE filename = '0008_resolve_relative_symlinks.sql'`;
+			await sql`DROP FUNCTION fs_resolve_internal(text, boolean, integer)`;
+			await expect(runMigrations(cfg)).rejects.toThrow(/Checksum mismatch.*0000_create_tables.sql/);
+			const after = await sql<{ resolver: string | null }[]>`
+				SELECT to_regprocedure('fs_resolve_internal(text,boolean,integer)')::text AS resolver
+			`;
+			expect(after).toEqual([{ resolver: null }]);
+			expect((await migrationLedger(sql)).map(({ filename }) => filename)).toEqual(MIGRATION_FILES.slice(0, -1));
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
+
+	it("preserves unknown newer migration history", async () => {
+		const url = await createScratchDb();
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await runMigrations(cfg);
+		const sql = postgres(url, { prepare: false, max: 1 });
+		try {
+			await sql`
+				INSERT INTO public.sql_fs_migrations (filename, sha256)
+				VALUES ('9999_newer_image.sql', ${"1".repeat(64)})
+			`;
+			const before = await migrationLedger(sql);
+			await runMigrations(cfg);
+			expect(await migrationLedger(sql)).toEqual(before);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
+
+	it("rolls back pending DDL and ledger entries together after a later failure", async () => {
+		const url = await createScratchDb();
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await runMigrations(cfg);
+		const sql = postgres(url, { prepare: false, max: 1 });
+		try {
+			await sql`DELETE FROM public.sql_fs_migrations WHERE filename >= '0007_fence_sandbox_epochs.sql'`;
+			await sql`DROP TABLE sandbox_epochs`;
+			await sql`ALTER TABLE sandboxes DROP COLUMN version`;
+			await sql`DROP FUNCTION fs_resolve_internal(text, boolean, integer)`;
+			await sql`CREATE FUNCTION fs_resolve_internal(text, boolean, integer) RETURNS text LANGUAGE sql AS 'SELECT NULL::text'`;
+			const before = await migrationLedger(sql);
+			await expect(runMigrations(cfg)).rejects.toThrow(/cannot change return type of existing function/);
+			expect(await migrationLedger(sql)).toEqual(before);
+			const rolledBack = await sql<{ epochs: string | null; has_version: boolean }[]>`
+				SELECT to_regclass('public.sandbox_epochs')::text AS epochs,
+					EXISTS (
+						SELECT 1 FROM information_schema.columns
+						WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
+					) AS has_version
+			`;
+			expect(rolledBack).toEqual([{ epochs: null, has_version: false }]);
+			await sql`DROP FUNCTION fs_resolve_internal(text, boolean, integer)`;
+			await runMigrations(cfg);
+			const after = await migrationLedger(sql);
+			expect(after.slice(0, before.length)).toEqual(before);
+			expect(after.map(({ filename }) => filename)).toEqual(MIGRATION_FILES);
+			const applied = await sql<{ epochs: string | null; has_version: boolean }[]>`
+				SELECT to_regclass('public.sandbox_epochs')::text AS epochs,
+					EXISTS (
+						SELECT 1 FROM information_schema.columns
+						WHERE table_schema = 'public' AND table_name = 'sandboxes' AND column_name = 'version'
+					) AS has_version
+			`;
+			expect(applied).toEqual([{ epochs: "sandbox_epochs", has_version: true }]);
+		} finally {
+			await sql.end({ timeout: 5 });
+		}
+	});
+
+	it("boots a migrated database while live writers hold filesystem table locks", async () => {
+		const url = await createScratchDb();
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await runMigrations(cfg);
+		const bootUrl = new URL(url);
+		bootUrl.searchParams.set("options", "-c lock_timeout=2s");
+		const bootCfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: bootUrl.toString() }) });
+		const writer = postgres(url, { prepare: false, max: 1 });
+		try {
+			await writer.begin(async (tx) => {
+				await tx`LOCK TABLE sandboxes, inodes, dirents, blobs IN ROW EXCLUSIVE MODE`;
+				await expect(runMigrations(bootCfg)).resolves.toBeUndefined();
+			});
+		} finally {
+			await writer.end({ timeout: 5 });
+		}
+	});
+
+	it("concurrent cold boots skip DDL while filesystem table locks are held", async () => {
+		const url = await createScratchDb();
+		const cfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: url }) });
+		await runMigrations(cfg);
+		const bootUrl = new URL(url);
+		bootUrl.searchParams.set("options", "-c lock_timeout=2s");
+		const bootCfg = loadTenantConfig({ TENANT_DATABASES: JSON.stringify({ default: bootUrl.toString() }) });
+		const writer = postgres(url, { prepare: false, max: 1 });
+		try {
+			await writer.begin(async (tx) => {
+				await tx`LOCK TABLE sandboxes, inodes, dirents, blobs IN ROW EXCLUSIVE MODE`;
+				const boots = await Promise.allSettled(Array.from({ length: 4 }, () => runMigrations(bootCfg)));
+				expect(boots).toEqual(Array.from({ length: 4 }, () => ({ status: "fulfilled", value: undefined })));
+			});
+		} finally {
+			await writer.end({ timeout: 5 });
+		}
+	});
 
 	/**
 	 * #164: the whole run must be one transaction, because that is what lets the

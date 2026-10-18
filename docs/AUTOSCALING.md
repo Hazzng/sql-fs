@@ -273,11 +273,15 @@ The default evidence directory is `scripts/verify/.run/aca-*`. `summary.json` se
 
 Keep script work fixed when comparing replica counts. This example includes sleep, so its throughput does not establish CPU-intensive bash capacity. Inspect generator delay and drops before attributing a limit to the service. Application metrics are load-balanced samples from individual replicas. Use per-pod Azure Monitor series to establish CPU and memory pressure across the fleet.
 
+For a cold scale-out test, prepare fixtures while ACA is fixed at one replica. Pass `--start-barrier <fresh-path>` to pause the load tool after setup. It writes `<fresh-path>.prepared.json` with a `runId` and waits without application or ARM sampling. Enable the intended scale range, verify that exactly one replica is ready, then atomically write `{"runId":"<prepared-run-id>","release":true}` to `<fresh-path>`. The tool takes its own pre-offer snapshot before starting arrivals. A stale release, stop signal or timeout fails into fixture cleanup. The default wait is five minutes; `--start-barrier-timeout-ms` accepts one second to fifteen minutes. Keep any run whose pre-offer snapshot already shows multiple replicas out of cold-start comparisons.
+
 ### Scale rules
 
 `deploy/azure/aca.yaml` starts with 1 CPU, 2 GiB, two workers, bounded five-second waits and an HTTP target of one concurrent request. It uses an immutable image reference. Set its digest to the image you verified. The example keeps at least two replicas for availability; use a minimum of zero for an idle development app when the wake-up delay is acceptable.
 
 The HTTP rule uses ACA's fleet request signal. It needs no application polling or Prometheus service. One scrape of the load-balanced `/metrics` endpoint describes one replica and cannot establish fleet pressure. Use the new metrics to observe queue capacity, wait, refusals and recovery. If you later add per-replica collection, a separate Prometheus rule can use its aggregate.
+
+ACA evaluates its HTTP signal every fifteen seconds. Changing `pollingInterval` affects custom event sources, not this HTTP loop. Scale-down stabilization is also separate from `cooldownPeriod`: allow for the platform's five-minute stabilization window when checking that a fleet has shrunk. See [ACA scale behavior](https://learn.microsoft.com/en-us/azure/container-apps/scale-app#scale-behavior).
 
 The queue waits apply at both gates, so an execution can wait up to ten seconds before it begins. They absorb a bounded burst; they do not hold an arbitrary surge for the whole time that replicas need to start. Clients should retry only explicit retryable overload responses, respect `Retry-After`, add bounded exponential backoff with jitter, and use a deadline that covers the observed scaling gap. Connection failures and unknown execution outcomes still require reconciliation.
 
@@ -286,6 +290,8 @@ Budget shared connections for old and new replicas during a rollout. With blob c
 ### Hosted measurements, 2026-10-18
 
 These bounded tests ran on the candidate in `virtualfs-api`, ACA Consumption in Australia East. Each replica had 1 CPU and 2 GiB. Two workers retained the default limit of one active execution per tenant. One tenant used distinct sandboxes with durable marker appends. Sandbox setup warmed the app before each thirty-second offer window. No retries were enabled for these fixed-replica points.
+
+The measured app retained its existing `REDIS_RWLOCK_ENABLED=false` and `REDIS_BLOB_CACHE_ENABLED=false` settings. These measurements do not establish the performance of either feature when enabled. The deployment example leaves the read/write-lock default unchanged; it is a starting configuration, not an exact reproduction of the measured app. Hosted startup and liveness used TCP probes; readiness used `/readyz` every two seconds.
 
 | Replicas | Offered writes/s | Successful completions/s during offer window | Eventual successful writes | Client p99 |
 | --- | ---: | ---: | ---: | ---: |
