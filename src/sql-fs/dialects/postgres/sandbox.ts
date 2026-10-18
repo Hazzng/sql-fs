@@ -3,9 +3,7 @@ import { createEnoent, translateSqlError } from "../../errors.js";
 import type { SandboxGeneration, SandboxListEntry, SandboxMeta } from "../../types.js";
 import type { PgTx, SandboxOperations } from "./types.js";
 
-export function epochParam(expectedEpoch?: bigint): string | null {
-	return expectedEpoch === undefined ? null : String(expectedEpoch);
-}
+type FenceContext = "existing" | "composite";
 
 export async function takeWriterLock(tx: PgTx, sandboxId: string): Promise<void> {
 	await tx`SELECT pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0))`;
@@ -16,10 +14,33 @@ export function fenceAndAdvance(
 	sandboxId: string,
 	expectedEpoch?: bigint,
 ): postgres.PendingQuery<postgres.Row[]> {
-	const epoch = epochParam(expectedEpoch);
+	return fenceCtes(tx, sandboxId, expectedEpoch, "existing");
+}
+
+export function compositeFenceAndAdvance(
+	tx: PgTx,
+	sandboxId: string,
+	expectedEpoch?: bigint,
+): postgres.PendingQuery<postgres.Row[]> {
+	return fenceCtes(tx, sandboxId, expectedEpoch, "composite");
+}
+
+function fenceCtes(
+	tx: PgTx,
+	sandboxId: string,
+	expectedEpoch: bigint | undefined,
+	context: FenceContext,
+): postgres.PendingQuery<postgres.Row[]> {
+	const epoch = expectedEpoch === undefined ? null : String(expectedEpoch);
+	const projection =
+		context === "existing"
+			? tx`s.version`
+			: tx`set_config('app.sandbox_id', ${sandboxId}, true),
+			       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
+			       s.version AS epoch`;
 	return tx`
 			ctx AS (
-				SELECT s.version
+				SELECT ${projection}
 				FROM sandboxes s
 				WHERE s.id = ${sandboxId}
 				  AND (

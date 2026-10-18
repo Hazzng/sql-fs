@@ -146,7 +146,7 @@ The session runtime opens a script scope only if the filesystem implements `IScr
 
 ## Ownership checks
 
-`pnpm check:architecture` enforces the worker module's named adapter imports and the script-scope completion owner. The allowed imports live in `scripts/check-architecture-boundaries.mjs`, with fixture tests beside the checker. Add a new adapter only when it has a real external responsibility; keep dispatch history, reservation state, and outcome classification inside worker ownership. The shared lease-loss context lives in `src/execution/owner-cancellation.ts` so filesystem fencing does not import worker internals.
+`pnpm check:architecture` enforces the worker module's named adapter imports, the script-scope completion owner, and the sandbox fence policy owner in `src/sql-fs/dialects/postgres/sandbox.ts`. The allowed imports live in `scripts/check-architecture-boundaries.mjs`, with fixture tests beside the checker. Add a new adapter only when it has a real external responsibility; keep dispatch history, reservation state, and outcome classification inside worker ownership. The shared lease-loss context lives in `src/execution/owner-cancellation.ts` so filesystem fencing does not import worker internals.
 
 ## Worker owners run scripts off the main thread
 

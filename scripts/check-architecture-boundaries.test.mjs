@@ -188,3 +188,112 @@ it("permits literal non-worker imports and rejects indirect scope method calls",
 		["SCRIPT_SCOPE_COMPLETION_OWNER", "SCRIPT_SCOPE_COMPLETION_OWNER", "SCRIPT_SCOPE_COMPLETION_OWNER"],
 	);
 });
+
+const sqlTag = "declare const tx: (strings: TemplateStringsArray, ...values: unknown[]) => unknown;\n";
+
+it("rejects fence policy copied into namespace and ingest SQL", () => {
+	const root = project({
+		"src/sql-fs/dialects/postgres/namespace.ts": `${sqlTag}export function copy(id: string, epoch: string | null) {
+	tx\`WITH ctx AS (SELECT s.version FROM sandboxes s WHERE s.id = \${id}
+		AND s.version = COALESCE(\${epoch}::bigint, NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint, s.version))
+		SELECT 1 FROM ctx\`;
+	tx\`UPDATE sandboxes s
+		SET version = s.version + 1 WHERE s.id = \${id}\`;
+}
+`,
+		"src/sql-fs/dialects/postgres/ingest.ts": `${sqlTag}export function publish(version: string) {
+	tx\`SELECT set_config('app.sandbox_epoch', \${version}, true)\`;
+}
+`,
+	});
+	const diagnostics = checkArchitectureBoundaries(root).filter(({ code }) => code === "FENCE_POLICY_OWNER");
+	assert.deepEqual(
+		diagnostics.map(({ file, line }) => [file, line]),
+		[
+			["src/sql-fs/dialects/postgres/ingest.ts", 3],
+			["src/sql-fs/dialects/postgres/namespace.ts", 3],
+			["src/sql-fs/dialects/postgres/namespace.ts", 6],
+		],
+	);
+});
+
+it("permits epoch consumers, version reads, and the fence policy owner", () => {
+	const root = project({
+		"src/sql-fs/dialects/postgres/sandbox.ts": `${sqlTag}export function fence(id: string) {
+	return tx\`ctx AS (SELECT s.version FROM sandboxes s WHERE s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint),
+		advanced AS (UPDATE sandboxes s SET version = s.version + 1 FROM ctx WHERE s.id = \${id} RETURNING s.version)\`;
+}
+`,
+		"src/sql-fs/dialects/postgres/namespace.ts": `${sqlTag}// app.sandbox_epoch is published by the fence policy
+const prose = "UPDATE sandboxes SET version = version + 1";
+export function consume(id: string, fence: unknown) {
+	tx\`WITH \${fence}, inserted AS (INSERT INTO inodes (sandbox_id) SELECT \${id} FROM epoch RETURNING id)
+		SELECT (SELECT count(*) FROM epoch)::int AS fenced, (SELECT id FROM inserted) AS id
+		FROM sandboxes WHERE id = \${id}\`;
+	tx\`SELECT version FROM sandboxes WHERE id = \${id}\`;
+	tx\`UPDATE sandboxes SET name = \${prose} WHERE id = \${id}\`;
+	tx\`UPDATE sandboxes SET name = \${prose} WHERE version = \${id}\`;
+}
+`,
+	});
+	assert.deepEqual(checkArchitectureBoundaries(root), []);
+});
+
+const sqlCapabilities = `declare const tx: {
+	(strings: TemplateStringsArray, ...values: unknown[]): unknown;
+	(values: unknown[] | Record<string, unknown>): unknown;
+	unsafe(query: string): unknown;
+	file(path: string): unknown;
+};
+`;
+
+it("rejects direct, extracted, destructured, and aliased raw SQL capabilities in both fence consumers", () => {
+	const accesses = [
+		'tx.unsafe("UPDATE sandboxes SET version = version + 1")',
+		'tx["unsafe"]("SELECT 1")',
+		'const run = tx.unsafe; run("SELECT 1")',
+		'const run = tx["unsafe"]; run("SELECT 1")',
+		'const { unsafe: run } = tx; run("SELECT 1")',
+		'const { "unsafe": run } = tx; run("SELECT 1")',
+		'const db = tx; db.unsafe("SELECT 1")',
+		'tx.file("query.sql")',
+		'tx["file"]("query.sql")',
+		'const run = tx.file; run("query.sql")',
+		'const run = tx["file"]; run("query.sql")',
+		'const { file: run } = tx; run("query.sql")',
+		'const db = tx; db.file("query.sql")',
+	];
+	const body = accesses.map((access) => `{ ${access}; }`).join("\n");
+	const files = ["namespace", "ingest"].map((name) => `src/sql-fs/dialects/postgres/${name}.ts`);
+	const root = project(Object.fromEntries(files.map((file) => [file, sqlCapabilities + body])));
+	const diagnostics = checkArchitectureBoundaries(root);
+	assert.equal(diagnostics.length, files.length * accesses.length);
+	for (const file of files) {
+		assert.deepEqual(
+			diagnostics.filter((item) => item.file === file).map(({ code, line }) => ({ code, line })),
+			accesses.map((_, index) => ({ code: "FENCE_POLICY_RAW_SQL", line: index + 7 })),
+		);
+	}
+});
+
+it("permits safe SQL builders, unrelated file data, and raw SQL in the sandbox lifecycle owner", () => {
+	const root = project({
+		"src/sql-fs/dialects/postgres/namespace.ts": `${sqlCapabilities}
+const db = tx;
+const prose = "UPDATE sandboxes SET version = version + 1";
+db([1, 2]);
+db({ name: prose });
+db\`SELECT \${prose}\`;
+const entry = { file: "notes.txt", unsafe: false };
+void entry.file;
+void entry["file"];
+const { file, unsafe } = entry;
+`,
+		"src/sql-fs/dialects/postgres/sandbox.ts": `${sqlCapabilities}
+tx.unsafe("UPDATE sandboxes SET version = version + 1");
+const { file: run } = tx;
+run("lifecycle.sql");
+`,
+	});
+	assert.deepEqual(checkArchitectureBoundaries(root), []);
+});
