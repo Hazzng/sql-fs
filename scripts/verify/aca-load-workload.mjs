@@ -1,4 +1,24 @@
+export async function visitConcurrent(items, concurrency, visit) {
+	let next = 0, failed = false, failure;
+	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+		while (!failed && next < items.length) {
+			const index = next++;
+			try { await visit(items[index], index); }
+			catch (error) { if (!failed) { failed = true; failure = error; } }
+		}
+	}));
+	if (failed) throw failure;
+}
+
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+
+export function overloadDelayMs(retryAfter, attempt, nowMs = Date.now()) {
+	const seconds = retryAfter?.trim() ? Number(retryAfter) : NaN;
+	const date = Date.parse(retryAfter || '');
+	const minimum = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 :
+		Number.isFinite(date) ? Math.max(0, date - nowMs) : 1000;
+	return Math.max(minimum, Math.min(10000, 1000 * 2 ** Math.min(attempt, 4)));
+}
 
 export function buildScript(marker, cfg, path = '/home/user/aca-markers.txt') {
 	return `${cfg.hold ? `sleep ${cfg.hold / 1000} && ` : ''}${cfg.cpu ? `i=0; while [ "$i" -lt ${cfg.cpu} ]; do i=$((i+1)); done; ` : ''}` +

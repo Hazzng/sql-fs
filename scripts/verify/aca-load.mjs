@@ -5,10 +5,10 @@ import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { buildScript, markerIntegrity, outcomeTotals, validateOperation } from './aca-load-workload.mjs';
+import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, validateOperation, visitConcurrent } from './aca-load-workload.mjs';
 
 const defaults = { app: 'virtualfs-api', group: 'rg-harry-dev', duration: '30', rate: '2', pool: '20',
-	'max-inflight': '20', 'timeout-ms': '120000', 'command-timeout-ms': '30000', 'hold-ms': '250',
+	'max-inflight': '20', 'setup-concurrency': '1', 'timeout-ms': '120000', 'command-timeout-ms': '30000', 'hold-ms': '250',
 	'cpu-iterations': '0', interval: '5', 'max-start-delay-ms': '250', retries: '0' };
 const { positionals: [command], values: flags } = parseArgs({ allowPositionals: true, options: {
 	...Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, { type: 'string', default: v }])),
@@ -22,7 +22,7 @@ if (flags.help || !['inspect', 'observe', 'load', 'cleanup'].includes(command)) 
 		'Observe: --duration SECONDS --interval SECONDS [--app-metrics]\n' +
 		'Load: --duration SECONDS --rate OPS_PER_SECOND --pool N --max-inflight N --hold-ms N\n' +
 		'      --cpu-iterations N --retries N --timeout-ms N --command-timeout-ms N --tenant ID\n' +
-		'      --max-start-delay-ms N --interval SECONDS\nCleanup: --manifest PATH');
+		'      --max-start-delay-ms N --interval SECONDS --setup-concurrency N (1..8, default 1)\nCleanup: --manifest PATH');
 	process.exit(flags.help ? 0 : 2);
 }
 function number(key, min, max, integer = false) {
@@ -31,12 +31,12 @@ function number(key, min, max, integer = false) {
 	return n;
 }
 const cfg = { duration: number('duration', 1, 7200), rate: number('rate', 0.01, 1000),
-	pool: number('pool', 1, 500, true), maxInflight: number('max-inflight', 1, 500, true),
+	pool: number('pool', 1, 500, true), setupConcurrency: number('setup-concurrency', 1, 8, true), maxInflight: number('max-inflight', 1, 500, true),
 	timeout: number('timeout-ms', 5000, 120000, true), commandTimeout: number('command-timeout-ms', 1000, 90000, true),
 	hold: number('hold-ms', 0, 60000), cpu: number('cpu-iterations', 0, 100000, true),
-	interval: number('interval', 1, 300), maxDelay: number('max-start-delay-ms', 1, 10000), retries: number('retries', 0, 5, true) };
-if (cfg.timeout <= cfg.commandTimeout + 5000 || cfg.hold >= cfg.commandTimeout || cfg.duration * cfg.rate > 500000)
-	throw new Error('Require timeout > command timeout + 5000ms, hold < command timeout, and <= 500000 planned operations');
+	interval: number('interval', 1, 300), maxDelay: number('max-start-delay-ms', 1, 10000), retries: number('retries', 0, 20, true) };
+if (cfg.timeout <= cfg.commandTimeout + 5000 || cfg.hold >= cfg.commandTimeout || Math.ceil(cfg.duration * cfg.rate) * (cfg.retries + 1) > 500000)
+	throw new Error('Require timeout > command timeout + 5000ms, hold < command timeout, and <= 500000 possible attempts');
 if (flags.resource.length > 8 || flags.resource.some(x => !/^\/subscriptions\/[\w-]+\/resourceGroups\/[\w.-]+\/providers\/Microsoft\.(App\/containerApps|DBforPostgreSQL\/flexibleServers|Cache\/Redis)\/[\w.-]+$/i.test(x)))
 	throw new Error('Resources must be up to 8 ACA, PostgreSQL Flexible Server or Azure Redis ARM IDs');
 const exec = promisify(execFile), now = () => new Date().toISOString(), sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -52,7 +52,12 @@ const safeCode = x => typeof x === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(x
 const safeError = error => ({ error: safeCode(error?.name) || 'Error', code: safeCode(error?.code ?? error?.cause?.code), killed: error?.killed === true });
 const record = row => { const entry = JSON.stringify({ at: now(), ...row }) + '\n'; logging = logging.then(() => appendFile(join(root, 'events.jsonl'), entry)); return logging; };
 async function jsonFile(name, value) { const path = join(root, name); await writeFile(path + '.tmp', JSON.stringify(value, null, 2)); await rename(path + '.tmp', path); }
-const saveManifest = () => jsonFile('manifest.json', manifest);
+let manifestWrites = Promise.resolve();
+const saveManifest = () => {
+	const snapshot = structuredClone(manifest);
+	manifestWrites = manifestWrites.then(() => jsonFile('manifest.json', snapshot));
+	return manifestWrites;
+};
 async function az(args) {
 	try { const r = await exec('az', [...args, '--output', 'json', '--only-show-errors'], { timeout: 60000, maxBuffer: 16 * 1024 ** 2 }); return JSON.parse(r.stdout); }
 	catch (error) { throw Object.assign(new Error('Azure CLI read failed; stdout and stderr suppressed'), { code: safeCode(String(error?.code)), name: 'AzureReadError' }); }
@@ -151,13 +156,14 @@ async function sample(withApp) {
 async function cleanup(recover = false) {
 	const found = await request('/v1/sandboxes');
 	await record({ kind: 'cleanupDiscovery', request: publicResult(found) });
-	if (found.status === 200 && Array.isArray(found.json?.sandboxes)) {
+	const discovered = found.status === 200 && !found.transportFailure && Array.isArray(found.json?.sandboxes);
+	if (discovered) {
 		for (const s of found.json.sandboxes) if (s.owner === manifest.owner && /^[0-9a-f-]{36}$/i.test(s.id)) {
 			if (!manifest.sandboxes.some(x => x.id === s.id)) manifest.sandboxes.push({ id: s.id, name: s.name });
 		}
 	}
-	manifest.cleanupPending = found.status !== 200 || found.transportFailure === true || !Array.isArray(found.json?.sandboxes); await saveManifest();
-	for (const sandbox of manifest.sandboxes) {
+	manifest.cleanupPending = true; await saveManifest();
+	await visitConcurrent(manifest.sandboxes, 4, async sandbox => {
 		if (recover) {
 			const r = await request(`/v1/sandboxes/${sandbox.id}/files/home/user/aca-markers.txt`, undefined, 'GET', 32 * 1024 ** 2);
 			const markerCounts = new Map();
@@ -174,9 +180,9 @@ async function cleanup(recover = false) {
 			await sleep(1000 + Math.random() * 500);
 		}
 		sandbox.deleted = [200, 204, 404].includes(r.status) && !r.transportFailure;
-		if (!sandbox.deleted) manifest.cleanupPending = true;
 		await saveManifest();
-	}
+	});
+	manifest.cleanupPending = !discovered || manifest.sandboxes.some(sandbox => !sandbox.deleted);
 	manifest.cleanedAt = now(); await saveManifest();
 	if (manifest.cleanupPending) process.exitCode = 1;
 }
@@ -187,7 +193,7 @@ function stats(values) {
 }
 async function validate() {
 	const validation = [], unknown = [], integrity = [];
-	for (const sandbox of manifest.sandboxes) {
+	await visitConcurrent(manifest.sandboxes, 4, async sandbox => {
 		const r = await request(`/v1/sandboxes/${sandbox.id}/files/home/user/aca-markers.txt`, undefined, 'GET', 32 * 1024 ** 2);
 		const counts = new Map();
 		if (r.status === 200 && !r.transportFailure) for (const line of r.text.split('\n').filter(Boolean)) counts.set(line, (counts.get(line) || 0) + 1);
@@ -200,7 +206,7 @@ async function validate() {
 		}
 		const checked = { sandbox: sandbox.id, ...markerIntegrity(operations, counts) }; integrity.push(checked);
 		await record({ kind: 'readback', sandbox: sandbox.id, request: publicResult(r), readable, markers: counts.size, integrity: checked });
-	}
+	});
 	await jsonFile('reconciliation.json', { checkedAt: now(), validation, integrity, unknown,
 		note: 'Unknown outcomes remain unknown even when a marker is found. Cleanup follows this saved readback.' });
 	return { validation, integrity };
@@ -224,10 +230,11 @@ async function execute(op) {
 		op.attempts.push({ ...publicResult(r), marker, success, safeRefusal: refused, rejected, sendDelayMs });
 		record({ kind: 'attempt', op: op.id, sandbox: op.sandbox, attempt, marker, success, safeRefusal: refused, rejected, result: publicResult(r) });
 		if (refused && attempt < cfg.retries && !stopped) {
-			const seconds = r.retryAfter === null ? NaN : Number(r.retryAfter), date = Date.parse(r.retryAfter || '');
-			const after = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Number.isFinite(date) ? Math.max(0, date - Date.now()) : 1000;
+			const after = overloadDelayMs(r.retryAfter, attempt);
 			if (performance.now() - began + after + cfg.commandTimeout + 5000 > cfg.timeout) { op.outcome = 'safeRefusal'; break; }
-			await sleep(after + Math.random() * Math.min(1000, after * .25 + 100)); continue;
+			await sleep(after + Math.random() * Math.min(1000, after * .25 + 100));
+			if (stopped) { op.outcome = 'safeRefusal'; break; }
+			continue;
 		}
 		op.outcome = success ? 'success' : refused ? 'safeRefusal' : rejected ? 'failed' : 'unknown'; break;
 	}
@@ -243,13 +250,14 @@ async function load() {
 	let sampler, sampling = true, validation = [], integrity = [], measurement, began, offeredEnd;
 	const loop = monitorEventLoopDelay({ resolution: 10 });
 	try {
-		for (let i = 0; i < cfg.pool && !stopped; i++) {
+		await visitConcurrent(Array.from({ length: cfg.pool }), cfg.setupConcurrency, async (_, i) => {
+			if (stopped) return;
 			const name = `${manifest.namePrefix}${i}`;
 			const r = await request('/v1/sandboxes', { name });
 			await record({ kind: 'create', name, request: publicResult(r) });
 			if (r.status !== 201 || r.json?.owner !== manifest.owner || !/^[0-9a-f-]{36}$/i.test(r.json?.id || '') || r.transportFailure) throw new Error('Sandbox creation failed; cleanup discovers any owned orphan');
 			manifest.sandboxes.push({ id: r.json.id, name }); await saveManifest();
-		}
+		});
 		await sample(true);
 		const available = [...manifest.sandboxes];
 		loop.enable(); began = performance.now(); loadStart = began; loadDeadline = began + cfg.duration * 1000; measurement = now();

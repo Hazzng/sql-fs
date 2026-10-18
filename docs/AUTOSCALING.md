@@ -275,35 +275,29 @@ Keep script work fixed when comparing replica counts. This example includes slee
 
 ### Scale rules
 
-`deploy/azure/aca.yaml` deploys sql-fs to Azure Container Apps. Its scale rule targets 50 concurrent requests for each replica. One replica admits only 8 requests by default and runs 2 operations at a time, so that rule starts adding replicas long after requests begin to fail. The example below shows only the fields to change. Merge them into the `template` block of `aca.yaml`, which keeps the image, environment and probes. It is a starting point, not a tested configuration.
+`deploy/azure/aca.yaml` starts with 1 CPU, 2 GiB, two workers, bounded five-second waits and an HTTP target of one concurrent request. It uses an immutable image reference. Set its digest to the image you verified. The example keeps at least two replicas for availability; use a minimum of zero for an idle development app when the wake-up delay is acceptable.
 
-```yaml
-template:
-  terminationGracePeriodSeconds: 90
-  containers:
-    - name: api
-      resources:
-        cpu: 2.0
-        memory: 4Gi
-  scale:
-    minReplicas: 2
-    maxReplicas: 10
-    rules:
-      - name: concurrent-requests
-        http:
-          metadata:
-            concurrentRequests: "4"
-      - name: worker-refusals
-        custom:
-          type: prometheus
-          metadata:
-            serverAddress: http://prometheus.example.internal:9090
-            query: sum(rate(sql_fs_ingress_refused_total[2m])) + sum(rate(sql_fs_worker_refused_total[2m]))
-            threshold: "1"
-```
+The HTTP rule uses ACA's fleet request signal. It needs no application polling or Prometheus service. One scrape of the load-balanced `/metrics` endpoint describes one replica and cannot establish fleet pressure. Use the new metrics to observe queue capacity, wait, refusals and recovery. If you later add per-replica collection, a separate Prometheus rule can use its aggregate.
 
-The HTTP rule needs no Prometheus. It scales on concurrent requests, which track the ingress and worker gates. Set `concurrentRequests` to about the worker count plus the queue you accept. Use 4 for short execs with 2 workers. Use a value closer to the worker count when scripts run for seconds.
+The queue waits apply at both gates, so an execution can wait up to ten seconds before it begins. They absorb a bounded burst; they do not hold an arbitrary surge for the whole time that replicas need to start. Clients should retry only explicit retryable overload responses, respect `Retry-After`, add bounded exponential backoff with jitter, and use a deadline that covers the observed scaling gap. Connection failures and unknown execution outcomes still require reconciliation.
 
-The `prometheus` rule is a KEDA scaler. It needs a Prometheus server that scrapes every replica with the token from [Endpoints](#endpoints). It asks for one replica for each refusal per second. Container Apps uses the highest replica count that any rule asks for. Once refusals stop, this rule asks for none, so the HTTP rule holds the steady count.
+Budget shared connections for old and new replicas during a rollout. With blob caching off, each replica holds a control Redis connection. Twenty old plus twenty new replicas already need forty connections before observation and restart headroom. A thirty-connection test instance cannot support that rollout safely. Keep control Redis on `noeviction`; use a separate data Redis when enabling blob caching. Postgres capacity must cover worker pools and metadata pools for configured tenants, including rollout overlap.
 
-On the Consumption plan, CPU and memory come in fixed pairs, and 2 CPUs come with 4 GiB. The measured capacity above used 2 CPUs and 2 GiB.
+### Hosted measurements, 2026-10-18
+
+These bounded tests ran on the candidate in `virtualfs-api`, ACA Consumption in Australia East. Each replica had 1 CPU and 2 GiB. Two workers retained the default limit of one active execution per tenant. One tenant used distinct sandboxes with durable marker appends. Sandbox setup warmed the app before each thirty-second offer window. No retries were enabled for these fixed-replica points.
+
+| Replicas | Offered writes/s | Successful completions/s during offer window | Eventual successful writes | Client p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 6 | 5.97 | 180/180 | 550 ms |
+| 5 | 15 | 14.83 | 450/450 | 733 ms |
+| 10 | 30 | 29.67 | 900/900 | 855 ms |
+| 20 | 60 | 59.20 | 1800/1800 | 879 ms |
+
+Every point had zero generator drops, refusals, unknown outcomes, duplicate markers or missing successful writes. These are tested rates, not estimates of maximum capacity or production latency guarantees. CPU-heavy scripts and same-sandbox contention need separate capacity measurements.
+
+A separate fifteen-second overload run offered 200 writes/s to twenty replicas. It completed 81.2 successful writes/s during the offer window. Including drain, 1613 writes succeeded and 1387 received explicit busy refusals. All 3000 operations reconciled correctly: each successful marker appeared once, each refused marker was absent, and no unknown outcome occurred. The load generator sent every arrival; maximum send delay was 21.3 ms and peak in-flight requests were 405 of the allowed 500. Queueing raised successful-request p99 to 6.05 seconds.
+
+The same AMD64 source and base images produced 179905757 compressed layer bytes with development dependencies and 106470873 after pruning, a 40.82% reduction. Runtime parity covered Git, JavaScript, TypeScript, Python, SQLite, tar, MCP and cross-replica persistence. Smaller transfer size is not proof of a faster ACA startup.
+
+The throwaway Redis accepted only thirty concurrent connections and refused `noeviction`. Twenty replicas therefore remain a test configuration. Production use requires suitable control Redis, rollout headroom and workload-specific confirmation. The load driver preserves raw summaries and durable reconciliation in its evidence directory.

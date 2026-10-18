@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { buildScript, markerIntegrity, outcomeTotals, validateOperation } from "./aca-load-workload.mjs";
+import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, validateOperation, visitConcurrent } from "./aca-load-workload.mjs";
 
 const execute = promisify(execFile);
 const operation = (outcome, attempts) => ({ id: 1, marker: "one", sandbox: "owned", outcome, attempts });
@@ -66,4 +66,51 @@ test("observed markers do not turn unknown or incomplete outcomes into successes
 		unknown: 2,
 		failed: 0,
 	});
+});
+
+test("overload backoff grows within the client deadline and respects Retry-After", () => {
+	assert.deepEqual([0, 1, 2, 3, 4, 20].map((attempt) => overloadDelayMs("1", attempt)), [
+		1000, 2000, 4000, 8000, 10000, 10000,
+	]);
+	assert.equal(overloadDelayMs(null, 0), 1000);
+	assert.equal(overloadDelayMs("", 0), 1000);
+	assert.equal(overloadDelayMs("not-a-date", 0), 1000);
+	assert.equal(overloadDelayMs("30", 0), 30000);
+	assert.equal(overloadDelayMs("Thu, 01 Jan 1970 00:00:30 GMT", 0, 0), 30000);
+	assert.equal(overloadDelayMs("Thu, 01 Jan 1970 00:00:01 GMT", 0, 30000), 1000);
+});
+
+
+test("fixture workers bound concurrency and drain active calls before rejecting", async () => {
+	let active = 0, peak = 0, released = false;
+	const started = [], finished = [];
+	let release;
+	const barrier = new Promise(resolve => { release = resolve; });
+	const failure = new Error("fixture creation failed");
+	const work = visitConcurrent([0, 1, 2, 3, 4], 3, async item => {
+		started.push(item); peak = Math.max(peak, ++active);
+		try {
+			if (item === 1) throw failure;
+			await barrier; finished.push(item);
+		} finally { active--; }
+	});
+	const rejected = assert.rejects(work, error => {
+		assert.equal(error, failure); assert.equal(released, true); assert.equal(active, 0); return true;
+	});
+	await Promise.resolve();
+	try { assert.deepEqual(started, [0, 1, 2]); assert.equal(peak, 2); }
+	finally { released = true; release(); }
+	await rejected;
+	assert.deepEqual(finished, [0, 2]);
+});
+
+test("fixture workers visit each item once at the requested bound", async () => {
+	let active = 0, peak = 0;
+	const visited = [];
+	await visitConcurrent(Array.from({ length: 11 }, (_, i) => i), 4, async item => {
+		peak = Math.max(peak, ++active); await new Promise(resolve => setTimeout(resolve, 1));
+		visited.push(item); active--;
+	});
+	assert.equal(peak, 4); assert.equal(active, 0);
+	assert.deepEqual(visited.sort((a, b) => a - b), Array.from({ length: 11 }, (_, i) => i));
 });
