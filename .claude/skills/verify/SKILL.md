@@ -22,7 +22,7 @@ Run every row your diff touches. `pnpm check` is always required; the full verif
 | `src/sql-fs/` (fs, transactions, cache, RLS, symlinks) | targeted `pnpm exec vitest run <file>`, `$S suite integration <file>`, [files](features/files.md) / [exec](features/exec.md) drive | `pnpm check` + `pnpm verify:local` |
 | `src/api/routes/`, `auth.ts`, `validation.ts`, `openapi-spec.ts` | the matching feature drive + `$S suite contracts` | `pnpm check` + `pnpm verify:local` |
 | `src/api/mcp/` | [mcp](features/mcp.md) drive + `$S suite contracts` | `pnpm check` + `pnpm verify:local` |
-| `src/api/worker-owner/`, `ingress-admission.ts`, `session-manager.ts`, `src/execution/`, `script-scope.ts`, budgets, cancellation, deadlines, body limits | `$S suite worker-failures`, `sse-finalization`, `input-budgets`, `output-cap` | `pnpm check` + `pnpm verify:architecture` |
+| `src/api/worker-owner/`, `ingress-admission.ts`, `session-manager.ts`, `src/execution/`, `script-scope.ts`, budgets, cancellation, deadlines, body limits | `$S suite worker-failures`, `sse-finalization`, `input-budgets`, `ingress-queue`, `output-cap` | `pnpm check` + `pnpm verify:architecture` |
 | `src/api/server.ts` startup/shutdown, `src/api/mcp/server.ts` listener lifecycle, ingress waits | `$S suite shutdown`, `$S suite contracts` | `pnpm check` + `pnpm verify:local` |
 | Tenancy, `TENANT_DATABASES`, owner isolation | `$S suite tenants`, [sandboxes](features/sandboxes.md) isolation steps | `pnpm check` + `pnpm verify:architecture` |
 | `src/redis/`, `redis-blob-cache.ts` | `$S suite integration src/redis` | `pnpm check` + `pnpm verify:local` |

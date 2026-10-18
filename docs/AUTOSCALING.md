@@ -84,7 +84,7 @@ The names below come from `src/api/worker-owner/metrics.ts` and from a scrape of
 | `sql_fs_worker_queue_timeouts_total` | counter | The part of `sql_fs_worker_refused_total` whose wait passed `SQL_FS_WORKER_QUEUE_WAIT_MS`. |
 | `sql_fs_worker_cancelled_total` | counter | Operations that left the queue because the client disconnected or the server shut down. |
 | `sql_fs_worker_completed_total` | counter | Operations that released their worker. |
-| `sql_fs_worker_queue_wait_milliseconds` | histogram | Time from the request for a worker to admission. Buckets: 1, 5, 25, 100, 250 and 1000 ms. |
+| `sql_fs_worker_queue_wait_milliseconds` | histogram | Time from the request for a worker to admission. Buckets: 1, 5, 25, 100, 250, 1000, 2500, 5000, 10000 and 30000 ms. |
 | `sql_fs_worker_queue_wait_milliseconds_total` | counter | Same value as the histogram's `_sum`. |
 
 The wait histogram counts admitted operations only. An operation admitted at once records 0. A refused operation records nothing, so the histogram never goes above `SQL_FS_WORKER_QUEUE_WAIT_MS` and hides the requests that hurt most. Read it together with the refusal counters.
@@ -95,11 +95,20 @@ Ingress admission runs before the worker queue. It bounds the requests that one 
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `sql_fs_ingress_request_capacity` | gauge | Configured ordinary active request limit. |
+| `sql_fs_ingress_queue_capacity` | gauge | Configured ordinary queued request limit. |
+| `sql_fs_ingress_raw_byte_capacity` | gauge | Configured global retained raw-body byte limit. |
+| `sql_fs_ingress_queue_wait_limit_milliseconds` | gauge | Configured ingress queue deadline. |
 | `sql_fs_ingress_active_requests` | gauge | Requests that hold one of the `SQL_FS_MAX_INGRESS_REQUESTS` permits. A permit stays held until the response finishes. |
 | `sql_fs_ingress_queued_requests` | gauge | Requests that wait for a permit. |
+| `sql_fs_ingress_offered_total` | counter | Requests that seek an ordinary ingress permit after the declared body-size check. |
+| `sql_fs_ingress_admitted_total` | counter | Requests that acquire an ordinary ingress permit. |
+| `sql_fs_ingress_completed_total` | counter | Ordinary ingress permits released after response and retained work completion. |
+| `sql_fs_ingress_cancelled_total` | counter | Requests removed before admission by client cancellation, shutdown or an input failure. |
+| `sql_fs_ingress_queue_wait_milliseconds` | histogram | Ordinary ingress delay for admitted requests, with the same buckets as worker admission. |
 | `sql_fs_ingress_refused_total` | counter | Requests that failed with `EWORKER_BUSY` (503) at ingress. It counts a full queue, a wait that ran out and a body that did not fit the byte budget. It does not count MCP listeners. |
 | `sql_fs_ingress_queue_timeouts_total` | counter | The part of `sql_fs_ingress_refused_total` whose wait passed `SQL_FS_MAX_INGRESS_WAIT_MS`. |
-| `sql_fs_ingress_retained_raw_bytes` | gauge | Request-body bytes that admitted requests hold, counted against `SQL_FS_MAX_INGRESS_BYTES`. |
+| `sql_fs_ingress_retained_raw_bytes` | gauge | Request-body bytes held by queued and admitted requests, counted against `SQL_FS_MAX_INGRESS_BYTES`. Transport buffers are additional memory. |
 | `sql_fs_ingress_payload_too_large_total` | counter | Requests that failed with 413 because the body passed its limit. More replicas do not help. |
 | `sql_fs_ingress_aborted_total` | counter | Requests whose client disconnected before the server finished. |
 | `sql_fs_ingress_mcp_listeners_active` | gauge | Open `GET /mcp` streams. |
@@ -107,7 +116,7 @@ Ingress admission runs before the worker queue. It bounds the requests that one 
 | `sql_fs_ingress_mcp_listeners_refused_total` | counter | `GET /mcp` streams that failed with 503. |
 | `sql_fs_ingress_mcp_listeners_queue_timeouts_total` | counter | The part of `sql_fs_ingress_mcp_listeners_refused_total` whose wait ran out. |
 
-Ingress has no wait histogram. Use `sql_fs_ingress_queued_requests` and the refusal counters.
+The ingress wait histogram records admitted requests only. Read it with queue depth, refusals and queue timeouts. Requests refused before admission do not appear in its latency distribution. MCP listeners use their separate gauges and counters.
 
 ### Memory
 
@@ -157,7 +166,7 @@ max(sql_fs_worker_runnable_queued)
 max(sql_fs_ingress_queued_requests)
 ```
 
-The p95 normally stays below `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. An event-loop stall can delay the refusal and let a slightly later admission through. A p95 at the limit means the histogram is saturated, not that the wait is bounded. The top finite bucket is 1000 ms. If you raise `SQL_FS_WORKER_QUEUE_WAIT_MS` above 1000 ms, quantiles above 1000 ms report 1000.
+The p95 normally stays below `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. An event-loop stall can delay the refusal and let a slightly later admission through. Read the deadline and refusal counters alongside the histogram. The top finite bucket is 30000 ms. Quantiles above that bucket report 30000 ms, so use client latency measurements for longer waits.
 
 Scale on `sql_fs_worker_runnable_queued`, not `sql_fs_worker_queued`. The difference is `sql_fs_worker_sandbox_waiting`, which more replicas do not reduce.
 
@@ -213,7 +222,7 @@ For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 
 - Configure Redis before you run more than one replica. `REDIS_URL` carries the sandbox locks. The [README](../README.md#deploy-with-docker) describes the multi-replica setup.
 - Scale out fast and scale in slowly. A short burst of refusals should add replicas within a minute. Removing replicas should wait for several minutes of low load, so that the count does not swing.
 - Let a replica drain before it stops. A script that is cut off mid-run has an unknown outcome, and the client gets no result.
-- Make clients retry. Retry a 503 with `retryable: true` after `Retry-After`, with jitter. Also retry connection errors on large uploads, because a client can see a refused upload as a socket error (`UND_ERR_SOCKET`) instead of the 503. Never retry `EEXEC_OUTCOME_UNKNOWN` automatically.
+- Retry an explicit 503 with `retryable: true` after `Retry-After`, with jitter and a deadline. A connection failure can hide a completed operation. Reconcile its state before replaying a mutation. Never retry `EEXEC_OUTCOME_UNKNOWN` automatically.
 - Size the caps for each box size and keep them fixed. Do not change worker counts, output caps or ingress limits at runtime to absorb load. Add replicas instead. The memory measurements in [CONFIGURATION.md](CONFIGURATION.md#sizing) hold only for the caps they were taken with.
 
 ### Shutdown and draining
@@ -232,7 +241,11 @@ The 30 s drain starts only after open requests finish, so an in-flight request e
 
 A request can wait twice before it gets a 503. It first waits for an ingress permit, up to `SQL_FS_MAX_INGRESS_WAIT_MS`. An exec then waits for a worker, up to `SQL_FS_WORKER_QUEUE_WAIT_MS`. Both default to 250 ms, so an exec can queue for up to 0.5 s before it fails.
 
-A longer ingress wait does not absorb bursts. The ingress queue holds at most as many requests as ingress admits at once: `SQL_FS_MAX_INGRESS_REQUESTS` for the replica and `SQL_FS_MAX_INGRESS_TENANT_REQUESTS` for each tenant, 8 and 4 by default. In a burst of 100 requests spread across tenants, 8 run, 8 wait and the rest are refused at once, whatever the wait. One tenant on its own gets 4 running and 4 waiting. The wait only decides how long those few queued requests hold their places. [#269](https://github.com/Hazzng/sql-fs/issues/269) tracks a deeper ingress queue.
+Queue depth and wait are separate controls. `SQL_FS_MAX_INGRESS_QUEUED_REQUESTS` sets the ordinary request queue for each replica. `SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS` sets one tenant's share. Defaults remain 8 and 4, derived from the corresponding active limits. A zero queue count refuses a request immediately when it cannot acquire an active permit. MCP GET listeners retain their separate quotas.
+
+Queued uploads make input progress within the same global and tenant byte budgets as admitted requests. This lets the server observe a disconnect behind unread network data. Active input follows consumer demand. A full byte budget returns 503, and a body above its limit returns 413. Increasing the count does not increase the byte budget or worker capacity.
+
+Size a queue against the delay you accept and the capacity gap you measure. A first estimate is excess incoming requests per second multiplied by the gap until useful capacity arrives. Apply this to the load arriving at each existing replica, including uneven routing. For example, 50 excess requests per second over 20 seconds needs 1000 queue places. A wait shorter than the gap expires first, and a finite queue cannot cover an arbitrary surge. Scale early, retain headroom, and use bounded client retries for explicit overload refusals.
 
 These runs used the same 2 GiB replica as [Measured capacity](#measured-capacity), with clients that waited 1 s after each 503, as `Retry-After: 1` asks. They ran on 2026-10-17.
 
@@ -243,9 +256,24 @@ These runs used the same 2 GiB replica as [Measured capacity](#measured-capacity
 | The same runs: successful execs/s | 74.5, 69.8, 68.5 | 67.8, 63.4, 67.2 |
 | The same runs: p99 latency | 123, 151, 174 ms | 246, 283, 173 ms |
 
-The longer wait refused as many requests in the burst, and slightly more under sustained overload, with higher tail latency. Keep the default. Raise the wait only if your clients cannot retry, and add replicas for any load that refuses requests for more than a burst.
+These historical runs kept queue counts equal to active counts. A longer wait alone therefore left most arrivals outside the queue. Measure depth and wait together before changing defaults, and add replicas for sustained demand.
 
 ## Example: Azure Container Apps
+
+### Measuring an existing app
+
+`scripts/verify/aca-load.mjs` runs a bounded open-loop workload against an existing ACA app. It resolves the app's signing secret through your current Azure CLI identity without writing credentials to evidence. Each run owns its sandboxes, verifies durable markers, and removes its resources. Run this only against an app authorized for load testing.
+
+```bash
+node scripts/verify/aca-load.mjs load --app virtualfs-api --group rg-harry-dev \
+  --duration 30 --rate 5 --pool 30 --max-inflight 30 --hold-ms 250 --retries 0
+```
+
+The default evidence directory is `scripts/verify/.run/aca-*`. `summary.json` separates offered arrivals, generator drops, sent attempts, successful operations, explicit overload refusals, and unknown outcomes. `reconciliation.json` checks durable markers before cleanup. To resume interrupted cleanup, run `node scripts/verify/aca-load.mjs cleanup --manifest <evidence>/manifest.json`.
+
+Keep script work fixed when comparing replica counts. This example includes sleep, so its throughput does not establish CPU-intensive bash capacity. Inspect generator delay and drops before attributing a limit to the service. Application metrics are load-balanced samples from individual replicas. Use per-pod Azure Monitor series to establish CPU and memory pressure across the fleet.
+
+### Scale rules
 
 `deploy/azure/aca.yaml` deploys sql-fs to Azure Container Apps. Its scale rule targets 50 concurrent requests for each replica. One replica admits only 8 requests by default and runs 2 operations at a time, so that rule starts adding replicas long after requests begin to fail. The example below shows only the fields to change. Merge them into the `template` block of `aca.yaml`, which keeps the image, environment and probes. It is a starting point, not a tested configuration.
 

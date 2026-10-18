@@ -173,13 +173,13 @@ To upgrade replicas that run with workers off, roll out in two stages. A rolling
 
 **Admission.** Each tenant has a queue, and the server takes requests from the queues in turn. On one sandbox, a waiting writer goes before new readers. With the defaults, one tenant can hold one of the two workers and four of the eight ingress permits. Long-lived `GET /mcp` streams count against a separate listener quota. A request that waits longer than `SQL_FS_MAX_INGRESS_WAIT_MS` for an ingress permit, or an exec that waits longer than `SQL_FS_WORKER_QUEUE_WAIT_MS` for a worker, fails with `EWORKER_BUSY` (503) and `Retry-After: 1`. With the defaults, an exec can queue for up to 0.5 s before it fails.
 
-A longer ingress wait does not absorb bursts, because the ingress queue holds no more requests than ingress admits at once. [Wait limits](AUTOSCALING.md#wait-limits) has the measurements.
+Ingress queue counts are independent of active capacity. `SQL_FS_MAX_INGRESS_QUEUED_REQUESTS` and `SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS` default to the active limits. Increase queue depth and wait together to hold a bounded burst. Queued request bodies share the existing global and tenant raw-byte budgets. A full queue or byte budget still refuses work. [Wait limits](AUTOSCALING.md#wait-limits) explains sizing.
 
 **Unknown outcomes.** If a script loses its worker, lease or response after it starts, the request fails with `EEXEC_OUTCOME_UNKNOWN` (503, `retryable: false`). The server and the SDKs do not replay it. That includes read-only scripts, because they can still have network side effects. Read the sandbox state before the next action. Earlier items in a batch can already be committed.
 
 **Input budget.** Every byte that a script reads counts against `SQL_FS_WORKER_INPUT_BYTES`. That includes repeated reads, cached reads and the Python and JavaScript bridges. If a script exceeds it, the exec fails with `EEXEC_INPUT_LIMIT` (413, not retryable) and its writes roll back.
 
-Every worker setting must be a positive integer. If a global limit is above 1, its per-tenant limit must be lower, so that other tenants keep some capacity.
+Every worker setting must be a positive integer. The two ingress queue count settings also accept zero, which disables waiting while preserving immediate admission. If a global limit is above 1, its per-tenant limit must be lower, so that other tenants keep some capacity.
 
 | Variable | Default |
 |---|---|
@@ -197,6 +197,8 @@ Every worker setting must be a positive integer. If a global limit is above 1, i
 | `SQL_FS_WORKER_CANCEL_GRACE_MS` | 500 ms |
 | `SQL_FS_MAX_INGRESS_REQUESTS` | 8 requests |
 | `SQL_FS_MAX_INGRESS_TENANT_REQUESTS` | Half of `SQL_FS_MAX_INGRESS_REQUESTS`, at least 1 |
+| `SQL_FS_MAX_INGRESS_QUEUED_REQUESTS` | `SQL_FS_MAX_INGRESS_REQUESTS` |
+| `SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS` | The active tenant limit, capped to the global queue's available tenant share |
 | `SQL_FS_MAX_INGRESS_BYTES` | 128 MiB |
 | `SQL_FS_MAX_INGRESS_TENANT_BYTES` | Three quarters of `SQL_FS_MAX_INGRESS_BYTES`, at least 1 |
 | `SQL_FS_MAX_INGRESS_MCP_LISTENERS` | 8 listeners |

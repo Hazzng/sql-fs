@@ -76,6 +76,8 @@ describe("ingress configuration", () => {
 		expect(loadIngressOptions({})).toEqual({
 			maxRequests: 8,
 			maxTenantRequests: 4,
+			maxQueuedRequests: 8,
+			maxTenantQueuedRequests: 4,
 			maxMcpListeners: 8,
 			maxTenantMcpListeners: 4,
 			maxBytes: 128 * 1024 * 1024,
@@ -120,6 +122,8 @@ describe("HTTP body admission", () => {
 		});
 		const first = app.request("/hold", { method: "POST", body: "retained" });
 		await entered.promise;
+		const queued = app.request("/write", { method: "PUT", body: "queued" });
+		await expect.poll(() => ingress.metrics.queuedRequests).toBe(1);
 		let reads = 0;
 		let cancelled = false;
 		const stream = new ReadableStream<Uint8Array>(
@@ -148,10 +152,17 @@ describe("HTTP body admission", () => {
 			expect(reads).toBe(0);
 			expect(cancelled).toBe(true);
 			expect(writes).toBe(0);
-			expect(ingress.metrics).toMatchObject({ activeRequests: 1, retainedRawBytes: 8, refused: 1 });
+			expect(ingress.metrics).toMatchObject({
+				activeRequests: 1,
+				queuedRequests: 1,
+				retainedRawBytes: 14,
+				refused: 1,
+				queueTimeouts: 0,
+			});
 		} finally {
 			hold.resolve();
 			await (await first).arrayBuffer();
+			await (await queued).arrayBuffer();
 		}
 		expect(ingress.metrics).toMatchObject({ activeRequests: 0, retainedRawBytes: 0 });
 	});

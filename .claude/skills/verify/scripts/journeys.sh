@@ -82,6 +82,7 @@ journey_files() {
 	EXPECT=204 api DELETE "/v1/sandboxes/$id/files/home/user/v/note.txt" >/dev/null
 	eq "$(EXPECT=404 api GET "/v1/sandboxes/$id/files/home/user/v/note.txt" | jq -r .code)" ENOENT "deleted file -> ENOENT"
 	drop "$id"
+	$S suite ingress-queue
 }
 
 journey_ingest() {

@@ -10,6 +10,12 @@ interface IngressRetention {
 	readonly hold: () => () => void;
 }
 
+type IngressFailure =
+	| { readonly kind: "busy" | "too_large" | "aborted" | "shutdown" }
+	| { readonly kind: "input_error"; readonly error: unknown };
+
+type InputDemand = { readonly kind: "queued" | "idle" } | { readonly kind: "pull"; readonly resolve: () => void };
+
 const ingressRetention = new AsyncLocalStorage<IngressRetention>();
 
 export function retainIngressWork<Args extends unknown[], Result>(
@@ -28,6 +34,8 @@ export function retainIngressWork<Args extends unknown[], Result>(
 export interface IngressOptions {
 	readonly maxRequests: number;
 	readonly maxTenantRequests: number;
+	readonly maxQueuedRequests?: number;
+	readonly maxTenantQueuedRequests?: number;
 	readonly maxMcpListeners?: number;
 	readonly maxTenantMcpListeners?: number;
 	readonly maxBytes: number;
@@ -37,16 +45,28 @@ export interface IngressOptions {
 }
 
 export function loadIngressOptions(env: NodeJS.ProcessEnv = process.env): IngressOptions {
-	const read = (name: string, fallback: number): number => {
+	const read = (name: string, fallback: number, minimum = 1): number => {
 		const raw = env[name];
 		const value = raw === undefined || raw === "" ? fallback : Number(raw);
-		if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer`);
+		if (!Number.isSafeInteger(value) || value < minimum) {
+			throw new Error(`${name} must be a ${minimum === 0 ? "nonnegative" : "positive"} safe integer`);
+		}
 		return value;
 	};
 	const maxRequests = read("SQL_FS_MAX_INGRESS_REQUESTS", 8);
 	const maxTenantRequests = read("SQL_FS_MAX_INGRESS_TENANT_REQUESTS", Math.max(1, Math.floor(maxRequests / 2)));
 	if (maxTenantRequests > Math.max(1, maxRequests - 1)) {
 		throw new Error("SQL_FS_MAX_INGRESS_TENANT_REQUESTS must leave capacity for another tenant");
+	}
+	const maxQueuedRequests = read("SQL_FS_MAX_INGRESS_QUEUED_REQUESTS", maxRequests, 0);
+	const tenantQueueShare = maxQueuedRequests > 1 ? maxQueuedRequests - 1 : maxQueuedRequests;
+	const maxTenantQueuedRequests = read(
+		"SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS",
+		Math.min(maxTenantRequests, tenantQueueShare),
+		0,
+	);
+	if (maxTenantQueuedRequests > tenantQueueShare) {
+		throw new Error("SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS must leave capacity for another tenant");
 	}
 	const maxMcpListeners = read("SQL_FS_MAX_INGRESS_MCP_LISTENERS", maxRequests);
 	const maxTenantMcpListeners = read(
@@ -64,6 +84,8 @@ export function loadIngressOptions(env: NodeJS.ProcessEnv = process.env): Ingres
 	return {
 		maxRequests,
 		maxTenantRequests,
+		maxQueuedRequests,
+		maxTenantQueuedRequests,
 		maxMcpListeners,
 		maxTenantMcpListeners,
 		maxBytes,
@@ -85,11 +107,14 @@ export class IngressAdmission {
 	private aborted = 0;
 
 	constructor(private readonly options: IngressOptions) {
+		const maxQueued = options.maxQueuedRequests ?? options.maxRequests;
 		this.admission = new FairAdmission({
 			capacity: options.maxRequests,
 			maxActivePerTenant: options.maxTenantRequests,
-			maxQueued: options.maxRequests,
-			maxQueuedPerTenant: options.maxTenantRequests,
+			maxQueued,
+			maxQueuedPerTenant:
+				options.maxTenantQueuedRequests ??
+				Math.min(options.maxTenantRequests, maxQueued > 1 ? maxQueued - 1 : maxQueued),
 			maxQueuedBytes: 0,
 			maxQueuedBytesPerTenant: 0,
 			waitMs: options.waitMs,
@@ -115,8 +140,18 @@ export class IngressAdmission {
 		const admission = this.admission.metrics;
 		const mcpListeners = this.mcpListenerAdmission.metrics;
 		return {
+			requestCapacity: this.options.maxRequests,
+			queueCapacity: this.options.maxQueuedRequests ?? this.options.maxRequests,
+			rawByteCapacity: this.options.maxBytes,
+			queueWaitLimitMs: this.options.waitMs,
 			activeRequests: admission.active,
 			queuedRequests: admission.queued,
+			offered: admission.offered,
+			admitted: admission.admitted,
+			completed: admission.completed,
+			cancelled: admission.cancelled,
+			totalWaitMs: admission.totalWaitMs,
+			waitBuckets: admission.waitBuckets,
 			queueTimeouts: admission.timedOut,
 			activeMcpListeners: mcpListeners.active,
 			queuedMcpListeners: mcpListeners.queued,
@@ -179,39 +214,76 @@ export class IngressAdmission {
 		}
 
 		const signal = c.req.raw.signal;
+		const cancellation = new AbortController();
 		const key = typeof tenant === "string" ? `tenant:${tenant}` : "bootstrap";
-		let releaseAdmission: () => void;
-		try {
-			releaseAdmission = await admission.acquire(key, key, 0, signal, true);
-		} catch (error) {
-			void body?.cancel().catch(() => {});
-			if (signal.aborted) {
-				this.aborted++;
-				return new Response(null, { status: 499 });
-			}
-			if (this.closed) return busy("ESHUTTINGDOWN");
-			if (error instanceof WorkerBusyError) return busy();
-			throw error;
-		}
+		let releaseAdmission: (() => void) | undefined;
 		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		let inputController: ReadableStreamDefaultController<Uint8Array> | undefined;
 		let retained = 0;
-		let failure: "busy" | "too_large" | "aborted" | undefined;
+		let failure: IngressFailure | undefined;
 		let ended = false;
-		let onAbort: (() => void) | undefined;
+		let demand: InputDemand = { kind: "idle" };
+		let wakeInput: (() => void) | undefined;
 		let abortOutput: (() => void) | undefined;
+		const hasDemand = () => demand.kind !== "idle";
+		const waitForInput = () =>
+			new Promise<void>((resolve) => {
+				wakeInput = resolve;
+			});
+		const finishPull = () => {
+			if (demand.kind !== "pull") return;
+			const { resolve } = demand;
+			demand = { kind: "idle" };
+			resolve();
+		};
 		const cancel = () => {
+			ended = true;
+			finishPull();
+			wakeInput?.();
+			wakeInput = undefined;
 			void (reader === undefined ? body?.cancel() : reader.cancel())?.catch(() => {});
 		};
+		const fail = (cause: IngressFailure) => {
+			if (failure !== undefined) return;
+			failure = cause;
+			if (cause.kind === "aborted") this.aborted++;
+			if (cause.kind === "too_large") this.payloadTooLarge++;
+			ended = true;
+			inputController?.error(
+				cause.kind === "input_error" ? cause.error : new DOMException("Request input stopped", "AbortError"),
+			);
+			cancellation.abort();
+			cancel();
+			if (cause.kind === "aborted") abortOutput?.();
+		};
+		const failureResponse = () => {
+			switch (failure?.kind) {
+				case "busy":
+					return busy();
+				case "shutdown":
+					return busy("ESHUTTINGDOWN");
+				case "too_large":
+					return tooLarge();
+				case "aborted":
+					return new Response(null, { status: 499 });
+				case "input_error":
+					throw failure.error;
+				default:
+					return undefined;
+			}
+		};
+		const onAbort = () => fail({ kind: "aborted" });
 		let references = 1;
 		const release = () => {
 			if (--references !== 0) return;
-			if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+			signal.removeEventListener("abort", onAbort);
+			inputController?.error(new DOMException("Request already completed", "AbortError"));
 			cancel();
 			this.retainedRawBytes -= retained;
 			const remainingBytes = (this.tenantBytes.get(tenant) ?? 0) - retained;
 			if (remainingBytes === 0) this.tenantBytes.delete(tenant);
 			else this.tenantBytes.set(tenant, remainingBytes);
-			releaseAdmission();
+			releaseAdmission?.();
 		};
 		const hold = () => {
 			if (references === 0) throw new DOMException("Request already completed", "AbortError");
@@ -223,12 +295,94 @@ export class IngressAdmission {
 				release();
 			};
 		};
+		const startInput = () => {
+			if (body === null || reader !== undefined || ended) return;
+			const bodyReader = body.getReader();
+			reader = bodyReader;
+			const counted = new ReadableStream<Uint8Array>(
+				{
+					start(controller) {
+						inputController = controller;
+					},
+					pull() {
+						if (ended) return;
+						return new Promise<void>((resolve) => {
+							demand = { kind: "pull", resolve };
+							wakeInput?.();
+							wakeInput = undefined;
+						});
+					},
+					cancel,
+				},
+				{ highWaterMark: 0 },
+			);
+			c.req.raw = new Request(c.req.raw, {
+				body: counted,
+				signal: cancellation.signal,
+				duplex: "half",
+			} as RequestInit);
+			const pump = async () => {
+				try {
+					while (!ended) {
+						while (!ended && !hasDemand()) await waitForInput();
+						if (ended) return;
+						const { done, value } = await bodyReader.read();
+						while (!ended && !hasDemand()) await waitForInput();
+						if (ended) return;
+						if (done) {
+							ended = true;
+							inputController?.close();
+							finishPull();
+							return;
+						}
+						if (value.byteLength > bodyLimit - retained) {
+							fail({ kind: "too_large" });
+							return;
+						}
+						if (
+							value.byteLength > this.options.maxBytes - this.retainedRawBytes ||
+							value.byteLength > this.options.maxTenantBytes - (this.tenantBytes.get(tenant) ?? 0)
+						) {
+							this.refused++;
+							fail({ kind: "busy" });
+							return;
+						}
+						retained += value.byteLength;
+						this.retainedRawBytes += value.byteLength;
+						this.tenantBytes.set(tenant, (this.tenantBytes.get(tenant) ?? 0) + value.byteLength);
+						inputController?.enqueue(value);
+						finishPull();
+					}
+				} catch (error) {
+					while (!ended && !hasDemand()) await waitForInput();
+					if (!ended) fail({ kind: "input_error", error });
+				}
+			};
+			void pump();
+		};
 		try {
-			if (signal.aborted) {
-				this.aborted++;
-				return new Response(null, { status: 499 });
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) onAbort();
+			try {
+				releaseAdmission = await admission.acquire(key, key, 0, cancellation.signal, true, () => {
+					demand = { kind: "queued" };
+					startInput();
+				});
+				demand = { kind: "idle" };
+			} catch (error) {
+				if (failure === undefined) {
+					if (this.closed) fail({ kind: "shutdown" });
+					else if (error instanceof WorkerBusyError) fail({ kind: "busy" });
+					else fail({ kind: "input_error", error });
+				}
+				return failureResponse();
 			}
-			if (this.closed) return busy("ESHUTTINGDOWN");
+			if (this.closed) fail({ kind: "shutdown" });
+			const rejected = failureResponse();
+			if (rejected !== undefined) return rejected;
+			startInput();
+			const inputFailure = failureResponse();
+			if (inputFailure !== undefined) return inputFailure;
 			const outgoing: unknown = c.env?.outgoing;
 			const nodeResponse =
 				outgoing instanceof ServerResponse || outgoing instanceof Http2ServerResponse ? outgoing : undefined;
@@ -245,77 +399,9 @@ export class IngressAdmission {
 				nodeResponse.once("error", finish);
 				if (nodeResponse.destroyed || nodeResponse.closed || nodeResponse.writableFinished) finish();
 			}
-			let inputController: ReadableStreamDefaultController<Uint8Array> | undefined;
-			onAbort = () => {
-				if (failure === "aborted") return;
-				failure = "aborted";
-				this.aborted++;
-				if (!ended) {
-					ended = true;
-					inputController?.error(new DOMException("Request aborted", "AbortError"));
-				}
-				cancel();
-				abortOutput?.();
-			};
-			signal.addEventListener("abort", onAbort, { once: true });
-			if (body !== null) {
-				const bodyReader = body.getReader();
-				reader = bodyReader;
-				const counted = new ReadableStream<Uint8Array>(
-					{
-						start(controller) {
-							inputController = controller;
-						},
-						pull: async (controller) => {
-							try {
-								const { done, value } = await bodyReader.read();
-								if (ended) return;
-								if (done) {
-									ended = true;
-									controller.close();
-									return;
-								}
-								if (value.byteLength > bodyLimit - retained) {
-									failure = "too_large";
-									this.payloadTooLarge++;
-								} else if (
-									value.byteLength > this.options.maxBytes - this.retainedRawBytes ||
-									value.byteLength > this.options.maxTenantBytes - (this.tenantBytes.get(tenant) ?? 0)
-								) {
-									failure = "busy";
-									this.refused++;
-								} else {
-									retained += value.byteLength;
-									this.retainedRawBytes += value.byteLength;
-									this.tenantBytes.set(tenant, (this.tenantBytes.get(tenant) ?? 0) + value.byteLength);
-									controller.enqueue(value);
-									return;
-								}
-								ended = true;
-								controller.error(new Error("Request body capacity exceeded"));
-								cancel();
-							} catch (error) {
-								ended = true;
-								controller.error(error);
-							}
-						},
-						cancel() {
-							ended = true;
-							cancel();
-						},
-					},
-					{ highWaterMark: 0 },
-				);
-				c.req.raw = new Request(c.req.raw, { body: counted, duplex: "half" } as RequestInit);
-			}
-			if (signal.aborted) {
-				onAbort();
-				return new Response(null, { status: 499 });
-			}
 			await ingressRetention.run({ hold }, next);
-			if (failure === "busy") c.res = busy();
-			if (failure === "too_large") c.res = tooLarge();
-			if (failure === "aborted") c.res = new Response(null, { status: 499 });
+			const failed = failureResponse();
+			if (failed !== undefined) c.res = failed;
 			if (c.req.method === "HEAD") {
 				void c.res.body?.cancel().catch(() => {});
 			} else if (nodeResponse === undefined && c.res.body !== null) {

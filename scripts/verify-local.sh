@@ -56,7 +56,7 @@ node scripts/verify/assert-integration-report.mjs "$evidence/integration.json"
 "${verify_env[@]}" node scripts/verify/sdk-clients.mjs
 
 if [[ "$profile" == architecture ]]; then
-	for suite in worker-failures sse-finalization input-budgets tenants; do
+	for suite in worker-failures sse-finalization input-budgets ingress-queue tenants; do
 		"${verify_env[@]}" node "scripts/verify/$suite.mjs"
 	done
 fi
