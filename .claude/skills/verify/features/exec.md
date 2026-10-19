@@ -26,7 +26,7 @@ Preconditions:
 - **SSE stream.** Run `$S api POST /v1/sandboxes/$ID/exec --json '{"script":"printf stream-proof"}'`. The output contains `event: stdout` with `"data":"stream-proof"` and exactly one `event: exit` with `"exitCode":0`.
 - **Batch.** Run `$S api POST /v1/sandboxes/$ID/exec-sync-batch --json '{"scripts":[{"id":"a","script":"echo one"},{"id":"b","script":"echo two"}]}' | jq -c '[.results[]|[.id,.exitCode,.stdout]]'`. The output is `[["a",0,"one\n"],["b",0,"two\n"]]`.
 - **Timeout prefix.** Run `EXPECT=408 $S api POST /v1/sandboxes/$ID/exec-sync --json '{"script":"echo p > /home/user/p.txt; sleep 2; echo s > /home/user/s.txt","timeoutMs":100}'`. The `code` is `EXEC_TIMEOUT`. Then `$S api GET /v1/sandboxes/$ID/files/home/user/p.txt` prints `p` and `EXPECT=404 $S api GET /v1/sandboxes/$ID/files/home/user/s.txt` succeeds.
-- **Worker modes.** Repeat the sync run after `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false" $S restart --no-build`, then restore with `SERVER_ENV= $S restart --no-build`. Both modes must give identical results.
+- **Worker modes.** Repeat the sync run after `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false" $S restart --no-build`, then restore with `SERVER_ENV="" $S restart --no-build`. Both modes must give identical results.
 
 ## Gotchas
 

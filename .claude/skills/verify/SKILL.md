@@ -45,7 +45,7 @@ $S up --no-build # reuse the current dist/
 
 `up` refuses while a stack is recorded for this checkout. Reuse it (`$S doctor`) or `$S down` first. After a failed `up`, run `$S down` too, because the containers may be running.
 
-Server environment overrides: `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false SQL_FS_WORKER_OUTPUT_BYTES=1048576" $S restart`. Overrides persist across later restarts until you pass `SERVER_ENV= $S restart`. Values are split on spaces, so use compact JSON with no spaces. `server.log` and `doctor` show only the override names; the values stay in the owner-only `state.env`.
+Server environment overrides: `SERVER_ENV="SQL_FS_WORKERS_ENABLED=false SQL_FS_WORKER_OUTPUT_BYTES=1048576" $S restart`. Overrides persist across later restarts until you pass `SERVER_ENV="" $S restart`. Values are split on spaces, so use compact JSON with no spaces. `server.log` and `doctor` show only the override names; the values stay in the owner-only `state.env`.
 
 ## Doctor
 

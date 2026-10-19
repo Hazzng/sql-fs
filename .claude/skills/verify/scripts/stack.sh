@@ -97,7 +97,8 @@ cmd_up() {
 	command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker daemon is not running"
 	[[ -d node_modules ]] || die "run pnpm setup:dev first"
 	deps_current || die "node_modules does not match pnpm-lock.yaml; run: pnpm install --frozen-lockfile"
-	local id="stack-$(date +%s)-$$"
+	local id
+	id="stack-$(date +%s)-$$"
 	DIR="$runs/$id"
 	PROJECT="sqlfs-$id"
 	if docker compose version >/dev/null 2>&1; then COMPOSE="docker compose"; else COMPOSE="docker-compose"; fi
@@ -149,8 +150,10 @@ cmd_doctor() {
 	[[ "$code" == 200 ]] && ok "minted token accepted (GET /v1/sandboxes 200)" || fail "GET /v1/sandboxes returned $code"
 	deps_current && ok "node_modules matches pnpm-lock.yaml" ||
 		fail "node_modules does not match pnpm-lock.yaml -> run: pnpm install --frozen-lockfile && $0 restart"
-	local newer
-	newer=$(find src \( -name '*.ts' -o -name '*.sql' \) -newer dist/api/server.js -not -path '*/tests/*' 2>/dev/null | head -3)
+	local sources newer
+	[[ -f dist/api/server.js ]] || { fail "dist/api/server.js is missing -> run: $0 restart"; return 1; }
+	sources=$(find src \( -name '*.ts' -o -name '*.sql' \) -newer dist/api/server.js -not -path '*/tests/*' 2>/dev/null)
+	newer=$(head -3 <<<"$sources")
 	if [[ -n "$newer" ]]; then
 		fail "dist is stale; source changed after build: $(echo "$newer" | tr '\n' ' ') -> run: $0 restart"
 	elif [[ dist/api/server.js -nt "$DIR/state.env" ]]; then
@@ -210,9 +213,10 @@ suite_names() {
 cmd_suite() {
 	load_state
 	(($# >= 1)) || die "usage: $0 suite NAME [args]   (NAME: integration or a suite entry point in scripts/verify/)"
-	local name=$1
+	local name=$1 names
 	shift
-	suite_names | grep -qx "$name" || die "$name is not a suite entry point (have: $(suite_names | tr '\n' ' '))"
+	names=$(suite_names)
+	grep -qx "$name" <<<"$names" || die "$name is not a suite entry point (have: $(tr '\n' ' ' <<<"$names"))"
 	local -a suite_env=("VERIFY_ENV_FILE=none" "VERIFY_EVIDENCE_DIR=$DIR/suites" "VERIFY_PYTHON=$repo/clients/python/.venv/bin/python")
 	mkdir -p "$DIR/suites"
 	if [[ "$name" == integration ]]; then
