@@ -43,7 +43,7 @@
 		"lint:oxlint:types": "NODE_OPTIONS=--import=tsx oxlint -c .oxlintrc-type-aware.json --deny-warnings src clients/typescript"
 	},
 	"dependencies": {
-		"@hono/node-server": "^1.19.17",
+		"@hono/node-server": "^2.1.5",
 		"@hono/swagger-ui": "^0.6.1",
 		"@modelcontextprotocol/sdk": "^1.32.1",
 		"async-mutex": "^0.5.0",
