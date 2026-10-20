@@ -62,7 +62,7 @@
 		"@changesets/cli": "^3.0.3",
 		"@oxlint/plugins": "1.87.0",
 		"@types/node": "^22.0.0",
-		"ajv": "^8.18.0",
+		"ajv": "^8.20.0",
 		"ajv-formats": "^3.0.1",
 		"knip": "^6.4.1",
 		"lefthook": "^1.11.0",
