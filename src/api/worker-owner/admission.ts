@@ -38,7 +38,7 @@ export class FairAdmission {
 	private totalWaitMs = 0;
 	private cancelled = 0;
 	private timedOut = 0;
-	private readonly waitBuckets = [1, 5, 25, 100, 250, 1000];
+	private readonly waitBuckets = [1, 5, 25, 100, 250, 1000, 2500, 5000, 10000, 30000];
 	private readonly waitCounts = this.waitBuckets.map(() => 0);
 
 	constructor(
@@ -65,7 +65,14 @@ export class FairAdmission {
 		};
 	}
 
-	acquire(tenant: string, key: string, bytes: number, signal?: AbortSignal, shared = false): Promise<() => void> {
+	acquire(
+		tenant: string,
+		key: string,
+		bytes: number,
+		signal?: AbortSignal,
+		shared = false,
+		onQueued?: () => void,
+	): Promise<() => void> {
 		this.offered++;
 		if (this.closed || signal?.aborted) {
 			this.cancelled++;
@@ -122,6 +129,13 @@ export class FairAdmission {
 			this.queues.set(tenant, queue);
 			this.queued++;
 			this.queuedBytes += bytes;
+			try {
+				onQueued?.();
+			} catch (error) {
+				this.remove(waiter);
+				this.cancelled++;
+				reject(error);
+			}
 			this.drain();
 		});
 	}

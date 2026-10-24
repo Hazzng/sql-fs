@@ -84,7 +84,7 @@ The names below come from `src/api/worker-owner/metrics.ts` and from a scrape of
 | `sql_fs_worker_queue_timeouts_total` | counter | The part of `sql_fs_worker_refused_total` whose wait passed `SQL_FS_WORKER_QUEUE_WAIT_MS`. |
 | `sql_fs_worker_cancelled_total` | counter | Operations that left the queue because the client disconnected or the server shut down. |
 | `sql_fs_worker_completed_total` | counter | Operations that released their worker. |
-| `sql_fs_worker_queue_wait_milliseconds` | histogram | Time from the request for a worker to admission. Buckets: 1, 5, 25, 100, 250 and 1000 ms. |
+| `sql_fs_worker_queue_wait_milliseconds` | histogram | Time from the request for a worker to admission. Buckets: 1, 5, 25, 100, 250, 1000, 2500, 5000, 10000 and 30000 ms. |
 | `sql_fs_worker_queue_wait_milliseconds_total` | counter | Same value as the histogram's `_sum`. |
 
 The wait histogram counts admitted operations only. An operation admitted at once records 0. A refused operation records nothing, so the histogram never goes above `SQL_FS_WORKER_QUEUE_WAIT_MS` and hides the requests that hurt most. Read it together with the refusal counters.
@@ -95,11 +95,20 @@ Ingress admission runs before the worker queue. It bounds the requests that one 
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `sql_fs_ingress_request_capacity` | gauge | Configured ordinary active request limit. |
+| `sql_fs_ingress_queue_capacity` | gauge | Configured ordinary queued request limit. |
+| `sql_fs_ingress_raw_byte_capacity` | gauge | Configured global retained raw-body byte limit. |
+| `sql_fs_ingress_queue_wait_limit_milliseconds` | gauge | Configured ingress queue deadline. |
 | `sql_fs_ingress_active_requests` | gauge | Requests that hold one of the `SQL_FS_MAX_INGRESS_REQUESTS` permits. A permit stays held until the response finishes. |
 | `sql_fs_ingress_queued_requests` | gauge | Requests that wait for a permit. |
+| `sql_fs_ingress_offered_total` | counter | Requests that seek an ordinary ingress permit after the declared body-size check. |
+| `sql_fs_ingress_admitted_total` | counter | Requests that acquire an ordinary ingress permit. |
+| `sql_fs_ingress_completed_total` | counter | Ordinary ingress permits released after response and retained work completion. |
+| `sql_fs_ingress_cancelled_total` | counter | Requests removed before admission by client cancellation, shutdown or an input failure. |
+| `sql_fs_ingress_queue_wait_milliseconds` | histogram | Ordinary ingress delay for admitted requests, with the same buckets as worker admission. |
 | `sql_fs_ingress_refused_total` | counter | Requests that failed with `EWORKER_BUSY` (503) at ingress. It counts a full queue, a wait that ran out and a body that did not fit the byte budget. It does not count MCP listeners. |
 | `sql_fs_ingress_queue_timeouts_total` | counter | The part of `sql_fs_ingress_refused_total` whose wait passed `SQL_FS_MAX_INGRESS_WAIT_MS`. |
-| `sql_fs_ingress_retained_raw_bytes` | gauge | Request-body bytes that admitted requests hold, counted against `SQL_FS_MAX_INGRESS_BYTES`. |
+| `sql_fs_ingress_retained_raw_bytes` | gauge | Request-body bytes held by queued and admitted requests, counted against `SQL_FS_MAX_INGRESS_BYTES`. Transport buffers are additional memory. |
 | `sql_fs_ingress_payload_too_large_total` | counter | Requests that failed with 413 because the body passed its limit. More replicas do not help. |
 | `sql_fs_ingress_aborted_total` | counter | Requests whose client disconnected before the server finished. |
 | `sql_fs_ingress_mcp_listeners_active` | gauge | Open `GET /mcp` streams. |
@@ -107,7 +116,7 @@ Ingress admission runs before the worker queue. It bounds the requests that one 
 | `sql_fs_ingress_mcp_listeners_refused_total` | counter | `GET /mcp` streams that failed with 503. |
 | `sql_fs_ingress_mcp_listeners_queue_timeouts_total` | counter | The part of `sql_fs_ingress_mcp_listeners_refused_total` whose wait ran out. |
 
-Ingress has no wait histogram. Use `sql_fs_ingress_queued_requests` and the refusal counters.
+The ingress wait histogram records admitted requests only. Read it with queue depth, refusals and queue timeouts. Requests refused before admission do not appear in its latency distribution. MCP listeners use their separate gauges and counters.
 
 ### Memory
 
@@ -157,7 +166,7 @@ max(sql_fs_worker_runnable_queued)
 max(sql_fs_ingress_queued_requests)
 ```
 
-The p95 normally stays below `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. An event-loop stall can delay the refusal and let a slightly later admission through. A p95 at the limit means the histogram is saturated, not that the wait is bounded. The top finite bucket is 1000 ms. If you raise `SQL_FS_WORKER_QUEUE_WAIT_MS` above 1000 ms, quantiles above 1000 ms report 1000.
+The p95 normally stays below `SQL_FS_WORKER_QUEUE_WAIT_MS`, because a request that waits longer is refused and not recorded. An event-loop stall can delay the refusal and let a slightly later admission through. Read the deadline and refusal counters alongside the histogram. The top finite bucket is 30000 ms. Quantiles above that bucket report 30000 ms, so use client latency measurements for longer waits.
 
 Scale on `sql_fs_worker_runnable_queued`, not `sql_fs_worker_queued`. The difference is `sql_fs_worker_sandbox_waiting`, which more replicas do not reduce.
 
@@ -213,7 +222,7 @@ For example, a peak of 300 execs per second from many tenants needs 300 / 100 = 
 - Configure Redis before you run more than one replica. `REDIS_URL` carries the sandbox locks. The [README](../README.md#deploy-with-docker) describes the multi-replica setup.
 - Scale out fast and scale in slowly. A short burst of refusals should add replicas within a minute. Removing replicas should wait for several minutes of low load, so that the count does not swing.
 - Let a replica drain before it stops. A script that is cut off mid-run has an unknown outcome, and the client gets no result.
-- Make clients retry. Retry a 503 with `retryable: true` after `Retry-After`, with jitter. Also retry connection errors on large uploads, because a client can see a refused upload as a socket error (`UND_ERR_SOCKET`) instead of the 503. Never retry `EEXEC_OUTCOME_UNKNOWN` automatically.
+- Automatically retry only overload refusals known to occur before dispatch, after `Retry-After`, with jitter and a deadline. `retryable: true` applies to the failing operation; earlier steps in a multi-step request may already be durable, so reconcile request state before replaying it. Treat `ECOHERENCE`, `EDRIVERFAULT`, transport failures after dispatch, and `EEXEC_OUTCOME_UNKNOWN` as requiring state inspection before replay.
 - Size the caps for each box size and keep them fixed. Do not change worker counts, output caps or ingress limits at runtime to absorb load. Add replicas instead. The memory measurements in [CONFIGURATION.md](CONFIGURATION.md#sizing) hold only for the caps they were taken with.
 
 ### Shutdown and draining
@@ -232,7 +241,11 @@ The 30 s drain starts only after open requests finish, so an in-flight request e
 
 A request can wait twice before it gets a 503. It first waits for an ingress permit, up to `SQL_FS_MAX_INGRESS_WAIT_MS`. An exec then waits for a worker, up to `SQL_FS_WORKER_QUEUE_WAIT_MS`. Both default to 250 ms, so an exec can queue for up to 0.5 s before it fails.
 
-A longer ingress wait does not absorb bursts. The ingress queue holds at most as many requests as ingress admits at once: `SQL_FS_MAX_INGRESS_REQUESTS` for the replica and `SQL_FS_MAX_INGRESS_TENANT_REQUESTS` for each tenant, 8 and 4 by default. In a burst of 100 requests spread across tenants, 8 run, 8 wait and the rest are refused at once, whatever the wait. One tenant on its own gets 4 running and 4 waiting. The wait only decides how long those few queued requests hold their places. [#269](https://github.com/Hazzng/sql-fs/issues/269) tracks a deeper ingress queue.
+Queue depth and wait are separate controls. `SQL_FS_MAX_INGRESS_QUEUED_REQUESTS` sets the ordinary request queue for each replica. `SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS` sets one tenant's share. Defaults remain 8 and 4, derived from the corresponding active limits. A zero queue count refuses a request immediately when it cannot acquire an active permit. MCP GET listeners retain their separate quotas.
+
+Queued uploads make input progress within the same global and tenant byte budgets as admitted requests. This lets the server observe a disconnect behind unread network data. Active input follows consumer demand. A full byte budget returns 503, and a body above its limit returns 413. Increasing the count does not increase the byte budget or worker capacity.
+
+Size a queue against the delay you accept and the capacity gap you measure. A first estimate is excess incoming requests per second multiplied by the gap until useful capacity arrives. Apply this to the load arriving at each existing replica, including uneven routing. For example, 50 excess requests per second over 20 seconds needs 1000 queue places. A wait shorter than the gap expires first, and a finite queue cannot cover an arbitrary surge. Scale early, retain headroom, and use bounded client retries for explicit overload refusals.
 
 These runs used the same 2 GiB replica as [Measured capacity](#measured-capacity), with clients that waited 1 s after each 503, as `Retry-After: 1` asks. They ran on 2026-10-17.
 
@@ -243,39 +256,78 @@ These runs used the same 2 GiB replica as [Measured capacity](#measured-capacity
 | The same runs: successful execs/s | 74.5, 69.8, 68.5 | 67.8, 63.4, 67.2 |
 | The same runs: p99 latency | 123, 151, 174 ms | 246, 283, 173 ms |
 
-The longer wait refused as many requests in the burst, and slightly more under sustained overload, with higher tail latency. Keep the default. Raise the wait only if your clients cannot retry, and add replicas for any load that refuses requests for more than a burst.
+These historical runs kept queue counts equal to active counts. A longer wait alone therefore left most arrivals outside the queue. Measure depth and wait together before changing defaults, and add replicas for sustained demand.
 
 ## Example: Azure Container Apps
 
-`deploy/azure/aca.yaml` deploys sql-fs to Azure Container Apps. Its scale rule targets 50 concurrent requests for each replica. One replica admits only 8 requests by default and runs 2 operations at a time, so that rule starts adding replicas long after requests begin to fail. The example below shows only the fields to change. Merge them into the `template` block of `aca.yaml`, which keeps the image, environment and probes. It is a starting point, not a tested configuration.
+### Measuring an existing app
 
-```yaml
-template:
-  terminationGracePeriodSeconds: 90
-  containers:
-    - name: api
-      resources:
-        cpu: 2.0
-        memory: 4Gi
-  scale:
-    minReplicas: 2
-    maxReplicas: 10
-    rules:
-      - name: concurrent-requests
-        http:
-          metadata:
-            concurrentRequests: "4"
-      - name: worker-refusals
-        custom:
-          type: prometheus
-          metadata:
-            serverAddress: http://prometheus.example.internal:9090
-            query: sum(rate(sql_fs_ingress_refused_total[2m])) + sum(rate(sql_fs_worker_refused_total[2m]))
-            threshold: "1"
+`scripts/verify/aca-load.mjs` runs a bounded open-loop workload against an existing ACA app. It resolves the app's signing secret through your current Azure CLI identity without writing credentials to evidence. Each run owns its sandboxes, verifies durable markers, and removes its resources. Run this only against an app authorized for load testing.
+
+```bash
+node scripts/verify/aca-load.mjs load --app virtualfs-api --group rg-harry-dev \
+  --duration 30 --rate 5 --pool 30 --max-inflight 30 --hold-ms 250 --retries 0
 ```
 
-The HTTP rule needs no Prometheus. It scales on concurrent requests, which track the ingress and worker gates. Set `concurrentRequests` to about the worker count plus the queue you accept. Use 4 for short execs with 2 workers. Use a value closer to the worker count when scripts run for seconds.
+The default evidence directory is `scripts/verify/.run/aca-*`. `summary.json` separates offered arrivals, generator drops, sent attempts, successful operations, explicit overload refusals, and unknown outcomes. `reconciliation.json` checks durable markers before cleanup. To resume interrupted cleanup, run `node scripts/verify/aca-load.mjs cleanup --manifest <evidence>/manifest.json`.
 
-The `prometheus` rule is a KEDA scaler. It needs a Prometheus server that scrapes every replica with the token from [Endpoints](#endpoints). It asks for one replica for each refusal per second. Container Apps uses the highest replica count that any rule asks for. Once refusals stop, this rule asks for none, so the HTTP rule holds the steady count.
+Keep script work fixed when comparing replica counts. This example includes sleep, so its throughput does not establish CPU-intensive bash capacity. Inspect generator delay and drops before attributing a limit to the service. Application metrics are load-balanced samples from individual replicas. Use per-pod Azure Monitor series to establish CPU and memory pressure across the fleet.
 
-On the Consumption plan, CPU and memory come in fixed pairs, and 2 CPUs come with 4 GiB. The measured capacity above used 2 CPUs and 2 GiB.
+For a cold scale-out test, prepare fixtures while ACA is fixed at one replica. Pass `--start-barrier <fresh-path>` to pause the load tool after setup. It writes `<fresh-path>.prepared.json` with a `runId` and waits without application or ARM sampling. Enable the intended scale range, verify that exactly one replica is ready, then atomically write `{"runId":"<prepared-run-id>","release":true}` to `<fresh-path>`. The tool takes its own pre-offer snapshot before starting arrivals. A stale release, stop signal or timeout fails into fixture cleanup. The default wait is five minutes; `--start-barrier-timeout-ms` accepts one second to fifteen minutes. Keep any run whose pre-offer snapshot already shows multiple replicas out of cold-start comparisons.
+
+### Scale rules
+
+`deploy/azure/aca.yaml` starts with 1 CPU, 2 GiB, two workers, bounded five-second waits and an HTTP target of one concurrent request. It uses an immutable image reference. Set its digest to the image you verified. The example keeps at least two replicas for availability; use a minimum of zero for an idle development app when the wake-up delay is acceptable.
+
+The HTTP rule uses ACA's fleet request signal and is evaluated every fifteen seconds. It needs no application polling or Prometheus service. One scrape of the load-balanced `/metrics` endpoint describes one replica and cannot establish fleet pressure. Use the new metrics to observe queue capacity, wait, refusals and recovery. If you later add per-replica collection, a separate Prometheus rule can use its aggregate.
+
+The platform's five-minute scale-down stabilization window applies when checking that a fleet has shrunk. See [ACA scale behavior](https://learn.microsoft.com/en-us/azure/container-apps/scale-app#scale-behavior).
+
+The queue waits apply at both gates, so an execution can wait up to ten seconds before it begins. They absorb a bounded burst; they do not hold an arbitrary surge for the whole time that replicas need to start. Clients should automatically retry only explicit overload refusals known to occur before dispatch, respect `Retry-After`, add bounded exponential backoff with jitter, and use a deadline that covers the observed scaling gap. Connection failures and unknown execution outcomes still require reconciliation before replaying a mutation.
+
+Budget shared connections for old and new replicas during a rollout. With blob caching off, each replica holds a control Redis connection. Twenty old plus twenty new replicas already need forty connections before observation and restart headroom. A thirty-connection test instance cannot support that rollout safely. Set `REDIS_URL` to the control Redis instance and keep it on `noeviction`. When blob caching is enabled, set `REDIS_DATA_URL` to a separate data Redis instance configured with `allkeys-lru` or `allkeys-lfu`; otherwise it defaults to `REDIS_URL`. Postgres capacity must cover worker pools and metadata pools for configured tenants, including rollout overlap.
+
+### Startup work
+
+Unchanged replicas check `public.sql_fs_migrations` and skip already applied filesystem DDL. This avoids taking filesystem table locks just because capacity is scaling out. Each tenant database records filenames, SHA-256 checksums and application timestamps under the existing transaction advisory lock. Pending DDL and its history commit together; an applied checksum mismatch stops startup.
+
+The first boot of this version against a legacy database establishes that history by applying the existing idempotent files once. Keep traffic idle for that adoption. Deployments with genuinely new migrations still need to account for their DDL locks. See [startup migration configuration](CONFIGURATION.md).
+
+### Hosted measurements, 2026-10-18
+
+These bounded tests ran on the candidate in `virtualfs-api`, ACA Consumption in Australia East. Each replica had 1 CPU and 2 GiB. Two workers retained the default limit of one active execution per tenant. One tenant used distinct sandboxes with durable marker appends. Sandbox setup warmed the app before each thirty-second offer window. No retries were enabled for these fixed-replica points.
+
+The measured app retained its existing `REDIS_RWLOCK_ENABLED=false` and `REDIS_BLOB_CACHE_ENABLED=false` settings. These measurements do not establish the performance of either feature when enabled. The deployment example leaves the read/write-lock default unchanged; it is a starting configuration, not an exact reproduction of the measured app. Hosted startup and liveness used TCP probes; readiness used `/readyz` every two seconds.
+
+| Replicas | Offered writes/s | Successful completions/s during offer window | Eventual successful writes | Client p99 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 6 | 5.97 | 180/180 | 550 ms |
+| 5 | 15 | 14.83 | 450/450 | 733 ms |
+| 10 | 30 | 29.67 | 900/900 | 855 ms |
+| 20 | 60 | 59.20 | 1800/1800 | 879 ms |
+
+Every point had zero generator drops, refusals, unknown outcomes, duplicate markers or missing successful writes. These are tested rates, not estimates of maximum capacity or production latency guarantees. CPU-heavy scripts and same-sandbox contention need separate capacity measurements.
+
+A separate fifteen-second overload run offered 200 writes/s to twenty replicas. It completed 81.2 successful writes/s during the offer window. Including drain, 1613 writes succeeded and 1387 received explicit busy refusals. All 3000 operations reconciled correctly: each successful marker appeared once, each refused marker was absent, and no unknown outcome occurred. The load generator sent every arrival; maximum send delay was 21.3 ms and peak in-flight requests were 405 of the allowed 500. Queueing raised successful-request p99 to 6.05 seconds.
+
+The dependency-pruning experiment used source `4b0a721` with the same AMD64 base images. It produced 179905757 compressed layer bytes with development dependencies and 106470873 after pruning, a 40.82% reduction. Runtime parity covered Git, JavaScript, TypeScript, Python, SQLite, tar, MCP and cross-replica persistence. The later migration-history candidate retains that pruning. Smaller transfer size is not proof of a faster ACA startup.
+
+The throwaway Redis accepted only thirty concurrent connections and refused `noeviction`. Twenty replicas therefore remain a test configuration. Production use requires suitable control Redis, rollout headroom and workload-specific confirmation. The load driver preserves raw summaries and durable reconciliation in its evidence directory.
+
+### Final cold and sustained confirmation
+
+The final candidate, source `e0bf5f3`, adds migration history to the same admission and worker code used for the fixed-replica points above. It ran as immutable image `ghcr.io/hazzng/sql-fs@sha256:fa390528895c1996b6ad0f3ccbc044b6d005c2d8125e9db51faeec506834f330`.
+
+A cold burst began with exactly one ready replica and allowed ACA to grow to ten. It offered twelve operations/s for three minutes, each including 250 ms of waiting work. All 2160 operations succeeded and reconciled once, with no generator drops or unknown outcomes. The reference client sent 3533 attempts, including 1373 explicit safe busy refusals. It retried those refusals within a 120-second operation deadline. Client p99 including queueing and backoff was 47.49 seconds; the maximum was 59.72 seconds.
+
+The scaler's rescale event appeared 9.79 seconds after demand. The earliest retained durable write on a new replica appeared at 28.36 seconds. Ten replicas were first observed ready at 46.40 seconds; that ARM read spanned 10.40 seconds. These are observations from one episode, not startup percentiles or a demonstrated speedup. Queues alone did not hold every request throughout that gap. The existing SDK write-execution defaults retain their conservative retry policy; callers need an explicit safe-overload retry policy to reproduce this result. Unknown outcomes and transport failures require reconciliation.
+
+The earlier cold candidate produced one nonretryable internal error and a container restart while the database deadlock counter rose by two. Repeated startup DDL was independently reproduced blocking behind live filesystem table locks. The final runner skips that DDL on unchanged boots. During the corrected episode the sampled deadlock counter stayed unchanged, with no observed lock waiters or container restarts. The retained earlier logs do not establish the exact cause of that particular internal error or restart.
+
+A separate five-minute confirmation fixed ten final-image replicas and offered thirty short writes/s with no retries. All 9000 operations succeeded and reconciled once, with zero refusals, unknown outcomes, generator drops or marker errors. Successful completions during the offer window were 29.96/s; client p50 was 318 ms, p95 932 ms and p99 1615 ms. Peak in-flight work was 25 of the allowed 200 and maximum initial send delay was 3.31 ms. All 200 fixtures were deleted. This confirms that workload for five minutes; CPU-heavy commands, large files, shared-sandbox contention and longer soaks need their own capacity evidence.
+
+### Cold-start follow-up, 2026-10-24
+
+The original trial files are unavailable. The timings below are transcript-recovered and exploratory, not a release baseline. Five alternating requests per profile reported a median of 22.18 s on Consumption and 9.32 s on an already allocated D4 node. This measures a replica starting inside a running D4 node. It does not measure provisioning a D4 node during a burst. The Dedicated profile was removed after testing because its idle cost was not justified.
+
+Regional ACR and overlapping boot work showed no reliable end-to-end latency improvement. A smaller image used 22.4% fewer compressed layer bytes, but its startup results did not establish a latency gain. These trials do not justify a runtime or boot-order change. Keep Consumption, bounded queues and replica headroom. This follow-up did not test a custom `/metrics` scaling rule or a burst that requires new Dedicated nodes.

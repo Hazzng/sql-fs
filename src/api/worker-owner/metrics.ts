@@ -32,6 +32,16 @@ const fields = [
 	["queue_wait_milliseconds_total", "counter", "totalWaitMs"],
 ] as const satisfies ReadonlyArray<readonly [string, "gauge" | "counter", keyof Snapshot]>;
 
+function waitHistogram(name: string, snapshot: Pick<Snapshot, "waitBuckets" | "admitted" | "totalWaitMs">): string[] {
+	return [
+		`# TYPE ${name} histogram`,
+		...snapshot.waitBuckets.map((bucket) => `${name}_bucket{le="${bucket.upperMs}"} ${bucket.count}`),
+		`${name}_bucket{le="+Inf"} ${snapshot.admitted}`,
+		`${name}_sum ${snapshot.totalWaitMs}`,
+		`${name}_count ${snapshot.admitted}`,
+	];
+}
+
 export function renderWorkerMetrics(snapshot: Snapshot | undefined, ingress?: IngressAdmission["metrics"]): string {
 	const lines = ["# TYPE sql_fs_workers_enabled gauge", `sql_fs_workers_enabled ${snapshot === undefined ? 0 : 1}`];
 	if (snapshot !== undefined) {
@@ -39,22 +49,21 @@ export function renderWorkerMetrics(snapshot: Snapshot | undefined, ingress?: In
 			const name = `sql_fs_worker_${suffix}`;
 			lines.push(`# TYPE ${name} ${type}`, `${name} ${snapshot[field]}`);
 		}
-		const histogram = "sql_fs_worker_queue_wait_milliseconds";
-		lines.push(`# TYPE ${histogram} histogram`);
-		for (const bucket of snapshot.waitBuckets) {
-			lines.push(`${histogram}_bucket{le="${bucket.upperMs}"} ${bucket.count}`);
-		}
-		lines.push(
-			`${histogram}_bucket{le="+Inf"} ${snapshot.admitted}`,
-			`${histogram}_sum ${snapshot.totalWaitMs}`,
-			`${histogram}_count ${snapshot.admitted}`,
-		);
+		lines.push(...waitHistogram("sql_fs_worker_queue_wait_milliseconds", snapshot));
 	}
 	lines.push("# TYPE sql_fs_ingress_enabled gauge", `sql_fs_ingress_enabled ${ingress === undefined ? 0 : 1}`);
 	if (ingress !== undefined) {
 		const ingressFields = [
+			["request_capacity", "gauge", "requestCapacity"],
+			["queue_capacity", "gauge", "queueCapacity"],
+			["raw_byte_capacity", "gauge", "rawByteCapacity"],
+			["queue_wait_limit_milliseconds", "gauge", "queueWaitLimitMs"],
 			["active_requests", "gauge", "activeRequests"],
 			["queued_requests", "gauge", "queuedRequests"],
+			["offered_total", "counter", "offered"],
+			["admitted_total", "counter", "admitted"],
+			["completed_total", "counter", "completed"],
+			["cancelled_total", "counter", "cancelled"],
 			["queue_timeouts_total", "counter", "queueTimeouts"],
 			["mcp_listeners_active", "gauge", "activeMcpListeners"],
 			["mcp_listeners_queued", "gauge", "queuedMcpListeners"],
@@ -69,6 +78,7 @@ export function renderWorkerMetrics(snapshot: Snapshot | undefined, ingress?: In
 			const name = `sql_fs_ingress_${suffix}`;
 			lines.push(`# TYPE ${name} ${type}`, `${name} ${ingress[field]}`);
 		}
+		lines.push(...waitHistogram("sql_fs_ingress_queue_wait_milliseconds", ingress));
 	}
 	return `${lines.join("\n")}\n`;
 }

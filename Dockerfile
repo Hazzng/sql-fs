@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-# ------- Builder -------
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 RUN corepack enable
@@ -16,14 +15,16 @@ RUN --mount=type=secret,id=proxy_ca \
 COPY . .
 RUN pnpm build
 
-# ------- Runtime -------
+FROM builder AS production-dependencies
+RUN pnpm --config.ignore-scripts=true prune --prod
+
 FROM node:22-slim AS runtime
 ENV NODE_ENV=production
 ENV PORT=8080
 WORKDIR /app
 RUN groupadd -r app && useradd -r -g app app
 COPY --from=builder --chown=app:app /app/dist ./dist
-COPY --from=builder --chown=app:app /app/node_modules ./node_modules
+COPY --from=production-dependencies --chown=app:app /app/node_modules ./node_modules
 COPY --from=builder --chown=app:app /app/package.json ./package.json
 USER app
 EXPOSE 8080

@@ -10,12 +10,12 @@ Use Node 22 from `.node-version`, pnpm 10.30.3 from `package.json`, Python 3.12,
 pnpm setup:dev          # install all three packages from their lockfiles; install git hooks
 pnpm check          # types, formatting, unit tests, builds, and both SDKs; no services or .env needed
 pnpm verify:local   # isolated Postgres/Redis, HTTP/MCP contracts, integration tests, and both live SDKs
-pnpm verify:architecture # also worker failure, stream finalization, input budgets, and multi-tenant proofs
+pnpm verify:architecture # also worker failure, stream finalization, input budgets, ingress queue, and multi-tenant proofs
 ```
 
 `pnpm verify:local` uses random loopback ports and a unique Compose project, applies migrations through server startup, and removes only its own containers and volumes. It ignores `.env` and inherited deployment settings. It writes logs and JSON proof to `scripts/verify/.run/`. A missing Docker daemon or skipped integration test fails the command.
 
-`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, or isolation changes. CI runs this expanded profile on pushes to `main`; PR checks keep the faster static, unit, build, and SDK gates. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
+`pnpm verify:architecture` runs the standard verification plus `worker-failures.mjs`, `sse-finalization.mjs`, `input-budgets.mjs`, `ingress-queue.mjs`, and `tenants.mjs` in the same disposable stack. Run it for worker ownership, script completion, command protocol, ingress admission, or isolation changes. CI runs this expanded profile on pushes to `main`; PR checks keep the faster static, unit, build, and SDK gates. Resource and large-file profiling remain separate and require a suitable cgroup v2 host.
 
 Use `pnpm check:typescript` or `pnpm check:python` for SDK-only changes. Run a targeted core test with `pnpm exec vitest run src/sql-fs/tests/unit/sql-fs.cache.test.ts`. A nonexistent test selection must fail. `pnpm test:integration` is the lower-level command for an already migrated disposable database with `DATABASE_URL` and `REDIS_URL`; it can skip without those variables. Prefer `pnpm verify:local` for completion evidence.
 
@@ -47,7 +47,7 @@ Evidence lands in `scripts/verify/.run/stack-<id>/` (`transcript.jsonl`, `server
 | `output-cap` | worker output limits in both worker modes | `verify:local` |
 | `shutdown` | graceful shutdown ends MCP listener streams and refuses new connections | `verify:local` |
 | `sdk-clients` (+ `sdk-python.py`) | live TypeScript and Python SDKs | `verify:local` |
-| `worker-failures`, `sse-finalization`, `input-budgets`, `tenants` | worker loss, stream finalization, input budgets, tenant isolation | `verify:architecture` |
+| `worker-failures`, `sse-finalization`, `input-budgets`, `ingress-queue`, `tenants` | worker loss, stream finalization, input budgets, ingress queue admission, tenant isolation | `verify:architecture` |
 | `ingest-admission`, `large-files` | ingest budgets, large-file profiling | manual; large files need cgroup v2 |
 
 `local-api.mjs` is the shared harness: owned servers, tokens, schema validation, `proof.json`. `assert-integration-report.mjs` is the shared check that an integration run executed tests with none failed or skipped. `*-faults.mjs` files are fault injectors loaded by the suites, not entry points. When you add an endpoint or client-visible behavior, add or extend a suite here, add its journey to `features/` and `journeys.sh`, and update `openapi-spec.ts`.

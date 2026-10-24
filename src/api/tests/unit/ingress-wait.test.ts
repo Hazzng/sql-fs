@@ -30,14 +30,15 @@ function setup(maxRequests = 8, maxTenantRequests = 4, env: NodeJS.ProcessEnv = 
 	return { ingress, app };
 }
 
-function unreadBody() {
+function unreadBody(complete = true) {
 	const observed = { reads: 0, cancelled: false };
 	const body = new ReadableStream<Uint8Array>(
 		{
 			pull(controller) {
 				observed.reads++;
 				controller.enqueue(new TextEncoder().encode("delayed"));
-				controller.close();
+				if (complete) controller.close();
+				else return new Promise<void>(() => {});
 			},
 			cancel() {
 				observed.cancelled = true;
@@ -64,7 +65,7 @@ afterEach(() => {
 });
 
 describe("bounded ingress wait", () => {
-	it("waits through a fifth observer request without reading its body or exceeding active quotas", async () => {
+	it("reads a queued fifth observer body without exceeding active quotas", async () => {
 		const { app, ingress } = setup();
 		const hold = deferred();
 		let peakActive = 0;
@@ -87,8 +88,8 @@ describe("bounded ingress wait", () => {
 				),
 			);
 			await flush();
-			expect(ingress.metrics).toMatchObject({ activeRequests: 5, queuedRequests: 1, retainedRawBytes: 20, refused: 0 });
-			expect(input.observed.reads).toBe(0);
+			expect(ingress.metrics).toMatchObject({ activeRequests: 5, queuedRequests: 1, retainedRawBytes: 27, refused: 0 });
+			expect(input.observed.reads).toBe(1);
 			hold.resolve();
 			await Promise.all(active.map(consume));
 			await flush();
@@ -119,7 +120,7 @@ describe("bounded ingress wait", () => {
 			await flush();
 			waiting.push(request("a"));
 			await flush();
-			expect(ingress.metrics).toMatchObject({ activeRequests: 2, queuedRequests: 1, retainedRawBytes: 8 });
+			expect(ingress.metrics).toMatchObject({ activeRequests: 2, queuedRequests: 1, retainedRawBytes: 12 });
 			const tenantInput = unreadBody();
 			const tenantResponse = await app.request(
 				new Request("http://localhost/work", {
@@ -135,7 +136,7 @@ describe("bounded ingress wait", () => {
 			expect(ingress.metrics).toMatchObject({ activeRequests: 2, queuedRequests: 1, refused: 1, queueTimeouts: 0 });
 			waiting.push(request("b"));
 			await flush();
-			expect(ingress.metrics).toMatchObject({ activeRequests: 2, queuedRequests: 2, retainedRawBytes: 8 });
+			expect(ingress.metrics).toMatchObject({ activeRequests: 2, queuedRequests: 2, retainedRawBytes: 16 });
 			for (const tenant of ["a", "c"]) {
 				const input = unreadBody();
 				const response = await app.request(
@@ -158,7 +159,7 @@ describe("bounded ingress wait", () => {
 		expect(ingress.metrics).toMatchObject({ activeRequests: 0, queuedRequests: 0, retainedRawBytes: 0 });
 	});
 
-	it("times out an unread queued body after 250ms with retry guidance and no dispatch", async () => {
+	it("times out a partially read queued body after 250ms with retry guidance and no dispatch", async () => {
 		const { app, ingress } = setup(2, 1);
 		const hold = deferred();
 		app.post("/hold", async (c) => {
@@ -167,7 +168,7 @@ describe("bounded ingress wait", () => {
 			return c.text("held");
 		});
 		const active = app.request("/hold", { method: "POST", body: "held" });
-		const input = unreadBody();
+		const input = unreadBody(false);
 		let waiting: Promise<Response> | undefined;
 		try {
 			await flush();
@@ -178,8 +179,8 @@ describe("bounded ingress wait", () => {
 			);
 			await flush();
 			await vi.advanceTimersByTimeAsync(249);
-			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, refused: 0 });
-			expect(input.observed.reads).toBe(0);
+			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, retainedRawBytes: 11, refused: 0 });
+			expect(input.observed.reads).toBe(1);
 			await vi.advanceTimersByTimeAsync(1);
 			const response = await waiting;
 			expect(response.status).toBe(503);
@@ -189,7 +190,7 @@ describe("bounded ingress wait", () => {
 				error: "Request capacity is busy",
 				retryable: true,
 			});
-			expect(input.observed).toEqual({ reads: 0, cancelled: true });
+			expect(input.observed).toEqual({ reads: 1, cancelled: true });
 			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 0, queueTimeouts: 1, refused: 1 });
 		} finally {
 			hold.resolve();
@@ -231,7 +232,7 @@ describe("bounded ingress wait", () => {
 		}
 	});
 
-	it("cancels a queued request without pulling its body and reuses its pending slot", async () => {
+	it("cancels a queued body and reuses its pending slot", async () => {
 		const { app, ingress } = setup(2, 1);
 		const hold = deferred();
 		app.post("/hold", async (c) => {
@@ -241,7 +242,7 @@ describe("bounded ingress wait", () => {
 		});
 		const active = app.request("/hold", { method: "POST", body: "held" });
 		const abort = new AbortController();
-		const input = unreadBody();
+		const input = unreadBody(false);
 		const pending: (Response | Promise<Response>)[] = [];
 		try {
 			await flush();
@@ -255,11 +256,11 @@ describe("bounded ingress wait", () => {
 			);
 			pending.push(waiting);
 			await flush();
-			expect(ingress.metrics.queuedRequests).toBe(1);
+			expect(ingress.metrics).toMatchObject({ queuedRequests: 1, retainedRawBytes: 11 });
 			abort.abort();
 			await flush();
 			expect((await waiting).status).toBe(499);
-			expect(input.observed).toEqual({ reads: 0, cancelled: true });
+			expect(input.observed).toEqual({ reads: 1, cancelled: true });
 			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 0, aborted: 1 });
 			const replacement = app.request("/work", { method: "POST", body: "replacement" });
 			pending.push(replacement);
@@ -317,7 +318,7 @@ describe("bounded ingress wait", () => {
 			});
 			expect(other.status).toBe(200);
 			expect(await other.text()).toBe("independent");
-			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, retainedRawBytes: 4 });
+			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, retainedRawBytes: 10 });
 		} finally {
 			hold.resolve();
 			await Promise.allSettled([active, ...pending].map(consume));
@@ -364,7 +365,7 @@ describe("bounded ingress wait", () => {
 			const waiting = app.request("/work", { method: "POST", body: "queued" });
 			pending.push(waiting);
 			await flush();
-			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, retainedRawBytes: 4 });
+			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1, retainedRawBytes: 10 });
 			hold.resolve();
 			await flush();
 			expect((await consume(waiting)).status).toBe(200);
@@ -376,7 +377,7 @@ describe("bounded ingress wait", () => {
 		expect(ingress.metrics).toMatchObject({ activeRequests: 0, queuedRequests: 0, retainedRawBytes: 0 });
 	});
 
-	it("keeps a queued request unread until an SSE response releases capacity", async () => {
+	it("counts a queued body while an SSE response retains capacity", async () => {
 		const { app, ingress } = setup(2, 1);
 		app.post("/events", () => new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } }));
 		const response = await app.request("/events", { method: "POST", body: "held" });
@@ -387,7 +388,7 @@ describe("bounded ingress wait", () => {
 		try {
 			await flush();
 			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 1 });
-			expect(input.observed.reads).toBe(0);
+			expect(input.observed.reads).toBe(1);
 			await response.body!.cancel();
 			await flush();
 			expect((await consume(waiting)).status).toBe(200);
@@ -430,7 +431,7 @@ describe("bounded ingress wait", () => {
 		expect((await consume(app.request("/work", { method: "POST", body: "reusable" }))).status).toBe(200);
 	});
 
-	it("closes pending admissions without reading them while preserving active retention", async () => {
+	it("closes pending admissions and releases their bytes while preserving active retention", async () => {
 		const { app, ingress } = setup(2, 1);
 		const hold = deferred();
 		app.post("/hold", async (c) => {
@@ -439,7 +440,7 @@ describe("bounded ingress wait", () => {
 			return c.text("held");
 		});
 		const active = app.request("/hold", { method: "POST", body: "held" });
-		const input = unreadBody();
+		const input = unreadBody(false);
 		let pending: Response | Promise<Response> | undefined;
 		try {
 			await flush();
@@ -447,7 +448,7 @@ describe("bounded ingress wait", () => {
 				new Request("http://localhost/work", { method: "POST", body: input.body, duplex: "half" } as RequestInit),
 			);
 			await flush();
-			expect(ingress.metrics.queuedRequests).toBe(1);
+			expect(ingress.metrics).toMatchObject({ queuedRequests: 1, retainedRawBytes: 11 });
 			ingress.close();
 			ingress.close();
 			await flush();
@@ -455,7 +456,7 @@ describe("bounded ingress wait", () => {
 			expect(response.status).toBe(503);
 			expect(response.headers.get("Retry-After")).toBe("1");
 			expect(await response.json()).toMatchObject({ code: "ESHUTTINGDOWN", retryable: true });
-			expect(input.observed).toEqual({ reads: 0, cancelled: true });
+			expect(input.observed).toEqual({ reads: 1, cancelled: true });
 			expect(ingress.metrics).toMatchObject({ activeRequests: 1, queuedRequests: 0, retainedRawBytes: 4 });
 			expect((await consume(app.request("/work", { method: "POST", body: "rejected" }))).status).toBe(503);
 		} finally {

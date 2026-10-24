@@ -76,6 +76,8 @@ describe("ingress configuration", () => {
 		expect(loadIngressOptions({})).toEqual({
 			maxRequests: 8,
 			maxTenantRequests: 4,
+			maxQueuedRequests: 8,
+			maxTenantQueuedRequests: 4,
 			maxMcpListeners: 8,
 			maxTenantMcpListeners: 4,
 			maxBytes: 128 * 1024 * 1024,
@@ -102,6 +104,42 @@ describe("ingress configuration", () => {
 });
 
 describe("HTTP body admission", () => {
+	it("preserves a successful route response after it handles a body input error", async () => {
+		const { app, ingress } = setup();
+		let mutationCompleted = false;
+		app.post("/handled-input-error", async (c) => {
+			const reader = c.req.raw.body?.getReader();
+			if (reader === undefined) throw new Error("Expected a request body");
+			await reader.read();
+			try {
+				await reader.read();
+			} catch {
+				mutationCompleted = true;
+			}
+			return c.text("committed", 201);
+		});
+		let reads = 0;
+		const body = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (reads++ === 0) controller.enqueue(new TextEncoder().encode("partial"));
+					else controller.error(new Error("input stream failed"));
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		try {
+			const response = await app.fetch(
+				new Request("http://localhost/handled-input-error", { method: "POST", body, duplex: "half" } as RequestInit),
+			);
+			expect(mutationCompleted).toBe(true);
+			expect(response.status).toBe(201);
+			expect(await response.text()).toBe("committed");
+		} finally {
+			ingress.close();
+		}
+	});
+
 	it("rejects excess request count without reading the rejected body", async () => {
 		const { app, ingress } = setup(1);
 		const hold = deferred();
@@ -120,6 +158,8 @@ describe("HTTP body admission", () => {
 		});
 		const first = app.request("/hold", { method: "POST", body: "retained" });
 		await entered.promise;
+		const queued = app.request("/write", { method: "PUT", body: "queued" });
+		await expect.poll(() => ingress.metrics.queuedRequests).toBe(1);
 		let reads = 0;
 		let cancelled = false;
 		const stream = new ReadableStream<Uint8Array>(
@@ -148,10 +188,17 @@ describe("HTTP body admission", () => {
 			expect(reads).toBe(0);
 			expect(cancelled).toBe(true);
 			expect(writes).toBe(0);
-			expect(ingress.metrics).toMatchObject({ activeRequests: 1, retainedRawBytes: 8, refused: 1 });
+			expect(ingress.metrics).toMatchObject({
+				activeRequests: 1,
+				queuedRequests: 1,
+				retainedRawBytes: 14,
+				refused: 1,
+				queueTimeouts: 0,
+			});
 		} finally {
 			hold.resolve();
 			await (await first).arrayBuffer();
+			await (await queued).arrayBuffer();
 		}
 		expect(ingress.metrics).toMatchObject({ activeRequests: 0, retainedRawBytes: 0 });
 	});
