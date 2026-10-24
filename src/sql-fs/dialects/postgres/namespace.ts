@@ -1,7 +1,7 @@
 import { createEnoent, createEstale, translateSqlError } from "../../errors.js";
 import type { CreateInodeOpts, DirentRow, InodeKind, InodeRow, PathCacheEntry, UpdateInodeOpts } from "../../types.js";
 import type { PostgresBlobs } from "./blobs.js";
-import { epochParam, fenceAndAdvance, takeWriterLock } from "./sandbox.js";
+import { compositeFenceAndAdvance, fenceAndAdvance, takeWriterLock } from "./sandbox.js";
 import type { NamespaceOperations, PgTx } from "./types.js";
 
 export class PostgresNamespace implements NamespaceOperations {
@@ -16,35 +16,7 @@ export class PostgresNamespace implements NamespaceOperations {
 	): Promise<bigint> {
 		await takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ fenced: number; id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
+			WITH ${compositeFenceAndAdvance(tx, sandboxId, expectedEpoch)},
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size)
 				SELECT ${sandboxId}, 2, ${mode}, 0 FROM epoch
@@ -74,35 +46,7 @@ export class PostgresNamespace implements NamespaceOperations {
 	): Promise<bigint> {
 		await takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ fenced: number; removed_inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
+			WITH ${compositeFenceAndAdvance(tx, sandboxId, expectedEpoch)},
 			removed_dirent AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(parentId)} AND name = ${name}
@@ -151,35 +95,7 @@ export class PostgresNamespace implements NamespaceOperations {
 		// script-tx must not hold the hot-blob `ON CONFLICT DO UPDATE` tuple lock.
 		await takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ fenced: number; new_inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
+			WITH ${compositeFenceAndAdvance(tx, sandboxId, expectedEpoch)},
 			new_inode AS (
 				INSERT INTO inodes (sandbox_id, kind, mode, size, content_sha256)
 				SELECT ${sandboxId}, 1, ${mode}, ${size}, ${sha256} FROM epoch
@@ -243,35 +159,7 @@ export class PostgresNamespace implements NamespaceOperations {
 		// refresh in SqlFs absorbs the double bump.
 		await takeWriterLock(tx, sandboxId);
 		const destinationRows = await tx<{ fenced: number }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
+			WITH ${compositeFenceAndAdvance(tx, sandboxId, expectedEpoch)},
 			old_dest AS (
 				DELETE FROM dirents
 				WHERE parent_inode_id = ${String(newParentId)} AND name = ${newName}
@@ -301,35 +189,7 @@ export class PostgresNamespace implements NamespaceOperations {
 		// Re-take for snapshot ordering; re-entrant within this tx.
 		await takeWriterLock(tx, sandboxId);
 		const rows = await tx<{ fenced: number; inode_id: string | null }[]>`
-			WITH ctx AS (
-				SELECT set_config('app.sandbox_id', ${sandboxId}, true),
-				       pg_advisory_xact_lock(hashtextextended(${sandboxId}, 0)),
-				       s.version AS epoch
-				FROM sandboxes s
-				WHERE s.id = ${sandboxId}
-				  AND (
-					s.version = COALESCE(
-						${epochParam(expectedEpoch)}::bigint,
-						NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint,
-						s.version
-					)
-					OR (
-						${epochParam(expectedEpoch)}::bigint IS NOT NULL
-						AND s.version > ${epochParam(expectedEpoch)}::bigint
-						AND s.version = NULLIF(current_setting('app.sandbox_epoch', true), '')::bigint
-					)
-				  )
-			),
-			advanced AS (
-				UPDATE sandboxes s
-				SET version = s.version + 1
-				FROM ctx
-				WHERE s.id = ${sandboxId}
-				RETURNING s.version
-			),
-			epoch AS (
-				SELECT set_config('app.sandbox_epoch', version::text, true) FROM advanced
-			),
+			WITH ${compositeFenceAndAdvance(tx, sandboxId, expectedEpoch)},
 			moved AS (
 				UPDATE dirents
 				SET parent_inode_id = ${String(newParentId)}, name = ${newName}

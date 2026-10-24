@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import * as ts from "typescript/unstable/sync";
 import * as ast from "typescript/unstable/ast";
 
-const { API, SymbolFlags } = ts;
+const { API, SignatureKind, SymbolFlags, TypeFlags } = ts;
 const { SyntaxKind } = ast;
 
 const workerImportAllowlist = new Map([
@@ -43,6 +43,40 @@ for (const importer of [
 }
 
 const scopeOperations = new Set(["beginScope", "endScope", "abortScope"]);
+
+const fencePolicyConsumers = new Set([
+	"src/sql-fs/dialects/postgres/namespace.ts",
+	"src/sql-fs/dialects/postgres/ingest.ts",
+]);
+const fencePolicyStatements = [/\bapp\.sandbox_epoch\b/i, /\bversion\s*=\s*(?:\w+\.)?version\s*\+/i];
+
+function forbiddenSqlApiAccess(node, checker) {
+	let receiver;
+	let name;
+	if (ast.isPropertyAccessExpression(node)) {
+		receiver = node.expression;
+		name = node.name.text;
+	} else if (ast.isElementAccessExpression(node) && ast.isStringLiteral(node.argumentExpression)) {
+		receiver = node.expression;
+		name = node.argumentExpression.text;
+	} else if (ast.isBindingElement(node) && ast.isObjectBindingPattern(node.parent)) {
+		receiver = node.parent;
+		const property = node.propertyName ?? node.name;
+		if (ast.isIdentifier(property) || ast.isStringLiteral(property)) name = property.text;
+	}
+	if (name !== "unsafe" && name !== "file") return false;
+	const type = checker.getTypeAtLocation(receiver);
+	return (
+		type === undefined ||
+		(type.flags & (TypeFlags.Any | TypeFlags.Unknown)) !== 0 ||
+		checker.getSignaturesOfType(type, SignatureKind.Call).length > 0
+	);
+}
+
+function templateLiteralText(template) {
+	if (ast.isNoSubstitutionTemplateLiteral(template)) return template.text;
+	return [template.head.text, ...template.templateSpans.map((span) => span.literal.text)].join(" ${} ");
+}
 
 function relative(root, filename) {
 	return path.relative(root, filename).split(path.sep).join("/");
@@ -411,6 +445,34 @@ export function checkArchitectureBoundaries(root) {
 						if (symbol !== undefined && initializerSymbol !== undefined && requireAliases.has(initializerSymbol)) {
 							requireAliases.add(symbol);
 						}
+					}
+				}
+
+				if (fencePolicyConsumers.has(sourcePath)) {
+					if (forbiddenSqlApiAccess(node, checker)) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"FENCE_POLICY_RAW_SQL",
+								"tx.unsafe and tx.file bypass fence-policy inspection; use tagged SQL and safe value builders",
+							),
+						);
+					}
+					if (
+						ast.isTaggedTemplateExpression(node) &&
+						fencePolicyStatements.some((pattern) => pattern.test(templateLiteralText(node.template)))
+					) {
+						diagnostics.push(
+							diagnostic(
+								absoluteRoot,
+								sourceFile,
+								node,
+								"FENCE_POLICY_OWNER",
+								"epoch acceptance, epoch publication, and sandboxes.version advancement belong to the fence policy in sandbox.ts; use fenceAndAdvance or compositeFenceAndAdvance",
+							),
+						);
 					}
 				}
 
