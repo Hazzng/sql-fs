@@ -256,7 +256,7 @@ export class IngressAdmission {
 			cancel();
 			if (cause.kind === "aborted") abortOutput?.();
 		};
-		const failureResponse = () => {
+		const failureResponse = (propagateInputError = true) => {
 			switch (failure?.kind) {
 				case "busy":
 					return busy();
@@ -267,7 +267,8 @@ export class IngressAdmission {
 				case "aborted":
 					return new Response(null, { status: 499 });
 				case "input_error":
-					throw failure.error;
+					if (propagateInputError) throw failure.error;
+					return undefined;
 				default:
 					return undefined;
 			}
@@ -400,7 +401,7 @@ export class IngressAdmission {
 				if (nodeResponse.destroyed || nodeResponse.closed || nodeResponse.writableFinished) finish();
 			}
 			await ingressRetention.run({ hold }, next);
-			const failed = failureResponse();
+			const failed = failureResponse(false);
 			if (failed !== undefined) c.res = failed;
 			if (c.req.method === "HEAD") {
 				void c.res.body?.cancel().catch(() => {});

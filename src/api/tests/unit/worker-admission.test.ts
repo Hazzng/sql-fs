@@ -25,7 +25,7 @@ describe("bounded tenant admission", () => {
 					throw new Error("queue hook failed");
 				}),
 			).rejects.toThrow("queue hook failed");
-			expect(admission.metrics).toMatchObject({ active: 1, queued: 0, queuedBytes: 0 });
+			expect(admission.metrics).toMatchObject({ active: 1, queued: 0, queuedBytes: 0, offered: 2, cancelled: 1 });
 			expect(vi.getTimerCount()).toBe(0);
 			const waiting = admission.acquire("queued", "queued", 2, undefined, false, notified);
 			expect(notified).toHaveBeenCalledTimes(1);

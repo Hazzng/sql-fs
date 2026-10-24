@@ -104,6 +104,42 @@ describe("ingress configuration", () => {
 });
 
 describe("HTTP body admission", () => {
+	it("preserves a successful route response after it handles a body input error", async () => {
+		const { app, ingress } = setup();
+		let mutationCompleted = false;
+		app.post("/handled-input-error", async (c) => {
+			const reader = c.req.raw.body?.getReader();
+			if (reader === undefined) throw new Error("Expected a request body");
+			await reader.read();
+			try {
+				await reader.read();
+			} catch {
+				mutationCompleted = true;
+			}
+			return c.text("committed", 201);
+		});
+		let reads = 0;
+		const body = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (reads++ === 0) controller.enqueue(new TextEncoder().encode("partial"));
+					else controller.error(new Error("input stream failed"));
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		try {
+			const response = await app.fetch(
+				new Request("http://localhost/handled-input-error", { method: "POST", body, duplex: "half" } as RequestInit),
+			);
+			expect(mutationCompleted).toBe(true);
+			expect(response.status).toBe(201);
+			expect(await response.text()).toBe("committed");
+		} finally {
+			ingress.close();
+		}
+	});
+
 	it("rejects excess request count without reading the rejected body", async () => {
 		const { app, ingress } = setup(1);
 		const hold = deferred();

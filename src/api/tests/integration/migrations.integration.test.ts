@@ -230,15 +230,18 @@ describe.skipIf(SKIP)("runMigrations (integration)", () => {
 		await runMigrations(cfg);
 		const sql = postgres(url, { prepare: false, max: 1 });
 		try {
+			const removedMigration = "0008_resolve_relative_symlinks.sql";
 			await sql`UPDATE public.sql_fs_migrations SET sha256 = ${"0".repeat(64)} WHERE filename = '0000_create_tables.sql'`;
-			await sql`DELETE FROM public.sql_fs_migrations WHERE filename = '0008_resolve_relative_symlinks.sql'`;
+			await sql`DELETE FROM public.sql_fs_migrations WHERE filename = ${removedMigration}`;
 			await sql`DROP FUNCTION fs_resolve_internal(text, boolean, integer)`;
 			await expect(runMigrations(cfg)).rejects.toThrow(/Checksum mismatch.*0000_create_tables.sql/);
 			const after = await sql<{ resolver: string | null }[]>`
 				SELECT to_regprocedure('fs_resolve_internal(text,boolean,integer)')::text AS resolver
 			`;
 			expect(after).toEqual([{ resolver: null }]);
-			expect((await migrationLedger(sql)).map(({ filename }) => filename)).toEqual(MIGRATION_FILES.slice(0, -1));
+			expect((await migrationLedger(sql)).map(({ filename }) => filename)).toEqual(
+				MIGRATION_FILES.filter((filename) => filename !== removedMigration),
+			);
 		} finally {
 			await sql.end({ timeout: 5 });
 		}

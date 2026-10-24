@@ -5,7 +5,8 @@ import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, validateOperation, visitConcurrent } from './aca-load-workload.mjs';
+import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, safeRetryAfter, validateOperation, visitConcurrent } from './aca-load-workload.mjs';
+import { createEventLogger } from './aca-load-logger.mjs';
 import { waitForStartBarrier } from './aca-load-barrier.mjs';
 
 const defaults = { app: 'virtualfs-api', group: 'rg-harry-dev', duration: '30', rate: '2', pool: '20',
@@ -48,7 +49,8 @@ if (flags.resource.length > 8 || flags.resource.some(x => !/^\/subscriptions\/[\
 const exec = promisify(execFile), now = () => new Date().toISOString(), sleep = ms => new Promise(r => setTimeout(r, ms));
 const runId = `aca-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 const root = flags.manifest ? dirname(resolve(flags.manifest)) : resolve(flags.out || join(dirname(fileURLToPath(import.meta.url)), '.run', runId));
-let manifest, base, token, loadStart, loadDeadline, stopped = false, logging = Promise.resolve();
+let manifest, base, token, loadStart, loadDeadline, stopped = false;
+const eventLogger = createEventLogger((entry) => appendFile(join(root, 'events.jsonl'), entry), () => { process.exitCode = 1; });
 const ledger = [], delays = [], running = new Set(), errors = Object.create(null);
 const counters = { planned: Math.ceil(cfg.rate * cfg.duration), offered: 0, dropped: 0, sentOperations: 0,
 	sentAttempts: 0, completedAttempts: 0, completedOperations: 0, completedInOfferWindow: 0, successesInOfferWindow: 0, httpResponses: 0,
@@ -56,7 +58,7 @@ const counters = { planned: Math.ceil(cfg.rate * cfg.duration), offered: 0, drop
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { stopped = true; });
 const safeCode = x => typeof x === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(x) ? x : null;
 const safeError = error => ({ error: safeCode(error?.name) || 'Error', code: safeCode(error?.code ?? error?.cause?.code), killed: error?.killed === true });
-const record = row => { const entry = JSON.stringify({ at: now(), ...row }) + '\n'; logging = logging.then(() => appendFile(join(root, 'events.jsonl'), entry)); return logging; };
+const record = row => eventLogger.record(JSON.stringify({ at: now(), ...row }) + '\n');
 async function jsonFile(name, value) { const path = join(root, name); await writeFile(path + '.tmp', JSON.stringify(value, null, 2)); await rename(path + '.tmp', path); }
 let manifestWrites = Promise.resolve();
 const saveManifest = () => {
@@ -114,7 +116,7 @@ async function request(path, body, method = body === undefined ? 'GET' : 'POST',
 	} catch (error) { return { status, requestedAt, ms: performance.now() - began, ...safeError(error), transportFailure: true }; }
 }
 function publicResult(r) { return { status: r.status, requestedAt: r.requestedAt, ms: r.ms, bytes: r.bytes, hash: r.hash,
-	code: r.code, retryable: r.retryable, retryAfter: safeCode(r.retryAfter), replica: r.replica, error: r.error,
+	code: r.code, retryable: r.retryable, retryAfter: safeRetryAfter(r.retryAfter), replica: r.replica, error: r.error,
 	transportFailure: r.transportFailure, exitCode: r.json?.exitCode, stdoutBytes: typeof r.json?.stdout === 'string' ? Buffer.byteLength(r.json.stdout) : undefined,
 	stderrBytes: typeof r.json?.stderr === 'string' ? Buffer.byteLength(r.json.stderr) : undefined }; }
 const safeRefusal = r => !r.transportFailure && r.status === 503 && r.retryable === true && ['EWORKER_BUSY', 'ERUNTIME_BUSY', 'ESHUTTINGDOWN'].includes(r.code);
@@ -306,7 +308,8 @@ async function load() {
 			const key = `${a.status ?? 'transport'}:${a.code || a.error || (a.success ? 'success' : 'unexpected')}`;
 			(attemptLatencies[key] ||= []).push(a.ms);
 		}
-		const summary = { runId, measurement, config: cfg, stopped, ...counters, ledgerOperations: ledger.length,
+		await eventLogger.flush();
+		const summary = { runId, measurement, config: cfg, stopped, ...counters, loggingError: eventLogger.error ? safeError(eventLogger.error) : undefined, ledgerOperations: ledger.length,
 			successes: totals.success, safeRefusals: totals.safeRefusal, unknown: totals.unknown, failed: totals.failed,
 			errors, offersSeconds: began === undefined ? null : (offeredEnd - began) / 1000,
 			wallSeconds: began === undefined ? null : (performance.now() - began) / 1000, targetOfferedRate: cfg.rate,
@@ -340,7 +343,8 @@ try {
 			do { await sample(flags['app-metrics']); if (Date.now() >= until || stopped) break; await sleep(Math.min(cfg.interval * 1000, until - Date.now())); } while (!stopped);
 		}
 	}
-	await logging; console.log(JSON.stringify({ evidence: root, exitCode: process.exitCode || 0 }));
+	await eventLogger.flush();
+	console.log(JSON.stringify({ evidence: root, loggingError: eventLogger.error ? safeError(eventLogger.error) : undefined, exitCode: process.exitCode || 0 }));
 } catch (error) {
 	await record({ kind: 'fatal', ...safeError(error) }).catch(() => {});
 	console.error(JSON.stringify({ error: 'Driver failed; inspect sanitized evidence', ...safeError(error), evidence: root })); process.exitCode = 1;

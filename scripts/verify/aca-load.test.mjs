@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, validateOperation, visitConcurrent } from "./aca-load-workload.mjs";
+import { buildScript, markerIntegrity, outcomeTotals, overloadDelayMs, safeRetryAfter, validateOperation, visitConcurrent } from "./aca-load-workload.mjs";
+import { createEventLogger } from "./aca-load-logger.mjs";
 
 const execute = promisify(execFile);
 const operation = (outcome, attempts) => ({ id: 1, marker: "one", sandbox: "owned", outcome, attempts });
@@ -78,6 +79,30 @@ test("overload backoff grows within the client deadline and respects Retry-After
 	assert.equal(overloadDelayMs("30", 0), 30000);
 	assert.equal(overloadDelayMs("Thu, 01 Jan 1970 00:00:30 GMT", 0, 0), 30000);
 	assert.equal(overloadDelayMs("Thu, 01 Jan 1970 00:00:01 GMT", 0, 30000), 1000);
+});
+
+test("Retry-After evidence preserves bounded HTTP dates", () => {
+	assert.equal(safeRetryAfter("Thu, 01 Jan 1970 00:00:30 GMT"), "Thu, 01 Jan 1970 00:00:30 GMT");
+	assert.equal(safeRetryAfter("30"), "30");
+	assert.equal(safeRetryAfter("not-a-date"), null);
+	assert.equal(safeRetryAfter("x".repeat(129)), null);
+});
+
+test("event logging recovers after an append failure and retains the first error", async () => {
+	const appendFailure = new Error("disk full");
+	const writes = [];
+	const failures = [];
+	let appendCalls = 0;
+	const logger = createEventLogger(async (entry) => {
+		if (appendCalls++ === 0) throw appendFailure;
+		writes.push(entry);
+	}, (error) => failures.push(error));
+	await logger.record("first");
+	await logger.record("second");
+	await logger.flush();
+	assert.equal(logger.error, appendFailure);
+	assert.deepEqual(failures, [appendFailure]);
+	assert.deepEqual(writes, ["second"]);
 });
 
 

@@ -20,6 +20,15 @@ export function overloadDelayMs(retryAfter, attempt, nowMs = Date.now()) {
 	return Math.max(minimum, Math.min(10000, 1000 * 2 ** Math.min(attempt, 4)));
 }
 
+export function safeRetryAfter(value) {
+	if (typeof value !== 'string' || value.length > 128) return null;
+	const trimmed = value.trim();
+	if (/^\d{1,10}$/.test(trimmed)) return trimmed;
+	if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(trimmed)) return null;
+	const timestamp = Date.parse(trimmed);
+	return Number.isFinite(timestamp) && new Date(timestamp).toUTCString() === trimmed ? trimmed : null;
+}
+
 export function buildScript(marker, cfg, path = '/home/user/aca-markers.txt') {
 	return `${cfg.hold ? `sleep ${cfg.hold / 1000} && ` : ''}${cfg.cpu ? `i=0; while [ "$i" -lt ${cfg.cpu} ]; do i=$((i+1)); done; ` : ''}` +
 		`printf '%s\\n' ${quote(marker)} >> ${quote(path)} && printf '%s' ${quote(marker)}`;

@@ -133,6 +133,7 @@ export class FairAdmission {
 				onQueued?.();
 			} catch (error) {
 				this.remove(waiter);
+				this.cancelled++;
 				reject(error);
 			}
 			this.drain();

@@ -4,7 +4,7 @@ This audit uses the eight areas in [Factory's Agent Readiness article](https://f
 
 ## Implementation workflow
 
-The entry point is [AGENTS.md](../AGENTS.md). Run `pnpm setup:dev`, `pnpm check`, and `pnpm verify:local`. The first command installs locked dependencies. The second covers the server and both SDKs without services. The third exercises real Postgres, Redis, HTTP, MCP, and SDK behavior in a disposable stack. Use `pnpm verify:architecture` for ownership or protocol changes; CI runs that expanded profile, including worker failures, SSE finalization, input budgets, and tenant isolation.
+The entry point is [AGENTS.md](../AGENTS.md). Run `pnpm setup:dev`, `pnpm check`, and `pnpm verify:local`. The first command installs locked dependencies. The second covers the server and both SDKs without services. The third exercises real Postgres, Redis, HTTP, MCP, and SDK behavior in a disposable stack. Use `pnpm verify:architecture` for ownership, protocol, or ingress admission changes; CI runs that expanded profile, including worker failures, SSE finalization, input budgets, ingress queue admission, and tenant isolation.
 
 | Area | Repository evidence | Remaining limit |
 | --- | --- | --- |
