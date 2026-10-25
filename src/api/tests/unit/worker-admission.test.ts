@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FairAdmission } from "../../worker-owner/admission.js";
 
 const options = {
@@ -12,6 +12,38 @@ const options = {
 };
 
 describe("bounded tenant admission", () => {
+	it("notifies only an accepted queue entry and removes it if the hook throws", async () => {
+		vi.useFakeTimers();
+		const admission = new FairAdmission({ ...options, maxQueued: 1 });
+		const notified = vi.fn();
+		const release = await admission.acquire("active", "active", 1, undefined, false, notified);
+		try {
+			expect(notified).not.toHaveBeenCalled();
+			await expect(
+				admission.acquire("broken", "broken", 2, undefined, false, () => {
+					expect(admission.metrics).toMatchObject({ queued: 1, queuedBytes: 2 });
+					throw new Error("queue hook failed");
+				}),
+			).rejects.toThrow("queue hook failed");
+			expect(admission.metrics).toMatchObject({ active: 1, queued: 0, queuedBytes: 0, offered: 2, cancelled: 1 });
+			expect(vi.getTimerCount()).toBe(0);
+			const waiting = admission.acquire("queued", "queued", 2, undefined, false, notified);
+			expect(notified).toHaveBeenCalledTimes(1);
+			await expect(admission.acquire("excess", "excess", 2, undefined, false, notified)).rejects.toMatchObject({
+				code: "EWORKER_BUSY",
+			});
+			expect(notified).toHaveBeenCalledTimes(1);
+			release();
+			(await waiting)();
+			expect(admission.metrics).toMatchObject({ active: 0, queued: 0, queuedBytes: 0 });
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			admission.close();
+			release();
+			vi.useRealTimers();
+		}
+	});
+
 	it("gives a queued writer priority over later readers of that sandbox", async () => {
 		const admission = new FairAdmission({ ...options, capacity: 3, maxActivePerTenant: 2, waitMs: 1000 });
 		const firstReader = await admission.acquire("tenant", "sandbox", 1, undefined, true);

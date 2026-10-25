@@ -22,9 +22,10 @@ properties:
       - name: ghcr-token
         value: "<GITHUB_PAT>"
   template:
+    terminationGracePeriodSeconds: 90
     containers:
       - name: api
-        image: ghcr.io/<GITHUB_USERNAME>/sql-fs-api:latest
+        image: ghcr.io/<GITHUB_USERNAME>/sql-fs@sha256:<IMAGE_DIGEST>
         resources:
           cpu: 1.0
           memory: 2Gi
@@ -39,17 +40,31 @@ properties:
             secretRef: redis-url
           - name: PORT
             value: "8080"
+          - name: REDIS_BLOB_CACHE_ENABLED
+            value: "false"
+          - name: SQL_FS_MAX_INGRESS_QUEUED_REQUESTS
+            value: "64"
+          - name: SQL_FS_MAX_INGRESS_TENANT_QUEUED_REQUESTS
+            value: "16"
+          - name: SQL_FS_MAX_INGRESS_WAIT_MS
+            value: "5000"
+          - name: SQL_FS_WORKER_QUEUE_WAIT_MS
+            value: "5000"
+          - name: SQL_FS_WORKER_EXECUTION_MS
+            value: "45000"
         probes:
           - type: Liveness
             httpGet:
               path: /healthz
               port: 8080
             periodSeconds: 15
+            timeoutSeconds: 3
           - type: Readiness
             httpGet:
               path: /readyz
               port: 8080
-            periodSeconds: 10
+            periodSeconds: 2
+            timeoutSeconds: 3
           - type: Startup
             httpGet:
               path: /readyz
@@ -57,10 +72,11 @@ properties:
             failureThreshold: 30
             periodSeconds: 2
     scale:
-      minReplicas: 1
+      minReplicas: 2
       maxReplicas: 10
+      # HTTP scaling uses ACA's fleet request signal, evaluated every 15 seconds.
       rules:
         - name: http-rule
           http:
             metadata:
-              concurrentRequests: "50"
+              concurrentRequests: "1"

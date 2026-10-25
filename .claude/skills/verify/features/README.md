@@ -46,6 +46,7 @@ These have no hand-driven journey yet. Run the suite through `$S suite <name>`, 
 - Worker crash, lease loss, and unknown-outcome errors: `worker-failures`
 - SSE stream finalization: `sse-finalization`
 - Request and input budgets: `input-budgets`
+- Queued upload cancellation and durable absence: `ingress-queue`
 - Output caps: `output-cap`
 - Graceful shutdown with open MCP streams: `shutdown`
 - Full HTTP/MCP contract against `/openapi.json`: `contracts`

@@ -17,8 +17,8 @@ import { workerRequestContext } from "../worker-owner/request-context.js";
 
 const createBodySchema = z.object({
 	name: z.string().max(255).optional(),
-	env: z.record(z.string()).optional(),
-	files: z.record(z.string()).optional(),
+	env: z.record(z.string(), z.string()).optional(),
+	files: z.record(z.string(), z.string()).optional(),
 	python: z.boolean().optional(),
 	javascript: z.boolean().optional(),
 	/** When true, js-exec fetch() is granted unrestricted outbound HTTPS access. */

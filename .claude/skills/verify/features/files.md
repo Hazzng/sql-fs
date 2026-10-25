@@ -10,6 +10,7 @@ Clients read and write sandbox files directly, without bash. They can write raw 
 - `files-mkdir` creates directories recursively (`204`).
 - `files-tree` lists entries under a prefix to a given depth.
 - `files-delete` removes a file (`204`), after which reads return `404 ENOENT`.
+- `files-queued-cancel` abandons a queued 1 MiB upload and verifies that it never becomes a durable file.
 
 ## How to get to it (user POV)
 
@@ -28,6 +29,7 @@ Preconditions:
 - **Bulk write, seen by bash.** Run `EXPECT=204 $S api POST /v1/sandboxes/$ID/writeFiles --json '{"files":{"/home/user/v/one.txt":"one\n","/home/user/v/two.txt":"two\n"}}'`, then `$S api POST /v1/sandboxes/$ID/exec-sync --json '{"script":"cat /home/user/v/one.txt /home/user/v/two.txt","readOnly":true}' | jq -r .stdout`. It prints `one` and `two`.
 - **Tree.** Run `$S api GET "/v1/sandboxes/$ID/tree?prefix=/home/user/v&depth=3" | jq -c '[.[].path]'`. The output lists `note.txt`, `one.txt`, and `two.txt` under `/home/user/v/`.
 - **Delete.** Run `EXPECT=204 $S api DELETE /v1/sandboxes/$ID/files/home/user/v/note.txt`, then `EXPECT=404 $S api GET /v1/sandboxes/$ID/files/home/user/v/note.txt`. The body is `{"error":"not_found","code":"ENOENT"}`.
+- **Queued cancellation.** Run `$S suite ingress-queue`. It holds ingress with an incomplete body, sends and abandons a queued upload, then checks queue removal before admission and reads the file after capacity returns. All five repetitions must leave no file and no retained bytes. A live 1 MiB upload control must preserve its exact hash.
 
 ## Gotchas
 
