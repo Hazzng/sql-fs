@@ -89,8 +89,8 @@ importers:
         specifier: 7.0.2004
         version: 7.0.2004
       portless:
-        specifier: ^0.13.0
-        version: 0.13.0
+        specifier: ^0.15.8
+        version: 0.15.8
       tsx:
         specifier: ^4.23.15
         version: 4.23.15
@@ -2015,9 +2015,9 @@ packages:
     resolution: {integrity: sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ==}
     engines: {node: '>=16.20.0'}
 
-  portless@0.13.0:
-    resolution: {integrity: sha512-PxMZ5BHH+ZZi9rTq4T8m003aZxh56qI0aBdNsxLn7jrTtvNJYBWYD3lc5PuQrom/aVh6z8iLb+tKUI6b7QNYQw==}
-    engines: {node: '>=20'}
+  portless@0.15.8:
+    resolution: {integrity: sha512-kzGoG4xLsEytczl7O/COZaBwSAOKsWsZDxHv7/iFHKIC0X71OonpgbsQw58CGO29RklIHIx6yLM31TJMnTtPEw==}
+    engines: {node: '>=24'}
     os: [darwin, linux, win32]
     hasBin: true
 
@@ -4054,7 +4054,7 @@ snapshots:
 
   pkce-challenge@5.0.1: {}
 
-  portless@0.13.0: {}
+  portless@0.15.8: {}
 
   postcss@8.5.10:
     dependencies:
