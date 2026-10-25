@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.1
+
+### Patch Changes
+
+- [#275](https://github.com/Hazzng/sql-fs/pull/275) Thanks [@Hazzng](https://github.com/Hazzng)! - Update the ACA deployment example with early HTTP concurrency scaling, bounded five-second queues, faster readiness probes, a drain grace period and an immutable image reference. Keep blob caching off in the example so control Redis does not also carry blob traffic.
+
+- [#275](https://github.com/Hazzng/sql-fs/pull/275) Thanks [@Hazzng](https://github.com/Hazzng)! - Read accepted queued HTTP and MCP request bodies within the existing byte budgets so client disconnects can remove waiting requests before route execution. Preserve streaming, response and retained-work ownership, and unread immediate queue-full refusal. Add independent global and tenant ingress queue limits, including zero waiting, while keeping the current queue sizes and 250 ms wait by default.
+
+  Expose ingress capacity, outcome counters and admitted queue wait histograms through metrics.
+
+- Update Zod, body-parser, undici, and certifi to resolve published security advisories.
+
+- [#274](https://github.com/Hazzng/sql-fs/pull/274) Thanks [@Hazzng](https://github.com/Hazzng)! - Centralize Postgres sandbox fencing while preserving transaction context, lock order, and statement counts. Add regression coverage for stale writes and concurrent transactions, and fix verification commands that could fail under shell pipefail.
+
+- [#275](https://github.com/Hazzng/sql-fs/pull/275) Thanks [@Hazzng](https://github.com/Hazzng)! - Record applied Postgres migrations and their SHA-256 checksums in a transactionally committed ledger per tenant database. Replica startup skips unchanged migrations instead of repeating table DDL while other replicas serve requests. Reject changes to recorded migration files and roll back pending DDL and history together on failure.
+
+- [#275](https://github.com/Hazzng/sql-fs/pull/275) Thanks [@Hazzng](https://github.com/Hazzng)! - Preserve completed route responses when request input fails after dispatch, and count queued-hook failures as cancelled admissions. Keep overload retry and Redis scaling guidance aligned with operation outcomes and configured cache roles.
+
+- [#275](https://github.com/Hazzng/sql-fs/pull/275) Thanks [@Hazzng](https://github.com/Hazzng)! - Remove development dependencies from the runtime Docker image after building the API.
+
 ## 1.2.0
 
 ### Minor Changes
